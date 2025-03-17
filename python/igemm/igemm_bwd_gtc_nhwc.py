@@ -1186,31 +1186,35 @@ class igemm_bwd_gtc_nhwc_t(mc_base_t):
             if IGEMM_BWD_GTC_NHWC_PACK_OUT_FLAG == 0:
                 if data_byte == 2:
                     if tb_k % 2 != 0:
-                        num_v_wei_flag              = self.v_tmp.value if tb_nc_per_thread <= 4 else vseq(tb_nc_per_thread)
-                        self.v_wei_flag             = sym_t("v_wei_flag"        ,num_v_wei_flag)
+                        #num_v_wei_flag              = self.v_tmp.value if tb_nc_per_thread <= 4 else vseq(tb_nc_per_thread)
+                        #self.v_wei_flag             = sym_t("v_wei_flag"        ,num_v_wei_flag)
+                        self.v_wei_flag             = sym_t("v_wei_flag"        ,vseq(tb_nc_per_thread))
                     else:
                         tb_num_pack_k_tmp = tb_k // 2
-                        def possible_assign_tmp(num_a, num_b, balance = 4):
-                            if num_a <= num_b:
-                                if num_b <= 4:
-                                    return vseq(num_a), self.v_tmp.value    # a <= b <= 4
-                                elif num_a <= 4:
-                                    return self.v_tmp.value, vseq(num_b)    # a <= 4 <= b
-                                else:
-                                    return vseq(num_a), vseq(num_b)         # 4 <= a <= b
-                            else:
-                                if num_a <= 4:
-                                    return self.v_tmp.value, vseq(num_b)
-                                elif num_b <= 4:
-                                    return vseq(num_a), self.v_tmp.value
-                                else:
-                                    return vseq(num_a), vseq(num_b)
-                        num_v_wei_flag, num_v_pack_k_tmp = possible_assign_tmp(tb_nc_per_thread, tb_num_pack_k_tmp)
-                        self.v_wei_flag             = sym_t("v_wei_flag"        ,num_v_wei_flag)
-                        self.v_pack_k_tmp           = sym_t("v_pack_k_tmp"      ,num_v_pack_k_tmp)
+                        #def possible_assign_tmp(num_a, num_b, balance = 4):
+                        #    if num_a <= num_b:
+                        #        if num_b <= 4:
+                        #            return vseq(num_a), self.v_tmp.value    # a <= b <= 4
+                        #        elif num_a <= 4:
+                        #            return self.v_tmp.value, vseq(num_b)    # a <= 4 <= b
+                        #        else:
+                        #            return vseq(num_a), vseq(num_b)         # 4 <= a <= b
+                        #    else:
+                        #        if num_a <= 4:
+                        #            return self.v_tmp.value, vseq(num_b)
+                        #        elif num_b <= 4:
+                        #            return vseq(num_a), self.v_tmp.value
+                        #        else:
+                        #            return vseq(num_a), vseq(num_b)
+                        #num_v_wei_flag, num_v_pack_k_tmp = possible_assign_tmp(tb_nc_per_thread, tb_num_pack_k_tmp)
+                        #self.v_wei_flag             = sym_t("v_wei_flag"        ,num_v_wei_flag)
+                        #self.v_pack_k_tmp           = sym_t("v_pack_k_tmp"      ,num_v_pack_k_tmp)
+                        self.v_pack_k_tmp           = sym_t("v_pack_k_tmp"      ,vseq(tb_num_pack_k_tmp))
+                        self.v_wei_flag             = sym_t("v_wei_flag"        ,vseq(tb_nc_per_thread))
 
                 else:
-                    self.v_wei_flag         = sym_t("v_wei_flag"        ,self.v_tmp.value if tb_nc_per_thread <= 4 else vseq(tb_nc_per_thread))
+                    #self.v_wei_flag         = sym_t("v_wei_flag"        ,self.v_tmp.value if tb_nc_per_thread <= 4 else vseq(tb_nc_per_thread))
+                    self.v_wei_flag          = sym_t("v_wei_flag"        ,vseq(tb_nc_per_thread))
 
             else:
                 assert False, "not supported now"
