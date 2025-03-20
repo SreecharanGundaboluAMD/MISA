@@ -103,8 +103,10 @@ v_mfma_f32_32x32x2f32   = inst_mfma_t(32, 32, 2,  AMDGPU_PRECISION_FP32,  64,   
 v_mfma_f32_4x4x4f16     = inst_mfma_t(4,  4,  4,  AMDGPU_PRECISION_FP16,   8,   2,   2,  4,    16)
 v_mfma_f32_16x16x4f16   = inst_mfma_t(16, 16, 4,  AMDGPU_PRECISION_FP16,  32,   2,   2,  16,   4 )
 v_mfma_f32_16x16x16f16  = inst_mfma_t(16, 16, 16, AMDGPU_PRECISION_FP16,  32,   2,   2,  4,    1 )
+v_mfma_f32_16x16x32f16  = inst_mfma_t(16, 16, 32, AMDGPU_PRECISION_FP16,  16,   4,   4,  4,    1, lanegroup_k=8)
 v_mfma_f32_32x32x4f16   = inst_mfma_t(32, 32, 4,  AMDGPU_PRECISION_FP16,  64,   2,   2,  32,   2 )
 v_mfma_f32_32x32x8f16   = inst_mfma_t(32, 32, 8,  AMDGPU_PRECISION_FP16,  64,   2,   2,  16,   1 )
+v_mfma_f32_32x32x16f16  = inst_mfma_t(32, 32, 16, AMDGPU_PRECISION_FP16,  32,   4,   4,  16,   1, lanegroup_k=8)
 
 v_mfma_f32_4x4x2bf16    = inst_mfma_t(4,  4,  2,  AMDGPU_PRECISION_BF16,   8,   1,   1,  4,    16)
 v_mfma_f32_16x16x2bf16  = inst_mfma_t(16, 16, 2,  AMDGPU_PRECISION_BF16,  32,   1,   1,  16,   4 )
@@ -116,21 +118,27 @@ v_mfma_i32_4x4x4i8      = inst_mfma_t(4,  4,  4,  AMDGPU_PRECISION_INT8,   8,   
 v_mfma_i32_16x16x4i8    = inst_mfma_t(16, 16, 4,  AMDGPU_PRECISION_INT8,  32,   1,   1,  16,   4 )
 v_mfma_i32_16x16x16i8   = inst_mfma_t(16, 16, 16, AMDGPU_PRECISION_INT8,  32,   1,   1,  4,    1 )
 v_mfma_i32_16x16x32i8   = inst_mfma_t(16, 16, 32, AMDGPU_PRECISION_INT8,  16,   2,   2,  4,    1, lanegroup_k=8)
+v_mfma_i32_16x16x64i8   = inst_mfma_t(16, 16, 64, AMDGPU_PRECISION_INT8,  16,   4,   4,  4,    1, lanegroup_k=16)
 v_mfma_i32_32x32x4i8    = inst_mfma_t(32, 32, 4,  AMDGPU_PRECISION_INT8,  64,   1,   1,  32,   2 )
 v_mfma_i32_32x32x8i8    = inst_mfma_t(32, 32, 8,  AMDGPU_PRECISION_INT8,  64,   1,   1,  16,   1 )
 v_mfma_i32_32x32x16i8   = inst_mfma_t(32, 32, 16, AMDGPU_PRECISION_INT8,  32,   2,   2,  16,   1, lanegroup_k=8)
+v_mfma_i32_32x32x32i8   = inst_mfma_t(32, 32, 32, AMDGPU_PRECISION_INT8,  32,   4,   4,  16,   1, lanegroup_k=16)
 
 v_mfma_f32_4x4x4bf16_1k     = inst_mfma_t(4,  4,  4,  AMDGPU_PRECISION_BF16,   8,   2,   2,  4,    16, bf16_1k=True)
 v_mfma_f32_16x16x4bf16_1k   = inst_mfma_t(16, 16, 4,  AMDGPU_PRECISION_BF16,  32,   2,   2,  16,   4 , bf16_1k=True)
 v_mfma_f32_16x16x16bf16_1k  = inst_mfma_t(16, 16, 16, AMDGPU_PRECISION_BF16,  32,   2,   2,  4,    1 , bf16_1k=True)
 v_mfma_f32_32x32x4bf16_1k   = inst_mfma_t(32, 32, 4,  AMDGPU_PRECISION_BF16,  64,   2,   2,  32,   2 , bf16_1k=True)
 v_mfma_f32_32x32x8bf16_1k   = inst_mfma_t(32, 32, 8,  AMDGPU_PRECISION_BF16,  64,   2,   2,  16,   1 , bf16_1k=True)
+v_mfma_f32_16x16x32bf16     = inst_mfma_t(16, 16, 32, AMDGPU_PRECISION_BF16,  16,   4,   4,  4,    1 , lanegroup_k=8)
+v_mfma_f32_32x32x16bf16     = inst_mfma_t(32, 32, 16, AMDGPU_PRECISION_BF16,  32,   4,   4,  16,   1 , lanegroup_k=8)
 
 v_mfma_f32_4x4x4_16f_m      = inst_mfma_t(4,  4,  4,  AMDGPU_PRECISION_BF16,   8,   2,   2,  4,    16, bf16_1k=True, name='v_mfma_f32_4x4x4_16f_m')
 v_mfma_f32_16x16x4_16f_m    = inst_mfma_t(16, 16, 4,  AMDGPU_PRECISION_BF16,  32,   2,   2,  16,   4 , bf16_1k=True, name='v_mfma_f32_16x16x4_16f_m')
 v_mfma_f32_16x16x16_16f_m   = inst_mfma_t(16, 16, 16, AMDGPU_PRECISION_BF16,  32,   2,   2,  4,    1 , bf16_1k=True, name='v_mfma_f32_16x16x16_16f_m')
 v_mfma_f32_32x32x4_16f_m    = inst_mfma_t(32, 32, 4,  AMDGPU_PRECISION_BF16,  64,   2,   2,  32,   2 , bf16_1k=True, name='v_mfma_f32_32x32x4_16f_m')
 v_mfma_f32_32x32x8_16f_m    = inst_mfma_t(32, 32, 8,  AMDGPU_PRECISION_BF16,  64,   2,   2,  16,   1 , bf16_1k=True, name='v_mfma_f32_32x32x8_16f_m')
+v_mfma_f32_16x16x32_16f_m   = inst_mfma_t(16, 16, 32, AMDGPU_PRECISION_BF16,  16,   4,   4,  4,    1 , bf16_1k=True, name='v_mfma_f32_32x32x16_16f_m', lanegroup_k=8)
+v_mfma_f32_32x32x16_16f_m   = inst_mfma_t(32, 32, 16, AMDGPU_PRECISION_BF16,  64,   4,   4,  16,   1 , bf16_1k=True, name='v_mfma_f32_32x32x16_16f_m', lanegroup_k=8)
 
 def inst_mfma_emit_macro_mfma_16f(mc, predefined_symbol_bf16_enable, default_value):
     mc.emit(f'.ifndef {predefined_symbol_bf16_enable}')

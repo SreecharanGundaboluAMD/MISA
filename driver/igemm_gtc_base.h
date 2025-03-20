@@ -152,10 +152,10 @@ static inline std::string get_igemm_gtc_fma_type(std::string arch_string, const 
             return IGEMM_GTC_TUNABLE_FMA_TYPE_MAC;
         if(arch_string == "gfx906" || arch_string == "gfx1030")
             return IGEMM_GTC_TUNABLE_FMA_TYPE_DLOPS;
-        if(arch_string == "gfx908" || arch_string == "gfx90a" || arch_string == "gfx940" || arch_string == "gfx942")
+        if(arch_string == "gfx908" || arch_string == "gfx90a" || arch_string == "gfx940" || arch_string == "gfx942" || arch_string == "gfx950")
             return IGEMM_GTC_TUNABLE_FMA_TYPE_DLOPS;
     }else if(sec.count("wave_tile_m") > 0 && sec.count("wave_tile_n") > 0){
-        assert(arch_string == "gfx908" || arch_string == "gfx90a" || arch_string == "gfx940" || arch_string == "gfx942");
+        assert(arch_string == "gfx908" || arch_string == "gfx90a" || arch_string == "gfx940" || arch_string == "gfx942" || arch_string == "gfx950");
         return IGEMM_GTC_TUNABLE_FMA_TYPE_XDLOPS;
     }
     return IGEMM_GTC_TUNABLE_FMA_TYPE_NA;
@@ -247,6 +247,9 @@ static inline int get_gcn_arch(char* archname)
     else if (!strncmp("gfx942", archname, 6)){
         gcn_arch = 942;
     }
+    else if (!strncmp("gfx950", archname, 6)){
+        gcn_arch = 950;
+    }
     return gcn_arch;
 }
 
@@ -306,6 +309,8 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += "gtcx2_";
         else if(gcn_arch == 940 || gcn_arch == 941 || gcn_arch == 942)
             kernel_name += "gtcx3_";
+        else if(gcn_arch == 950)
+            kernel_name += "gtcx35_";
     }
     std::string vector_c_str = "";
     if(tunable->vector_c > 1)
