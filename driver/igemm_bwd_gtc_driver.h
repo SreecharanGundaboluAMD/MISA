@@ -487,7 +487,10 @@ public:
                 return false;
             }
 
-            if(tunable->precision == "fp16"){
+            if (tunable->precision == "fp32") {
+                // no additional checks;
+            }
+            else if (tunable->precision == "fp16" || tunable->precision == "bf16") {
                 // fp16 support vector writeout by default. check get_vector_write_out()
                 if(tunable->tensor_a_thread_lengths[1] == 1 && tunable->tensor_b_thread_lengths[3] == 1 && tunable->merge_e && !tunable->gemm_k_global_split){
                     ;   // only case that support every config
@@ -503,9 +506,8 @@ public:
                             return false;
                     }
                 }
-            }
-
-            if(tunable->precision == "int8"){
+            } 
+            else if(tunable->precision == "int8"){
                 // fp16 support vector writeout by default. check get_vector_write_out()
                 if(tunable->tensor_a_thread_lengths[1] == 1){
                     ;   // if both 1, c is also write out one by one
@@ -519,6 +521,9 @@ public:
                             return false;
                     }
                 }
+            }
+            else {
+                assert(0);
             }
         }
 
