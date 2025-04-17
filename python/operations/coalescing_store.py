@@ -881,7 +881,7 @@ class igemm_coalescing_store_xdlops_t(mc_base_t):
             then, consider that introduced by granularity
             '''
             self._emit(f"v_lshrrev_b32 v[{v_tmp4}], {utility_log2(ctrl.cxm.lanegroup_m_per_thread())}, v[{v_gemm_im}]")
-            self._emit(f"v_and_b32 v[{v_tmp4}],  {ctrl.cxm.lanegroup_m_per_cluster() - 1} v[{v_tmp4}]   ; thread id of lanegroup_m_per_cluster")
+            self._emit(f"v_and_b32 v[{v_tmp4}],  {ctrl.cxm.lanegroup_m_per_cluster() - 1}, v[{v_tmp4}]   ; thread id of lanegroup_m_per_cluster")
             self._emit(f"v_lshlrev_b32 v[{v_co_sst}], {utility_log2(ctrl.cxm.lanegroup_m_per_thread())}, v[{v_tmp4}]")
 
             if ctrl.cxm.block_m_per_lanegroup() != 1:
@@ -1277,13 +1277,14 @@ class igemm_coalescing_store_xdlops_t(mc_base_t):
                                 self._emit(f"v_pack_b32_f16 v[{v_c(vgpr_index + 0)}], v[{v_c(vgpr_index + 0)}], v[{v_c(vgpr_index + 1)}]")
                                 self._emit(f"v_pack_b32_f16 v[{v_c(vgpr_index + 1)}], v[{v_c(vgpr_index + 2)}], v[{v_c(vgpr_index + 3)}]")
                         if ctrl.precision == 'bf16':
+                            macro_packhi = macro_packhi_b32_t(self.mc)
                             if ctrl.vector_write_out == 1:
                                 if not ctrl.accvgpr_unified:
-                                    self._emit(f"v_pack_b32_f16 v[{v_c(vgpr_index + 0)}], v[{v_c(vgpr_index + 0)}], v[{v_c(vgpr_index + 1)}] op_sel:[1,1]")
-                                    self._emit(f"v_pack_b32_f16 v[{v_c(vgpr_index + 1)}], v[{v_c(vgpr_index + 2)}], v[{v_c(vgpr_index + 3)}] op_sel:[1,1]")
+                                    self._emit(macro_packhi(v_c(vgpr_index + 0), v_c(vgpr_index + 0), v_c(vgpr_index + 1)))
+                                    self._emit(macro_packhi(v_c(vgpr_index + 1), v_c(vgpr_index + 2), v_c(vgpr_index + 3)))
                                 else:
-                                    self._emit(f"v_pack_b32_f16 v[{v_c(vgpr_index + 0)}], v[{a_c(agpr_index + 0)}], v[{a_c(agpr_index + 1)}] op_sel:[1,1]") ; agpr_consume_list.append(agpr_index + 0) ; agpr_consume_list.append(agpr_index + 1)
-                                    self._emit(f"v_pack_b32_f16 v[{v_c(vgpr_index + 1)}], v[{a_c(agpr_index + 2)}], v[{a_c(agpr_index + 3)}] op_sel:[1,1]") ; agpr_consume_list.append(agpr_index + 2) ; agpr_consume_list.append(agpr_index + 3)
+                                    self._emit(macro_packhi(v_c(vgpr_index + 0), a_c(agpr_index + 0), a_c(agpr_index + 1))) ; agpr_consume_list.append(agpr_index + 0) ; agpr_consume_list.append(agpr_index + 1)
+                                    self._emit(macro_packhi(v_c(vgpr_index + 1), a_c(agpr_index + 2), a_c(agpr_index + 3))) ; agpr_consume_list.append(agpr_index + 2) ; agpr_consume_list.append(agpr_index + 3)
                             else:
                                 if not ctrl.accvgpr_unified:
                                     self._emit(f"v_lshrrev_b32 v[{v_c(vgpr_index + 0)}], 16, v[{v_c(vgpr_index + 0)}]")

@@ -27,6 +27,8 @@
 from ..codegen import *
 import math
 
+DBG_USE_PACK_F16_FOR_BF16 = 0
+
 class macro_int_div_vv_t(macro_base_t):
     '''
     integer divide to compute `v_q = v_n / v_d`, v_q, v_n, v_d all vgpr
@@ -538,6 +540,41 @@ class gpr_sequencer_t(object):
     def get(self):
         return self.cnt
 
+class macro_packlo_b32_t(macro_base_t):
+    def __init__(self, mc):
+        macro_base_t.__init__(self, mc, True)
+        self.declare_arg("v_dst")
+        self.declare_arg("v_a")
+        self.declare_arg("v_b")
+
+    def name(self):
+        return '.v_packlo_b32'
+
+    def expr(self):
+        if DBG_USE_PACK_F16_FOR_BF16:
+            self._emit(f"v_pack_b32_f16 v[{self.v_dst()}], v[{self.v_a()}], v[{self.v_b()}]")
+        else:
+            self._emit(f"v_lshlrev_b32  v[{self.v_dst()}], 16, v[{self.v_a()}]")
+            self._emit(f"v_alignbit_b32 v[{self.v_dst()}], v[{self.v_b()}], v[{self.v_dst()}], 16")
+
+class macro_packhi_b32_t(macro_base_t):
+    def __init__(self, mc):
+        macro_base_t.__init__(self, mc, True)
+        self.declare_arg("v_dst")
+        self.declare_arg("v_a")
+        self.declare_arg("v_b")
+
+    def name(self):
+        return '.v_packhi_b32'
+
+    def expr(self):
+        if DBG_USE_PACK_F16_FOR_BF16:
+            self._emit(f"v_pack_b32_f16 v[{self.v_dst()}], v[{self.v_a()}], v[{self.v_b()}] op_sel:[1, 1]")
+        else:
+            self._emit(f"v_lshrrev_b32  v[{self.v_dst()}], 16, v[{self.v_b()}]")
+            self._emit(f"v_alignbit_b32 v[{self.v_dst()}], v[{self.v_dst()}], v[{self.v_a()}], 16")
+
+
 class macro_packed_fp16_to_bf16_t(macro_base_t):
     def __init__(self, mc, **options):
         macro_base_t.__init__(self, mc, True)
@@ -554,7 +591,7 @@ class macro_packed_fp16_to_bf16_t(macro_base_t):
         for i in range(num_vgpr):
             self._emit(f"v_cvt_f32_f16 v[{self.v_tmp()}], v[{self.v_packed_f16(i)}]")
             self._emit(f"v_cvt_f32_f16 v[{self.v_packed_f16(i)}], v[{self.v_packed_f16(i)}] src0_sel:WORD_1")
-            self._emit(f"v_pack_b32_f16 v[{self.v_packed_f16(i)}], v[{self.v_tmp()}], v[{self.v_packed_f16(i)}] op_sel:[1,1]")
+            self._emit(macro_packhi_b32_t(self.v_packed_f16(i), self.v_tmp(), self.v_packed_f16(i)))
 
 def utility_list_to_string(arr):
     assert type(arr) is list
