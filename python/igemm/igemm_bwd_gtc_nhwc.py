@@ -1209,7 +1209,7 @@ class igemm_bwd_gtc_nhwc_t(mc_base_t):
                         #num_v_wei_flag, num_v_pack_k_tmp = possible_assign_tmp(tb_nc_per_thread, tb_num_pack_k_tmp)
                         #self.v_wei_flag             = sym_t("v_wei_flag"        ,num_v_wei_flag)
                         #self.v_pack_k_tmp           = sym_t("v_pack_k_tmp"      ,num_v_pack_k_tmp)
-                        self.v_pack_k_tmp           = sym_t("v_pack_k_tmp"      ,vseq(tb_num_pack_k_tmp))
+                        self.v_pack_k_tmp           = sym_t("v_pack_k_tmp"      ,vseq(tb_num_pack_k_tmp,2))
                         self.v_wei_flag             = sym_t("v_wei_flag"        ,vseq(tb_nc_per_thread))
 
                 else:
@@ -1574,24 +1574,22 @@ class igemm_bwd_gtc_nhwc_t(mc_base_t):
                             for i_pk in range(packed_k_dword):
                                 idx_0 = 2 * i_pk * dwords_per_c + i_c // 2
                                 idx_1 = 2 * i_pk * dwords_per_c + i_c // 2 + dwords_per_c
+                                m_pack = macro_packhi_b32_t(self.mc) if i_c % 2 else macro_packlo_b32_t(self.mc)
+
                                 if self.outer.use_bf16_1k_in_fp16():
                                     src0_sel = '' if i_c % 2 == 0 else ' src0_sel:WORD_1'
                                     fp16_alt_impl_pds = self.outer.get_predefine_for_bf16_1k_in_fp16()
                                     self._emit(f'.if {fp16_alt_impl_pds} == 1')
                                     self._emit(f"v_cvt_f32_f16 v[{self.v_tmp2(0)}], v[{self.v_src(idx_0)}]{src0_sel}")
                                     self._emit(f"v_cvt_f32_f16 v[{self.v_tmp2(1)}], v[{self.v_src(idx_1)}]{src0_sel}")
-                                    self._emit(f"v_pack_b32_f16 v[{self.v_pack_k_tmp(i_pk)}], v[{self.v_tmp2(0)}], v[{self.v_tmp2(1)}]  op_sel:[1, 1]")
+                                    self._emit(macro_packhi_b32_t(self.v_pack_k_tmp(i_pk), self.v_tmp2(0), self.v_tmp2(1)))
                                     self._emit(f'.else')
-                                    op_sel = '' if i_c % 2 == 0 else ' op_sel:[1, 1]'
-                                    self._emit(f"v_pack_b32_f16 v[{self.v_pack_k_tmp(i_pk)}], v[{self.v_src(idx_0)}], v[{self.v_src(idx_1)}]{op_sel}")
+                                    self._emit(m_pack(self.v_pack_k_tmp(i_pk), self.v_src(idx_0), self.v_src(idx_1)))
                                     self._emit(f'.endif')
                                 else:
-                                    op_sel = '' if i_c % 2 == 0 else ' op_sel:[1, 1]'
-                                    # print(f"i_pk:{i_pk}, i_c:{i_c}, idx_0:{idx_0}, idx_1:{idx_1}")
-                                    self._emit(f"v_pack_b32_f16 v[{self.v_pack_k_tmp(i_pk)}], v[{self.v_src(idx_0)}], v[{self.v_src(idx_1)}]{op_sel}")
+                                    self._emit(m_pack(self.v_pack_k_tmp(i_pk), self.v_src(idx_0), self.v_src(idx_1)))
                             self._emit(ds_write(self.v_sst_os(), self.v_pack_k_tmp(), i_c * stride_dc))
                             self.issue_cnt = self.issue_cnt + ds_write.get_issues(i_c * stride_dc)
-
                     return
                 if tb_c1 == 1:
                     assert ta_k % tb_k == 0, "currently only need tb_k smaller than ta_k, other wise need add support for split k_pack"
@@ -2332,7 +2330,7 @@ class igemm_bwd_gtc_nhwc_t(mc_base_t):
                 self._emit(f"s_add_u32 s[{s.s_tmp()}], s[{s.s_tmp()}], s[{s.s_dtile_ix()}]")
             self._emit(f"v_add_lshl_u32 v[{v.v_wei_os()}], v[{v.v_tmp(4)}], v[{v.v_tmp(5)}], {igemm_log2(data_byte)}")
             if self.tunable.nxe != 0:
-                self._emit(f"s_lshl_b32 s[{s.s_tmp(1)}] s[{s.s_c()}], {igemm_log2(data_byte)}")
+                self._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_c()}], {igemm_log2(data_byte)}")
 
             if self.tunable.merge_e == 1:
                 self._emit(f"v_mul_u32_u24 v[{v.v_tmp(0)}], s[{s.s_dtile_x()}], v[{v.v_wei_dslice_ix_itr()}]")

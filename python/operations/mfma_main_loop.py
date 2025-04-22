@@ -228,7 +228,7 @@ class mfma_main_loop_t(mc_base_t):
         if mbb_p_clear == 1:
             # hack on v_clear_nc
             v_clear_nc_strs = mbb_gld_p[0].mc_inst(-1).inst_str
-            v_clear_nc_list = re.split('[,\s]+', v_clear_nc_strs)
+            v_clear_nc_list = re.split(r"[,\s]+", v_clear_nc_strs)
             assert len(v_clear_nc_list) == 3 and v_clear_nc_list[0] == '.v_clear_nc'
             num_gld_p = int(v_clear_nc_list[2]) # TODO: check number
             assert num_gld_p % (len(mbb_gld_p) - mbb_p_clear) == 0
@@ -475,7 +475,7 @@ class mfma_main_loop_t(mc_base_t):
                                         self._emit(f".if {ctrl.pass_through_bf16_1k_in_fp16_predefine} == 1")
                                         self._emit(f"v_cvt_f32_f16 v[{v_gld_p(i_pnum)}], v[{v_gld_p_gpf(i_pnum)}]")
                                         self._emit(f"v_cvt_f32_f16 v[{v_gld_p_gpf(i_pnum)}], v[{v_gld_p_gpf(i_pnum)}] src0_sel:WORD_1")
-                                        self._emit(f"v_pack_b32_f16 v[{v_gld_p(i_pnum)}], v[{v_gld_p(i_pnum)}], v[{v_gld_p_gpf(i_pnum)}] op_sel:[1,1]")
+                                        self._emit(macro_packhi_b32_t(v_gld_p(i_pnum), v_gld_p(i_pnum), v_gld_p_gpf(i_pnum)))
                                         self._emit(f".else")
                                         self._emit(f"v_mov_b32 v[{v_gld_p(i_pnum)}], v[{v_gld_p_gpf(i_pnum)}]")
                                         self._emit(f".endif")

@@ -466,7 +466,11 @@ public:
             if((nxe == 0) && !unit_conv){
                 return false;
             }
-            if(tunable->precision == "fp16"){
+
+            if (tunable->precision == "fp32") {
+                // no additional checks;
+            }
+            else if (tunable->precision == "fp16" || tunable->precision == "bf16") {
                 // fp16 support vector writeout by default. check get_vector_write_out()
                 if(tunable->tensor_a_thread_lengths[1] == 1 && tunable->tensor_b_thread_lengths[1] == 1){
                     ;   // if both 1, k is also write out one by one
@@ -482,8 +486,7 @@ public:
                     }
                 }
             }
-
-            if(tunable->precision == "int8"){
+            else if (tunable->precision == "int8") {
                 // fp16 support vector writeout by default. check get_vector_write_out()
                 if(tunable->tensor_a_thread_lengths[1] == 1 && tunable->tensor_b_thread_lengths[1] == 1){
                     ;   // if both 1, k is also write out one by one
@@ -497,6 +500,9 @@ public:
                             return false;
                     }
                 }
+            }
+            else {
+                assert(0);
             }
         }else if(tunable->tensor_layout.compare(0, 5, "nchwc") == 0){
             auto tunable_wei_layout = tunable->tensor_layout.substr(6);

@@ -82,7 +82,7 @@ class inst_mt_operand_t(object):
     def __call__(self):
         def expr_operand(opr):
             if type(self.operand) is str:
-                if re.search('[vs]\d+', self.operand) != None:
+                if re.search(r"[vs]\d+", self.operand) != None:
                     return self.operand
                 elif self.operand[0] == 's' or (self.operand[0:2] == r'\s'):
                     return f's[{self.operand}]'
@@ -161,7 +161,7 @@ class inst_v_cndmask_b32_t(inst_base_t):
         inst_base_t.__init__(self, INST_ENCODING_VOPC)
     def __call__(self, dst, src0, src1):
         if mc_get_current().arch_config.arch < 1000:
-            return 'v_cndmask_b32 {}, {}, {} vcc'.format(mt_opr(dst), mt_opr(src0), mt_opr(src1))
+            return 'v_cndmask_b32 {}, {}, {}, vcc'.format(mt_opr(dst), mt_opr(src0), mt_opr(src1))
         else:
             return 'v_cndmask_b32 {}, {}, {}'.format(mt_opr(dst), mt_opr(src0), mt_opr(src1))
 v_cndmask_b32 = inst_v_cndmask_b32_t()
