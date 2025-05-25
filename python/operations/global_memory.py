@@ -194,7 +194,7 @@ def inst_buffer_atomic_add_emit_with_macro(mc):
         mc.emit(f'{label_cas_loop_start}:')
         mc.emit(f'    buffer_load_dword v[v_tmp+2], \\addr, \\base, \\other sc1') # should bypass L1
         mc.emit(f'    s_waitcnt vmcnt(0)')
-        mc.emit(f'    v_mov_b32 v[v_tmp+3] v[v_tmp+2]')
+        mc.emit(f'    v_mov_b32 v[v_tmp+3], v[v_tmp+2]')
         mc.emit(f'    {get_add_inst(inst)} v[v_tmp+2], \\data, v[v_tmp+3]')
         ########      tmp = dst, dst = v_tmp+3 == tmp ? v_tmp+2 : v_tmp, v_tmp+2 = v_tmp(return value)
         mc.emit(f'    buffer_atomic_cmpswap v[v_tmp+2:v_tmp+3], \\addr, \\base, \\other sc0')

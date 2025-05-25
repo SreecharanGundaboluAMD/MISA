@@ -476,6 +476,14 @@ public:
                 return false;
             }
         } else if (tunable->tensor_layout == "nhwc"){
+            // limitation for loading filter using multielement instructions
+            int tb_c1 = tunable->tensor_b_thread_lengths[3];
+            int data_byte = utility_string_to_data_byte(tunable->precision);
+            int vector_d1 = utility_gcd(tb_c1, 4 * (4 / data_byte));
+            if ((c / group) % vector_d1 != 0)
+                return false;
+
+
             if(tunable->tensor_a_thread_lengths[1] == 1){
                 ;   // if output k 1, indicate padded k support
             }
