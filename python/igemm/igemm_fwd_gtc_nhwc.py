@@ -28,7 +28,7 @@ from ..codegen import *
 from ..operations import *
 from .igemm_base import *
 
-
+SHISA_DEBUG = 0
 IGEMM_FWD_GTC_NHWC_PACK_IN_FLAG = 0
 # IGEMM_FWD_GTC_NHWC_P_INTERLEAVE_GLD = False     # p tensor interleave
 IGEMM_FWD_GTC_NHWC_ACCVGPR_UNIFIED = True   # used in gfx90a
@@ -867,6 +867,10 @@ class igemm_fwd_gtc_nhwc_t(mc_base_t):
                 self.s_gemmk_split         = sym_t("s_gemmk_split"            ,sseq(1))
                 self.s_sub_c               = sym_t("s_sub_c"                  ,sseq(1))
             self.s_tmp                     = sym_t("s_tmp"                    ,sseq(6, 2))
+            if SHISA_DEBUG:
+                self.s_GroupIDX            = sym_t("GroupIDX"                 ,sseq(1))
+                self.s_GroupIDY            = sym_t("GroupIDY"                 ,sseq(1))
+                self.s_debugcnt            = sym_t("debugcnt"                 ,sseq(1))
             self.s_end                     = sym_t("s_end"                    ,sseq())
 
         def get_count(self):
@@ -990,6 +994,8 @@ class igemm_fwd_gtc_nhwc_t(mc_base_t):
             else:
                 self.v_wei_flag         = sym_t("v_wei_flag"        ,vseq(nk_per_thread))
 
+            if SHISA_DEBUG:
+                self.v_ThreadID         = sym_t("ThreadID", vseq(1))
             total_vgpr                  = vseq()
             self.accum_start            = 0
             if outer.tunable.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_XDLOPS:
@@ -1519,6 +1525,11 @@ class igemm_fwd_gtc_nhwc_t(mc_base_t):
         k_pack_gld_b = m_wei_2d_global_load.ctrl.vector_d1
 
         # start emit
+        if SHISA_DEBUG:
+            self._emit(f"v_mov_b32 v[{v.v_ThreadID()}], v0")
+            self._emit(f"s_mov_b32 s[{s.s_GroupIDX()}], s[{s.s_bx()}]")
+            self._emit(f"s_mov_b32 s[{s.s_GroupIDY()}], s[{s.s_by()}]")
+            self._emit(f"s_mov_b32 s[{s.s_debugcnt()}], 0")
         self._emit(f"s_load_dwordx2  s[{s.s_p_in((0,1))}],    s[{s.s_ka((0, 1))}],    0+{k.k_p_in()}")
         self._emit(f"s_load_dwordx2  s[{s.s_p_wei((0,1))}],   s[{s.s_ka((0, 1))}],    0+{k.k_p_wei()}")
         self._emit(f"s_load_dwordx2  s[{s.s_p_out((0,1))}],   s[{s.s_ka((0, 1))}],    0+{k.k_p_out()}")
