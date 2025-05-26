@@ -84,6 +84,7 @@ static void dump_wrw_karg(igemm_wrw_gtc_karg_t * karg){
     std::cout<<"x:"            <<karg->x<<",";
     std::cout<<"gemm_k_global_split:" <<karg->gemm_k_global_split<<",";
     std::cout<<"group:"        <<karg->group;
+    std::cout<<"gemm_k_per_wg:"        <<karg->gemm_k_per_wg;
     std::cout<<std::endl;
 }
 
@@ -692,6 +693,7 @@ public:
         else
             HIP_CALL(hipMalloc(&p_wei_workspace, workspace_size));
 
+        kargtype_t ktype = kargtype_t::igemm_wrw_gtc_karg_t;
         igemm_wrw_gtc_karg_t karg;
         size_t karg_size = sizeof(karg);
         karg.p_in          = p_in;
@@ -766,9 +768,9 @@ public:
             std::function<float()>{[&]() -> float{
                 return .0;
             }};
+        const size_t thread_length_cast = (static_cast<size_t>(group) * (k / group) * (c / group) * y * x + 8 * 256) / (8 * 256) * (8 * 256) / 8;
         auto wrw_postlog = use_workspace == 1 ?
             std::function<float()>{[&]() -> float{
-                size_t thread_length_cast = (static_cast<size_t>(group) * (k / group) * (c / group) * y * x + 8 * 256) / (8 * 256) * (8 * 256) / 8;
                 igemm_launch_kernel_single(tensor_cast_func, &karg_tensor_cast, karg_tensor_cast_size, {thread_length_cast, 1, 1}, {256, 1, 1});
                 return .0;
             }} :
@@ -777,6 +779,42 @@ public:
             }};
 
         result_t result;
+        result.kernel_name = kernel_name;
+
+        std::string dump_dir = env_get_str("IGEMM_DUMPDIR_ALL", "");
+        if (dump_dir.size()) {
+            std::cout << "DEBUG: Dumping all dispatches to " << dump_dir
+                      << std::endl;
+        }
+        result.dumpdata.clear();
+        memset(&result.dumpheader, 0, sizeof(result.dumpheader));
+        result.dumpheader.workspace_size = workspace_size;
+        result.dumpheader.gi_postlog.gsize = {
+            static_cast<uint32_t>(thread_length_cast), 1, 1};
+        result.dumpheader.gi_postlog.wsize = {256, 1, 1};
+        result.dumpheader.use_prolog = gemm_k_global_split;
+        result.dumpheader.use_postlog = use_workspace == 1;
+        result.dumpheader.cast_total_length = karg_tensor_cast.total_length;
+        result.dumpheader.conv.hi = hi;
+        result.dumpheader.conv.wi = wi;
+        result.dumpheader.conv.n = n;
+        result.dumpheader.conv.k = k;
+        result.dumpheader.conv.c = c;
+        result.dumpheader.conv.ho = ho;
+        result.dumpheader.conv.wo = wo;
+        result.dumpheader.conv.stride_h = stride_h;
+        result.dumpheader.conv.stride_w = stride_w;
+        result.dumpheader.conv.ddilation_h = 1;
+        result.dumpheader.conv.ddilation_w = 1;
+        result.dumpheader.conv.fdilation_h = dilation_h;
+        result.dumpheader.conv.fdilation_w = dilation_w;
+        result.dumpheader.conv.pad_h = pad_h;
+        result.dumpheader.conv.pad_w = pad_w;
+        result.dumpheader.conv.y = y;
+        result.dumpheader.conv.x = x;
+        result.dumpheader.conv.group = group;
+        result.dumpheader.conv.dir = convdir_t::WRW;
+        result.dumpheader.conv.dtype = dtype(tunable->precision);
 
         int max_split_num = tunable->gemm_k_global_split == 0 ? 1 : (this->max_gks == -1 ? WRW_MAX_GEMM_K_SPLITS : this->max_gks);
         float min_duration = FLT_MAX;
@@ -806,6 +844,11 @@ public:
                 //     size_t thread_length_cast = (static_cast<size_t>(group) * (k / group) * (c / group) * y * x + 8 * 256) / (8 * 256) * (8 * 256) / 8;
                 //     kernel_launchers.push_back({tensor_cast_func, &karg_tensor_cast, karg_tensor_cast_size, {thread_length_cast, 1, 1}, {256, 1, 1}});
                 // }
+                result.dumpheader.n_dispatches = kernel_launchers.size();
+                result.dumpheader.gks = gemm_k_global_splits;
+                result.dumpdata.push_back(kernel_launchers.back());
+                result.dumpdata.back().ktype = ktype;
+
                 float duration = igemm_launch_kernels({
                         kernel_launchers
                     }, wrw_prolog, wrw_postlog, this->warmup, this->repeat);
@@ -819,9 +862,19 @@ public:
 
             }else{
                 // nchw do not search for gemmksplit
-                float duration = igemm_launch_kernels({
-                            {kernel_func, &karg, karg_size, {grid_size * block_size, 1, 1}, {block_size, 1, 1}}
-                        }, wrw_prolog, wrw_postlog, this->warmup, this->repeat);
+                std::vector<igemm_launch_kernel_t> kernel_launchers = {
+                    {kernel_func,
+                     &karg,
+                     karg_size,
+                     {grid_size * block_size, 1, 1},
+                     {block_size, 1, 1}}};
+
+                result.dumpheader.n_dispatches = kernel_launchers.size();
+                result.dumpheader.gks = gemm_k_global_splits;
+                result.dumpdata.push_back(kernel_launchers.back());
+                result.dumpdata.back().ktype = ktype;
+
+                float duration = igemm_launch_kernels(kernel_launchers, wrw_prolog, wrw_postlog, this->warmup, this->repeat);
                 min_duration = duration;
                 selected_gkgs = gemm_k_global_splits;
                 selected_grid_size = grid_size;
@@ -830,17 +883,22 @@ public:
         };
         if(current_gks != -1){
             run_with_gks(current_gks);
+            if (dump_dir.size())
+                    dump_shader_args(dump_dir, result.dumpheader, result.dumpdata, result.kernel_name);
+            result.dumpdata.clear();
         }else{
             std::vector<int> all_gks = get_gks_list(arg, tunable);
             for(int gks : all_gks){
                 run_with_gks(gks);
+                if (dump_dir.size())
+                    dump_shader_args(dump_dir, result.dumpheader, result.dumpdata, result.kernel_name);
+                result.dumpdata.clear();
             }
         }
 
         result.return_code = 0;
         result.duration_ms = min_duration;
         result.gks         = selected_gkgs;
-        result.kernel_name = kernel_name;
         result.grid_size   = selected_grid_size;
 		// debug section of code
 #if 0

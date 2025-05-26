@@ -37,6 +37,8 @@
 #include <cmath>
 #include <algorithm>
 #include <limits>
+#include <cstdlib>
+#include <iostream>
 
 #ifndef USE_EXT_MODULE_LAUNCH
 #define USE_EXT_MODULE_LAUNCH 1
@@ -75,6 +77,42 @@
 #include "igemm_fwd_gtc_driver.h"
 #include "igemm_bwd_gtc_driver.h"
 #include "igemm_wrw_gtc_driver.h"
+
+void dump_shader_args(std::string dump_dir,
+                      const dumpheader_t &const_header,
+                      const std::vector<dispatchinfo_t> &dispatches,
+                      std::string kernel_name)
+{
+    dumpheader_t header = const_header;
+    header.version = DUMPFILE_VERSION;
+    if (header.n_dispatches != dispatches.size()) {
+        std::cout << "ERROR: header.n_dispatches != dispatches.size()" << std::endl;
+        assert(0);
+    }
+
+    std::string dump_path = dump_dir + kernel_name + ".gks" + std::to_string(header.gks) + ".dump";
+    std::ofstream fs(dump_path, std::ios::out | std::ios::binary);
+    fs.write(reinterpret_cast<const char *>(&header), sizeof(dumpheader_t));
+    for (auto &di : dispatches) {
+        fs.write(reinterpret_cast<const char *>(&di), sizeof(di));
+    }
+    fs.write(kernel_name.c_str(), kernel_name.size());
+    fs.close();
+}
+
+misadatatype_t dtype(const std::string &s) {
+    if (!s.compare("fp32"))
+        return misadatatype_t::FP32;
+    if (!s.compare("fp16"))
+        return misadatatype_t::FP16;
+    if (!s.compare("bf16"))
+        return misadatatype_t::BF16;
+    if (!s.compare("int8"))
+        return misadatatype_t::INT8;
+    if (!s.compare("int4"))
+        return misadatatype_t::INT4;
+    return misadatatype_t::UNKNOWN;
+}
 
 static inline double theoritical_gflops(double sclk_ghz, size_t cu,
                                              size_t simd) {

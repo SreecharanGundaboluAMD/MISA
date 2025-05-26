@@ -286,6 +286,7 @@ static inline args_t create_conv_args(int argc, char *argv[]) {
                     "\n>0 Immediate mode, build and run solution_id = N"
                     "\n<0 Use Find() API (Default=-1)",
                     "int");
+    args.insert_arg("dbg_info", 'h', "0", "Show debug info", "int");
     args.parse(argc, argv);
     return args;
 }
