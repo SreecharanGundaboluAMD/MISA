@@ -1075,7 +1075,7 @@ public:
         HIP_CALL(hipModuleUnload(cur_kernel_module));
 #endif
         hipFree(p_in_workspace);
-        usleep(1000 * 5);
+        //usleep(1000 * 5);
         return result;
     }
     std::vector<int> get_gks_list(const args_t *arg, const igemm_gtc_tunable_t *tunable) override
