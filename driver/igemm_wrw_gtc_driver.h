@@ -206,6 +206,12 @@ public:
         if(need_wrw == 0)
             return false;
 
+        int fil_h_ext = y * dilation_h + 1 - y;
+        int fil_w_ext = x * dilation_w + 1 - x;
+        if (pad_w >= fil_w_ext || pad_h >= fil_h_ext)
+            return false;
+
+
         int nxb = tunable->nxb == 0 ? 1 : tunable->nxb;
         int b  = tunable->nxe == 0 ? (ho * wo) : ((ho * wo + nxb - 1) / nxb) * nxb;   // pad to nxb modulo when nxe != 0
         int data_byte = utility_string_to_data_byte(tunable->precision);
