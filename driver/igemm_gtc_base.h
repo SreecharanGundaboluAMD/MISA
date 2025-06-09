@@ -442,13 +442,37 @@ static inline float igemm_launch_kernel(hipFunction_t kernel_func, void* args, s
     return avg_duration;
 }
 
-typedef struct{
+struct igemm_launch_kernel_t {
     hipFunction_t           kernel_func;
     void *                  args;
     size_t                  arg_size;
     std::vector<size_t>     grid_size;
     std::vector<size_t>     block_size;
-}igemm_launch_kernel_t;
+
+    operator dispatchinfo_t() const {
+        if (grid_size.size() != 3 || block_size.size() != 3) {
+            std::cout << "ERROR: dispatch size n_dims !=3 (grid_size.size() != 3 || block_size.size() != 3)" << std::endl;
+            assert(0);
+        }
+        if (arg_size > MAX_KARG_DUMP_BYTES) {
+            std::cout << "ERROR: arg_size > MAX_KARG_DUMP_BYTES" << std::endl;
+            assert(0);
+        }
+        dispatchinfo_t di;
+        di.gi.gsize = {static_cast<uint32_t>(grid_size[0]),
+                       static_cast<uint32_t>(grid_size[1]),
+                       static_cast<uint32_t>(grid_size[2])};
+        di.gi.wsize = {static_cast<uint32_t>(block_size[0]),
+                       static_cast<uint32_t>(block_size[1]),
+                       static_cast<uint32_t>(block_size[2])};
+        di.karg_size = arg_size;
+        di.ktype = kargtype_t::unknown;
+        memset(di.karg_dump, 0, MAX_KARG_DUMP_BYTES);
+        memcpy(di.karg_dump, args, arg_size);
+        
+        return di;
+    }
+};
 
 template<typename prolog_kernel_t, typename postlog_kernel_t>
 static inline float igemm_launch_kernels(const std::vector<igemm_launch_kernel_t> & kernels, prolog_kernel_t prolog_kernel, postlog_kernel_t postlog_kernel, int warmup, int repeat)

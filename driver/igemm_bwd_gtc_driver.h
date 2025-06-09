@@ -36,6 +36,7 @@
 #include <vector>
 #include <algorithm>
 #include <numeric>
+#include <cstring>
 
 // #define IGEMM_BWD_UPSAMPLING_USE_CUSTOM_KERNEL 1
 #define MAX_GEMM_K_SPLITS_BWD 8
@@ -324,19 +325,22 @@ public:
         int h_tilda_slice = h_tilda_right - h_tilda_left;
         int w_tilda_slice = w_tilda_right - w_tilda_left;
 
+        int gemm_m = -1;
+        int gemm_n = -1;
+
         size_t grid_size = 0;
         if(tunable->tensor_layout == "nchw"){
             int nxe = tunable->nxe;
             int nxb = tunable->nxb;
             int b = h_tilda_slice * w_tilda_slice;
             b = (nxe == 0) ? (b) : ((b + nxb - 1) / nxb) * nxb;   // pad to nxb modulo when nxe != 0
-            int gemm_m = c / group;
-            int gemm_n = n * b;
+            gemm_m = c / group;
+            gemm_n = n * b;
             grid_size = static_cast<size_t>(group) * utility_integer_divide_ceil(gemm_m, gemm_m_per_block) *
                                     utility_integer_divide_ceil(gemm_n, gemm_n_per_block);
         }else if (tunable->tensor_layout == "nhwc"){
-            int gemm_m = n * h_tilda_slice * w_tilda_slice;
-            int gemm_n = c / group;
+            gemm_m = n * h_tilda_slice * w_tilda_slice;
+            gemm_n = c / group;
             grid_size = static_cast<size_t>(group) * utility_integer_divide_ceil(gemm_m, gemm_m_per_block) *
                                     utility_integer_divide_ceil(gemm_n, gemm_n_per_block);
         }
@@ -345,6 +349,51 @@ public:
         if(tunable->multihead)
             grid_size *= num_of_gemm;
         assert(grid_size <= 0xffffffffUL);
+
+        if (arg->get_int("dbg_info")) {
+            std::cout << "igemm_bwd_gtc_driver.h : get_grid_size()"
+                      << "\n\thi \t" << hi
+                      << "\n\twi \t" << wi
+                      << "\n\tn \t" << n
+                      << "\n\tk \t" << k
+                      << "\n\tc \t" << c
+                      << "\n\tstride_h \t" << stride_h
+                      << "\n\tstride_w \t" << stride_w
+                      << "\n\tdilation_h \t" << dilation_h
+                      << "\n\tdilation_w \t" << dilation_w
+                      << "\n\tpad_h \t" << pad_h
+                      << "\n\tpad_w \t" << pad_w
+                      << "\n\ty \t" << y
+                      << "\n\tx \t" << x
+                      << "\n\tho \t" << ho
+                      << "\n\two \t" << wo
+                      << "\n\tgroup \t" << group
+                      << "\n\tsplits \t" << splits
+                      << "\n\tgemm_m_per_block \t" << gemm_m_per_block
+                      << "\n\tgemm_n_per_block \t" << gemm_n_per_block
+                      << "\n\tgemm_k_per_block \t" << gemm_k_per_block
+                      << "\n\tgcd_stride_dilation_h \t" << gcd_stride_dilation_h
+                      << "\n\tgcd_stride_dilation_w \t" << gcd_stride_dilation_w
+                      << "\n\ty_tilda \t" << y_tilda
+                      << "\n\tx_tilda \t" << x_tilda
+                      << "\n\ty_dot \t" << y_dot
+                      << "\n\tx_dot \t" << x_dot
+                      << "\n\th_tilda \t" << h_tilda
+                      << "\n\tw_tilda \t" << w_tilda
+                      << "\n\th_tilda_left \t" << h_tilda_left
+                      << "\n\tw_tilda_left \t" << w_tilda_left
+                      << "\n\th_tilda_right \t" << h_tilda_right
+                      << "\n\tw_tilda_right \t" << w_tilda_right
+                      << "\n\th_tilda_slice \t" << h_tilda_slice
+                      << "\n\tw_tilda_slice \t" << w_tilda_slice
+                      << "\n\tgemm_m \t" << gemm_m
+                      << "\n\tgemm_n \t" << gemm_n
+                      << "\n\tgrid_size \t" << grid_size
+                      << "\n\tnum_of_gemm \t" << num_of_gemm
+                << std::endl;
+        }
+
+
         return grid_size;
     }
 
@@ -482,7 +531,6 @@ public:
             int vector_d1 = utility_gcd(tb_c1, 4 * (4 / data_byte));
             if ((c / group) % vector_d1 != 0)
                 return false;
-
 
             if(tunable->tensor_a_thread_lengths[1] == 1){
                 ;   // if output k 1, indicate padded k support
@@ -625,6 +673,7 @@ public:
 #if USE_MAGIC_DIV
         magic_div_u32_t mdiv_0, mdiv_1, mdiv_2, mdiv_3, mdiv_4, mdiv_5, mdiv_6;
 #endif
+        kargtype_t ktype = kargtype_t::unknown;
         if(tunable->tensor_layout == "nchw"){
             int nxe = tunable->nxe;
             int nxb = tunable->nxb;
@@ -633,6 +682,7 @@ public:
             int gemm_m = c / group;
             int gemm_n = n * b;
 
+            ktype = kargtype_t::igemm_bwd_gtc_karg_t;
             igemm_bwd_gtc_karg_t karg;
             karg.p_in          = p_in;
             karg.p_wei         = p_wei;
@@ -702,6 +752,7 @@ public:
             int gemm_m = n * h_tilda_slice * w_tilda_slice;
             int gemm_n = c / group;
 
+            ktype = kargtype_t::igemm_bwd_gtc_nhwc_karg_t;
             igemm_bwd_gtc_nhwc_karg_t karg;
             if(use_workspace == 1)
                 karg.p_in      = p_in_workspace;
@@ -843,9 +894,9 @@ public:
             std::function<float()>{[&]() -> float{
                 return .0;
             }};
+        const size_t thread_length_cast = (static_cast<size_t>(n) * c * hi * wi + 8 * 256) / (8 * 256) * (8 * 256) / 8;
         auto bwd_postlog = use_workspace == 1 ?
             std::function<float()>{[&]() -> float{
-                size_t thread_length_cast = (static_cast<size_t>(n) * c * hi * wi + 8 * 256) / (8 * 256) * (8 * 256) / 8;
                 igemm_launch_kernel_single(tensor_cast_func, &karg_tensor_cast, karg_tensor_cast_size, {thread_length_cast, 1, 1}, {256, 1, 1});
                 return .0;
             }} :
@@ -855,6 +906,39 @@ public:
 
         result_t result;
         result.kernel_name = kernel_name;
+
+        std::string dump_dir = env_get_str("IGEMM_DUMPDIR_ALL", "");
+        if (dump_dir.size()) {
+            std::cout << "DEBUG: Dumping all dispatches to " << dump_dir << std::endl;
+        }
+        result.dumpdata.clear();
+        memset(&result.dumpheader, 0, sizeof(result.dumpheader));
+        result.dumpheader.workspace_size = workspace_size;
+        result.dumpheader.gi_postlog.gsize = {static_cast<uint32_t>(thread_length_cast), 1, 1};
+        result.dumpheader.gi_postlog.wsize = {256, 1, 1};
+        result.dumpheader.use_prolog = (need_set_zero || tunable->gemm_k_global_split);
+        result.dumpheader.use_postlog = use_workspace == 1;
+        result.dumpheader.cast_total_length = karg_tensor_cast.total_length;
+        result.dumpheader.conv.hi = hi;
+        result.dumpheader.conv.wi = wi;
+        result.dumpheader.conv.n = n;
+        result.dumpheader.conv.k = k;
+        result.dumpheader.conv.c = c;
+        result.dumpheader.conv.ho = ho;
+        result.dumpheader.conv.wo = wo;
+        result.dumpheader.conv.stride_h = stride_h;
+        result.dumpheader.conv.stride_w = stride_w;
+        result.dumpheader.conv.ddilation_h = 1;
+        result.dumpheader.conv.ddilation_w = 1;
+        result.dumpheader.conv.fdilation_h = dilation_h;
+        result.dumpheader.conv.fdilation_w = dilation_w;
+        result.dumpheader.conv.pad_h = pad_h;
+        result.dumpheader.conv.pad_w = pad_w;
+        result.dumpheader.conv.y = y;
+        result.dumpheader.conv.x = x;
+        result.dumpheader.conv.group = group;
+        result.dumpheader.conv.dir = convdir_t::BWD;
+        result.dumpheader.conv.dtype = dtype(tunable->precision);
 
         if(true){
             float min_duration = FLT_MAX;
@@ -882,6 +966,10 @@ public:
                         karg->ks       = _gks;
 
                         kernels.push_back({kernel_func, karg_buffer, karg_size, std::vector<size_t>{grid_size * block_size, splits, 1}, std::vector<size_t>{block_size, 1, 1}});
+                        result.dumpheader.n_dispatches = kernels.size();
+                        result.dumpheader.gks = _gks;
+                        result.dumpdata.push_back(kernels.back());
+                        result.dumpdata.back().ktype = ktype;
                         // if(use_workspace == 1){
                         //     size_t thread_length_cast = (static_cast<size_t>(n) * c * hi * wi + 8 * 256) / (8 * 256) * (8 * 256) / 8;
                         //     kernels.push_back({tensor_cast_func, &karg_tensor_cast, karg_tensor_cast_size, {thread_length_cast, 1, 1}, {256, 1, 1}});
@@ -937,6 +1025,10 @@ public:
                             }
 
                             kernels.push_back({kernel_func, (void*)&kargs[valid_kernel_index * karg_size], karg_size, std::vector<size_t>{grid_size * block_size, splits, 1}, std::vector<size_t>{block_size, 1, 1}});
+                            result.dumpheader.n_dispatches = kernels.size();
+                            result.dumpheader.gks = _gks;
+                            result.dumpdata.push_back(kernels.back());
+                            result.dumpdata.back().ktype = ktype;
 
                             valid_kernel_index++;
                         }
@@ -962,10 +1054,16 @@ public:
             };
             if(current_gks != -1){
                 run_with_gks(current_gks);
+                if (dump_dir.size())
+                    dump_shader_args(dump_dir, result.dumpheader, result.dumpdata, result.kernel_name);
+                result.dumpdata.clear();
             }else{
                 std::vector<int> all_gks = get_gks_list(arg, tunable);
                 for(int gks : all_gks){
                     run_with_gks(gks);
+                    if (dump_dir.size())
+                        dump_shader_args(dump_dir, result.dumpheader, result.dumpdata, result.kernel_name);
+                    result.dumpdata.clear();
                 }
             }
             result.return_code = 0;
@@ -977,7 +1075,7 @@ public:
         HIP_CALL(hipModuleUnload(cur_kernel_module));
 #endif
         hipFree(p_in_workspace);
-        usleep(1000 * 5);
+        //usleep(1000 * 5);
         return result;
     }
     std::vector<int> get_gks_list(const args_t *arg, const igemm_gtc_tunable_t *tunable) override

@@ -28,7 +28,7 @@ from ..codegen import *
 from ..operations import *
 from .igemm_base import *
 
-
+SHISA_DEBUG = 0
 IGEMM_FWD_GTC_LDS_STORE_ORDER_GEMM_M_K0_K1 = 0
 IGEMM_FWD_GTC_LDS_STORE_ORDER_GEMM_M_K1_K0 = 1
 IGEMM_FWD_GTC_LDS_STORE_ORDER_GEMM_N_N0_N1B = 4
@@ -768,6 +768,10 @@ class igemm_fwd_gtc_t(mc_base_t):
                 self.s_magic_0             = sym_t("s_magic_0"                ,self.s_p_wei.value + 2)
                 self.s_magic_1             = sym_t("s_magic_1"                ,self.s_p_wei.value + 3)
 
+            if SHISA_DEBUG:
+                self.s_GroupIDX            = sym_t("GroupIDX"                 ,sseq(1))
+                self.s_GroupIDY            = sym_t("GroupIDY"                 ,sseq(1))
+                self.s_debugcnt            = sym_t("debugcnt"                 ,sseq(1))
             self.s_end                     = sym_t("s_end"                    ,sseq())
 
         def get_count(self):
@@ -860,6 +864,8 @@ class igemm_fwd_gtc_t(mc_base_t):
             self.v_cur_k          = sym_t("v_cur_k" ,vseq(1))
 
             self.v_tmp           = sym_t("v_tmp"          ,vseq(6, 2))
+            if SHISA_DEBUG:
+                self.v_ThreadID  = sym_t("ThreadID", vseq(1))
             total_vgpr           = vseq()
             if outer.tunable.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_XDLOPS:
                 # if xdlops agpr is larger than vgpr usage, must change vgpr count to agpr
@@ -1395,6 +1401,11 @@ class igemm_fwd_gtc_t(mc_base_t):
         global_load_ta_order = IGEMM_FWD_GTC_GLOBAL_LOAD_TA_ORDER_M_K   # for fwd, it seems always K dimension first is better
 
         # start emit
+        if SHISA_DEBUG:
+            self._emit(f"v_mov_b32 v[{v.v_ThreadID()}], v0")
+            self._emit(f"s_mov_b32 s[{s.s_GroupIDX()}], s[{s.s_bx()}]")
+            self._emit(f"s_mov_b32 s[{s.s_GroupIDY()}], s[{s.s_by()}]")
+            self._emit(f"s_mov_b32 s[{s.s_debugcnt()}], 0")
         #self._emit(f"; unmerge_sub_k:{unmerge_sub_k}, unmerge_sub_k1:{unmerge_sub_k1}, unmerge_sub_n:{unmerge_sub_n}, unmerge_sub_n1:{unmerge_sub_n1}")
         self._emit(f"; gemm_m_unmerge_cluster:{gemm_m_unmerge_cluster}, gemm_n_unmerge_cluster:{gemm_n_unmerge_cluster}, gemm_k_unmerge_cluster:{gemm_k_unmerge_cluster}")
         self._emit(f"s_load_dwordx2  s[{s.s_p_in((0,1))}],    s[{s.s_ka((0, 1))}],    0+{k.k_p_in()}")

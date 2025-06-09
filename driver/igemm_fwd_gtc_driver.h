@@ -585,7 +585,9 @@ public:
         else
             HIP_CALL(hipMalloc(&p_out_workspace, workspace_size));
 
+        kargtype_t ktype = kargtype_t::unknown;
         if(tunable->tensor_layout == "nchw"){
+            ktype = kargtype_t::igemm_fwd_gtc_karg_t;
             igemm_fwd_gtc_karg_t karg;
             karg.p_in          = p_in;
             karg.p_wei         = p_wei;
@@ -642,6 +644,7 @@ public:
             karg_size = sizeof(karg);
             memcpy(static_cast<void*>(&karg_buffer[0]), static_cast<void*>(&karg), karg_size);
         }else if(tunable->tensor_layout == "nhwc"){
+            ktype = kargtype_t::igemm_fwd_gtc_nhwc_karg_t;
             igemm_fwd_gtc_nhwc_karg_t karg;
             karg.p_in          = p_in;
             karg.p_wei         = p_wei;
@@ -697,6 +700,7 @@ public:
             karg_size = sizeof(karg);
             memcpy(static_cast<void*>(&karg_buffer[0]), static_cast<void*>(&karg), karg_size);
         } else if(tunable->tensor_layout.compare(0, 5, "nchwc") == 0) {
+            ktype = kargtype_t::igemm_fwd_gtc_nchwc_karg_t;
             igemm_fwd_gtc_nchwc_karg_t karg;
             igemm_spatial_tiling_t tiling = get_spatial_tiling(arg);
             uint32_t ntile_h   = (ho + tiling.tile_h - 1) / tiling.tile_h;
@@ -801,9 +805,9 @@ public:
                 return .0;
             }};
 
+        const size_t thread_length_cast = (static_cast<size_t>(n) * k * ho * wo + 8 * 256) / (8 * 256) * (8 * 256) / 8;
         auto fwd_postlog = use_workspace == 1 ?
             std::function<float()>{[&]() -> float{
-                size_t thread_length_cast = (static_cast<size_t>(n) * k * ho * wo + 8 * 256) / (8 * 256) * (8 * 256) / 8;
                 igemm_launch_kernel_single(tensor_cast_func, &karg_tensor_cast, karg_tensor_cast_size, {thread_length_cast, 1, 1}, {256, 1, 1});
                 return .0;
             }} :
@@ -813,6 +817,41 @@ public:
 
         result_t result;
         result.kernel_name = kernel_name;
+
+        std::string dump_dir = env_get_str("IGEMM_DUMPDIR_ALL", "");
+        if (dump_dir.size()) {
+            std::cout << "DEBUG: Dumping all dispatches to " << dump_dir
+                      << std::endl;
+        }
+        result.dumpdata.clear();
+        memset(&result.dumpheader, 0, sizeof(result.dumpheader));
+        result.dumpheader.workspace_size = workspace_size;
+        result.dumpheader.gi_postlog.gsize = {static_cast<uint32_t>(thread_length_cast), 1, 1};
+        result.dumpheader.gi_postlog.wsize = {256, 1, 1};
+        result.dumpheader.use_prolog = tunable->gemm_k_global_split;
+        result.dumpheader.use_postlog = use_workspace == 1;
+        result.dumpheader.cast_total_length = karg_tensor_cast.total_length;
+        result.dumpheader.conv.hi = hi;
+        result.dumpheader.conv.wi = wi;
+        result.dumpheader.conv.n = n;
+        result.dumpheader.conv.k = k;
+        result.dumpheader.conv.c = c;
+        result.dumpheader.conv.ho = ho;
+        result.dumpheader.conv.wo = wo;
+        result.dumpheader.conv.stride_h = stride_h;
+        result.dumpheader.conv.stride_w = stride_w;
+        result.dumpheader.conv.ddilation_h = 1;
+        result.dumpheader.conv.ddilation_w = 1;
+        result.dumpheader.conv.fdilation_h = dilation_h;
+        result.dumpheader.conv.fdilation_w = dilation_w;
+        result.dumpheader.conv.pad_h = pad_h;
+        result.dumpheader.conv.pad_w = pad_w;
+        result.dumpheader.conv.y = y;
+        result.dumpheader.conv.x = x;
+        result.dumpheader.conv.group = group;
+        result.dumpheader.conv.dir = convdir_t::FWD;
+        result.dumpheader.conv.dtype = dtype(tunable->precision);
+
         if(this->driver_mode == driver_mode_normal){
             float min_duration = FLT_MAX;
             int selected_gks = 0;
@@ -830,6 +869,10 @@ public:
                 //printf("block:%d, grid:%d\n", block_size, grid_size);
                 std::vector<igemm_launch_kernel_t> kernel_launchers;
                 kernel_launchers.push_back({kernel_func, karg_buffer, karg_size, {grid_size * block_size, splits, 1}, {block_size, 1, 1}});
+                result.dumpheader.n_dispatches = kernel_launchers.size();
+                result.dumpheader.gks = _gks;
+                result.dumpdata.push_back(kernel_launchers.back());
+                result.dumpdata.back().ktype = ktype;
                 // if(use_workspace == 1){
                 //     size_t thread_length_cast = (static_cast<size_t>(n) * k * ho * wo + 8 * 256) / (8 * 256) * (8 * 256) / 8;
                 //     kernel_launchers.push_back({tensor_cast_func, &karg_tensor_cast, karg_tensor_cast_size, {thread_length_cast, 1, 1}, {256, 1, 1}});
@@ -843,10 +886,16 @@ public:
             };
             if(current_gks != -1){
                 run_with_gks(current_gks);
+                if (dump_dir.size())
+                    dump_shader_args(dump_dir, result.dumpheader, result.dumpdata, result.kernel_name);
+                result.dumpdata.clear();
             }else{
                 std::vector<int> all_gks = get_gks_list(arg, tunable);
                 for(int gks : all_gks){
                     run_with_gks(gks);
+                    if (dump_dir.size())
+                        dump_shader_args(dump_dir, result.dumpheader, result.dumpdata, result.kernel_name);
+                    result.dumpdata.clear();
                 }
             }
 
@@ -862,9 +911,17 @@ public:
                 karg_revalue->ks = gks;
             }
 
-            float duration = igemm_launch_kernels({
-                    {kernel_func, karg_buffer, karg_size, {grid_size * block_size, splits, 1}, {block_size, 1, 1}}
-                }, fwd_prolog, fwd_postlog, this->warmup, this->repeat);
+            std::vector<igemm_launch_kernel_t> kernel_launchers = {
+                {kernel_func,
+                 karg_buffer,
+                 karg_size,
+                 {grid_size * block_size, splits, 1},
+                 {block_size, 1, 1}}};
+            result.dumpheader.n_dispatches = kernel_launchers.size();
+            result.dumpheader.gks = gks;
+            result.dumpdata.push_back(kernel_launchers.back());
+            result.dumpdata.back().ktype = ktype;
+            float duration = igemm_launch_kernels(kernel_launchers, fwd_prolog, fwd_postlog, this->warmup, this->repeat);
 
             result.return_code = 0;
             result.duration_ms = duration;
@@ -898,7 +955,7 @@ public:
         HIP_CALL(hipModuleUnload(cur_kernel_module));
 #endif
         hipFree(p_out_workspace);
-        usleep(1000 * 5);
+        //usleep(1000 * 5);
         return result;
     }
     std::vector<int> get_gks_list(const args_t *arg, const igemm_gtc_tunable_t *tunable) override
