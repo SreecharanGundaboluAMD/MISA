@@ -1589,7 +1589,7 @@ class igemm_bwd_gtc_nhwc_t(mc_base_t):
                                     self._emit(f'.if {fp16_alt_impl_pds} == 1')
                                     self._emit(f"v_cvt_f32_f16 v[{self.v_tmp2(0)}], v[{self.v_src(idx_0)}]{src0_sel}")
                                     self._emit(f"v_cvt_f32_f16 v[{self.v_tmp2(1)}], v[{self.v_src(idx_1)}]{src0_sel}")
-                                    self._emit(macro_packhi_b32_t(self.v_pack_k_tmp(i_pk), self.v_tmp2(0), self.v_tmp2(1)))
+                                    self._emit(macro_packhi_b32_t(self.mc)(self.v_pack_k_tmp(i_pk), self.v_tmp2(0), self.v_tmp2(1)))
                                     self._emit(f'.else')
                                     self._emit(m_pack(self.v_pack_k_tmp(i_pk), self.v_src(idx_0), self.v_src(idx_1)))
                                     self._emit(f'.endif')
