@@ -591,7 +591,7 @@ class macro_packed_fp16_to_bf16_t(macro_base_t):
         for i in range(num_vgpr):
             self._emit(f"v_cvt_f32_f16 v[{self.v_tmp()}], v[{self.v_packed_f16(i)}]")
             self._emit(f"v_cvt_f32_f16 v[{self.v_packed_f16(i)}], v[{self.v_packed_f16(i)}] src0_sel:WORD_1")
-            self._emit(macro_packhi_b32_t(self.mc)(self.v_packed_f16(i), self.v_tmp(), self.v_packed_f16(i)))
+            self._emit(macro_packhi_b32_t(self.v_packed_f16(i), self.v_tmp(), self.v_packed_f16(i)))
 
 def utility_list_to_string(arr):
     assert type(arr) is list

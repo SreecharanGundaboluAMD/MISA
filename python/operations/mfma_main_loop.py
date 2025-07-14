@@ -475,7 +475,7 @@ class mfma_main_loop_t(mc_base_t):
                                         self._emit(f".if {ctrl.pass_through_bf16_1k_in_fp16_predefine} == 1")
                                         self._emit(f"v_cvt_f32_f16 v[{v_gld_p(i_pnum)}], v[{v_gld_p_gpf(i_pnum)}]")
                                         self._emit(f"v_cvt_f32_f16 v[{v_gld_p_gpf(i_pnum)}], v[{v_gld_p_gpf(i_pnum)}] src0_sel:WORD_1")
-                                        self._emit(macro_packhi_b32_t(self.mc)(v_gld_p(i_pnum), v_gld_p(i_pnum), v_gld_p_gpf(i_pnum)))
+                                        self._emit(macro_packhi_b32_t(v_gld_p(i_pnum), v_gld_p(i_pnum), v_gld_p_gpf(i_pnum)))
                                         self._emit(f".else")
                                         self._emit(f"v_mov_b32 v[{v_gld_p(i_pnum)}], v[{v_gld_p_gpf(i_pnum)}]")
                                         self._emit(f".endif")
