@@ -150,21 +150,23 @@ class igemm_wmma_mapping_t(mc_base_t):
         return self._get_deferred()
 
 
-# seeded with exactly one entry for the fwd/nhwc/fp16 correctness-first milestone:
-# block_size = 4 waves * 32 = 128, macro_tile 128x128, wave_repeat 2x2 -> waves_per_m=waves_per_n=4?
-# waves = waves_per_m*waves_per_n must equal 4: pick waves_per_m=2, waves_per_n=2, wave_repeat_m=wave_repeat_n=4
+# seeded with exactly one entry per precision for the correctness-first milestones:
+# block_size = 4 waves * 32 = 128, macro_tile 128x128, wave_repeat 4x4, waves_per_m=waves_per_n=2
 #   macro_tile_m = wave_tile_m(16) * wave_repeat_m(4) * waves_per_m(2) = 128  (same for n)
-ctrl_wmma_mapping_fp16 = [
-    ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x32_f16),
-]
+# fp16/bf16 share the same K=32, 8-VGPR/lane instruction footprint (both verified, see
+# docs/gfx1250_wmma_layout.md) so they share the same tile-shape table.
+ctrl_wmma_mapping_table = {
+    'fp16': [ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x32_f16)],
+    'bf16': [ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x32_bf16)],
+}
 
 def get_ctrl_wmma_mapping_from_wave_tile(macro_tile_m, macro_tile_n, wave_tile_m, wave_tile_n, wave_repeat_m, wave_repeat_n, waves, precision):
-    assert precision == 'fp16', f'wmma mapping table not yet populated for precision:{precision}'
-    target_wmma_tiling = [c for c in ctrl_wmma_mapping_fp16 if
+    assert precision in ctrl_wmma_mapping_table, f'wmma mapping table not yet populated for precision:{precision}'
+    target_wmma_tiling = [c for c in ctrl_wmma_mapping_table[precision] if
                             c.macro_tile_m == macro_tile_m and c.macro_tile_n == macro_tile_n and
                             c.wave_tile_m == wave_tile_m and c.wave_tile_n == wave_tile_n and
                             c.wave_repeat_m == wave_repeat_m and c.wave_repeat_n == wave_repeat_n and
                             c.waves == waves]
-    assert len(target_wmma_tiling) != 0, f"not found for macro_tile:{macro_tile_m}x{macro_tile_n}, wave_tile:{wave_tile_m}x{wave_tile_n}, " + \
+    assert len(target_wmma_tiling) != 0, f"not found for precision:{precision}, macro_tile:{macro_tile_m}x{macro_tile_n}, wave_tile:{wave_tile_m}x{wave_tile_n}, " + \
             f"wave_repeat:{wave_repeat_m}x{wave_repeat_n}, waves:{waves}"
     return target_wmma_tiling[0]

@@ -26,12 +26,45 @@ summed by the instruction itself. For the output, the two halves instead split t
 C and D may be distinct register ranges (no aliasing requirement) — confirmed via `llvm-mc`
 accepting `v_wmma_f32_16x16x32_f16 v[40:47], v[8:15], v[16:23], v[0:7]`.
 
+## `v_wmma_f32_16x16x32_bf16` (M=16, N=16, K=32, bf16 in / fp32 accum)
+
+**Verified** — identical formula to the fp16 case above (same 8-VGPR/lane footprint, same 2
+elements/dword packing). Confirmed via the same round-trip technique across 3 random-seed
+trials (`/tmp/wmma_probe/probe_bf16.s`, `host_bf16.cpp`).
+
 ## Not yet re-verified for other instructions
 
-This was only verified for `v_wmma_f32_16x16x32_f16`. The same formula is assumed (not yet
-re-verified) to generalize to `v_wmma_f32_16x16x32_bf16` (identical operand footprint) and,
-with `k` ranging over the appropriate wider set, to the K=64/K=128 int8/fp8 variants and the
-K=4 fp32 variant. Re-run the round-trip probe before relying on this for a new instruction/dtype.
+Only `v_wmma_f32_16x16x32_f16` and `v_wmma_f32_16x16x32_bf16` (both K=32, identical footprint)
+are verified. Do **not** assume the same formula for the K=64 (`v_wmma_i32_16x16x64_iu8`), K=128
+(`v_wmma_f32_16x16x128_fp8_fp8`, note its A/B footprint is 16 VGPRs/lane, not 8 — a structurally
+different layout, not just a wider `k` range), or K=4 (`v_wmma_f32_16x16x4_f32`) variants — the
+D-operand (output) layout is expected to carry over (M=N=16, `num_v_c=8` for all of them), but
+the A/B operand layout must be independently re-verified with the same round-trip probe
+technique before trusting it for a new instruction.
+
+## Workgroup ID delivery (gfx1250-specific, not WMMA-specific — relevant to any multi-workgroup kernel)
+
+gfx1250 delivers `blockIdx.x`/`blockIdx.y` via **`ttmp9`/`ttmp7`** (trap-temporary registers),
+**not** classical pre-loaded system SGPRs — regardless of the `.amdhsa_system_sgpr_workgroup_id_x/y`
+kernel-descriptor flags, which are accepted by the assembler but do not correspond to where the
+hardware actually places the value on this ROCm/LLVM build. Found by compiling and disassembling
+a trivial HIP kernel that reads `blockIdx.x`/`.y` (`hipcc -x hip --offload-arch=gfx1250
+--cuda-device-only -c -O0`, then `clang-offload-bundler --unbundle` + `llvm-objdump -d`) — the
+compiler's own generated code is ground truth for the ABI it targets. The generated code also
+does a runtime check (`s_getreg_b32 s4, hwreg(HW_REG_IB_STS2, 6, 4)` compared against 0) with a
+fallback bitfield-decode path when nonzero — almost certainly gating between plain dispatch and
+gfx1250's new "workgroup cluster" feature; `s_mov_b32 sX, ttmp9`/`ttmp7` is the simple,
+non-clustered (default) case. Verified independently on real hardware via a multi-workgroup
+atomic-slot dispatch test. No official documentation found for this — discovered purely by
+disassembly; re-verify if targeting a different ROCm/LLVM version.
+
+## Accumulator initialization
+
+`v_wmma_*` computes `D = A@B + C`. If a kernel reuses the same VGPR range for both the C and D
+operand across the whole main loop (the natural choice, since WMMA has no separate
+accumulator-clear instruction), that range **must be explicitly zeroed before the first use** —
+it is not zero at kernel entry. Skipping this produces a kernel that runs to completion and
+looks plausible but silently accumulates onto garbage VGPR contents.
 
 ## GCN12.5 ISA quirks found along the way (relevant to any gfx1250 codegen, not just WMMA)
 

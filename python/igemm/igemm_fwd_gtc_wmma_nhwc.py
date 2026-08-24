@@ -51,20 +51,23 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
     was judged riskier than writing new, small, auditable addressing logic here.
 
     Supports exactly one tile shape: gemm_m_per_block == gemm_n_per_block == 128,
-    gemm_k_per_block == 32 (== wmma K for fp16), block_size == 128 (4 waves),
+    gemm_k_per_block == 32 (== wmma K for fp16/bf16), block_size == 128 (4 waves),
     wmma_tile_m == wmma_tile_n == 16, wmma_repeat_m == wmma_repeat_n == 4.
     gemm_k (total) must be a multiple of 32; gemm_m/gemm_n must be multiples of 128.
+    precision: 'fp16' or 'bf16' (both 2 bytes/element, same K=32 instruction shape --
+    see docs/gfx1250_wmma_layout.md for the empirically-verified per-lane layout of both).
     '''
     def __init__(self, mc, tunable):
         mc_base_t.__init__(self, mc)
         assert tunable.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA
-        assert tunable.precision == 'fp16'
+        assert tunable.precision in ('fp16', 'bf16'), f'unsupported precision:{tunable.precision}'
         assert tunable.tensor_layout == 'nhwc'
         assert tunable.gemm_m_per_block == 128 and tunable.gemm_n_per_block == 128 and tunable.gemm_k_per_block == 32
         assert tunable.wmma_tile_m == 16 and tunable.wmma_tile_n == 16
         assert tunable.wmma_repeat_m == 4 and tunable.wmma_repeat_n == 4
         assert tunable.block_size == 128
         self.tunable = tunable
+        self.data_byte = amdgpu_precision_data_byte(tunable.precision)
 
         ctrl_wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(tunable.gemm_m_per_block, tunable.gemm_n_per_block,
                 tunable.wmma_tile_m, tunable.wmma_tile_n, tunable.wmma_repeat_m, tunable.wmma_repeat_n,
@@ -77,8 +80,13 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_coalescing_store_wmma.precision = tunable.precision
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
 
-        self.lds_a_size = 128 * 32 * 2   # gemm_m_per_block * gemm_k_per_block * fp16 bytes = 8192
-        self.lds_b_size = 128 * 32 * 2   # gemm_n_per_block * gemm_k_per_block * fp16 bytes = 8192
+        # NOTE: the byte-level address math in emit_kernel_prologue/the shared-load/store/
+        # move-slice-window functors below is currently only re-derived from self.data_byte
+        # here; it still hardcodes "2 bytes/element" (via literal shifts/strides) elsewhere,
+        # which is correct for fp16/bf16 (both 2 bytes) but will need generalizing when a
+        # different-width precision (e.g. int8) is added.
+        self.lds_a_size = tunable.gemm_m_per_block * tunable.gemm_k_per_block * self.data_byte
+        self.lds_b_size = tunable.gemm_n_per_block * tunable.gemm_k_per_block * self.data_byte
 
         self.sgpr = self.kernel_sgpr_t(mc, self)
         self.vgpr = self.kernel_vgpr_t(mc, self)
