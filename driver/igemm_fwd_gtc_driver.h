@@ -120,11 +120,12 @@ typedef struct {
 #endif
 } __attribute__((packed)) igemm_fwd_gtc_nhwc_karg_t;
 
-// Karg for the gfx1250 WMMA fwd kernel (igemm_fwd_gtc_wmma_nhwc_t): group==1 only, but
-// Phase 5a added arbitrary stride/pad and Phase 5d added multi-tap filters (y,x>=1) +
-// dilation -- see that class's docstring in python/igemm/igemm_fwd_gtc_wmma_nhwc.py.
-// Layout must match its get_kernel_args() exactly (3 pointers + 15 ints, 84 bytes total,
-// no padding).
+// Karg for the gfx1250 WMMA fwd kernel (igemm_fwd_gtc_wmma_nhwc_t). Phase 5a added arbitrary
+// stride/pad, Phase 5d added multi-tap filters (y,x>=1) + dilation, Phase 7 added group>1 (the
+// only new field is `group` itself -- gemm_m/gemm_n/gemm_k are already per-group values, but
+// A/output need `group` to compute their total-channel-count row stride, see that class's
+// docstring in python/igemm/igemm_fwd_gtc_wmma_nhwc.py). Layout must match its
+// get_kernel_args() exactly (3 pointers + 16 ints, 88 bytes total, no padding).
 typedef struct {
     void *p_in;
     void *p_wei;
@@ -144,6 +145,7 @@ typedef struct {
     int   x;
     int   dilation_h;
     int   dilation_w;
+    int   group;
 } __attribute__((packed)) igemm_fwd_gtc_wmma_nhwc_karg_t;
 
 typedef struct {
@@ -433,13 +435,16 @@ public:
         bool unit_conv = (x==1)&&(y==1)&&(stride_h==1)&&(stride_w==1)&&(dilation_h==1)&&(dilation_w==1)&&(pad_h==0)&&(pad_w==0);
 
         if(tunable->fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA){
-            // igemm_fwd_gtc_wmma_nhwc_t requires group==1 and a single fixed 128x128
-            // macro-tile shape -- checked directly here rather than falling through the
-            // XDLOPS/DLOPS-oriented nhwc checks below (vector-writeout divisibility, merge_e,
-            // gemm_k_global_split) which don't apply to this kernel's addressing scheme at
-            // all. Phase 5a added arbitrary stride/pad, Phase 5d added arbitrary y/x (multi-
-            // tap filters) and dilation -- see that class's docstring.
-            if(tunable->tensor_layout != "nhwc" || group != 1)
+            // igemm_fwd_gtc_wmma_nhwc_t requires a single fixed 128x128 macro-tile shape --
+            // checked directly here rather than falling through the XDLOPS/DLOPS-oriented
+            // nhwc checks below (vector-writeout divisibility, merge_e, gemm_k_global_split)
+            // which don't apply to this kernel's addressing scheme at all. Phase 5a added
+            // arbitrary stride/pad, Phase 5d added arbitrary y/x (multi-tap filters) and
+            // dilation, Phase 7 added group>1 (group is folded into grid_y and decoded
+            // on-device -- see that class's docstring for the per-operand offset scheme).
+            if(tunable->tensor_layout != "nhwc")
+                return false;
+            if(group < 1 || c % group != 0 || k % group != 0)
                 return false;
             int gemm_m = n * ho * wo;
             int gemm_n = k / group;
@@ -634,6 +639,7 @@ public:
             karg.x          = x;
             karg.dilation_h = dilation_h;
             karg.dilation_w = dilation_w;
+            karg.group      = group;
             size_t karg_size = sizeof(karg);
 
             hipFunction_t kernel_func;
@@ -649,7 +655,10 @@ public:
 
             size_t block_size = get_block_size(tunable);
             size_t grid_x = utility_integer_divide_ceil(gemm_m, tunable->gemm_m_per_block);
-            size_t grid_y = utility_integer_divide_ceil(gemm_n, tunable->gemm_n_per_block);
+            // group is folded into grid_y (not a genuine 3rd grid dimension -- gfx1250 has no
+            // working workgroup_id_z delivery mechanism for these kernels, see
+            // docs/gfx1250_wmma_layout.md); the kernel decodes group_idx back out on-device.
+            size_t grid_y = static_cast<size_t>(group) * utility_integer_divide_ceil(gemm_n, tunable->gemm_n_per_block);
 
             result_t result;
             result.kernel_name = kernel_name;

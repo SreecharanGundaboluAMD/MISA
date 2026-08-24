@@ -31,13 +31,42 @@ from .igemm_base import *
 class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
     '''
     gfx1250 WMMA fwd kernel. Phase 5a added arbitrary stride/pad (1x1 filter only).
-    Phase 5d now adds multi-tap filters (y,x >= 1) and dilation (group=1 still
-    required -- see igemm_bwd/wrw for their own status):
+    Phase 5d added multi-tap filters (y,x >= 1) and dilation. Phase 7 adds group>1:
 
-        output[n,ho,wo, k] = sum_{iy,ix,c} input[n, ho*stride_h-pad_h+iy*dilation_h,
-                                                    wo*stride_w-pad_w+ix*dilation_w, c]
-                                          * weight[k, iy, ix, c]
-                              (0 if the input pixel above is out of [0,hi)x[0,wi) bounds)
+        output[n,ho,wo, g*Kpg+k] = sum_{iy,ix,c} input[n, ho*stride_h-pad_h+iy*dilation_h,
+                                                    wo*stride_w-pad_w+ix*dilation_w, g*Cpg+c]
+                                                * weight[g*Kpg+k, iy, ix, c]
+                              (0 if the input pixel above is out of [0,hi)x[0,wi) bounds;
+                               g = group index, Kpg/Cpg = K_out/C_in per group)
+
+    group>1 (Phase 7): `gemm_m`/`gemm_n`/`gemm_k` are already per-group values (the driver
+    divides `k`/`c` by `group` before writing the karg, unchanged from every earlier phase);
+    `group` itself is folded into `grid_y` by the driver (`grid_y = group *
+    ceil(gemm_n/gemm_n_per_block)`) rather than a genuine 3rd grid dimension (gfx1250 has no
+    working `workgroup_id_z` delivery for these kernels). The kernel decodes `group_idx` back
+    out of `s_by` on-device (`blocks_per_group_n = ceil(gemm_n/128)`, needs no division since
+    128 is a compile-time power of 2; the `group_idx`/corrected-`s_by` split reuses the same
+    wave32-safe division macro as everywhere else via a broadcast-to-vgpr +
+    `v_readfirstlane_b32` round-trip, rather than a new scalar-scalar macro variant), then
+    overwrites `s_by` in place so `s_block_n_off` (computed right after) is unchanged.
+
+    Two DIFFERENT per-operand corrections are needed, because NHWC group-splitting works
+    differently for each tensor:
+    - **Input and output**: group is INTERLEAVED within each pixel's channel dimension (NHWC
+      layout is `[N,H,W,G*C_per_group]`/`[N,Ho,Wo,G*K_per_group]`), so the per-pixel/row
+      memory stride must be the tensor's TOTAL channel count (`gemm_k*group`/`gemm_n*group`,
+      new `s_in_c_total`/`s_out_k_total`), NOT the per-group `gemm_k`/`gemm_n` used for the
+      K-reduction size and the base-pointer offset (those stay unchanged) -- **this was a real
+      bug caught by hardware validation**: an early draft reused `gemm_k`/`gemm_n` for the row
+      stride too (correct only for `group=1`, where total==per-group), producing wrong,
+      uncorrelated-looking output for every group except group 0 (group 0's offset is always
+      zero, so the row-stride bug was invisible there) until traced down to exactly this.
+    - **Weight**: needs NO equivalent correction. Its group split is the OUTERMOST dimension
+      (`[G][K_per_group][Y][X][C_per_group]`, confirmed against `driver/naive_conv.h` and the
+      general XDLOPS kernel's own grouped-conv addressing), so a group's entire weight
+      sub-tensor is self-contained/block-contiguous -- the existing `wei_k_stride`-based
+      addressing, with `group_idx * gemm_n * wei_k_stride` added to the base pointer once, is
+      already correct unchanged.
 
     m enumerates (n,ho,wo) output pixels (GEMM_M = n*ho*wo), k enumerates input
     channels PER TAP (GEMM_K = c -- unchanged from Phase 5a; the y*x taps are a
@@ -195,6 +224,10 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             self.s_wei_k_stride = sym_t('s_wei_k_stride', sseq(1))   # = y*x*gemm_k, computed on-device once
             self.s_iy          = sym_t('s_iy'          , sseq(1))   # runtime tap-loop counters
             self.s_ix          = sym_t('s_ix'          , sseq(1))
+            self.s_group_idx   = sym_t('s_group_idx'   , sseq(1))   # decoded from s_by (group folded into grid_y)
+            self.s_group       = sym_t('s_group'       , sseq(1))   # kernarg: total group count
+            self.s_in_c_total  = sym_t('s_in_c_total'  , sseq(1))   # = gemm_k*group, A's per-pixel row stride
+            self.s_out_k_total = sym_t('s_out_k_total' , sseq(1))   # = gemm_n*group, output's per-pixel row stride
             self.s_block_m_off = sym_t('s_block_m_off' , sseq(1))
             self.s_block_n_off = sym_t('s_block_n_off' , sseq(1))
             self.s_kitr        = sym_t('s_kitr'        , sseq(1))
@@ -271,6 +304,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         kas.append(amdgpu_kernel_arg_t('x'         , 4, 72, 'by_value', 'i32'))
         kas.append(amdgpu_kernel_arg_t('dilation_h', 4, 76, 'by_value', 'i32'))
         kas.append(amdgpu_kernel_arg_t('dilation_w', 4, 80, 'by_value', 'i32'))
+        # Phase 7 (group>1): the only new kernarg needed -- gemm_m/gemm_n/gemm_k are already
+        # per-group values (host divides by group before writing them), but A (input) and the
+        # output (D) need the tensor's TOTAL channel count for their per-pixel row stride,
+        # which requires knowing group itself (see class docstring).
+        kas.append(amdgpu_kernel_arg_t('group'     , 4, 84, 'by_value', 'i32'))
         return kas
 
     def get_kernel_code(self):
@@ -280,7 +318,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             'enable_sgpr_workgroup_id_y'       :   1,
             'enable_vgpr_workitem_id'          :   0,
             'workgroup_group_segment_byte_size':   self.lds_a_size + self.lds_b_size,
-            'kernarg_segment_byte_size'         :   84,
+            'kernarg_segment_byte_size'         :   88,
             'wavefront_sgpr_count'              :   self.sgpr.s_end.value + 2 * 3,
             'workitem_vgpr_count'               :   self.vgpr.v_end.value,
             'wavefront_size'                    :   32,
@@ -335,6 +373,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_load_dword s[{s.s_x()}], s[{s.s_ka()}:{s.s_ka(1)}], 72")
         self._emit(f"s_load_dword s[{s.s_dilation_h()}], s[{s.s_ka()}:{s.s_ka(1)}], 76")
         self._emit(f"s_load_dword s[{s.s_dilation_w()}], s[{s.s_ka()}:{s.s_ka(1)}], 80")
+        self._emit(f"s_load_dword s[{s.s_group()}], s[{s.s_ka()}:{s.s_ka(1)}], 84")
         self._emit(f"v_mov_b32 v[{v.v_tid()}], v0")
         # gfx1250 delivers workgroup id via ttmp9/ttmp7 (verified empirically against a
         # disassembled HIP-compiled kernel using blockIdx.x/.y on this hardware/toolchain --
@@ -344,6 +383,53 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_mov_b32 s[{s.s_bx()}], ttmp9")
         self._emit(f"s_mov_b32 s[{s.s_by()}], ttmp7")
         self._emit(f"s_wait_kmcnt 0x0")
+        self._emit_empty_line()
+
+        m_int_div_rem_vs = macro_int_div_rem_vs_gfx1250_t(self.mc)
+
+        # ---- group>1: decode group_idx out of s_by (group is folded into grid_y by the
+        # driver: grid_y = group * ceil(gemm_n/gemm_n_per_block)), and correct s_by in place
+        # to the within-group N-block index BEFORE s_block_n_off is computed from it below --
+        # blocks_per_group_n needs no division (gemm_n_per_block=128 is a compile-time power
+        # of 2), but the group_idx/corrected-s_by split does need a genuine runtime division
+        # (blocks_per_group_n is only known at launch time). Reuses the same wave32-safe
+        # division macro as everywhere else in this kernel (broadcast s_by to a vgpr, divide,
+        # v_readfirstlane_b32 both outputs back to scalar) rather than a new scalar-scalar
+        # variant. Applies A's and the output's per-group address offset here (both only need
+        # gemm_k/gemm_n, already loaded); B's offset is applied further below, once
+        # s_wei_k_stride is available. ----
+        self._emit(f"; --- group>1: decode group_idx, correct s_by, offset A/output base pointers ---")
+        self._emit(f"s_add_u32 s[{s.s_tmp(0)}], s[{s.s_gemm_n()}], 127")
+        self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], 7   ; blocks_per_group_n = ceil(gemm_n/128)")
+        self._emit(f"v_mov_b32 v[{v.v_gtc_tmp(0)}], s[{s.s_by()}]")
+        self._emit(m_int_div_rem_vs(v.v_gtc_tmp(1), v.v_gtc_tmp(2), v.v_gtc_tmp(0), s.s_tmp(0), v.v_tmp(), s.s_tmp(1)))
+        self._emit(f"v_readfirstlane_b32 s[{s.s_group_idx()}], v[{v.v_gtc_tmp(2)}]   ; group_idx")
+        self._emit(f"v_readfirstlane_b32 s[{s.s_by()}], v[{v.v_gtc_tmp(1)}]   ; s_by <- corrected within-group N-block index")
+        self._emit_empty_line()
+
+        # ---- group>1: A (input) and the output (D) are NHWC tensors with the group split
+        # INTERLEAVED within each pixel's channel dimension, so the per-pixel/row memory
+        # stride must be the TOTAL channel count (gemm_k*group / gemm_n*group), not the
+        # per-group gemm_k/gemm_n the rest of this kernel uses for the K-reduction size and
+        # the base-pointer offset -- those stay unchanged. B (weight) needs no equivalent
+        # correction: its group split is the OUTERMOST/block-contiguous dimension ([G][K_out
+        # per group][Y][X][C_in per group]), so a group's entire weight sub-tensor is
+        # self-contained and the existing wei_k_stride-based addressing is already correct.
+        self._emit(f"s_mul_i32 s[{s.s_in_c_total()}], s[{s.s_gemm_k()}], s[{s.s_group()}]")
+        self._emit(f"s_mul_i32 s[{s.s_out_k_total()}], s[{s.s_gemm_n()}], s[{s.s_group()}]")
+        self._emit_empty_line()
+
+        self._emit(f"; A (input): group offset = group_idx * gemm_k elements")
+        self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group_idx()}], s[{s.s_gemm_k()}]")
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {utility_log2(self.data_byte)}")
+        self._emit(f"s_add_u32 s[{s.s_p_in()}], s[{s.s_p_in()}], s[{s.s_tmp(0)}]")
+        self._emit(f"s_addc_u32 s[{s.s_p_in(1)}], s[{s.s_p_in(1)}], 0")
+
+        self._emit(f"; output: group offset = group_idx * gemm_n elements (D-operand is always fp32/int32, 4 bytes)")
+        self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group_idx()}], s[{s.s_gemm_n()}]")
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], 2")
+        self._emit(f"s_add_u32 s[{s.s_p_out()}], s[{s.s_p_out()}], s[{s.s_tmp(0)}]")
+        self._emit(f"s_addc_u32 s[{s.s_p_out(1)}], s[{s.s_p_out(1)}], 0")
         self._emit_empty_line()
 
         # zero the accumulator -- v_wmma_* does D = A@B + C, and v_c is used as both C and D
@@ -361,7 +447,6 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
 
         # ---- one-time decomposition of this thread's GEMM_M index into (n_idx, ho_idx, wo_idx),
         # kept persistent: every tap re-derives hi_idx/wi_idx from the SAME ho_idx/wo_idx ----
-        m_int_div_rem_vs = macro_int_div_rem_vs_gfx1250_t(self.mc)
         self._emit(f"s_mul_i32 s[{s.s_hi_wi()}], s[{s.s_hi()}], s[{s.s_wi()}]")
         self._emit(f"; decode this thread's absolute GEMM_M index into (n_idx, ho_idx, wo_idx)")
         self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_block_m_off()}], v[{v.v_tid()}]   ; m_idx")
@@ -376,6 +461,17 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"; s_wei_k_stride = y * x * gemm_k")
         self._emit(f"s_mul_i32 s[{s.s_wei_k_stride()}], s[{s.s_x()}], s[{s.s_y()}]")
         self._emit(f"s_mul_i32 s[{s.s_wei_k_stride()}], s[{s.s_wei_k_stride()}], s[{s.s_gemm_k()}]")
+        self._emit_empty_line()
+
+        # ---- group>1: B's group offset = group_idx * gemm_n * wei_k_stride elements (the
+        # per-group weight tensor size, K_per_group*Y*X*C_per_group = gemm_n*wei_k_stride) --
+        # applied here (not alongside A/output above) since it needs s_wei_k_stride ----
+        self._emit(f"; B (weight): group offset = group_idx * gemm_n * wei_k_stride elements")
+        self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group_idx()}], s[{s.s_gemm_n()}]")
+        self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_wei_k_stride()}]")
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {utility_log2(self.data_byte)}")
+        self._emit(f"s_add_u32 s[{s.s_p_wei()}], s[{s.s_p_wei()}], s[{s.s_tmp(0)}]")
+        self._emit(f"s_addc_u32 s[{s.s_p_wei(1)}], s[{s.s_p_wei(1)}], 0")
         self._emit_empty_line()
 
         # ---- B's fixed per-thread row base (this tap's column offset is added fresh every
@@ -455,8 +551,9 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"v_add_u32 v[{v.v_gtc_tmp(2)}], v[{v.v_gtc_tmp(2)}], v[{v.v_gtc_tmp(1)}]")
         self._emit_empty_line()
 
-        self._emit(f"; v_addr_a = p_in + row_idx * gemm_k * {self.data_byte} bytes")
-        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(2)}], s[{s.s_gemm_k()}], v[{v.v_gtc_tmp(2)}]")
+        self._emit(f"; v_addr_a = p_in + row_idx * in_c_total * {self.data_byte} bytes (in_c_total = gemm_k*group --")
+        self._emit(f"; the pixel-to-pixel stride is the TENSOR's total channel count, not the per-group gemm_k, see class docstring)")
+        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(2)}], s[{s.s_in_c_total()}], v[{v.v_gtc_tmp(2)}]")
         self._emit(f"v_lshlrev_b32 v[{v.v_gtc_tmp(2)}], {utility_log2(self.data_byte)}, v[{v.v_gtc_tmp(2)}]")
         self._emit(f"v_mov_b32 v[{v.v_addr_a(1)}], s[{s.s_p_in(1)}]   ; reset high half fresh -- this")
         self._emit(f"                                                ; tap's address is NOT a continuation of the previous tap's")
@@ -648,7 +745,9 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
     def emit_kernel_epilogue(self):
         v = self.vgpr
         s = self.sgpr
-        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_gemm_n.label, v.v_addr_out.label))
+        # s_out_k_total (=gemm_n*group) is the output tensor's TOTAL row stride (see class
+        # docstring's group>1 note) -- s_gemm_n alone (per-group) is only correct for group=1.
+        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_k_total.label, v.v_addr_out.label))
         self._emit(f"s_wait_storecnt 0x0")
 
     def emit_kernel_body(self):
