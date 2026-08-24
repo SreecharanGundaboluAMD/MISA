@@ -62,15 +62,38 @@ file's class docstring.
 match against a CPU reference (int32, no tolerance needed) across single-block, multi-block,
 non-square, and multi-K-block configurations, multiple random seeds.
 
+## `v_wmma_f32_16x16x4_f32` (M=16, N=16, K=4, fp32 in / fp32 accum, no packing)
+
+**Verified** — a genuinely simpler, differently-shaped layout family from fp16/bf16/int8:
+`num_v_a = num_v_b = 2` (not 8), and **no packing at all** (1 fp32/dword, unlike fp16's 2/dword
+or int8's 4/dword):
+
+- **A operand** (2 VGPRs/lane, 1 fp32/dword): for vgpr index `a` (0..1):
+  `row = l % 16`, `k = (l / 16) * 2 + a`
+- **B operand** (2 VGPRs/lane, same): for vgpr index `a` (0..1):
+  `col = l % 16`, `k = (l / 16) * 2 + a`
+- **D operand**: identical to every other precision (`row = (l/16)*8 + j, col = l % 16`,
+  `num_v_c=8`, fp32 accumulator) — confirmed via the same round-trip, not assumed.
+
+Confirmed via the same round-trip technique across 6 random-seed trials
+(`/tmp/wmma_probe/probe_fp32.s`, `host_fp32.cpp`).
+
+`gemm_k_per_block` is forced to 4 (matching `inst_wmma.k`) since `wmma_main_loop.py` requires
+`unroll_k == inst_wmma.k` exactly (no k-sub-loop). This breaks the "`gemm_k_per_block *
+data_byte` is always 64 bytes" coincidence every fp16/bf16/int8 literal above assumed (true for
+32×2, 32×2, 64×1, but 4×4=16 for fp32) — see Phase 8 below for the resulting generalization
+work, and the num_v_a/num_v_b=2 (not 8) footprint above for a second, independent invariant
+break the LDS-read functors needed fixing for.
+
 ## Not yet re-verified for other instructions
 
-`v_wmma_f32_16x16x32_f16`, `v_wmma_f32_16x16x32_bf16` (K=32), and `v_wmma_i32_16x16x64_iu8`
-(K=64) are verified. Do **not** assume the same formula for K=128
-(`v_wmma_f32_16x16x128_fp8_fp8`, note its A/B footprint is 16 VGPRs/lane, not 8 — a structurally
-different layout, not just a wider `k` range), or K=4 (`v_wmma_f32_16x16x4_f32`) variants — the
-D-operand (output) layout is expected to carry over (M=N=16, `num_v_c=8` for all of them), but
-the A/B operand layout must be independently re-verified with the same round-trip probe
-technique before trusting it for a new instruction.
+`v_wmma_f32_16x16x32_f16`, `v_wmma_f32_16x16x32_bf16` (K=32), `v_wmma_i32_16x16x64_iu8` (K=64),
+and `v_wmma_f32_16x16x4_f32` (K=4) are verified. Do **not** assume any of these formulas for
+K=128 (`v_wmma_f32_16x16x128_fp8_fp8`, note its A/B footprint is 16 VGPRs/lane, not 8 or 2 — a
+structurally different layout again, not just a wider `k` range) — the D-operand (output)
+layout is expected to carry over (M=N=16, `num_v_c=8` for all of them), but the A/B operand
+layout must be independently re-verified with the same round-trip probe technique before
+trusting it for a new instruction.
 
 ## Workgroup ID delivery (gfx1250-specific, not WMMA-specific — relevant to any multi-workgroup kernel)
 
@@ -678,7 +701,48 @@ x 3 precisions) x 2 group-counts regression sweep also passes.
 With Phase 7 complete, this milestone's ENTIRE originally-scoped surface (fwd/bwd/wrw x
 fp16/bf16/int8 x general stride/pad/multi-tap/dilation x group>1) is now COMPLETE.
 
-Remaining gaps: fp8/fp32 WMMA instruction layouts remain unverified (would need their own
-hardware round-trip probes before use, per the same discipline that caught the int8 signedness
-bug above -- do not assume any new instruction/precision is correct without independently
-re-verifying against real random (not just small positive) test data).
+## Phase 8: fp32 support, all three directions
+
+Full parity for fp32 (`v_wmma_f32_16x16x4_f32`) with the fp16/bf16/int8 surface above: general
+stride/pad, multi-tap+dilation, and group>1, across fwd/bwd/wrw. fp8 remains out of scope (see
+"Remaining gaps" below).
+
+**Why this needed real generalization work, not just a config change**: `gemm_k_per_block` must
+equal `inst_wmma.k` exactly (4 for fp32, vs 32/64 for fp16/bf16/int8), which breaks the
+"`gemm_k_per_block * data_byte == 64 bytes`" coincidence noted above. Every kernel file had
+literals built on that coincidence (hardcoded shift-by-6/shift-by-5 address multipliers, a
+literal `1024`/`64`, loop bounds `range(4)`/`range(16)`) — all three kernel files now derive
+`self.bytes_per_row = gemm_k_per_block * data_byte`, `self.num_dwordx4 = bytes_per_row // 16`,
+`self.num_dwords = bytes_per_row // 4` once in `__init__`, and every affected literal reads
+from these instead. `wmma_tile_m/n`/`wmma_repeat_m/n`-based loop bounds (tile-shape constants,
+unrelated to K or data_byte) were left untouched.
+
+A second, independent invariant break: the LDS-read functors for TRANSPOSED operands (bwd's
+weight/B, both of wrw's operands) hardcoded "8 VGPRs per wave_repeat step" and a binary
+`ds_read_u16`/`ds_read_u8` choice, both assuming `num_v_a`/`num_v_b == 8` (true for
+fp16/bf16/int8, false for fp32's `num_v_a = num_v_b = 2`, per the Phase 8 layout section
+above). Fixed by deriving the loop bound/index from `inst_wmma.num_v_a`/`num_v_b` instead of a
+hardcoded 8, and adding a third `read_instr` branch (`ds_read_b32`, a full-width read with no
+zero-extension) for `data_byte == 4`. The UNTRANSPOSED LDS-read functors (fwd's A/B, bwd's A)
+had the same 8-VGPR assumption but a simpler fix: a new `_emit_ds_read_chunked` helper reads
+`num_v` dwords in the largest `ds_read_*` chunk available (b128/b64/b32), replacing the
+hardcoded `2x ds_read_b128`.
+
+**No driver-side changes were needed anywhere** — `driver/conv_driver.cpp`'s `driverFloat`
+codepath (pre-existing, used for the general/non-WMMA fp32 kernels) already reads/writes
+buffers at `data_byte == sizeof(float)` width, unlike fp16/bf16/int8 which needed the
+`is_wmma`-gated buffer-widening fix from earlier phases.
+
+**Validated on real gfx1250 hardware** through `conv_driver.exe`, all three directions, against
+`naive_conv_{fwd,bwd,wrw}_nhwc`: 1x1 degenerate case, multi-K-block, multi-block M/N,
+multi-tap+dilation, stride+pad, group=2, group=4, and combined stride+multi-tap+group=2 cases —
+all exact matches. fp16/bf16/int8 regression-tested after the generalization edits (all three
+kernel files), all still exact matches — confirming the byte-constant generalization didn't
+disturb the precisions it was extracted from.
+
+Remaining gaps: fp8 (`v_wmma_f32_16x16x128_fp8_fp8`) WMMA instruction layout remains unverified
+(would need its own hardware round-trip probe before use, per the same discipline that caught
+the int8 signedness bug above -- do not assume any new instruction/precision is correct without
+independently re-verifying against real random (not just small positive) test data). Note its
+A/B footprint is 16 VGPRs/lane (K=128), a third distinct layout family from both the 8-VGPR
+fp16/bf16/int8 family and fp32's 2-VGPR/no-packing family above.
