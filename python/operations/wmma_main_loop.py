@@ -37,9 +37,12 @@ class ctrl_wmma_main_loop_t(object):
     Also unlike the mfma track there is no AGPR/accvgpr_unified field at all: WMMA
     accumulates directly in v_c (plain VGPR), same register model as the DLOPS track.
 
-    One v_wmma_* call already consumes the whole wave_tile_k (e.g. 32 for fp16) worth
-    of the K dimension, so (unlike dotx's main loop) there is no k-sub-loop inside one
-    unroll_k step -- unroll_k must equal wmma_m.inst_wmma.k for this loop body.
+    Phase 1 (k-sub-loop): `unroll_k` may now be any power-of-2 MULTIPLE of
+    `wmma_m.inst_wmma.k` (not just equal to it) -- one `v_wmma_*` call only ever
+    consumes `inst_wmma.k` worth of K, so `unroll_k // inst_wmma.k` k-sub-steps are
+    issued against the SAME already-in-LDS tile before the next global-load/shared-
+    store/barrier round-trip, amortizing that synchronization cost over more useful
+    FLOPs. See `k_substep_stride_bytes_a/b` below for the per-substep LDS offset.
     '''
     def __init__(self):
         self.wmma_m                      = None   # ctrl_wmma_mapping_t
@@ -49,6 +52,14 @@ class ctrl_wmma_main_loop_t(object):
 
         self.lds_single_size             = 0       # in byte, should be power of 2
         self.lds_buffer_num              = 1        # single-buffered for this milestone
+
+        # Phase 1 (k-sub-loop): byte offset between consecutive inst_wmma.k-wide K-slices
+        # within one already-in-LDS tile, one value per operand since transposed vs
+        # untransposed operands advance through LDS differently (contiguous-within-a-row
+        # vs row-to-row) -- computed by the kernel file that knows each operand's actual
+        # LDS layout, not derivable here. Only used when unroll_k > inst_wmma.k.
+        self.k_substep_stride_bytes_a    = 0
+        self.k_substep_stride_bytes_b    = 0
 
         # functor
         self.global_load_a_functor       = None
@@ -81,10 +92,11 @@ class wmma_main_loop_t(mc_base_t):
         ctrl = self.ctrl
         wmma_m = ctrl.wmma_m
         inst_wmma = wmma_m.inst_wmma
-        assert ctrl.unroll_k == inst_wmma.k, \
-            f"wmma main loop requires unroll_k({ctrl.unroll_k}) == inst_wmma.k({inst_wmma.k}), " \
-            "one v_wmma_* call already consumes the whole K step"
+        assert ctrl.unroll_k % inst_wmma.k == 0, \
+            f"wmma main loop requires unroll_k({ctrl.unroll_k}) to be a multiple of " \
+            f"inst_wmma.k({inst_wmma.k}) -- one v_wmma_* call only ever consumes inst_wmma.k worth of K"
         assert ctrl.lds_buffer_num == 1, "only single-buffered LDS is implemented for this milestone"
+        num_k_substeps = ctrl.unroll_k // inst_wmma.k
 
         label_body     = f'L_{ctrl.label_prefix}_wmma_body'
         label_end      = f'L_{ctrl.label_prefix}_wmma_end'
@@ -115,6 +127,21 @@ class wmma_main_loop_t(mc_base_t):
                         v_a((a_index, a_index + inst_wmma.num_v_a - 1)),
                         v_b((b_index, b_index + inst_wmma.num_v_b - 1)),
                         v_c((c_index, c_index + inst_wmma.num_v_c - 1))))
+
+        def emit_extra_substeps():
+            # k-sub-step 0's shared_load+wmma is always emitted at its original position
+            # (see below) so the pre-existing global-load-latency-hiding overlap is
+            # preserved byte-for-byte; substeps 1..N-1 (this drain) have no such overlap
+            # opportunity left (the next tile's global load is already in flight by the
+            # time this runs), so they're a plain sequential load+wait+compute sequence
+            # against the same already-in-LDS tile -- no new barrier/global-load needed.
+            for ks in range(1, num_k_substeps):
+                off_a = ks * ctrl.k_substep_stride_bytes_a
+                off_b = ks * ctrl.k_substep_stride_bytes_b
+                self._emit(f_sld_a(v_a(), v_sld_a_os(), off_a))
+                self._emit(f_sld_b(v_b(), v_sld_b_os(), off_b))
+                self._emit(f"s_wait_dscnt 0x0")
+                emit_wmma_tile()
 
         # ---- prologue: caller has already issued the first global A/B load ----
         # Structure note: the LDS-load + compute for a tile always happens at the TOP
@@ -153,6 +180,7 @@ class wmma_main_loop_t(mc_base_t):
         self._emit_empty_line()
 
         emit_wmma_tile()
+        emit_extra_substeps()
         self._emit_empty_line()
 
         self._emit(f"s_wait_loadcnt 0x0")
@@ -163,6 +191,7 @@ class wmma_main_loop_t(mc_base_t):
 
         self._emit_front(f"{label_body}_last:")
         emit_wmma_tile()
+        emit_extra_substeps()
         self._emit_empty_line()
 
         self._emit_front(f"{label_end}:")

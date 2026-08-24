@@ -159,10 +159,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(tunable.gemm_m_per_block, tunable.gemm_n_per_block,
                 tunable.wmma_tile_m, tunable.wmma_tile_n, tunable.wmma_repeat_m, tunable.wmma_repeat_n,
                 tunable.block_size // tunable.wave_size, tunable.precision)
-        # gemm_k_per_block must equal the wired-up instruction's K (32 for fp16/bf16, 64 for
-        # int8) -- wmma_main_loop.py requires unroll_k == inst_wmma.k exactly (no k-sub-loop).
-        assert tunable.gemm_k_per_block == ctrl_wmma_mapping.inst_wmma.k, \
-            f"gemm_k_per_block({tunable.gemm_k_per_block}) must equal inst_wmma.k({ctrl_wmma_mapping.inst_wmma.k}) for precision {tunable.precision}"
+        # gemm_k_per_block must be a multiple of the wired-up instruction's K (32 for
+        # fp16/bf16, 64 for int8, 4 for fp32) -- Phase 1's k-sub-loop (wmma_main_loop.py)
+        # issues gemm_k_per_block // inst_wmma.k v_wmma_* calls per LDS round-trip.
+        assert tunable.gemm_k_per_block % ctrl_wmma_mapping.inst_wmma.k == 0, \
+            f"gemm_k_per_block({tunable.gemm_k_per_block}) must be a multiple of inst_wmma.k({ctrl_wmma_mapping.inst_wmma.k}) for precision {tunable.precision}"
         self.wmma_mapping = igemm_wmma_mapping_t(self.mc, ctrl_wmma_mapping)
 
         ctrl_coalescing_store_wmma = ctrl_coalescing_store_wmma_t()
@@ -182,6 +183,20 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self.bytes_per_row = tunable.gemm_k_per_block * self.data_byte   # per-thread A/B row width
         self.num_dwordx4   = self.bytes_per_row // 16   # global_load/shared_store loop bound (was hardcoded 4)
         self.num_dwords    = self.bytes_per_row // 4    # v_gld_a/b zero-init loop bound (was hardcoded 16)
+        # Phase 1 (k-sub-loop): the WMMA "k_half" wave-split (lane>>4) only ever applies
+        # WITHIN one inst_wmma.k-wide instruction, never across the whole (possibly
+        # multi-substep) gemm_k_per_block row -- must be derived from inst_wmma.k, NOT
+        # bytes_per_row (which now can be a multiple of inst_wmma.k*data_byte).
+        self.inst_wmma_k_bytes = ctrl_wmma_mapping.inst_wmma.k * self.data_byte
+        # Phase 1 (k-sub-loop): global_load/shared_store are chunked into num_k_chunks
+        # rounds of one inst_wmma.k-worth each, REUSING the same small v_gld_a/b buffer
+        # (sized to chunk_num_dword{,x4}, not the whole row) across chunks -- growing
+        # v_gld_a/b to hold the whole (now possibly multi-substep) row would exceed the
+        # 256-VGPR/wave hardware limit for fp16/bf16/int8, which already sit at 252/256
+        # with the single-substep tile. See docs/gfx1250_wmma_layout.md.
+        self.chunk_num_dwordx4 = self.inst_wmma_k_bytes // 16
+        self.chunk_num_dwords  = self.inst_wmma_k_bytes // 4
+        self.num_k_chunks      = self.num_dwordx4 // self.chunk_num_dwordx4
         self.lds_a_size = tunable.gemm_m_per_block * tunable.gemm_k_per_block * self.data_byte
         self.lds_b_size = tunable.gemm_n_per_block * tunable.gemm_k_per_block * self.data_byte
 
@@ -253,8 +268,13 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             self.v_c           = sym_t('v_c'           , vseq(outer.tunable.num_vgpr_accumulate_c))     # 128
             self.v_a           = sym_t('v_a'           , vseq(outer.tunable.num_vgpr_accumulate_a))     # 32
             self.v_b           = sym_t('v_b'           , vseq(outer.tunable.num_vgpr_accumulate_b))     # 32
-            self.v_gld_a       = sym_t('v_gld_a'       , vseq(16))   # gemm_k_per_block*data_byte = 64B row (any precision), staged before LDS store
-            self.v_gld_b       = sym_t('v_gld_b'       , vseq(16))
+            # Phase 1 (k-sub-loop): sized to outer.chunk_num_dwords (one inst_wmma.k-worth),
+            # NOT outer.num_dwords (the whole, possibly multi-substep, row) -- global_load/
+            # shared_store are now chunked and reuse this same small buffer across chunks,
+            # since growing it to hold the whole row would exceed the 256-VGPR/wave limit
+            # for fp16/bf16/int8. See self.chunk_num_dwords in __init__.
+            self.v_gld_a       = sym_t('v_gld_a'       , vseq(outer.chunk_num_dwords))
+            self.v_gld_b       = sym_t('v_gld_b'       , vseq(outer.chunk_num_dwords))
             self.v_tid         = sym_t('v_tid'         , vseq(1))
             # 64-bit VADDR pairs must be even-aligned on gfx1250 (verified with llvm-mc)
             self.v_addr_a      = sym_t('v_addr_a'      , vseq(2, 2))    # persistent global A address (64-bit)
@@ -505,7 +525,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix(v.v_sld_b_os(), v.v_sld_a_os(), v.v_tid(), v.v_tmp()))
         self._emit(f"v_lshrrev_b32 v[{v.v_tmp()}], 4, v[{v.v_tid()}]")
         self._emit(f"v_and_b32 v[{v.v_tmp()}], 1, v[{v.v_tmp()}]")
-        self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.bytes_per_row // 2)}, v[{v.v_tmp()}]      ; k_half * {self.bytes_per_row // 2} bytes")
+        self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.inst_wmma_k_bytes // 2)}, v[{v.v_tmp()}]      ; k_half * {self.inst_wmma_k_bytes // 2} bytes")
         self._emit(f"v_lshlrev_b32 v[{v.v_sld_a_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_sld_a_os()}]  ; row * {self.bytes_per_row} byte row-stride")
         self._emit(f"v_add_u32 v[{v.v_sld_a_os()}], v[{v.v_tmp()}], v[{v.v_sld_a_os()}]")
         self._emit(f"v_lshlrev_b32 v[{v.v_sld_b_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_sld_b_os()}]")
@@ -610,27 +630,71 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_cbranch_scc1 {label_tap_y}")
         self._emit_empty_line()
 
+    def _emit_gld_chunk_load(self, v_gld, v_addr, chunk_idx, v_flag=None):
+        ''' Phase 1 (k-sub-loop): issues (does not wait) ONE inst_wmma.k-wide chunk's
+        global load into the small, reused v_gld buffer. '''
+        if v_flag is not None:
+            for i in range(self.chunk_num_dwords):
+                self._emit(f"v_mov_b32 v[{v_gld(i)}], 0")
+            self._emit(f"v_cmpx_le_u32 1, v[{v_flag()}]")
+        for i in range(self.chunk_num_dwordx4):
+            idx = chunk_idx * self.chunk_num_dwordx4 + i
+            self._emit(f"global_load_dwordx4 v[{v_gld(i*4)}:{v_gld(i*4+3)}], v[{v_addr()}:{v_addr(1)}], off offset:{idx*16}")
+        if v_flag is not None:
+            self._emit(f"s_mov_b32 exec_lo, -1")
+
+    def _emit_sst_chunk(self, v_gld, v_sst_os, sst_extra_off, chunk_idx):
+        ''' Phase 1 (k-sub-loop): stores ONE already-loaded-and-waited chunk to LDS. '''
+        for i in range(self.chunk_num_dwordx4):
+            idx = chunk_idx * self.chunk_num_dwordx4 + i
+            self._emit(f"ds_write_b128 v[{v_sst_os()}], v[{v_gld(i*4)}:{v_gld(i*4+3)}] offset:{sst_extra_off + idx*16}")
+
+    def _emit_sst_remaining_chunks(self, v_gld, v_addr, v_sst_os, sst_extra_off, v_flag=None):
+        '''
+        Phase 1 (k-sub-loop): stores chunk 0 (already loaded+waited by the caller, via the
+        EXISTING global_load_a/b_functor + outer s_wait_loadcnt call sequence in
+        wmma_main_loop.py -- unchanged from the original design), then load+wait+stores
+        chunks 1..num_k_chunks-1 sequentially, reusing the SAME small v_gld buffer (sized
+        to chunk_num_dword{,x4}, one inst_wmma.k-worth -- growing it to hold the whole row
+        would exceed the 256-VGPR/wave hardware limit for fp16/bf16/int8).
+
+        Deliberately does NOT overlap remaining chunks' global loads with wmma compute the
+        way chunk 0's does: ALL of these stores happen only after shared_store_a/b_functor
+        is called, which itself is only reached after emit_wmma_tile()+emit_extra_substeps()
+        (ALL of the current tile's LDS reads) have completed -- see class docstring. This
+        preserves the single-buffered-LDS safety invariant the original (pre-k-sub-loop)
+        design relies on: no wave may overwrite a tile's LDS storage until every wave has
+        finished reading it. An early attempt stored chunk 0 immediately after ITS OWN load
+        (right after global_load_a/b_functor, well before the other waves' reads of that
+        same region were guaranteed done) and produced silent wrong-answer corruption on
+        real hardware starting at the 3rd within-workgroup K-block -- caught by comparing
+        against naive_conv_fwd_nhwc, not by any assembler/compile-time check.
+        '''
+        self._emit_sst_chunk(v_gld, v_sst_os, sst_extra_off, 0)
+        for c in range(1, self.num_k_chunks):
+            self._emit_gld_chunk_load(v_gld, v_addr, c, v_flag=v_flag)
+            self._emit(f"s_wait_loadcnt 0x0")
+            self._emit_sst_chunk(v_gld, v_sst_os, sst_extra_off, c)
+
     def global_load_a_functor(self):
         '''
-        Zeros all 16 v_gld_a registers on EVERY call (not just once, since Phase 5d's per-tap
-        flag can flip between taps -- same discipline Phase 5c/wrw established for its own
+        Zeros v_gld_a on EVERY call (not just once, since Phase 5d's per-tap flag can flip
+        between taps -- same discipline Phase 5c/wrw established for its own
         per-iteration-varying gather), then EXEC-masks the load itself so a padding lane's
-        v_gld_a simply stays zero for this tap/K-chunk.
+        v_gld_a simply stays zero for this tap/K-chunk. Phase 1: only chunk 0's load is
+        issued here (matching the original single-chunk design's overlap-with-compute
+        placement); chunks 1..N-1 are loaded+stored later -- see
+        _emit_sst_remaining_chunks's docstring for why.
         '''
         outer = self
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    for i in range(outer.num_dwords):
-                        outer._emit(f"v_mov_b32 v[{v.v_gld_a(i)}], 0")
-                    outer._emit(f"v_cmpx_le_u32 1, v[{v.v_flag()}]")
-                    for i in range(outer.num_dwordx4):
-                        outer._emit(f"global_load_dwordx4 v[{v.v_gld_a(i*4)}:{v.v_gld_a(i*4+3)}], v[{v.v_addr_a()}:{v.v_addr_a(1)}], off offset:{i*16}")
-                    outer._emit(f"s_mov_b32 exec_lo, -1")
+                    outer._emit_gld_chunk_load(v.v_gld_a, v.v_addr_a, 0, v_flag=v.v_flag)
                 return outer._get_deferred()
             def get_issues(self):
-                return outer.num_dwordx4
+                return outer.chunk_num_dwordx4
         return functor_t()
 
     def global_load_b_functor(self):
@@ -639,11 +703,10 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    for i in range(outer.num_dwordx4):
-                        outer._emit(f"global_load_dwordx4 v[{v.v_gld_b(i*4)}:{v.v_gld_b(i*4+3)}], v[{v.v_addr_b()}:{v.v_addr_b(1)}], off offset:{i*16}")
+                    outer._emit_gld_chunk_load(v.v_gld_b, v.v_addr_b, 0, v_flag=None)
                 return outer._get_deferred()
             def get_issues(self):
-                return outer.num_dwordx4
+                return outer.chunk_num_dwordx4
         return functor_t()
 
     def shared_store_a_functor(self):
@@ -652,11 +715,10 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    for i in range(outer.num_dwordx4):
-                        outer._emit(f"ds_write_b128 v[{v.v_sst_os()}], v[{v.v_gld_a(i*4)}:{v.v_gld_a(i*4+3)}] offset:{i*16}")
+                    outer._emit_sst_remaining_chunks(v.v_gld_a, v.v_addr_a, v.v_sst_os, 0, v_flag=v.v_flag)
                 return outer._get_deferred()
             def get_issues(self):
-                return outer.num_dwordx4
+                return outer.chunk_num_dwordx4
         return functor_t()
 
     def shared_store_b_functor(self):
@@ -665,11 +727,10 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    for i in range(outer.num_dwordx4):
-                        outer._emit(f"ds_write_b128 v[{v.v_sst_os()}], v[{v.v_gld_b(i*4)}:{v.v_gld_b(i*4+3)}] offset:{outer.lds_a_size + i*16}")
+                    outer._emit_sst_remaining_chunks(v.v_gld_b, v.v_addr_b, v.v_sst_os, outer.lds_a_size, v_flag=None)
                 return outer._get_deferred()
             def get_issues(self):
-                return outer.num_dwordx4
+                return outer.chunk_num_dwordx4
         return functor_t()
 
     def _emit_ds_read_chunked(self, v_base_sym, v_os_sym, base_off, num_v):
@@ -752,6 +813,10 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.precision        = self.tunable.precision
         ctrl.lds_single_size  = self.lds_a_size + self.lds_b_size
         ctrl.lds_buffer_num   = 1
+        # Phase 1 (k-sub-loop): both A and B are untransposed here (K contiguous within
+        # an LDS row), so advancing inst_wmma.k K-elements is just inst_wmma.k*data_byte.
+        ctrl.k_substep_stride_bytes_a    = self.wmma_mapping.ctrl.inst_wmma.k * self.data_byte
+        ctrl.k_substep_stride_bytes_b    = self.wmma_mapping.ctrl.inst_wmma.k * self.data_byte
         ctrl.global_load_a_functor       = self.global_load_a_functor()
         ctrl.global_load_b_functor       = self.global_load_b_functor()
         ctrl.shared_store_a_functor      = self.shared_store_a_functor()

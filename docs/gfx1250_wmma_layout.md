@@ -746,3 +746,103 @@ the int8 signedness bug above -- do not assume any new instruction/precision is 
 independently re-verifying against real random (not just small positive) test data). Note its
 A/B footprint is 16 VGPRs/lane (K=128), a third distinct layout family from both the 8-VGPR
 fp16/bf16/int8 family and fp32's 2-VGPR/no-packing family above.
+
+## Phase 9 (2026-08-24): k-sub-loop performance mechanism for the WMMA main loop
+
+Motivated by a user question about whether MISA's gfx1250 WMMA solvers can be made
+competitively fast: `wmma_main_loop.py` originally required `unroll_k == inst_wmma.k` exactly
+(32 for fp16/bf16, 64 for int8, 4 for fp32), so **every single `v_wmma_*` issue was preceded by
+a full global-load -> shared-store -> barrier -> shared-load round-trip**. `gemm_k_per_block`
+can now be any power-of-2 *multiple* of `inst_wmma.k` -- `num_k_substeps =
+gemm_k_per_block // inst_wmma.k` `v_wmma_*` issues now happen per LDS round-trip, amortizing
+that synchronization cost. See `ctrl_wmma_main_loop_t`'s docstring (`wmma_main_loop.py`) for
+the exact restructuring, and the `k_substep_stride_bytes_a/b` fields each kernel file computes
+(different formula for untransposed vs transposed operands -- `inst_wmma.k * data_byte` vs
+`inst_wmma.k * row_pitch`).
+
+### Two correctness bugs found via hardware validation, not compile-time checks
+
+1. **k_half stride derived from the wrong quantity.** The untransposed operand's (fwd's A/B,
+   bwd's A) `k_half` LDS-read offset was computed as `bytes_per_row // 2` -- correct only when
+   `bytes_per_row == inst_wmma.k * data_byte` (true for every existing single-substep config,
+   false once `gemm_k_per_block` becomes a multiple of `inst_wmma.k`). Must be
+   `inst_wmma.k * data_byte // 2` instead (`self.inst_wmma_k_bytes` in each kernel file). The
+   TRANSPOSED read helper (`get_gemm_index_for_src_matrix_transposed` in `wmma_mapping.py`) was
+   already correct -- it derives its own k_half stride from `ctrl.inst_wmma.k` directly, never
+   from a caller-supplied byte-row-width.
+
+2. **Cross-wave LDS-overwrite race + a VGPR-reuse data-clobbering bug**, both specific to
+   `global_load_a/b_functor`/`shared_store_a/b_functor`'s staging buffer (`v_gld_a`/`v_gld_b`):
+   - Growing `v_gld_a`/`v_gld_b` to hold a whole (now possibly multi-substep) row overflows the
+     256-VGPR/wave hardware limit -- fp16/bf16/int8's existing 128x128 tile already sits at
+     252/256 VGPRs. Fixed by keeping `v_gld_a`/`v_gld_b` sized to ONE `inst_wmma.k`-worth
+     (`chunk_num_dwords`), chunking global_load/shared_store into `num_k_chunks` rounds that
+     reuse the same small buffer.
+   - An early attempt stored chunk 0 immediately after its own global-load-wait (to keep the
+     original design's "issue load early, overlap with compute" latency hiding). This produced
+     silent wrong-answer corruption starting at the 2nd-3rd within-workgroup K-block: nothing in
+     this design synchronizes different WAVES within a workgroup between "read the current
+     tile" and "overwrite it with the next tile", and the original single-substep design's
+     safety margin (LDS-store always happens only after the WHOLE current-tile compute, late in
+     the iteration) was violated by storing chunk 0 much earlier. Fixed by deferring ALL LDS
+     stores (not just extra chunks) until after `emit_wmma_tile()`/`emit_extra_substeps()` have
+     consumed the current tile -- see `_emit_sst_remaining_chunks` in each kernel file.
+   - A THIRD, distinct bug surfaced only for TRANSPOSED operands (bwd's B, wrw's A+B):
+     `shared_load_b_functor`'s read-and-pack technique reuses `v_gld_b` as scratch, and is
+     called again (for `emit_extra_substeps()`'s substep>=1) in the window between when chunk
+     0's global load is issued and when it's finally stored -- clobbering the staged data
+     before it's ever written to LDS (a data-overwrite bug, not just a race: waiting longer for
+     the load doesn't help, since the SCRATCH REUSE overwrites the register regardless). Fixed
+     by giving operands that use this scratch technique (bwd's B; wrw's A+B) a fully-deferred
+     `_emit_sst_all_chunks` path with NO early/overlapped chunk-0 load at all, while operands
+     that read directly into `v_a`/`v_b` with no scratch (fwd's A+B; bwd's A) keep chunk 0's
+     overlap-with-compute via `_emit_sst_remaining_chunks`.
+   - All three bugs were caught by comparing against `naive_conv_{fwd,bwd,wrw}_nhwc` on real
+     hardware -- none produced an assembler or compile-time error, only silent wrong answers.
+
+Regression safety: every one of these changes was designed so that `num_k_chunks == 1` (every
+existing single-substep config) produces **byte-identical** generated `.s` output to before --
+verified by direct `.s` diff for fp16 in all three directions before any new config was even
+written, plus a full hardware re-run of the existing fp16/bf16/int8/fp32 configs after.
+
+### Validated on real hardware, all 12 (direction x precision) combos
+
+New `_k2x` configs (`gemm_k_per_block` doubled for fp16/bf16/int8, 8x'd for fp32 to reach the
+same ~32KB LDS budget from its much smaller starting K=4) pass the full battery -- 1x1
+degenerate/multi-K-block, larger multi-K-block, stride+pad, multi-tap+dilation, group=2,
+group=4 -- for all 12 combos, exact matches against `naive_conv_{fwd,bwd,wrw}_nhwc`.
+
+### Benchmark results: a genuinely mixed picture, not a uniform win
+
+tflops on a K-loop-bound problem (`c=k=2048`, 1x1, single/near-single tile-block), old
+(single-substep) vs new (k2x) config, same problem size:
+
+| direction/precision | old tflops | new tflops | delta |
+|---|---|---|---|
+| fwd/fp16  | 19.99 | 17.82 | **-11%** |
+| fwd/int8  | 32.46 | 28.42 | **-12%** |
+| fwd/fp32  |  7.33 |  6.25 | **-15%** |
+| bwd/fp16  |  8.08 |  8.13 | +0.7% |
+| bwd/int8  | 13.07 | 12.58 | -4% |
+| bwd/fp32  |  2.88 |  3.57 | **+24%** |
+| wrw/fp16  | 34.82 | 34.93 | +0.3% |
+| wrw/int8  | 52.14 | 52.67 | +1% |
+| wrw/fp32  | 13.68 | 17.38 | **+27%** |
+
+**fwd consistently regresses**; bwd/wrw are roughly flat to significantly better, with fp32
+the biggest winner. The reason: only chunk 0 of each outer iteration gets the "issue early,
+overlap with compute" treatment (see the VGPR-clobbering bug above) -- chunks 1..N-1 are loaded
+and stored strictly AFTER compute, fully exposed with no latency hiding at all. fwd's A/B
+compute is cheap (a plain `_emit_ds_read_chunked` read straight into `v_a`/`v_b`, no
+read-and-pack overhead), so the newly-exposed global-memory round-trip for the extra chunks
+costs more than the barrier savings buy back. bwd/wrw's TRANSPOSED-operand compute is much more
+expensive per substep (the read-and-pack technique is dozens of instructions per wave_repeat
+step), so barrier savings dominate instead -- and fp32's win is largest because its
+`inst_wmma.k=4` means the OLD design paid a barrier every 4 K-elements, so cutting substep count
+by 8x (the biggest multiplier used) removes the most relative overhead.
+
+**This is exactly the gap Phase 2 (LDS double-buffering) is meant to close**: with a
+double-buffered LDS, every chunk's global load could safely overlap with the PREVIOUS tile's
+compute (no read-after-write hazard against a buffer still being consumed), restoring full
+latency hiding for every chunk, not just chunk 0 -- expected to turn fwd's current regression
+into a win too, on top of bwd/wrw's already-larger gains.
