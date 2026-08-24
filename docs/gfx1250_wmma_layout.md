@@ -173,7 +173,8 @@ through the real `conv_driver.exe`, not just the standalone `/tmp/wmma_probe/` h
 during Phases 1-4. Each direction's driver class gained: a `fma_type == WMMA` branch in
 `get_block_size()` (wave32, no `wave_step`), an early WMMA branch in `tunable_is_valid()`
 (degenerate-case-only checks, bypassing the XDLOPS/DLOPS-oriented nhwc checks entirely), a
-minimal 36-byte karg struct (`igemm_{fwd,bwd,wrw}_gtc_wmma_nhwc_karg_t`), and a self-contained
+minimal karg struct (`igemm_{fwd,bwd,wrw}_gtc_wmma_nhwc_karg_t`, 36 bytes for bwd/wrw, grown to
+68 bytes for fwd by Phase 5a below), and a self-contained
 `run()` branch that builds the karg and launches directly via `igemm_launch_kernels()` with a
 genuine 2D `(grid_x, grid_y)` dispatch — unlike the general kernels, which flatten the block
 index into one dimension and decode it via magic division inside the kernel, this kernel reads
@@ -215,3 +216,57 @@ standalone harnesses): fwd (fp16/bf16/int8), bwd (fp16), and wrw (fp16), each ac
 single-block and multi-block/multi-K-block configurations, using the driver's own
 `naive_conv_*_nhwc`/`gpu_naive_conv_*_nhwc_fp32` CPU/GPU reference and `valid_vector<T>`
 comparison — no bespoke verification code, unlike Phases 1-4.
+
+## Phase 5a: general stride/padding for fwd (still 1x1 filter, dilation=1, group=1)
+
+`igemm_fwd_gtc_wmma_nhwc_t` was extended in place (not a new sibling class) to support
+arbitrary `stride_h/w` and `pad_h/w` — the first departure from the pure-degenerate-GEMM
+addressing every earlier phase used. Mechanism (full detail in the class's docstring and
+`emit_kernel_prologue`):
+
+- Kernarg grew from 36 to 68 bytes: added `hi, wi, stride_h, stride_w, pad_h, pad_w, wo,
+  ho_wo` (`ho_wo` = `ho*wo`, host-precomputed — the kernel never needs `ho` on its own).
+- Each thread's merged GEMM_M index is decomposed back into `(n_idx, ho_idx, wo_idx)` via
+  two chained runtime `u32` divisions (by `ho_wo` then `wo`), **not** magic division —
+  correctness-first, per the original plan's own guidance, since `ho`/`wo` are only known at
+  launch time. `hi_idx = ho_idx*stride_h - pad_h` / `wi_idx` similarly (signed subtract, so a
+  negative result is a valid two's-complement bit pattern, not clamped).
+- Out-of-bounds (padding) detection reuses `igemm_fwd_gtc_nhwc.py`'s established unsigned-
+  wraparound trick (`v_cmp_gt_u32` treats a negative signed index, reinterpreted as u32, as
+  huge, so one comparison rejects "negative" and "too large" together) — but instead of that
+  file's post-load `v_cndmask_b32` select, padding is enforced via **EXEC masking**
+  (`v_cmpx_le_u32`/`s_mov_b32 exec_lo, -1`) around the global load itself, since for a 1x1
+  filter a thread's padding-vs-real status is a compile-time-fixed-per-thread constant for
+  the whole kernel (never depends on which K-chunk is loading) — computed once in the
+  prologue, `v_gld_a` pre-zeroed once, and a padding lane's global load simply never executes
+  again for the kernel's lifetime, no per-iteration recheck needed. Weight (B) and the output
+  write are completely untouched — a 1x1 filter has no spatial extent on the weight side, and
+  every GEMM_M index is a real (non-padding) *output* pixel regardless of input padding.
+
+**Real bug found**: the codebase's existing plain-division macro (`macro_int_div_rem_vs_t` /
+`macro_int_div_vs_t` in `python/operations/utility.py`) uses bare `vcc` and 64-bit SGPR-pair
+compare destinations (`s[\s_tmp4:\s_tmp4+1]`) — both **fail to assemble on gfx1250** (confirmed
+via `llvm-mc`: "operands are not valid for this GPU or mode" / "invalid operand for
+instruction"), since gfx1250 is wave32 and needs `vcc_lo` plus single-SGPR (32-bit) condition
+masks. This wasn't caught earlier because no prior WMMA kernel needed runtime division. Fixed
+by adding **new**, wave32-specific sibling classes (`macro_int_div_vs_gfx1250_t`,
+`macro_int_div_rem_vs_gfx1250_t`) rather than modifying the existing ones in place — zero risk
+to other architectures' codegen, which keep using the original wave64-oriented classes
+unchanged. The new division routine was independently verified on real gfx1250 hardware across
+24 divisors × 32 numerators each (768 cases total, including 0, exact multiples, and
+near-`UINT32_MAX` numerators) via a standalone probe (`/tmp/wmma_probe/probe_div.s`,
+`host_div.cpp`) *before* being trusted inside the real kernel — same discipline as every other
+new primitive in this project.
+
+**Validated on real gfx1250 hardware** through `conv_driver.exe`: fp16/bf16/int8 fwd, each
+across a stride-1/pad-0 regression case (unchanged behavior) plus multiple genuine stride
+(1/2/3) × padding (0/1/2) combinations, multi-block grids, asymmetric stride_h≠stride_w, and
+multi-K-block configs — all compared against the driver's own `naive_conv_fwd_nhwc` reference,
+which already implements general stride/padding/dilation correctly (no separate reference
+needed for this phase, unlike the WMMA-layout probes of Phases 1-4).
+
+**Not yet done** (deliberately deferred, scoped as separate future steps): multi-tap filters
+(`y,x > 1`, needs a real K-loop-coupled tap iteration, unlike 1x1's single-input-pixel-per-
+output-pixel gather), dilation, `group > 1`, and replicating this same stride/pad extension to
+bwd and wrw (whose transposed-operand addressing would need the same division+masking
+treatment applied to a different operand).

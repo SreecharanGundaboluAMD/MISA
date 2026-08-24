@@ -170,6 +170,68 @@ class macro_int_div_vs_t(macro_base_t):
                 self._emit("v_cmp_ne_i32      vcc,          s[\\s_d],   0")
                 self._emit("v_cndmask_b32     v[\\v_q],      -1,         v[\\v_tmp4+2],      vcc")
 
+class macro_int_div_vs_gfx1250_t(macro_base_t):
+    '''
+    gfx1250 (wave32)-specific plain u32 division: v_q = v_n / s_d, v_q/v_n vgpr, s_d sgpr.
+    Algorithm identical to macro_int_div_vs_t's else-branch (works for any u32 divisor >= 1,
+    including the non-power-of-2 conv dimensions this is used for), but using vcc_lo (not bare
+    vcc) and single-SGPR (not 64-bit-pair) condition masks, since gfx1250 is wave32 and rejects
+    both wave64-only forms outright (confirmed via llvm-mc). Verified independently on real
+    gfx1250 hardware across many (numerator, divisor) pairs before being trusted in any kernel
+    -- see /tmp/wmma_probe/{probe_div.s,host_div.cpp}.
+    '''
+    def name(self):
+        return '.v_u32_div_vs_gfx1250'
+    def __init__(self, mc):
+        macro_base_t.__init__(self, mc)
+    def __call__(self, v_q, v_n, s_d, v_tmp4, s_tmp4):
+        return '{} {}, {}, {}, {}, {}'.format(self.name(), v_q, v_n, s_d, v_tmp4, s_tmp4)
+    def emit(self):
+        with self._emit_macro_indented(".macro {} v_q, v_n, s_d, v_tmp4, s_tmp4".format(self.name())):
+            self._emit("v_cvt_f32_u32     v[\\v_tmp4+0],   s[\\s_d]")
+            self._emit("v_rcp_f32         v[\\v_tmp4+0],   v[\\v_tmp4+0]")
+            self._emit("v_mul_f32         v[\\v_tmp4+0],   0x4f800000, v[\\v_tmp4+0]")
+            self._emit("v_cvt_u32_f32     v[\\v_tmp4+0],   v[\\v_tmp4+0]")
+            self._emit("v_mul_lo_u32      v[\\v_tmp4+1],   s[\\s_d],      v[\\v_tmp4+0]")
+            self._emit("v_mul_hi_u32      v[\\v_tmp4+2],   s[\\s_d],      v[\\v_tmp4+0]")
+            self._emit("v_sub_co_u32      v[\\v_tmp4+3],   vcc_lo, 0,     v[\\v_tmp4+1]")
+            self._emit("v_cmp_ne_i32      s[\\s_tmp4+0], 0,          v[\\v_tmp4+2]")
+            self._emit("v_cndmask_b32     v[\\v_tmp4+1],   v[\\v_tmp4+3],   v[\\v_tmp4+1],   s[\\s_tmp4+0]")
+            self._emit("v_mul_hi_u32      v[\\v_tmp4+1],   v[\\v_tmp4+1],   v[\\v_tmp4+0]")
+            self._emit("v_sub_co_u32      v[\\v_tmp4+2],   vcc_lo,        v[\\v_tmp4+0],   v[\\v_tmp4+1]")
+            self._emit("v_add_co_u32      v[\\v_tmp4+0],   vcc_lo,        v[\\v_tmp4+0],   v[\\v_tmp4+1]")
+            self._emit("v_cndmask_b32     v[\\v_tmp4+0],   v[\\v_tmp4+0],   v[\\v_tmp4+2],   s[\\s_tmp4+0]")
+            self._emit("v_mul_hi_u32      v[\\v_tmp4+0],   v[\\v_tmp4+0],   v[\\v_n]")
+            self._emit("v_mul_lo_u32      v[\\v_tmp4+1],   s[\\s_d],     v[\\v_tmp4+0]")
+            self._emit("v_sub_co_u32      v[\\v_tmp4+2],   vcc_lo,        v[\\v_n],      v[\\v_tmp4+1]")
+            self._emit("v_cmp_ge_u32      s[\\s_tmp4+0], v[\\v_n],      v[\\v_tmp4+1]")
+            self._emit("v_cmp_le_u32      s[\\s_tmp4+1],  s[\\s_d],    v[\\v_tmp4+2]")
+            self._emit("v_add_co_u32      v[\\v_tmp4+2],   vcc_lo, 1, v[\\v_tmp4+0]")
+            self._emit("s_and_b32         s[\\s_tmp4+1], s[\\s_tmp4+0], s[\\s_tmp4+1]")
+            self._emit("v_add_co_u32      v[\\v_tmp4+1],   vcc_lo, -1,    v[\\v_tmp4+0]")
+            self._emit("v_cndmask_b32     v[\\v_tmp4+2],   v[\\v_tmp4+0],   v[\\v_tmp4+2],      s[\\s_tmp4+1]")
+            self._emit("v_cndmask_b32     v[\\v_tmp4+2],   v[\\v_tmp4+1],   v[\\v_tmp4+2],      s[\\s_tmp4+0]")
+            self._emit("v_cmp_ne_i32      vcc_lo,          s[\\s_d],   0")
+            self._emit("v_cndmask_b32     v[\\v_q],      -1,         v[\\v_tmp4+2],      vcc_lo")
+
+class macro_int_div_rem_vs_gfx1250_t(macro_base_t):
+    '''
+    gfx1250 (wave32) counterpart to macro_int_div_rem_vs_t: v_q = v_n / s_d, v_r = v_n % s_d.
+    '''
+    def name(self):
+        return '.v_u32_div_rem_vs_gfx1250'
+    def __init__(self, mc):
+        macro_base_t.__init__(self, mc)
+    def __call__(self, v_r, v_q, v_n, s_d, v_tmp4, s_tmp4):
+        return '{} {}, {}, {}, {}, {}, {}'.format(self.name(), v_r, v_q, v_n, s_d, v_tmp4, s_tmp4)
+    def emit(self):
+        int_div_vs = macro_int_div_vs_gfx1250_t(self.mc)
+        with self._emit_macro_indented(".macro {} v_r, v_q, v_n, s_d, v_tmp4, s_tmp4".format(self.name())):
+            self._emit(int_div_vs("\\v_q", "\\v_n", "\\s_d", "\\v_tmp4", "\\s_tmp4"))
+            self._emit(f"v_mul_lo_u32 v[\\v_tmp4], s[\\s_d], v[\\v_q]")
+            self._emit(f"v_sub_u32 v[\\v_r], v[\\v_n], v[\\v_tmp4]")
+            self._emit("s_nop 0")
+
 class macro_int_div_rem_vs_t(macro_base_t):
     '''
     integer divide to compute `v_q = v_n / s_d, v_r = v_n % s_d`, v_r, v_q, v_n are vgpr, s_d is sgpr
