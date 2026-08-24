@@ -168,6 +168,14 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # contiguous] tiles -- same total byte size either way (32*128*databyte).
         self.lds_a_size = tunable.gemm_k_per_block * tunable.gemm_m_per_block * self.data_byte
         self.lds_b_size = tunable.gemm_k_per_block * tunable.gemm_n_per_block * self.data_byte
+        # Phase 2 (double-buffering): see igemm_fwd_gtc_wmma_nhwc_t's identically-named
+        # fields for the full rationale. NOTE: wrw's A+B are BOTH transposed (read-and-
+        # pack scratch reuse), so unlike fwd/bwd's A, wrw's functors do NOT gain the
+        # early-store optimization from double buffering -- see global_load_a/b_functor.
+        # This still needs to be wired up correctly so the buffer-switch bookkeeping in
+        # wmma_main_loop.py addresses LDS correctly whenever a wrw _dbuf config is built.
+        self.lds_single_size = igemm_next_pow2(self.lds_a_size + self.lds_b_size)
+        self.lds_buffer_num  = 2 if tunable.lds_double_buffer else 1
 
         # gemm_k_per_block*data_byte happens to equal 64 bytes for fp16/bf16/int8 (32*2, 32*2,
         # 64*1), but fp32 forces gemm_k_per_block=4 (matching inst_wmma.k), giving 4*4=16 --
@@ -323,7 +331,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             'enable_sgpr_workgroup_id_x'       :   1,
             'enable_sgpr_workgroup_id_y'       :   1,
             'enable_vgpr_workitem_id'          :   0,
-            'workgroup_group_segment_byte_size':   self.lds_a_size + self.lds_b_size,
+            'workgroup_group_segment_byte_size':   self.lds_single_size * self.lds_buffer_num,
             'kernarg_segment_byte_size'         :   88,
             'wavefront_sgpr_count'              :   self.sgpr.s_end.value + 2 * 3,
             'workitem_vgpr_count'               :   self.vgpr.v_end.value,
@@ -358,6 +366,29 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit('s_endpgm')
 
     def emit_kernel_footer(self):
+        self._emit_empty_line()
+
+    def _emit_lds_offset_setup(self):
+        ''' See igemm_fwd_gtc_wmma_nhwc_t's identically-named method for the full
+        rationale (recompute, not save/restore, to avoid needing new VGPRs). '''
+        v = self.vgpr
+        # ---- fixed per-thread shared-memory store offset: this thread owns byte-chunk
+        # tid*bytes_per_row ---- (both A's and B's (row_local,col_group) gemm_k_per_block-
+        # element chunk land at the same linear tid position, see class docstring)
+        self._emit(f"v_lshlrev_b32 v[{v.v_sst_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_tid()}]   ; tid*{self.bytes_per_row} bytes")
+        self._emit_empty_line()
+
+        # ---- shared-memory load offset for A (TRANSPOSED -- grad_output is [K][M] in LDS) ----
+        # row_pitch_bytes = gemm_m_per_block * databyte (128 * databyte); A's region starts at
+        # byte 0 within the shared LDS tile (no lds_a_size-style base needed, unlike B below).
+        self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix_transposed(v.v_sld_a_os(), v.v_tid(), v.v_tmp(),
+                self.tunable.gemm_m_per_block * self.data_byte, self.data_byte, 'm'))
+        self._emit_empty_line()
+
+        # ---- shared-memory load offset for B (TRANSPOSED -- input is [K][N] in LDS) ----
+        # row_pitch_bytes = gemm_n_per_block * databyte (128 * databyte)
+        self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix_transposed(v.v_sld_b_os(), v.v_tid(), v.v_tmp(),
+                self.tunable.gemm_n_per_block * self.data_byte, self.data_byte, 'n'))
         self._emit_empty_line()
 
     def emit_kernel_prologue(self):
@@ -494,24 +525,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"v_lshlrev_b32 v[{v.v_b_col_off()}], {utility_log2(self.data_byte)}, v[{v.v_tmp()}]")
         self._emit_empty_line()
 
-        # ---- fixed per-thread shared-memory store offset: this thread owns byte-chunk
-        # tid*bytes_per_row ---- (both A's and B's (row_local,col_group) gemm_k_per_block-
-        # element chunk land at the same linear tid position, see class docstring)
-        self._emit(f"v_lshlrev_b32 v[{v.v_sst_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_tid()}]   ; tid*{self.bytes_per_row} bytes")
-        self._emit_empty_line()
-
-        # ---- shared-memory load offset for A (TRANSPOSED -- grad_output is [K][M] in LDS) ----
-        # row_pitch_bytes = gemm_m_per_block * databyte (128 * databyte); A's region starts at
-        # byte 0 within the shared LDS tile (no lds_a_size-style base needed, unlike B below).
-        self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix_transposed(v.v_sld_a_os(), v.v_tid(), v.v_tmp(),
-                self.tunable.gemm_m_per_block * self.data_byte, self.data_byte, 'm'))
-        self._emit_empty_line()
-
-        # ---- shared-memory load offset for B (TRANSPOSED -- input is [K][N] in LDS) ----
-        # row_pitch_bytes = gemm_n_per_block * databyte (128 * databyte)
-        self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix_transposed(v.v_sld_b_os(), v.v_tid(), v.v_tmp(),
-                self.tunable.gemm_n_per_block * self.data_byte, self.data_byte, 'n'))
-        self._emit_empty_line()
+        self._emit_lds_offset_setup()
 
         # ---- persistent (im, in) for the epilogue, converted to global output indices ----
         self._emit(self.wmma_mapping.get_gemm_index_for_dst_matrix(v.v_gemm_in(), v.v_gemm_im(), v.v_tid(), v.v_tmp()))
@@ -539,6 +553,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit_front(f"{label_tap_y}:")
         self._emit(f"s_mov_b32 s[{s.s_ix()}], 0")
         self._emit_front(f"{label_tap_x}:")
+
+        if self.lds_buffer_num == 2:
+            # Phase 2 (double-buffering): recompute the fresh, untoggled state at the
+            # start of EVERY tap -- see _emit_lds_offset_setup's docstring for why.
+            self._emit_lds_offset_setup()
 
         # ---- zero the accumulator fresh for this tap (grad_weight's [iy,ix] slice is an
         # independent reduction, not a running sum across taps) ----
@@ -889,8 +908,8 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.unroll_k         = self.tunable.gemm_k_per_block
         ctrl.label_prefix     = self.name()
         ctrl.precision        = self.tunable.precision
-        ctrl.lds_single_size  = self.lds_a_size + self.lds_b_size
-        ctrl.lds_buffer_num   = 1
+        ctrl.lds_single_size  = self.lds_single_size
+        ctrl.lds_buffer_num   = self.lds_buffer_num
         # Phase 1 (k-sub-loop): both A (grad_output) and B (input) are TRANSPOSED here
         # ([K rows][M or N cols] in LDS), so advancing inst_wmma.k K-elements means
         # advancing inst_wmma.k whole K-rows, i.e. inst_wmma.k * row_pitch, matching each

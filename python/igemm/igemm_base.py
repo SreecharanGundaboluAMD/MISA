@@ -210,6 +210,9 @@ class igemm_gtc_tunable_parameter_t(object):
             self.wmma_repeat_m                  = tunable_dict['wmma_repeat_m']
             self.wmma_tile_n                    = tunable_dict['wmma_tile_n']
             self.wmma_repeat_n                  = tunable_dict['wmma_repeat_n']
+            # Phase 2 (gfx1250 WMMA LDS double-buffering): optional, defaults to 0
+            # (single-buffered, every existing config) so old configs are unaffected.
+            self.lds_double_buffer              = utility_dict_with_default_t(tunable_dict)('lds_double_buffer', 0)
         else:
             assert False
 

@@ -199,6 +199,12 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self.num_k_chunks      = self.num_dwordx4 // self.chunk_num_dwordx4
         self.lds_a_size = tunable.gemm_m_per_block * tunable.gemm_k_per_block * self.data_byte
         self.lds_b_size = tunable.gemm_n_per_block * tunable.gemm_k_per_block * self.data_byte
+        # Phase 2 (double-buffering): lds_single_size must be a power of 2 for the
+        # v_xor_b32 ping-pong switch (wmma_main_loop.py) to correctly alternate between
+        # exactly two adjacent buffers -- same rounding igemm_base.py's XDLOPS/DLOPS
+        # tracks already use for their own (long-since-validated) double buffering.
+        self.lds_single_size = igemm_next_pow2(self.lds_a_size + self.lds_b_size)
+        self.lds_buffer_num  = 2 if tunable.lds_double_buffer else 1
 
         self.sgpr = self.kernel_sgpr_t(mc, self)
         self.vgpr = self.kernel_vgpr_t(mc, self)
@@ -343,7 +349,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             'enable_sgpr_workgroup_id_x'       :   1,
             'enable_sgpr_workgroup_id_y'       :   1,
             'enable_vgpr_workitem_id'          :   0,
-            'workgroup_group_segment_byte_size':   self.lds_a_size + self.lds_b_size,
+            'workgroup_group_segment_byte_size':   self.lds_single_size * self.lds_buffer_num,
             'kernarg_segment_byte_size'         :   88,
             'wavefront_sgpr_count'              :   self.sgpr.s_end.value + 2 * 3,
             'workitem_vgpr_count'               :   self.vgpr.v_end.value,
@@ -378,6 +384,42 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit('s_endpgm')
 
     def emit_kernel_footer(self):
+        self._emit_empty_line()
+
+    def _emit_lds_offset_setup(self):
+        '''
+        Computes v_sst_os/v_sld_a_os/v_sld_b_os fresh from v_tid (and v_tmp scratch) --
+        called once from emit_kernel_prologue, and AGAIN at the start of every tap when
+        double-buffered (see emit_kernel_tap_loop). Recomputing (instead of saving/
+        restoring a "_base" copy in dedicated VGPRs) avoids needing any new persistent
+        registers: bwd's kernel is already at the hard 256-VGPR/wave limit before Phase
+        2, so 3 more registers for save/restore would not have fit. Without this reset,
+        v_sst_os/v_sld_a_os/v_sld_b_os -- XOR-toggled once per outer K-loop iteration by
+        wmma_main_loop.py's double-buffer switch -- would carry whatever buffer-parity
+        the PREVIOUS tap's K-loop happened to leave them in into the next tap, silently
+        misaligning reads/writes for every tap after the first (caught on real hardware
+        as wrong answers specific to multi-tap (y,x>1) configs -- 1x1/single-tap configs
+        never exercise a second tap, so they passed).
+        '''
+        v = self.vgpr
+        # ---- fixed per-thread shared-memory store offset: this thread owns row `tid` ----
+        # bytes_per_row (=gemm_k_per_block*data_byte) is 64 for fp16/bf16/int8, but 16 for
+        # fp32 (gemm_k_per_block forced to 4) -- see class docstring / self.bytes_per_row.
+        self._emit(f"v_lshlrev_b32 v[{v.v_sst_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_tid()}]   ; tid*{self.bytes_per_row} bytes")
+        self._emit_empty_line()
+
+        # ---- shared-memory load offsets (WMMA operand layout, see docs/gfx1250_wmma_layout.md) ----
+        # v_gemm_in/v_gemm_im outputs land directly in v_sld_b_os/v_sld_a_os (element-unit row/col,
+        # contiguous wave-block base already folded in) -- kept distinct from the v_tmp scratch
+        # triple the function itself uses internally, to avoid the two aliasing.
+        self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix(v.v_sld_b_os(), v.v_sld_a_os(), v.v_tid(), v.v_tmp()))
+        self._emit(f"v_lshrrev_b32 v[{v.v_tmp()}], 4, v[{v.v_tid()}]")
+        self._emit(f"v_and_b32 v[{v.v_tmp()}], 1, v[{v.v_tmp()}]")
+        self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.inst_wmma_k_bytes // 2)}, v[{v.v_tmp()}]      ; k_half * {self.inst_wmma_k_bytes // 2} bytes")
+        self._emit(f"v_lshlrev_b32 v[{v.v_sld_a_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_sld_a_os()}]  ; row * {self.bytes_per_row} byte row-stride")
+        self._emit(f"v_add_u32 v[{v.v_sld_a_os()}], v[{v.v_tmp()}], v[{v.v_sld_a_os()}]")
+        self._emit(f"v_lshlrev_b32 v[{v.v_sld_b_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_sld_b_os()}]")
+        self._emit(f"v_add_u32 v[{v.v_sld_b_os()}], v[{v.v_tmp()}], v[{v.v_sld_b_os()}]")
         self._emit_empty_line()
 
     def emit_kernel_prologue(self):
@@ -512,25 +554,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit_empty_line()
 
 
-        # ---- fixed per-thread shared-memory store offset: this thread owns row `tid` ----
-        # bytes_per_row (=gemm_k_per_block*data_byte) is 64 for fp16/bf16/int8, but 16 for
-        # fp32 (gemm_k_per_block forced to 4) -- see class docstring / self.bytes_per_row.
-        self._emit(f"v_lshlrev_b32 v[{v.v_sst_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_tid()}]   ; tid*{self.bytes_per_row} bytes")
-        self._emit_empty_line()
-
-        # ---- shared-memory load offsets (WMMA operand layout, see docs/gfx1250_wmma_layout.md) ----
-        # v_gemm_in/v_gemm_im outputs land directly in v_sld_b_os/v_sld_a_os (element-unit row/col,
-        # contiguous wave-block base already folded in) -- kept distinct from the v_tmp scratch
-        # triple the function itself uses internally, to avoid the two aliasing.
-        self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix(v.v_sld_b_os(), v.v_sld_a_os(), v.v_tid(), v.v_tmp()))
-        self._emit(f"v_lshrrev_b32 v[{v.v_tmp()}], 4, v[{v.v_tid()}]")
-        self._emit(f"v_and_b32 v[{v.v_tmp()}], 1, v[{v.v_tmp()}]")
-        self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.inst_wmma_k_bytes // 2)}, v[{v.v_tmp()}]      ; k_half * {self.inst_wmma_k_bytes // 2} bytes")
-        self._emit(f"v_lshlrev_b32 v[{v.v_sld_a_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_sld_a_os()}]  ; row * {self.bytes_per_row} byte row-stride")
-        self._emit(f"v_add_u32 v[{v.v_sld_a_os()}], v[{v.v_tmp()}], v[{v.v_sld_a_os()}]")
-        self._emit(f"v_lshlrev_b32 v[{v.v_sld_b_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_sld_b_os()}]")
-        self._emit(f"v_add_u32 v[{v.v_sld_b_os()}], v[{v.v_tmp()}], v[{v.v_sld_b_os()}]")
-        self._emit_empty_line()
+        self._emit_lds_offset_setup()
 
         # ---- persistent (im, in) for the epilogue, converted to global output indices ----
         self._emit(self.wmma_mapping.get_gemm_index_for_dst_matrix(v.v_gemm_in(), v.v_gemm_im(), v.v_tid(), v.v_tmp()))
@@ -610,6 +634,10 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit_front(f"{label_tap_y}:")
         self._emit(f"s_mov_b32 s[{s.s_ix()}], 0")
         self._emit_front(f"{label_tap_x}:")
+        if self.lds_buffer_num == 2:
+            # Phase 2 (double-buffering): recompute the fresh, untoggled state at the
+            # start of EVERY tap -- see _emit_lds_offset_setup's docstring for why.
+            self._emit_lds_offset_setup()
         self._emit_tap_gather()
         # ---- issue the first global loads for this tap (main loop expects this precondition;
         # global_load_a_functor re-zeros v_gld_a on every call, see its own docstring) ----
@@ -681,10 +709,19 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         Zeros v_gld_a on EVERY call (not just once, since Phase 5d's per-tap flag can flip
         between taps -- same discipline Phase 5c/wrw established for its own
         per-iteration-varying gather), then EXEC-masks the load itself so a padding lane's
-        v_gld_a simply stays zero for this tap/K-chunk. Phase 1: only chunk 0's load is
-        issued here (matching the original single-chunk design's overlap-with-compute
-        placement); chunks 1..N-1 are loaded+stored later -- see
-        _emit_sst_remaining_chunks's docstring for why.
+        v_gld_a simply stays zero for this tap/K-chunk. Only chunk 0's load is issued
+        here (matching the original single-chunk design's overlap-with-compute
+        placement -- issued early, waited/stored much later in shared_store_a_functor);
+        chunks 1..N-1 are loaded+stored later too -- see _emit_sst_remaining_chunks's
+        docstring for why. NOTE (Phase 2): double-buffering does NOT change this --
+        moving chunk 0's wait+store earlier (right after this call) was tried and
+        actively REGRESSED performance, since it throws away the very overlap-with-
+        compute this placement exists for; the buffer-reuse constraint (one small
+        v_gld_a for all chunks) means chunks 1..N-1 can't be pipelined ahead of their
+        own wait regardless of how many LDS buffers exist -- only a true interleaved
+        schedule (pairing each chunk's load with a DIFFERENT substep's compute, not yet
+        implemented) could change that. Double buffering here exists purely so a
+        future interleaved schedule has a safe place to land its early stores.
         '''
         outer = self
         class functor_t:
@@ -698,6 +735,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         return functor_t()
 
     def global_load_b_functor(self):
+        ''' See global_load_a_functor's docstring -- B is untransposed too, same treatment. '''
         outer = self
         class functor_t:
             def __call__(self):
@@ -811,8 +849,8 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.unroll_k         = self.tunable.gemm_k_per_block
         ctrl.label_prefix     = self.name()
         ctrl.precision        = self.tunable.precision
-        ctrl.lds_single_size  = self.lds_a_size + self.lds_b_size
-        ctrl.lds_buffer_num   = 1
+        ctrl.lds_single_size  = self.lds_single_size
+        ctrl.lds_buffer_num   = self.lds_buffer_num
         # Phase 1 (k-sub-loop): both A and B are untransposed here (K contiguous within
         # an LDS row), so advancing inst_wmma.k K-elements is just inst_wmma.k*data_byte.
         ctrl.k_substep_stride_bytes_a    = self.wmma_mapping.ctrl.inst_wmma.k * self.data_byte

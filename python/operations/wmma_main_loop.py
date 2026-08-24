@@ -43,6 +43,17 @@ class ctrl_wmma_main_loop_t(object):
     issued against the SAME already-in-LDS tile before the next global-load/shared-
     store/barrier round-trip, amortizing that synchronization cost over more useful
     FLOPs. See `k_substep_stride_bytes_a/b` below for the per-substep LDS offset.
+
+    Phase 2 (double-buffering): `lds_buffer_num` may now be 1 (default, unchanged) or
+    2. When 2, `v_sst_a_os`/`v_sst_b_os` (aliases of the SAME physical store-offset
+    VGPR -- see each kernel file's emit_kernel_fma_main_loop) are kept permanently
+    `lds_single_size` bytes ahead of `v_sld_a_os`/`v_sld_b_os`, i.e. always pointing at
+    the OTHER of the two adjacent, power-of-2-sized/aligned LDS buffers -- so a tile
+    being prefetched into the "next" buffer never overwrites the tile still being read
+    out of the "current" one, without needing a barrier between them. Mirrors
+    mfma_main_loop.py's `v_xor_b32 v[offset], lds_single_size, v[offset]` ping-pong
+    technique. `lds_single_size` must be a power of 2 for the XOR toggle to correctly
+    alternate between exactly two adjacent buffers.
     '''
     def __init__(self):
         self.wmma_m                      = None   # ctrl_wmma_mapping_t
@@ -95,7 +106,8 @@ class wmma_main_loop_t(mc_base_t):
         assert ctrl.unroll_k % inst_wmma.k == 0, \
             f"wmma main loop requires unroll_k({ctrl.unroll_k}) to be a multiple of " \
             f"inst_wmma.k({inst_wmma.k}) -- one v_wmma_* call only ever consumes inst_wmma.k worth of K"
-        assert ctrl.lds_buffer_num == 1, "only single-buffered LDS is implemented for this milestone"
+        assert ctrl.lds_buffer_num in (1, 2), "wmma main loop supports single (1) or double (2) buffered LDS only"
+        double_buffer = ctrl.lds_buffer_num == 2
         num_k_substeps = ctrl.unroll_k // inst_wmma.k
 
         label_body     = f'L_{ctrl.label_prefix}_wmma_body'
@@ -143,6 +155,15 @@ class wmma_main_loop_t(mc_base_t):
                 self._emit(f"s_wait_dscnt 0x0")
                 emit_wmma_tile()
 
+        def emit_buffer_switch():
+            # Phase 2 (double-buffering): toggle the store offset (v_sst_a_os and
+            # v_sst_b_os alias the same physical VGPR, so one toggle covers both) and
+            # both read offsets to the OTHER LDS buffer, maintaining the invariant that
+            # store and read always point at different buffers.
+            self._emit(f"v_xor_b32 v[{v_sst_a_os()}], {ctrl.lds_single_size}, v[{v_sst_a_os()}]")
+            self._emit(f"v_xor_b32 v[{v_sld_a_os()}], {ctrl.lds_single_size}, v[{v_sld_a_os()}]")
+            self._emit(f"v_xor_b32 v[{v_sld_b_os()}], {ctrl.lds_single_size}, v[{v_sld_b_os()}]")
+
         # ---- prologue: caller has already issued the first global A/B load ----
         # Structure note: the LDS-load + compute for a tile always happens at the TOP
         # of the loop, before checking whether another tile remains -- this ensures the
@@ -153,6 +174,15 @@ class wmma_main_loop_t(mc_base_t):
         self._emit(f_sst_a())
         self._emit(f_sst_b())
         self._emit_empty_line()
+
+        if double_buffer:
+            # Phase 2: the tile just stored above landed in buffer 0 (v_sst_a_os's
+            # initial position, same as v_sld_a/b_os's) -- advance the STORE offset
+            # alone to buffer 1 so the first loop iteration's read (buffer 0, this
+            # tile) and prefetch-store (buffer 1, the next tile) target different
+            # buffers from the very first iteration onward.
+            self._emit(f"v_xor_b32 v[{v_sst_a_os()}], {ctrl.lds_single_size}, v[{v_sst_a_os()}]")
+            self._emit_empty_line()
 
         self._emit(f"s_mov_b32 s[{s_kitr()}], s[{s_knum()}]")
         self._emit_empty_line()
@@ -186,6 +216,8 @@ class wmma_main_loop_t(mc_base_t):
         self._emit(f"s_wait_loadcnt 0x0")
         self._emit(f_sst_a())
         self._emit(f_sst_b())
+        if double_buffer:
+            emit_buffer_switch()
         self._emit(f"s_branch {label_body}")
         self._emit_empty_line()
 

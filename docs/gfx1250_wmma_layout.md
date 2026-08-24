@@ -846,3 +846,76 @@ double-buffered LDS, every chunk's global load could safely overlap with the PRE
 compute (no read-after-write hazard against a buffer still being consumed), restoring full
 latency hiding for every chunk, not just chunk 0 -- expected to turn fwd's current regression
 into a win too, on top of bwd/wrw's already-larger gains.
+
+## Phase 10 (2026-08-24): LDS double-buffering -- infrastructure landed, no perf win yet
+
+Following up on Phase 9's finding that fwd's k-sub-loop regressed (chunks 1..N-1 have no
+latency-hiding overlap at all), this phase ported gfx942/950's ping-pong double-buffer
+technique (`mfma_main_loop.py`'s `v_xor_b32 v[offset], lds_single_size, v[offset]` pattern)
+into `wmma_main_loop.py`, gated on a new optional tunable `lds_double_buffer` (default 0, every
+existing config unaffected). `lds_single_size = igemm_next_pow2(lds_a_size + lds_b_size)`;
+buffer 0 at LDS offset 0, buffer 1 at offset `lds_single_size`; `v_sst_a_os`/`v_sst_b_os`
+(aliases of the same physical VGPR) and `v_sld_a_os`/`v_sld_b_os` are kept permanently one
+buffer apart and XOR-toggled together once per outer iteration.
+
+**A new correctness bug, found via the multi-tap hardware test specifically**: `v_sst_os`/
+`v_sld_a_os`/`v_sld_b_os` are computed ONCE in `emit_kernel_prologue`, outside the runtime
+tap loop, and get progressively XOR-toggled by every outer K-loop iteration. Since the SAME
+compiled main-loop code is re-entered (via a runtime branch) once per tap, the buffer-parity
+state left over from tap N's K-loop was silently carried into tap N+1's execution, misaligning
+every read/write from the second tap onward -- 1x1/single-tap configs never exercise a second
+tap, so this passed everywhere except multi-tap (y,x>1) configs specifically. Fixed by
+recomputing (not saving to a "_base" VGPR and restoring) `v_sst_os`/`v_sld_a_os`/`v_sld_b_os`
+fresh at the start of every tap, factored into a shared `_emit_lds_offset_setup()` method
+called from both the prologue and the tap loop. Recompute, not save/restore, was a deliberate
+choice: bwd's kernel is already at the hard 256-VGPR/wave limit even at K=32 single-buffered
+(confirmed via `.vgpr_count`), so 3 more "_base" registers would not have fit at all --
+recomputing from `v_tid` (already persistent) and `v_tmp` (already-available scratch) needs
+zero new VGPRs.
+
+**gfx1250's LDS-per-workgroup limit is at least 64KB**, confirmed empirically (no repo-side
+hardware constant exists for this) -- both the standalone `_dbuf` variants (32KB fp16/bf16/
+int8, 8KB fp32) and the combined `_k2x_dbuf` variants (64KB for all four precisions) codegen,
+load, and run correctly on real hardware for all 12 (direction x precision) combos, full
+battery (degenerate, multi-K-block, stride+pad, multi-tap+dilation, group=2/4) -- 144 test
+cases, zero failures, zero regression to the 24 existing (single-buffered) configs (byte-
+identical `.s` diff, same discipline as Phase 9).
+
+### An abandoned attempt, and the honest benchmark result
+
+An initial attempt tried to make double-buffering IMMEDIATELY useful by having untransposed
+operands (fwd's A+B, bwd's A) issue+wait+store EVERY k-sub-loop chunk right away (before
+compute), reasoning that writes to the "other" buffer are always safe regardless of timing.
+This was WRONG in a way that only showed up in benchmarks, not correctness tests: it moved
+chunk 0's WAIT from its original late position (after `emit_wmma_tile()`+`emit_extra_substeps()`,
+maximally overlapped with compute) to immediately after its own load issue -- discarding the
+existing overlap Phase 9 already had for chunk 0, for zero compensating benefit (chunks 1..N-1
+still can't be pipelined ahead of their own wait regardless of LDS buffering, since they all
+reuse the SAME small `v_gld_a`/`v_gld_b` staging buffer -- a VGPR-level serialization,
+completely orthogonal to which LDS buffer the result lands in). This produced a MEASURED
+regression (fwd/fp16 k2x+dbuf dropped to ~14 tflops vs k2x-alone's ~17.8) before being caught
+and reverted back to Phase 9's exact functor structure.
+
+**With that reverted, the honest result is: double-buffering is currently performance-neutral
+everywhere** -- `_dbuf` matches the original single-substep config's tflops to within
+measurement noise (same functors, same instruction positions, just alternating which LDS
+buffer is targled), and `_k2x_dbuf` matches Phase 9's `_k2x` numbers the same way, across all
+three directions. It does NOT fix fwd's Phase 9 regression as originally hoped.
+
+**Why not, and what actually would**: double-buffering only removes the *cross-wave
+LDS-overwrite race* that made storing early unsafe under single buffering. It does nothing
+about the OTHER constraint that caused chunks 1..N-1 to have zero latency hiding in the first
+place: they all share ONE small reused VGPR staging buffer (forced by the 256-VGPR/wave
+limit), so chunk `i+1`'s load cannot even be ISSUED until chunk `i`'s data has been consumed
+(read or stored) -- a buffer-reuse serialization, not an LDS-safety one. The only way to
+actually hide that latency is to INTERLEAVE each chunk's load with a DIFFERENT piece of useful
+work in between the issue and the wait -- concretely, pairing chunk `i`'s load with substep
+`i`'s LDS-read-and-compute (a natural 1:1 pairing, since `num_k_chunks == num_k_substeps` by
+construction, and LDS reads/ALU use different hardware queues than global memory, so they can
+genuinely proceed concurrently with an in-flight global load). This is a real restructuring of
+`wmma_main_loop.py`'s loop body (blending the chunk-load and substep-compute loops together,
+not just reordering the existing separate phases) -- closer in spirit to mfma's own ~10
+hand-scheduled interleaved variants than to a simple buffer-switch. Explicitly not attempted in
+this phase; the double-buffering infrastructure landed here (LDS allocation, correct addressing
+across taps, hardware-confirmed 64KB budget) is the necessary PREREQUISITE for it, not a
+substitute.
