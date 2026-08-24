@@ -169,7 +169,12 @@ class igemm_wmma_mapping_t(mc_base_t):
             self._emit(f"v_lshlrev_b32 v[{v_byte_offset}], {utility_log2(elem_bytes)}, v[{v_byte_offset}]   ; local index * elem_bytes")
             self._emit(f"v_lshrrev_b32 v[{v_tmp2}], 4, v[{v_thread_id}]")
             self._emit(f"v_and_b32 v[{v_tmp2}], 1, v[{v_tmp2}]                ; k_half (0/1)")
-            self._emit(f"v_lshlrev_b32 v[{v_tmp2}], {utility_log2(16 * row_pitch_bytes)}, v[{v_tmp2}]  ; k_half * 16 * row_pitch_bytes")
+            # k_half spans inst_wmma.k/2 rows of the transposed [K][M or N] LDS tile (16 for
+            # fp16/bf16's K=32, 32 for int8's K=64 -- NOT a hardcoded 16, since the A/B operand
+            # layout's "upper vs lower 16 lanes" split always covers half of K regardless of
+            # how many k-values a lane's vgprs cover per half. See docs/gfx1250_wmma_layout.md.
+            half_k = ctrl.inst_wmma.k // 2
+            self._emit(f"v_lshlrev_b32 v[{v_tmp2}], {utility_log2(half_k * row_pitch_bytes)}, v[{v_tmp2}]  ; k_half * {half_k} * row_pitch_bytes")
             self._emit(f"v_add_u32 v[{v_byte_offset}], v[{v_tmp2}], v[{v_byte_offset}]")
             self._emit_empty_line()
         return self._get_deferred()

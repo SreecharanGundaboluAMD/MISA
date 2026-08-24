@@ -1184,6 +1184,10 @@ int main(int argc, char **argv) {
                 tensor_copy<bfloat16, float>(static_cast<bfloat16*>(host_input_dtype), host_input, static_cast<size_t>(n) * c * hi * wi);
                 tensor_copy<bfloat16, float>(static_cast<bfloat16*>(host_output_dtype), host_output, static_cast<size_t>(n) * k * ho * wo);
             }
+            else if(driver_data_type == driverInt8){
+                tensor_copy<int8_t, float>(static_cast<int8_t*>(host_input_dtype), host_input, static_cast<size_t>(n) * c * hi * wi);
+                tensor_copy<int8_t, float>(static_cast<int8_t*>(host_output_dtype), host_output, static_cast<size_t>(n) * k * ho * wo);
+            }
 #ifdef USE_GPU_NAIVE_CONV
             HIP_CALL(hipMemcpy(device_input, host_input,
                        static_cast<size_t>(n) * c * hi * wi * sizeof(float), hipMemcpyHostToDevice));
@@ -1282,13 +1286,17 @@ int main(int argc, char **argv) {
                     is_valid = valid_vector<float>(host_weight, static_cast<float*>(device_weight_to_host),
                                     static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x, nrms);
                 }else if(is_wmma){
-                    // WMMA always writes grad_weight at full fp32 width (wrw has no int8
-                    // WMMA kernel, so no int32 case to handle here).
+                    // WMMA always writes grad_weight at full width (fp32, or int32 for int8) --
+                    // see the equivalent fwd/bwd comment near is_wmma.
                     HIP_CALL(hipMemcpy(device_weight_to_host, device_weight_dtype,
                                    static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x * sizeof(float),
                                    hipMemcpyDeviceToHost));
-                    is_valid = valid_vector<float>(host_weight, static_cast<float*>(device_weight_to_host),
-                                    static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x, nrms);
+                    if(driver_data_type == driverInt8)
+                        is_valid = valid_vector<int32_t>(host_weight, static_cast<int32_t*>(device_weight_to_host),
+                                        static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x, nrms);
+                    else
+                        is_valid = valid_vector<float>(host_weight, static_cast<float*>(device_weight_to_host),
+                                        static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x, nrms);
                 }else{
                     HIP_CALL(hipMemcpy(device_weight_to_host, device_weight_dtype,
                                    static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x * data_byte,

@@ -139,9 +139,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
     def __init__(self, mc, tunable):
         mc_base_t.__init__(self, mc)
         assert tunable.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA
-        assert tunable.precision in ('fp16', 'bf16'), f'unsupported precision:{tunable.precision}'
+        assert tunable.precision in ('fp16', 'bf16', 'int8'), f'unsupported precision:{tunable.precision}'
         assert tunable.tensor_layout == 'nhwc'
-        assert tunable.gemm_m_per_block == 128 and tunable.gemm_n_per_block == 128 and tunable.gemm_k_per_block == 32
+        assert tunable.gemm_m_per_block == 128 and tunable.gemm_n_per_block == 128
         assert tunable.wmma_tile_m == 16 and tunable.wmma_tile_n == 16
         assert tunable.wmma_repeat_m == 4 and tunable.wmma_repeat_n == 4
         assert tunable.block_size == 128
@@ -151,6 +151,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(tunable.gemm_m_per_block, tunable.gemm_n_per_block,
                 tunable.wmma_tile_m, tunable.wmma_tile_n, tunable.wmma_repeat_m, tunable.wmma_repeat_n,
                 tunable.block_size // tunable.wave_size, tunable.precision)
+        # gemm_k_per_block must equal the wired-up instruction's K (32 for fp16/bf16, 64 for
+        # int8) -- wmma_main_loop.py requires unroll_k == inst_wmma.k exactly (no k-sub-loop).
+        assert tunable.gemm_k_per_block == ctrl_wmma_mapping.inst_wmma.k, \
+            f"gemm_k_per_block({tunable.gemm_k_per_block}) must equal inst_wmma.k({ctrl_wmma_mapping.inst_wmma.k}) for precision {tunable.precision}"
         self.wmma_mapping = igemm_wmma_mapping_t(self.mc, ctrl_wmma_mapping)
 
         ctrl_coalescing_store_wmma = ctrl_coalescing_store_wmma_t()
@@ -362,7 +366,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # unlike fwd's compile-time-constant +64 bytes. B has no equivalent constant stride
         # anymore (Phase 5c): its address is recomputed fresh every iteration (see
         # move_slice_window_b_functor), since the (n,ho,wo)->(hi,wi) gather changes every block.
-        self._emit(f"s_lshl_b32 s[{s.s_a_k_stride()}], s[{s.s_gemm_m()}], {utility_log2(self.data_byte) + 5}   ; K_out * databyte * 32")
+        # NOTE: gemm_k_per_block is 32 for fp16/bf16 but 64 for int8 -- must NOT hardcode a
+        # "+5" (*32) shift here, or A's per-K-block stride silently undercounts by 2x for int8.
+        self._emit(f"s_lshl_b32 s[{s.s_a_k_stride()}], s[{s.s_gemm_m()}], {utility_log2(self.data_byte * self.tunable.gemm_k_per_block)}   ; K_out * databyte * {self.tunable.gemm_k_per_block}")
         self._emit(f"s_mul_i32 s[{s.s_hi_wi()}], s[{s.s_hi()}], s[{s.s_wi()}]")
         # grad_weight's per-K_out-row element count is y*x*c (not just c as in the 1x1 case) --
         # reused for the epilogue's row stride (Phase 5f). B (input) itself has no y/x
@@ -372,16 +378,21 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit_empty_line()
 
         # ---- global address for this thread's chunk of the A tile (grad_output, natural [GEMM_K][GEMM_M]) ----
-        # thread tid owns row_local=tid>>2 (one of 32 rows of this K-block), col_group=tid&3
-        # (one of 4 32-wide chunks of the 128-wide K_out tile) -- same scheme bwd's B operand
-        # used, now applied to A since A also needs the transposed treatment here. Tap-
-        # independent (grad_output has no Y,X extent), so computed once into the persistent
-        # v_addr_a_base and reset into v_addr_a fresh at the start of every tap (Phase 5f).
+        # thread tid owns row_local (one of gemm_k_per_block rows of this K-block) and
+        # col_group (one of num_col_groups chunks of the 128-wide K_out tile, each chunk
+        # exactly gemm_k_per_block elements wide -- see bwd's Phase-int8 fix docstring for why
+        # this can't stay hardcoded at tid>>2/tid&3/col_group*32: that's only correct when
+        # gemm_k_per_block==32, i.e. fp16/bf16, not int8's 64). Tap-independent (grad_output
+        # has no Y,X extent), so computed once into the persistent v_addr_a_base and reset into
+        # v_addr_a fresh at the start of every tap (Phase 5f).
+        num_col_groups = self.tunable.gemm_m_per_block // self.tunable.gemm_k_per_block
+        col_group_bits = utility_log2(num_col_groups)
+        col_start_shift = utility_log2(self.tunable.gemm_k_per_block)
         self._emit(f"; v_addr_a_base = p_in + (row_local*K_out + block_m_off + col_start) * databyte")
-        self._emit(f"v_lshrrev_b32 v[{v.v_tmp()}], 2, v[{v.v_tid()}]        ; row_local = tid>>2")
+        self._emit(f"v_lshrrev_b32 v[{v.v_tmp()}], {col_group_bits}, v[{v.v_tid()}]        ; row_local = tid>>{col_group_bits}")
         self._emit(f"v_mul_lo_u32 v[{v.v_tmp()}], s[{s.s_gemm_m()}], v[{v.v_tmp()}]  ; row_local * K_out")
-        self._emit(f"v_and_b32 v[{v.v_tmp(1)}], 3, v[{v.v_tid()}]           ; col_group = tid&3")
-        self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], 5, v[{v.v_tmp(1)}]      ; col_start = col_group*32")
+        self._emit(f"v_and_b32 v[{v.v_tmp(1)}], {num_col_groups - 1}, v[{v.v_tid()}]           ; col_group = tid&{num_col_groups - 1}")
+        self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], {col_start_shift}, v[{v.v_tmp(1)}]      ; col_start = col_group*{self.tunable.gemm_k_per_block}")
         self._emit(f"v_add_u32 v[{v.v_tmp()}], v[{v.v_tmp(1)}], v[{v.v_tmp()}]")
         self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_block_m_off()}], v[{v.v_tmp()}]")
         self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.data_byte)}, v[{v.v_tmp()}]")
@@ -391,11 +402,12 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit_empty_line()
 
         # ---- persistent setup for B's per-iteration gather (input, gathered through
-        # stride/pad -- see class docstring) ----
-        self._emit(f"v_lshrrev_b32 v[{v.v_row_local()}], 2, v[{v.v_tid()}]        ; row_local = tid>>2 (fixed for the whole kernel)")
+        # stride/pad -- see class docstring). Same num_col_groups/col_group_bits/
+        # col_start_shift as A above (A and B are both 128-wide tiles here). ----
+        self._emit(f"v_lshrrev_b32 v[{v.v_row_local()}], {col_group_bits}, v[{v.v_tid()}]        ; row_local = tid>>{col_group_bits} (fixed for the whole kernel)")
         self._emit(f"; v_b_col_off = (block_n_off + col_start) * databyte (fixed for the whole kernel)")
-        self._emit(f"v_and_b32 v[{v.v_tmp()}], 3, v[{v.v_tid()}]            ; col_group = tid&3")
-        self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], 5, v[{v.v_tmp()}]        ; col_start = col_group*32")
+        self._emit(f"v_and_b32 v[{v.v_tmp()}], {num_col_groups - 1}, v[{v.v_tid()}]            ; col_group = tid&{num_col_groups - 1}")
+        self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {col_start_shift}, v[{v.v_tmp()}]        ; col_start = col_group*{self.tunable.gemm_k_per_block}")
         self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_block_n_off()}], v[{v.v_tmp()}]")
         self._emit(f"v_lshlrev_b32 v[{v.v_b_col_off()}], {utility_log2(self.data_byte)}, v[{v.v_tmp()}]")
         self._emit_empty_line()
@@ -627,25 +639,30 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         '''
         Transposed read for grad_output: LDS holds it as natural [K rows][M cols]
         (row_pitch = gemm_m_per_block*databyte bytes). Same technique as bwd's
-        shared_load_b_functor (see that file for the detailed explanation), applied here to
-        the A operand instead of B, and with A's region based at LDS byte 0 (not lds_a_size).
+        shared_load_b_functor (see that file for the detailed explanation, including why
+        int8's elem_per_dword=4 case processes one vgpr index `a` at a time with a small
+        scratch slice instead of batching all 8 reads before waiting), applied here to the A
+        operand instead of B, and with A's region based at LDS byte 0 (not lds_a_size).
         '''
         outer = self
         class functor_t:
             def __call__(self, v_dst, v_os, extra_off):
                 v = outer.vgpr
                 row_pitch = outer.tunable.gemm_m_per_block * outer.data_byte
+                elem_per_dword = 4 // outer.data_byte
+                read_instr = 'ds_read_u16' if outer.data_byte == 2 else 'ds_read_u8'
                 with outer._deferred_context():
                     for i_rm in range(4):
                         col_off = i_rm * outer.tunable.wmma_tile_m * outer.data_byte
                         for a in range(8):
-                            off_lo = col_off + (a * 2 + 0) * row_pitch
-                            off_hi = col_off + (a * 2 + 1) * row_pitch
-                            outer._emit(f"ds_read_u16 v[{v.v_gld_a(a*2)}], v[{v.v_sld_a_os()}] offset:{extra_off + off_lo}")
-                            outer._emit(f"ds_read_u16 v[{v.v_gld_a(a*2+1)}], v[{v.v_sld_a_os()}] offset:{extra_off + off_hi}")
-                        outer._emit(f"s_wait_dscnt 0x0")
-                        for a in range(8):
-                            outer._emit(f"v_lshl_or_b32 v[{v.v_a(i_rm*8+a)}], v[{v.v_gld_a(a*2+1)}], 16, v[{v.v_gld_a(a*2)}]")
+                            for s in range(elem_per_dword):
+                                off = col_off + (a * elem_per_dword + s) * row_pitch
+                                outer._emit(f"{read_instr} v[{v.v_gld_a(s)}], v[{v.v_sld_a_os()}] offset:{extra_off + off}")
+                            outer._emit(f"s_wait_dscnt 0x0")
+                            outer._emit(f"v_mov_b32 v[{v.v_a(i_rm*8+a)}], v[{v.v_gld_a(0)}]")
+                            for s in range(1, elem_per_dword):
+                                shift = s * 8 * outer.data_byte
+                                outer._emit(f"v_lshl_or_b32 v[{v.v_a(i_rm*8+a)}], v[{v.v_gld_a(s)}], {shift}, v[{v.v_a(i_rm*8+a)}]")
                 return outer._get_deferred()
         return functor_t()
 
@@ -661,19 +678,22 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self, v_dst, v_os, extra_off):
                 v = outer.vgpr
                 row_pitch = outer.tunable.gemm_n_per_block * outer.data_byte
+                elem_per_dword = 4 // outer.data_byte
+                read_instr = 'ds_read_u16' if outer.data_byte == 2 else 'ds_read_u8'
                 with outer._deferred_context():
                     for i_rn in range(4):
                         col_off = i_rn * outer.tunable.wmma_tile_n * outer.data_byte
                         for a in range(8):
                             # B region starts at outer.lds_a_size within the shared LDS tile;
                             # v_sld_b_os only carries the offset local to B's own region.
-                            off_lo = outer.lds_a_size + col_off + (a * 2 + 0) * row_pitch
-                            off_hi = outer.lds_a_size + col_off + (a * 2 + 1) * row_pitch
-                            outer._emit(f"ds_read_u16 v[{v.v_gld_b(a*2)}], v[{v.v_sld_b_os()}] offset:{extra_off + off_lo}")
-                            outer._emit(f"ds_read_u16 v[{v.v_gld_b(a*2+1)}], v[{v.v_sld_b_os()}] offset:{extra_off + off_hi}")
-                        outer._emit(f"s_wait_dscnt 0x0")
-                        for a in range(8):
-                            outer._emit(f"v_lshl_or_b32 v[{v.v_b(i_rn*8+a)}], v[{v.v_gld_b(a*2+1)}], 16, v[{v.v_gld_b(a*2)}]")
+                            for s in range(elem_per_dword):
+                                off = outer.lds_a_size + col_off + (a * elem_per_dword + s) * row_pitch
+                                outer._emit(f"{read_instr} v[{v.v_gld_b(s)}], v[{v.v_sld_b_os()}] offset:{extra_off + off}")
+                            outer._emit(f"s_wait_dscnt 0x0")
+                            outer._emit(f"v_mov_b32 v[{v.v_b(i_rn*8+a)}], v[{v.v_gld_b(0)}]")
+                            for s in range(1, elem_per_dword):
+                                shift = s * 8 * outer.data_byte
+                                outer._emit(f"v_lshl_or_b32 v[{v.v_b(i_rn*8+a)}], v[{v.v_gld_b(s)}], {shift}, v[{v.v_b(i_rn*8+a)}]")
                 return outer._get_deferred()
         return functor_t()
 

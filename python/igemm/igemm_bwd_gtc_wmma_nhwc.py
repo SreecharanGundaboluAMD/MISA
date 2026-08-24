@@ -84,9 +84,9 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
     def __init__(self, mc, tunable):
         mc_base_t.__init__(self, mc)
         assert tunable.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA
-        assert tunable.precision in ('fp16', 'bf16'), f'unsupported precision:{tunable.precision}'
+        assert tunable.precision in ('fp16', 'bf16', 'int8'), f'unsupported precision:{tunable.precision}'
         assert tunable.tensor_layout == 'nhwc'
-        assert tunable.gemm_m_per_block == 128 and tunable.gemm_n_per_block == 128 and tunable.gemm_k_per_block == 32
+        assert tunable.gemm_m_per_block == 128 and tunable.gemm_n_per_block == 128
         assert tunable.wmma_tile_m == 16 and tunable.wmma_tile_n == 16
         assert tunable.wmma_repeat_m == 4 and tunable.wmma_repeat_n == 4
         assert tunable.block_size == 128
@@ -96,6 +96,10 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(tunable.gemm_m_per_block, tunable.gemm_n_per_block,
                 tunable.wmma_tile_m, tunable.wmma_tile_n, tunable.wmma_repeat_m, tunable.wmma_repeat_n,
                 tunable.block_size // tunable.wave_size, tunable.precision)
+        # gemm_k_per_block must equal the wired-up instruction's K (32 for fp16/bf16, 64 for
+        # int8) -- wmma_main_loop.py requires unroll_k == inst_wmma.k exactly (no k-sub-loop).
+        assert tunable.gemm_k_per_block == ctrl_wmma_mapping.inst_wmma.k, \
+            f"gemm_k_per_block({tunable.gemm_k_per_block}) must equal inst_wmma.k({ctrl_wmma_mapping.inst_wmma.k}) for precision {tunable.precision}"
         self.wmma_mapping = igemm_wmma_mapping_t(self.mc, ctrl_wmma_mapping)
 
         ctrl_coalescing_store_wmma = ctrl_coalescing_store_wmma_t()
@@ -316,7 +320,9 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         # move_slice_window_b's per-K-iteration stride.
         self._emit(f"s_mul_i32 s[{s.s_wei_row_c()}], s[{s.s_x()}], s[{s.s_y()}]")
         self._emit(f"s_mul_i32 s[{s.s_wei_row_c()}], s[{s.s_wei_row_c()}], s[{s.s_gemm_n()}]")
-        self._emit(f"s_lshl_b32 s[{s.s_wei_k_stride()}], s[{s.s_wei_row_c()}], {utility_log2(self.data_byte) + 5}   ; wei_row_c * databyte * 32")
+        # NOTE: gemm_k_per_block is 32 for fp16/bf16 but 64 for int8 -- must NOT hardcode a
+        # "+5" (*32) shift here, or B's per-K-block stride silently undercounts by 2x for int8.
+        self._emit(f"s_lshl_b32 s[{s.s_wei_k_stride()}], s[{s.s_wei_row_c()}], {utility_log2(self.data_byte * self.tunable.gemm_k_per_block)}   ; wei_row_c * databyte * {self.tunable.gemm_k_per_block}")
         self._emit_empty_line()
 
         # ---- one-time decomposition of this thread's GEMM_M index into (n_idx, hi_idx,
@@ -332,14 +338,22 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit_empty_line()
 
         # ---- B's fixed per-thread row base (this tap's column offset is added fresh every
-        # tap in _emit_tap_gather) -- thread tid owns row_local=tid>>2 (one of 32 K_out rows
-        # WITHIN this K-block), col_group=tid&3 (one of 4 32-wide chunks of the 128-wide C_in
-        # tile) -- see class docstring / wmma_mapping.py ----
+        # tap in _emit_tap_gather) -- thread tid owns row_local (one of gemm_k_per_block K_out
+        # rows WITHIN this K-block) and col_group (one of num_col_groups chunks of the
+        # 128-wide C_in tile, each chunk exactly gemm_k_per_block elements wide -- since the
+        # global load is always a fixed 64 bytes/thread, and gemm_k_per_block*databyte==64
+        # always, the chunk width in ELEMENTS equals gemm_k_per_block for every precision: 32
+        # for fp16/bf16 (4 col_groups), 64 for int8 (2 col_groups) -- NOT the hardcoded
+        # tid>>2/tid&3/col_group*32 an fp16-only version of this code once had) -- see class
+        # docstring / wmma_mapping.py ----
+        num_col_groups = self.tunable.gemm_n_per_block // self.tunable.gemm_k_per_block
+        col_group_bits = utility_log2(num_col_groups)
+        col_start_shift = utility_log2(self.tunable.gemm_k_per_block)
         self._emit(f"; v_addr_b_base = p_wei + (row_local*wei_row_c + block_n_off + col_start) * databyte")
-        self._emit(f"v_lshrrev_b32 v[{v.v_tmp()}], 2, v[{v.v_tid()}]        ; row_local = tid>>2")
+        self._emit(f"v_lshrrev_b32 v[{v.v_tmp()}], {col_group_bits}, v[{v.v_tid()}]        ; row_local = tid>>{col_group_bits}")
         self._emit(f"v_mul_lo_u32 v[{v.v_tmp()}], s[{s.s_wei_row_c()}], v[{v.v_tmp()}]  ; row_local * wei_row_c")
-        self._emit(f"v_and_b32 v[{v.v_tmp(1)}], 3, v[{v.v_tid()}]           ; col_group = tid&3")
-        self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], 5, v[{v.v_tmp(1)}]      ; col_start = col_group*32")
+        self._emit(f"v_and_b32 v[{v.v_tmp(1)}], {num_col_groups - 1}, v[{v.v_tid()}]           ; col_group = tid&{num_col_groups - 1}")
+        self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], {col_start_shift}, v[{v.v_tmp(1)}]      ; col_start = col_group*{self.tunable.gemm_k_per_block}")
         self._emit(f"v_add_u32 v[{v.v_tmp()}], v[{v.v_tmp(1)}], v[{v.v_tmp()}]")
         self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_block_n_off()}], v[{v.v_tmp()}]")
         self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.data_byte)}, v[{v.v_tmp()}]")
@@ -349,8 +363,9 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit_empty_line()
 
         # ---- fixed per-thread shared-memory store offset: this thread owns byte-chunk tid*64 ----
-        # (A: row tid's full 32-element row; B: (row_local,col_group)'s 32-element chunk -- the
-        # linear tid-order enumeration happens to coincide exactly for both, see class docstring)
+        # (A: row tid's full gemm_k_per_block-element row; B: (row_local,col_group)'s
+        # gemm_k_per_block-element chunk -- the linear tid-order enumeration happens to
+        # coincide exactly for both, see class docstring)
         self._emit(f"v_lshlrev_b32 v[{v.v_sst_os()}], 6, v[{v.v_tid()}]   ; tid*64 bytes")
         self._emit_empty_line()
 
@@ -561,31 +576,42 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         '''
         Transposed read for the weight operand: LDS holds it as natural [K rows][N cols]
         (row_pitch = gemm_n_per_block*databyte bytes), but the WMMA B operand needs
-        col-major/k-contiguous packed pairs. For each wave_repeat step i_rn and each of the 8
-        vgpr indices a (k-half-relative), read the two k-sub-elements (s=0,1) as separate
-        16-bit LDS loads (they are row_pitch_bytes apart, not adjacent) into v_gld_b (reused as
-        scratch here -- safe, since this iteration's real global load into v_gld_b happens
-        later in the main loop, after shared_load completes), then pack them into one dword
-        with v_lshl_or_b32 -- deliberately correctness-over-speed, see class docstring.
+        col-major/k-contiguous packed elements. For each wave_repeat step i_rn and each of the 8
+        vgpr indices a (k-half-relative), read the `elem_per_dword` k-sub-elements (s=0..
+        elem_per_dword-1) as separate sub-dword LDS loads (they are row_pitch_bytes apart, not
+        adjacent) into a small slice of v_gld_b (reused as scratch here -- safe, since this
+        iteration's real global load into v_gld_b happens later in the main loop, after
+        shared_load completes), then pack them into one dword with a v_lshl_or_b32 chain --
+        deliberately correctness-over-speed, see class docstring. `elem_per_dword` is 2 for
+        fp16/bf16 (16-bit reads, one shift-16 pack) or 4 for int8 (8-bit reads, three chained
+        shift-8/16/24 packs) -- see docs/gfx1250_wmma_layout.md's per-precision A/B operand
+        layout facts. Processes one vgpr index `a` at a time (wait, then pack, before moving to
+        the next `a`) rather than batching all 8 reads-then-all-8-packs like the fp16-only
+        version this replaced: int8's elem_per_dword=4 would need 32 scratch registers to batch
+        all 8 (v_gld_b is only 16, sized for its OTHER use as the real global-load staging
+        buffer) -- trading some latency-hiding for staying within the existing VGPR budget.
         '''
         outer = self
         class functor_t:
             def __call__(self, v_dst, v_os, extra_off):
                 v = outer.vgpr
                 row_pitch = outer.tunable.gemm_n_per_block * outer.data_byte
+                elem_per_dword = 4 // outer.data_byte
+                read_instr = 'ds_read_u16' if outer.data_byte == 2 else 'ds_read_u8'
                 with outer._deferred_context():
                     for i_rn in range(4):
                         col_off = i_rn * outer.tunable.wmma_tile_n * outer.data_byte
                         for a in range(8):
                             # B region starts at outer.lds_a_size within the shared LDS tile;
                             # v_sld_b_os only carries the offset local to B's own region.
-                            off_lo = outer.lds_a_size + col_off + (a * 2 + 0) * row_pitch
-                            off_hi = outer.lds_a_size + col_off + (a * 2 + 1) * row_pitch
-                            outer._emit(f"ds_read_u16 v[{v.v_gld_b(a*2)}], v[{v.v_sld_b_os()}] offset:{extra_off + off_lo}")
-                            outer._emit(f"ds_read_u16 v[{v.v_gld_b(a*2+1)}], v[{v.v_sld_b_os()}] offset:{extra_off + off_hi}")
-                        outer._emit(f"s_wait_dscnt 0x0")
-                        for a in range(8):
-                            outer._emit(f"v_lshl_or_b32 v[{v.v_b(i_rn*8+a)}], v[{v.v_gld_b(a*2+1)}], 16, v[{v.v_gld_b(a*2)}]")
+                            for s in range(elem_per_dword):
+                                off = outer.lds_a_size + col_off + (a * elem_per_dword + s) * row_pitch
+                                outer._emit(f"{read_instr} v[{v.v_gld_b(s)}], v[{v.v_sld_b_os()}] offset:{extra_off + off}")
+                            outer._emit(f"s_wait_dscnt 0x0")
+                            outer._emit(f"v_mov_b32 v[{v.v_b(i_rn*8+a)}], v[{v.v_gld_b(0)}]")
+                            for s in range(1, elem_per_dword):
+                                shift = s * 8 * outer.data_byte
+                                outer._emit(f"v_lshl_or_b32 v[{v.v_b(i_rn*8+a)}], v[{v.v_gld_b(s)}], {shift}, v[{v.v_b(i_rn*8+a)}]")
                 return outer._get_deferred()
         return functor_t()
 
@@ -615,7 +641,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
     def emit_kernel_fma_main_loop(self):
         ctrl = ctrl_wmma_main_loop_t()
         ctrl.wmma_m           = self.wmma_mapping.ctrl
-        ctrl.unroll_k         = 32
+        ctrl.unroll_k         = self.tunable.gemm_k_per_block
         ctrl.label_prefix     = self.name()
         ctrl.precision        = self.tunable.precision
         ctrl.lds_single_size  = self.lds_a_size + self.lds_b_size

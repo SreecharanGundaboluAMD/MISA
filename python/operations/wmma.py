@@ -65,7 +65,8 @@ class inst_wmma_t(object):
 
     def __call__(self, reg_d, reg_a, reg_b, reg_c):
         wmma_inst = self.name()
-        return f"{wmma_inst} v[{reg_d}], v[{reg_a}], v[{reg_b}], v[{reg_c}]"
+        modifier = self.options.get('modifier', '')
+        return f"{wmma_inst} v[{reg_d}], v[{reg_a}], v[{reg_b}], v[{reg_c}]{modifier}"
 
 
 #                                        m,  n,  k,   precision,              cycle, v_a, v_b, v_c
@@ -74,7 +75,15 @@ class inst_wmma_t(object):
 # on real hardware for the fp16 entry below).
 v_wmma_f32_16x16x32_f16   = inst_wmma_t(16, 16, 32,  AMDGPU_PRECISION_FP16,  None,  8,   8,   8,  name='v_wmma_f32_16x16x32_f16')
 v_wmma_f32_16x16x32_bf16  = inst_wmma_t(16, 16, 32,  AMDGPU_PRECISION_BF16,  None,  8,   8,   8,  name='v_wmma_f32_16x16x32_bf16')
-v_wmma_i32_16x16x64_iu8   = inst_wmma_t(16, 16, 64,  AMDGPU_PRECISION_INT8,  None,  8,   8,   8,  name='v_wmma_i32_16x16x64_iu8')
+# neg_lo:[1,1,0] selects SIGNED interpretation of A and B (the base encoding with no modifier
+# defaults to unsigned, confirmed via llvm-mc -- see docs/gfx1250_wmma_layout.md). The original
+# fwd-only round-trip probe used small UNSIGNED (0..8) test values, so this never mattered
+# until bwd/wrw's driver validation exercised genuinely signed (-5..5) random data and exposed
+# it: without this modifier, a negative int8 input is reinterpreted as a large unsigned byte,
+# producing silently wrong results whenever real data (not just small positive probe values)
+# is used. Conv's int8 tensors are signed (int8_t) throughout the driver, so this must always
+# be signed*signed, never the unsigned default.
+v_wmma_i32_16x16x64_iu8   = inst_wmma_t(16, 16, 64,  AMDGPU_PRECISION_INT8,  None,  8,   8,   8,  name='v_wmma_i32_16x16x64_iu8', modifier=' neg_lo:[1,1,0]')
 # NOTE: no AMDGPU_PRECISION_FP8 constant exists yet in codegen/amdgpu.py; this stretch entry
 # is not wired into any mapping table yet, so the placeholder FP32 data_type is unused for now.
 v_wmma_f32_16x16x128_fp8_fp8 = inst_wmma_t(16, 16, 128, AMDGPU_PRECISION_FP32, None, 16, 16,   8,  name='v_wmma_f32_16x16x128_fp8_fp8')

@@ -556,6 +556,73 @@ K-loop reduction and independent output store) — all exact matches, all passin
 hardware run.
 
 With Phase 5f complete, all three directions (fwd/bwd/wrw) now support arbitrary multi-tap
-filters, dilation, and stride/padding for fp16, `group=1`. Remaining gaps: `group > 1` (all
-directions), and bf16/int8 support for the general (non-degenerate) addressing in bwd/wrw
-(only fwd has bf16/int8 wired through the general-addressing driver path so far).
+filters, dilation, and stride/padding for fp16, `group=1`.
+
+## Phase 6: bf16 and int8 for bwd/wrw's general addressing
+
+**bf16 was already free**: `igemm_bwd_gtc_wmma_nhwc_t` and `igemm_wrw_gtc_wmma_nhwc_t` already
+asserted `precision in ('fp16', 'bf16')` and use `data_byte` generically throughout (same
+2-byte-element layout as fp16, `num_v_a=num_v_b=8` for both instructions) -- validated on
+hardware with zero code changes, just new `.config` files.
+
+**int8 required real fixes** in three layers, found by working through bwd first (fp16's
+`gemm_k_per_block=32` vs int8's `=64` breaks several hardcoded assumptions that happened to
+never matter until now):
+
+1. **`gemm_k_per_block`-hardcoded literals**: `wmma_mapping.py`'s
+   `get_gemm_index_for_src_matrix_transposed` hardcoded the "k_half" row-jump as `16` (half of
+   32) -- fixed to `ctrl.inst_wmma.k // 2` (32 for int8). Both bwd's `s_wei_k_stride` and wrw's
+   `s_a_k_stride` hardcoded their per-K-block stride shift as `+5` (i.e. `*32`) -- fixed to
+   `log2(data_byte * gemm_k_per_block)`. Both bwd's B operand and wrw's A/B operands hardcoded
+   their thread-to-LDS-tile `row_local=tid>>2`/`col_group=tid&3`/`col_start=col_group*32`
+   partition -- this is only correct when `gemm_k_per_block==32`; generalized to
+   `num_col_groups = 128/gemm_k_per_block`, `row_local=tid>>log2(num_col_groups)`,
+   `col_start=col_group*gemm_k_per_block` (a clean identity: the per-thread global-load is
+   always a fixed 64 bytes, and `gemm_k_per_block*data_byte==64` always, so the column-chunk
+   width in *elements* always equals `gemm_k_per_block`, for every precision).
+2. **Transpose-read packing width**: the shared LDS-transpose-read pack logic
+   (`shared_load_b_functor` in bwd, `shared_load_a_functor`/`shared_load_b_functor` in wrw) was
+   hardcoded to 2-way 16-bit packing (`ds_read_u16` x2 + one `<<16` OR). Generalized to
+   `elem_per_dword = 4/data_byte` (2 for fp16/bf16, 4 for int8), `ds_read_u16`-or-`ds_read_u8`,
+   and a chained `v_lshl_or_b32` pack with `shift = s*8*data_byte`. Naively batching all 8
+   vgpr-indices' reads before packing (the original fp16-only structure) would need 32 scratch
+   VGPRs for int8's 4-way packing -- exceeded the wave's VGPR budget (confirmed by `llvm-mc`
+   "register index out of range" on the first build attempt) -- restructured to process one
+   vgpr-index at a time (read `elem_per_dword` sub-elements, wait, pack, move on), trading some
+   latency-hiding for staying within the existing 16-register scratch budget.
+3. **A real, previously-latent signedness bug in the int8 WMMA instruction itself**: the base
+   `v_wmma_i32_16x16x64_iu8` encoding (no modifier) defaults to **unsigned** interpretation of
+   both A and B (confirmed via `llvm-mc`), but conv's int8 tensors are `int8_t` (signed)
+   throughout the driver. fwd's original int8 validation only ever used constant value `1` for
+   every element (`igemm_rand_int`'s weak-data branch) -- positive, so signed vs unsigned never
+   differed, and the bug was invisible. bwd's driver harness uses genuinely random `-5..5` data,
+   which immediately exposed it (`valid:n` with wildly wrong values). Fixed by adding the
+   `neg_lo:[1,1,0]` modifier (confirmed via `llvm-mc` to assemble and, empirically, to produce
+   correct signed results against the driver's own reference) to the instruction table entry in
+   `wmma.py` -- this is a **retroactive fix to already-shipped fwd int8 support**, not just a
+   bwd/wrw addition; re-verified fwd's existing tests still pass with the modifier applied.
+
+Also found and fixed a **real driver gap** (not a kernel bug): `conv_driver.cpp`'s wrw
+data-generation block only had `tensor_copy<T,float>` branches for `driverHalf`/`driverBFloat16`
+-- there was no `driverInt8` branch at all, so `host_input_dtype`/`host_output_dtype` were never
+populated for int8, and the kernel computed on stale/uninitialized device memory. This produced
+a `valid:n` that looked exactly like a kernel bug and cost significant debugging time before the
+missing branch was spotted; the kernel-side fixes above were all independently correct and
+already passing once real data was actually being fed to them. Also added the matching
+`is_wmma`+`int8_t` branch to `wrw_post`'s output comparison (mirroring fwd/bwd's, which already
+had it) -- previously wrw's output comparison unconditionally read the int32 D-operand as
+`float`, producing `-nan`.
+
+**Validated on real gfx1250 hardware** through `conv_driver.exe`, both bf16 and int8, for both
+bwd and wrw, against `naive_conv_{bwd,wrw}_nhwc`: 1x1 regression, combined stride+multi-tap
+(3x3, stride=2, pad=1), and multi-block/multi-K-block cases -- all exact matches. A full
+9-way (3 directions x 3 precisions) regression sweep at the simplest 1x1 configuration also
+passes.
+
+Remaining gaps: `group > 1` (all directions, all precisions) -- not attempted, a materially
+larger undertaking (new grid dimension or folded-grid decode, plus per-group channel-slice
+addressing across every operand in every direction). fp8/fp32 WMMA instruction layouts remain
+unverified (would need their own hardware round-trip probes before use, per the same discipline
+that caught the int8 signedness bug above -- do not assume any new instruction/precision is
+correct without independently re-verifying against real random (not just small positive)
+test data).
