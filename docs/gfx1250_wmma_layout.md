@@ -297,3 +297,69 @@ regression plus stride (1/2/3) × padding (0/1/2), multi-block, asymmetric strid
 and multi-K-block configs — all passed on the first hardware run (no bugs found this time,
 unlike wrw's `side='m'` bug in Phase 4) — against the driver's own `naive_conv_bwd_nhwc`
 reference.
+
+## Phase 5c: general stride/padding for wrw (still 1x1 filter, dilation=1, group=1)
+
+wrw's GEMM_K is `N·Ho·Wo` — batch×output-spatial, not a channel count — so unlike fwd/bwd
+(where the gather-vs-bounds decision is made once per thread in the prologue and never
+revisited), wrw's two operands sit on *opposite sides* of the K-loop and need opposite
+treatment:
+
+- **A (grad_output)** needs **no change at all**. GEMM_K is *defined* as grad_output's own
+  pixel space (`n*ho*wo`), so every K-index the main loop walks through is, by construction, a
+  real grad_output pixel — there is no padding/stride gather to do on this operand, in any
+  direction.
+- **B (input)** needs fwd's simpler multiply-based gather (`hi_idx = ho_idx*stride_h - pad_h`,
+  2 bounds conditions, not bwd's 4-condition division-based one — the K-index here indexes
+  *output* pixels, same role fwd's GEMM_M played), but it must be **recomputed every main-loop
+  iteration**, not once in the prologue: each iteration consumes a different 32-row slice of
+  K-space (`k_block_off = s_knum - s_kitr`, evaluated right after `wmma_main_loop.py`'s
+  per-iteration `s_kitr -= unroll_k`, giving the K already consumed = the offset of the block
+  about to be loaded), so the `(n_idx, ho_idx, wo_idx)` decomposition and resulting
+  gather/flag are entirely different values each time.
+
+Implementation consequences of the per-iteration gather:
+- `global_load_b_functor` now **re-zeroes all 16 `v_gld_b` registers on every call**, not just
+  once — a lane that was valid (in-bounds) on a previous iteration but is invalid on this one
+  must not silently keep stale non-zero data from the earlier load; zero-then-maybe-load is the
+  only way to guarantee that.
+- The row/column split that used to be computed once (`row_local = tid>>2`, `col_group =
+  tid&3`) is now split: `v_row_local` and `v_b_col_off` (the fixed byte offset from
+  `block_n_off + col_start`) are still computed once (they don't depend on which K-block is
+  loaded), but the row's *absolute* K-position (`k_abs = k_block_off + row_local`) and
+  everything downstream of it (division, gather, flag, final address) live in a new shared
+  method, `_emit_b_gather(s_k_block_off)`, called once from the prologue (`k_block_off=None`,
+  i.e. 0) and once per iteration from `move_slice_window_b_functor`.
+- `s_b_k_stride` (Phase 4's constant per-iteration address bump for B) is gone — B's address is
+  fully recomputed from scratch each iteration instead of incrementally bumped, since the
+  gather makes a constant stride meaningless.
+
+Kernarg grew from 36 to 68 bytes (`ho_wo, wo, stride_h, stride_w, pad_h, pad_w, hi, wi`) — same
+field *values* as fwd's Phase 5a (wrw's B/input gather is structurally fwd's A/input gather,
+just driven by a runtime-varying K-offset instead of a compile-time-fixed M-offset).
+
+**Real bug found (driver-side, not kernel-side)**: `driver/igemm_wrw_gtc_driver.h`'s
+`tunable_is_valid()` has a long-standing generic guard, `fil_h_ext = y*dilation_h+1-y` (which
+is exactly `1` for any 1x1 filter) combined with `if (pad_w >= fil_w_ext || pad_h >=
+fil_h_ext) return false;` — this unconditionally rejected *every* padded 1x1-filter config,
+WMMA or not, since `pad_h >= 1` always trips `1 >= 1`. The WMMA-specific validity branch was
+being evaluated *after* this check, so it never got a chance to run for any padded case. Fixed
+by relocating the WMMA branch to run immediately after the `need_wrw` check, before the
+`fil_*_ext` guard — using `tunable->gemm_m_per_block` etc. directly (the function's local
+aliases for those fields aren't declared yet at that point).
+
+**Validated on real gfx1250 hardware** through `conv_driver.exe`: fp16 wrw, stride-1/pad-0
+regression, stride=2/pad=1 (a 4-K-block case, `n=1,ho=16,wo=8 → gemm_k=128`, already exercising
+the per-iteration gather across multiple main-loop iterations on the very first stride/pad
+test), stride=3/pad=2, asymmetric stride_h≠stride_w, multi-block M/N, and a larger multi-K-block
+case (`n=4` batch) — all passed, all against the driver's own `naive_conv_wrw_nhwc` reference.
+No numerical bugs found in the per-iteration re-gather/re-zero mechanism itself; the only issue
+was the pre-existing driver-side validity guard above.
+
+With Phase 5c complete, all three directions (fwd/bwd/wrw) now support arbitrary stride and
+padding for 1x1 filters, `group=1`, `dilation=1`, on fp16 (bf16/int8 stride/pad extension is
+straightforward parametrization of the same mechanism, not attempted yet — see Phase 5d below).
+
+**Not yet done**: multi-tap filters (`y,x > 1`), dilation, `group > 1`, and replicating
+stride/pad support to bf16/int8 for bwd/wrw (only fwd has all three precisions with general
+stride/pad so far).
