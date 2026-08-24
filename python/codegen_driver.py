@@ -49,7 +49,9 @@ class codegen_driver_t(mc_base_t):
             for tdd in tunable_dicts:
                 assert tdd['direction'] == 'fwd'
             # gtc fwd
-            if 'tensor_layout' in tunable_dicts[0] and tunable_dicts[0]['tensor_layout'] == 'nhwc':
+            if 'wmma_tile_m' in tunable_dicts[0]:
+                kernel_list.extend([igemm_fwd_gtc_wmma_nhwc_t(mc_asm_printer_t(mc.emitter, mc.arch_config), igemm_gtc_tunable_parameter_t(td)) for td in tunable_dicts])
+            elif 'tensor_layout' in tunable_dicts[0] and tunable_dicts[0]['tensor_layout'] == 'nhwc':
                 kernel_list.extend([igemm_fwd_gtc_nhwc_t(mc_asm_printer_t(mc.emitter, mc.arch_config), igemm_gtc_tunable_parameter_t(td)) for td in tunable_dicts])
             elif 'tensor_layout' in tunable_dicts[0] and tunable_dicts[0]['tensor_layout'][0:5] == 'nchwc':
                 kernel_list.extend([igemm_fwd_gtc_nchwc_t(mc_asm_printer_t(mc.emitter, mc.arch_config), igemm_gtc_tunable_parameter_t(td)) for td in tunable_dicts])
@@ -149,6 +151,8 @@ class codegen_driver_t(mc_base_t):
             #    self._emit_dotx_vop2_macro()
             #else:
             #    self._emit_dotx_vop3p_macro()
+        elif self.mc.arch_config.arch == AMDGPU_ARCH_GFX1250:
+            pass    # WMMA kernel emits everything inline, no global macro needed
         else:
             self._emit_fma_macro()
         if hasattr(self.kernel_list[0], 'use_bf16_1k_in_fp16'):
@@ -189,6 +193,8 @@ class codegen_driver_t(mc_base_t):
                 self._emit_dotx_vop2_macro()
             else:
                 self._emit_dotx_vop3p_macro()
+        elif self.mc.arch_config.arch == AMDGPU_ARCH_GFX1250:
+            pass    # WMMA kernel emits everything inline, no global macro needed
         else:
             self._emit_fma_macro()
 

@@ -52,6 +52,7 @@ using float16 = int16_t;
 #define IGEMM_GTC_TUNABLE_FMA_TYPE_MAC              "mac"
 #define IGEMM_GTC_TUNABLE_FMA_TYPE_DLOPS            "dlops"
 #define IGEMM_GTC_TUNABLE_FMA_TYPE_XDLOPS           "xdlops"
+#define IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA              "wmma"
 #define IGEMM_GTC_TUNABLE_FMA_TYPE_NA               "fma_na"
 #define AMDGPU_WAVE_SIZE        64
 
@@ -117,6 +118,9 @@ typedef struct {
             int dummy;
         };
         struct{
+            // also reused for WMMA (fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA): wave_tile_m/n
+            // hold wmma_tile_m/n, wave_repeat_m/n hold wmma_repeat_m/n; wave_step_m/n and
+            // wave_tile_k are unused/left zero for WMMA (no step/k-tile concept there).
             int wave_tile_m;
             int wave_step_m;
             int wave_repeat_m;
@@ -158,6 +162,9 @@ static inline std::string get_igemm_gtc_fma_type(std::string arch_string, const 
     }else if(sec.count("wave_tile_m") > 0 && sec.count("wave_tile_n") > 0){
         assert(arch_string == "gfx908" || arch_string == "gfx90a" || arch_string == "gfx940" || arch_string == "gfx942" || arch_string == "gfx950");
         return IGEMM_GTC_TUNABLE_FMA_TYPE_XDLOPS;
+    }else if(sec.count("wmma_tile_m") > 0 && sec.count("wmma_tile_n") > 0){
+        assert(arch_string == "gfx1250");
+        return IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA;
     }
     return IGEMM_GTC_TUNABLE_FMA_TYPE_NA;
 }
@@ -193,6 +200,15 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.lanegroup_tile_n        = sec.at("lanegroup_tile_n").get_int();
                 tunable.lanegroup_wave_n    = sec.at("lanegroup_wave_n").get_int();
                 tunable.lanegroup_repeat_n    = sec.at("lanegroup_repeat_n").get_int();
+            }
+            else if(tunable.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA){
+                tunable.wave_tile_m              = sec.at("wmma_tile_m").get_int();
+                tunable.wave_step_m              = 0;
+                tunable.wave_repeat_m            = sec.at("wmma_repeat_m").get_int();
+                tunable.wave_tile_n              = sec.at("wmma_tile_n").get_int();
+                tunable.wave_step_n              = 0;
+                tunable.wave_repeat_n            = sec.at("wmma_repeat_n").get_int();
+                tunable.wave_tile_k              = 0;
             }
             else{
                 tunable.wave_tile_m              = sec.at("wave_tile_m").get_int();
@@ -250,6 +266,9 @@ static inline int get_gcn_arch(char* archname)
     }
     else if (!strncmp("gfx950", archname, 6)){
         gcn_arch = 950;
+    }
+    else if (!strncmp("gfx1250", archname, 7)){
+        gcn_arch = 1250;
     }
     return gcn_arch;
 }
@@ -313,6 +332,10 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
         else if(gcn_arch == 950)
             kernel_name += "gtcx35_";
     }
+    else if (tunable->fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA){
+        if(gcn_arch == 1250)
+            kernel_name += "gtcw_";
+    }
     std::string vector_c_str = "";
     if(tunable->vector_c > 1)
         vector_c_str += std::string("x") + std::to_string(tunable->vector_c);
@@ -361,8 +384,12 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
                          "lw" + std::to_string(tunable->lanegroup_wave_m) + "x" + std::to_string(tunable->lanegroup_wave_n) + "_" +
                          "lr" + std::to_string(tunable->lanegroup_repeat_m) + "x" + std::to_string(tunable->lanegroup_repeat_n) + "_";
     }else if (tunable->fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_XDLOPS){
-        kernel_name +=   std::string("wt") + std::to_string(tunable->wave_tile_m) + "x" + std::to_string(tunable->wave_tile_n) + "x" + std::to_string(tunable->wave_tile_k) + "_" + 
+        kernel_name +=   std::string("wt") + std::to_string(tunable->wave_tile_m) + "x" + std::to_string(tunable->wave_tile_n) + "x" + std::to_string(tunable->wave_tile_k) + "_" +
                          "ws" + std::to_string(tunable->wave_step_m) + "x" + std::to_string(tunable->wave_step_n) + "_" +
+                         "wr" + std::to_string(tunable->wave_repeat_m) + "x" + std::to_string(tunable->wave_repeat_n) + "_";
+    }else if (tunable->fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA){
+        // wave_tile_m/n and wave_repeat_m/n hold wmma_tile_m/n and wmma_repeat_m/n (see union comment above)
+        kernel_name +=   std::string("wt") + std::to_string(tunable->wave_tile_m) + "x" + std::to_string(tunable->wave_tile_n) + "_" +
                          "wr" + std::to_string(tunable->wave_repeat_m) + "x" + std::to_string(tunable->wave_repeat_n) + "_";
     }
 

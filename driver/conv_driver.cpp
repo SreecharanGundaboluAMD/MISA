@@ -186,9 +186,11 @@ static inline double get_theoritical_gpu_gflops(int sclk_mhz, driverDataType_t d
             fp_factor = 8;  // xdlops
         else if(gcn_arch == 908 || gcn_arch == 910)
             fp_factor = 4;  // xdlops
+        else if(gcn_arch == 1250)
+            fp_factor = 8;  // wmma, v_wmma_f32_16x16x32_f16
         else
             fp_factor = 2;  // dlops
-        if(gcn_arch >= 1000)
+        if(gcn_arch >= 1000 && gcn_arch != 1250)
             fp_factor = 2;
     }
     if(data_type == driverInt8){
@@ -196,6 +198,8 @@ static inline double get_theoritical_gpu_gflops(int sclk_mhz, driverDataType_t d
             fp_factor = 8;  // xdlops
         else if(gcn_arch == 908 || gcn_arch == 910)
             fp_factor = 4;  // xdlops
+        else if(gcn_arch == 1250)
+            fp_factor = 16; // wmma, v_wmma_i32_16x16x64_iu8
         else
             fp_factor = 4;  // dlops
     }

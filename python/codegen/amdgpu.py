@@ -49,6 +49,7 @@ AMDGPU_ARCH_GFX940      = 940
 AMDGPU_ARCH_GFX942      = 942
 AMDGPU_ARCH_GFX950      = 950
 AMDGPU_ARCH_GFX1030     = 1030
+AMDGPU_ARCH_GFX1250     = 1250
 
 AMDGPU_WAVE_SIZE        = 64
 AMDGPU_XDLOPS_LANEGROUP_GRANULARITY_M = 4
@@ -81,6 +82,8 @@ def amdgpu_string_to_arch(amdgpu_arch_string):
         return AMDGPU_ARCH_GFX950
     if amdgpu_arch_string == 'gfx1030':
         return AMDGPU_ARCH_GFX1030
+    if amdgpu_arch_string == 'gfx1250':
+        return AMDGPU_ARCH_GFX1250
     assert False
 
 def amdgpu_arch_to_string(amdgpu_arch_gfxxxx):
@@ -100,6 +103,8 @@ def amdgpu_arch_to_string(amdgpu_arch_gfxxxx):
         return 'gfx950'
     if amdgpu_arch_gfxxxx == AMDGPU_ARCH_GFX1030:
         return 'gfx1030'
+    if amdgpu_arch_gfxxxx == AMDGPU_ARCH_GFX1250:
+        return 'gfx1250'
     assert False
 
 def amdgpu_string_to_codeobj(amdgpu_codeobj_string):
@@ -289,15 +294,23 @@ class amdgpu_arch_config_t(object):
         if self.arch == AMDGPU_ARCH_GFX900:
             self.use_dlops  = ad('use_dlops', False)
             self.use_xdlops = ad('use_xdlops', False)
+            self.use_wmma   = ad('use_wmma', False)
         if self.arch == AMDGPU_ARCH_GFX906:
             self.use_dlops  = ad('use_dlops', True)
             self.use_xdlops = ad('use_xdlops', False)
+            self.use_wmma   = ad('use_wmma', False)
         elif self.arch in (AMDGPU_ARCH_GFX908, AMDGPU_ARCH_GFX90A, AMDGPU_ARCH_GFX940, AMDGPU_ARCH_GFX942, AMDGPU_ARCH_GFX950):
             self.use_dlops  = ad('use_dlops', False)
             self.use_xdlops = ad('use_xdlops', True)
+            self.use_wmma   = ad('use_wmma', False)
         elif self.arch == AMDGPU_ARCH_GFX1030:
             self.use_dlops  = ad('use_dlops', True)
             self.use_xdlops = ad('use_xdlops', False)
+            self.use_wmma   = ad('use_wmma', False)
+        elif self.arch == AMDGPU_ARCH_GFX1250:
+            self.use_dlops  = ad('use_dlops', False)
+            self.use_xdlops = ad('use_xdlops', False)
+            self.use_wmma   = ad('use_wmma', True)
 
         self.data_type      = ad('data_type', AMDGPU_PRECISION_FP32)
         self.code_object    = ad('code_object', AMDGPU_CODEOBJECT_V3)
@@ -535,8 +548,11 @@ class amd_kernel_code_t(mc_base_t):
                 self._emit('.amdhsa_next_free_vgpr {}'.format(                      self.ki.kernel_code.workitem_vgpr_count))
                 self._emit('.amdhsa_next_free_sgpr {}'.format(                      self.ki.kernel_code.wavefront_sgpr_count - 2*3))
 
-                self._emit('.amdhsa_ieee_mode {}'.format(                           self.ki.kernel_code.amdhsa_ieee_mode))
-                self._emit('.amdhsa_dx10_clamp {}'.format(                          self.ki.kernel_code.amdhsa_dx10_clamp))
+                # .amdhsa_ieee_mode / .amdhsa_dx10_clamp are rejected outright by the assembler
+                # on gfx1170+ (verified with llvm-mc), gfx1250 included.
+                if self.mc.arch_config.arch != AMDGPU_ARCH_GFX1250:
+                    self._emit('.amdhsa_ieee_mode {}'.format(                       self.ki.kernel_code.amdhsa_ieee_mode))
+                    self._emit('.amdhsa_dx10_clamp {}'.format(                      self.ki.kernel_code.amdhsa_dx10_clamp))
                 if self.ki.kernel_code.amdhsa_float_round_mode_32:
                     self._emit('.amdhsa_float_round_mode_32 {}'.format(             self.ki.kernel_code.amdhsa_float_round_mode_32))
                 if self.ki.kernel_code.amdhsa_float_round_mode_16_64:
@@ -552,7 +568,10 @@ class amd_kernel_code_t(mc_base_t):
                     self._emit('.amdhsa_accum_offset {}'.format(                    self.ki.kernel_code.accum_offset))
                 if self.mc.arch_config.arch >= 1000:
                     self._emit('.amdhsa_wavefront_size32 {}'.format(                1 if self.ki.kernel_code.wavefront_size == 32 else 0))
-                    self._emit('.amdhsa_workgroup_processor_mode {}'.format(        1 if not self.ki.kernel_code.cumode else 0))
+                    # gfx1250's assembler rejects this directive outright (verified with llvm-mc);
+                    # it's still accepted on gfx1030/gfx11xx/gfx1200.
+                    if self.mc.arch_config.arch != AMDGPU_ARCH_GFX1250:
+                        self._emit('.amdhsa_workgroup_processor_mode {}'.format(    1 if not self.ki.kernel_code.cumode else 0))
             self._emit('.end_amdhsa_kernel')
         else:
             assert False

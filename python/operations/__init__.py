@@ -35,6 +35,10 @@ from .coalescing_store_dotx import *
 from .mfma import *
 from .xdlops_mapping import *
 from .mfma_main_loop import *
+from .wmma import *
+from .wmma_mapping import *
+from .wmma_main_loop import *
+from .coalescing_store_wmma import *
 from .nop import *
 from .dotx import *
 from .dotx_mapping import *

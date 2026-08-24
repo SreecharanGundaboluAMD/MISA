@@ -71,7 +71,19 @@ class igemm_fwd_gtc_nhwc_t(mc_base_t):
             assert not tunable.tensor_a_pass_through, "currently not support pass through a while do merge e"
 
         self.coalescing_store_groups = igemm_next_pow2(self.tunable.coalescing_store_groups)
-        if self.tunable.fma_type != IGEMM_GTC_TUNABLE_FMA_TYPE_XDLOPS and not igemm_use_lanegroup_thread_mapping(self.tunable):
+        if self.tunable.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA:
+            ctrl_wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(self.tunable.gemm_m_per_block, self.tunable.gemm_n_per_block,
+                    self.tunable.wmma_tile_m, self.tunable.wmma_tile_n, self.tunable.wmma_repeat_m, self.tunable.wmma_repeat_n,
+                    self.tunable.block_size // self.tunable.wave_size, self.tunable.precision)
+            self.wmma_mapping = igemm_wmma_mapping_t(self.mc, ctrl_wmma_mapping)
+
+            ctrl_coalescing_store_wmma = ctrl_coalescing_store_wmma_t()
+            ctrl_coalescing_store_wmma.cxm = ctrl_wmma_mapping
+            ctrl_coalescing_store_wmma.block_size = self.tunable.block_size
+            ctrl_coalescing_store_wmma.precision = self.tunable.precision
+            self.coalescing_store = igemm_coalescing_store_wmma_t(mc, ctrl_coalescing_store_wmma)
+
+        elif self.tunable.fma_type != IGEMM_GTC_TUNABLE_FMA_TYPE_XDLOPS and not igemm_use_lanegroup_thread_mapping(self.tunable):
             assert (self.tunable.gemm_m_per_thread * self.tunable.gemm_m_repeat) % self.coalescing_store_groups == 0, \
                 f"coalescing store groups should be divided by thread m {self.tunable.gemm_m_per_thread}x{self.tunable.gemm_m_repeat}"
 
