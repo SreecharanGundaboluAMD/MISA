@@ -445,10 +445,8 @@ independent per-axis stride/pad/dilation, 7x7, multi-block M/N grids, and multi-
 (large `C_in`) — all exact matches, largest case: n=2, C=256 (multiple K-blocks per tap), 5x5
 filter, stride=2, pad=2, multi-block grid.
 
-**Still not done**: `group > 1`, and replicating multi-tap/dilation to wrw (bwd got this in
-Phase 5e below) — the same runtime-tap-loop pattern should transfer directly to wrw too, since
-it only touches the K-loop wrapper and per-tap gather, not the transpose/LDS mechanism wrw
-already has working.
+**Still not done**: `group > 1` (all directions) — see Phase 5f below for wrw's multi-tap/
+dilation extension, which completes multi-tap+dilation support across all three directions.
 
 ## Phase 5e: multi-tap filters (y,x >= 1) and dilation for bwd
 
@@ -496,3 +494,68 @@ fwd's Phase 5d). Driver's `tunable_is_valid()` dropped its `unit_conv_1x1` requi
 dilation subtraction for the first time), non-square 3x5 with independent per-axis
 stride/pad, and a multi-block/multi-K-block 5x5 stride=2 case (C=256, spanning multiple
 K-blocks per tap) — all exact matches, all passing on the first hardware run.
+
+## Phase 5f: multi-tap filters (y,x >= 1) and dilation for wrw
+
+**wrw's tap loop is structurally different from fwd/bwd's**, and this is the key thing to
+remember before touching this code again: in fwd/bwd, every tap contributes to the SAME output
+pixel (all y*x taps are summed into one accumulator, stored once at the very end). In wrw,
+each tap produces a DIFFERENT, INDEPENDENT slice of the output tensor — confirmed against
+`driver/naive_conv.h`'s `naive_conv_wrw_nhwc`: `filter_grad[...,ir,is,...] = value` is computed
+FRESH per `(ir,is)` tap, summed only over the `(n,ho,wo)` reduction dimension (GEMM_K), never
+accumulated across taps. So here, `v_c` is zeroed and the epilogue (`coalescing_store`) fires
+**once per tap**, not once at kernel end:
+
+```
+s_iy = 0
+L_tap_y: s_ix = 0
+  L_tap_x: zero v_c
+           reset A's address to its tap-independent base (v_addr_a_base)
+           <B's initial per-tap gather + issue first A/B loads>
+           <run the WMMA K-main-loop over N*Ho*Wo -- emitted EXACTLY ONCE>
+           <store v_c to THIS TAP's own [iy,ix] output slice, s_wait_storecnt>
+           s_ix++; branch to L_tap_x if s_ix < s_x
+  s_iy++; branch to L_tap_y if s_iy < s_y
+```
+
+**Tensor A (grad_output)** needs no tap-dependence at all (same as Phase 5c): grad_output has
+no Y,X extent in its own storage. Only its *address* needs resetting to a persistent
+`v_addr_a_base` at the start of every tap, since `move_slice_window_a` incrementally bumps
+`v_addr_a` across a tap's own K-loop and it would otherwise carry over into the next tap.
+
+**Tensor B (input)** extends its existing per-iteration gather (`_emit_b_gather`, structurally
+unchanged from Phase 5c) with a per-tap bias: `hi_idx = ho_idx*stride_h - pad_h +
+iy*dilation_h` (same ADD sign as fwd's Phase 5d, since this is an output-index->input-index
+gather via multiplication, not bwd's harder divide-based one). Since `_emit_b_gather` reads the
+CURRENT `s_iy`/`s_ix` live every time it's invoked — once per tap from the new
+`emit_kernel_tap_loop`, and once per K-iteration from `move_slice_window_b` — no special-casing
+was needed beyond adding the bias terms; both existing call sites automatically pick up
+whichever tap is active.
+
+**Output (grad_weight)** is `[K_out][Y][X][C_in]` for a multi-tap filter (was plain
+`[K_out][C_in]`), so its row stride becomes `y*x*c` (`s_wei_row_c = gemm_n*x*y`, the same
+scalar fwd's Phase 5d / bwd's Phase 5e introduce for the *weight* tensor, reused here for
+grad_weight since they share the on-disk layout convention). Each tap's C_in-column-block
+starts `(iy*x+ix)*c` elements into that row — expressed as a byte offset added to a **fresh
+per-tap base pointer** `s_p_out_tap` (not a per-thread VGPR offset), since
+`coalescing_store_wmma.py`'s `s_p_out` argument is the literal store base address shared by
+every thread in the block; adding the tap's constant offset to the base pointer once per tap
+needed zero changes to that shared, direction-agnostic epilogue helper. `s_p_out_tap` needed
+explicit 2-alignment (`sseq(2, 2)`) since it's used as a VADDR base by `global_store_dword` —
+caught immediately by `llvm-mc`'s "invalid register alignment" on the first build attempt.
+
+Kernarg grew from 68 to 84 bytes (`y, x, dilation_h, dilation_w`, identical field additions to
+fwd/bwd). Driver's `tunable_is_valid()` dropped its `unit_conv_1x1` requirement (still checked
+*before* the pre-existing `fil_h_ext`/pad guard, per Phase 5c's fix).
+
+**Validated on real gfx1250 hardware** through `conv_driver.exe` (fp16) against
+`naive_conv_wrw_nhwc`: 1x1 stride-1/pad-0 regression, 3x3 with padding, 3x3 with dilation=2,
+3x3 combined with stride=2, non-square 3x5 with independent per-axis stride/pad, and a
+multi-block/multi-K-block 5x5 stride=2 case (`n=4,c=256`, 25 taps each running their own
+K-loop reduction and independent output store) — all exact matches, all passing on the first
+hardware run.
+
+With Phase 5f complete, all three directions (fwd/bwd/wrw) now support arbitrary multi-tap
+filters, dilation, and stride/padding for fp16, `group=1`. Remaining gaps: `group > 1` (all
+directions), and bf16/int8 support for the general (non-degenerate) addressing in bwd/wrw
+(only fwd has bf16/int8 wired through the general-addressing driver path so far).

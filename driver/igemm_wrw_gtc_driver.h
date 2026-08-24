@@ -65,11 +65,11 @@ typedef struct {
     int gemm_k_per_wg;
 } __attribute__((packed)) igemm_wrw_gtc_karg_t;
 
-// Karg for the gfx1250 WMMA wrw kernel (igemm_wrw_gtc_wmma_nhwc_t): 1x1 filter only, but
-// Phase 5c added arbitrary stride/pad support (for the B/input operand's gather -- A/
-// grad_output needs no stride/pad awareness, see that class's docstring). Layout must match
-// get_kernel_args() in python/igemm/igemm_wrw_gtc_wmma_nhwc.py exactly (3 pointers + 11 ints,
-// 68 bytes). NOTE the kernel's own field semantics: p_in=grad_output (READ), p_wei=input
+// Karg for the gfx1250 WMMA wrw kernel (igemm_wrw_gtc_wmma_nhwc_t). Phase 5c added arbitrary
+// stride/pad (for the B/input operand's gather -- A/grad_output needs no stride/pad
+// awareness), Phase 5f added multi-tap filters (y,x>=1) + dilation. Layout must match
+// get_kernel_args() in python/igemm/igemm_wrw_gtc_wmma_nhwc.py exactly (3 pointers + 15 ints,
+// 84 bytes). NOTE the kernel's own field semantics: p_in=grad_output (READ), p_wei=input
 // (READ), p_out=grad_weight (WRITE) -- run()'s conventional p_in/p_wei/p_out for wrw are
 // p_in=input(READ), p_wei=grad_weight(WRITE), p_out=grad_output(READ), so the mapping is a
 // 3-way ROTATION, not a simple swap -- see the WMMA branch in run().
@@ -88,6 +88,10 @@ typedef struct {
     int   pad_w;
     int   hi;
     int   wi;
+    int   y;
+    int   x;
+    int   dilation_h;
+    int   dilation_w;
 } __attribute__((packed)) igemm_wrw_gtc_wmma_nhwc_karg_t;
 
 static void dump_wrw_karg(igemm_wrw_gtc_karg_t * karg){
@@ -239,16 +243,15 @@ public:
             return false;
 
         if(tunable->fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA){
-            // igemm_wrw_gtc_wmma_nhwc_t requires a 1x1 filter, no dilation, group==1, and a
-            // single fixed 128x128 macro-tile shape -- see igemm_fwd_gtc_driver.h's identical
-            // WMMA branch for the rationale. Phase 5c added arbitrary stride/pad support, so
-            // (unlike unit_conv) stride_h/w and pad_h/w are NOT required to be 1/0 here.
-            // Checked here, BEFORE the fil_h_ext/pad sanity check below: that check assumes
-            // the general kernel's addressing (padding >= a 1x1 filter's extent-of-1 is
-            // nonsensical for it) and would incorrectly reject every padded WMMA config, which
-            // this kernel's gather+mask mechanism handles correctly.
-            bool unit_conv_1x1 = (x==1) && (y==1) && (dilation_h==1) && (dilation_w==1);
-            if(tunable->tensor_layout != "nhwc" || !unit_conv_1x1 || group != 1)
+            // igemm_wrw_gtc_wmma_nhwc_t requires group==1 and a single fixed 128x128 macro-
+            // tile shape -- see igemm_fwd_gtc_driver.h's identical WMMA branch for the
+            // rationale. Phase 5c added arbitrary stride/pad, Phase 5f added arbitrary y/x
+            // (multi-tap filters) and dilation. Checked here, BEFORE the fil_h_ext/pad sanity
+            // check below: that check assumes the general kernel's addressing (padding >= a
+            // 1x1 filter's extent-of-1 is nonsensical for it) and would incorrectly reject
+            // every padded WMMA config, which this kernel's gather+mask mechanism handles
+            // correctly regardless of filter size.
+            if(tunable->tensor_layout != "nhwc" || group != 1)
                 return false;
             int wmma_gemm_m = k / group;
             int wmma_gemm_n = c / group;
@@ -722,6 +725,10 @@ public:
             karg.pad_w    = pad_w;
             karg.hi       = hi;
             karg.wi       = wi;
+            karg.y          = y;
+            karg.x          = x;
+            karg.dilation_h = dilation_h;
+            karg.dilation_w = dilation_w;
             size_t karg_size = sizeof(karg);
 
             hipFunction_t kernel_func;

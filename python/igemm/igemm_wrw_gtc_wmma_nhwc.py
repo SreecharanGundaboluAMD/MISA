@@ -30,10 +30,48 @@ from .igemm_base import *
 
 class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
     '''
-    gfx1250 WMMA kernel for backward-weight (grad-weight) convolution. Phase 5c extends this
-    beyond the original degenerate 1x1/stride1/no-pad GEMM to support arbitrary stride and
-    padding (still 1x1 filter, dilation=1, group=1) -- see igemm_fwd_gtc_wmma_nhwc_t's Phase
-    5a and igemm_bwd_gtc_wmma_nhwc_t's Phase 5b docstrings for the sibling extensions.
+    gfx1250 WMMA kernel for backward-weight (grad-weight) convolution. Phase 5c added arbitrary
+    stride and padding (1x1 filter only). Phase 5f now adds multi-tap filters (y,x >= 1) and
+    dilation -- see igemm_fwd_gtc_wmma_nhwc_t's Phase 5d and igemm_bwd_gtc_wmma_nhwc_t's Phase
+    5e docstrings for the sibling extensions this partially mirrors, and read on for why wrw's
+    version is structurally different from both.
+
+    **Critical difference from fwd/bwd's tap loop**: in fwd/bwd, every tap contributes to the
+    SAME output pixel (all y*x taps are summed into one accumulator, stored once at the very
+    end). In wrw, each tap produces a DIFFERENT, INDEPENDENT slice of the output tensor --
+    confirmed against driver/naive_conv.h's naive_conv_wrw_nhwc: `filter_grad[...,ir,is,...] =
+    value` is a value computed FRESH per (ir,is) tap, summed only over the (n,ho,wo) reduction
+    dimension, NOT accumulated across taps. So here, `v_c` must be zeroed and the epilogue
+    (coalescing_store) must fire ONCE PER TAP, not once at kernel end -- the tap loop's body is
+    "zero accumulator; run one full K-main-loop reduction; store to this tap's own [Y,X] output
+    slice", repeated y*x times via the same runtime (not compile-time-unrolled) branch loop
+    fwd/bwd use to wrap a single static K-main-loop emission.
+
+    Tensor A (grad_output) needs NO tap-dependence at all (same as the non-tap Phase 5c): its
+    addressing is a plain [K_out] row read, and grad_output has no Y,X extent in its own
+    storage. Only its address needs resetting to a persistent `v_addr_a_base` at the start of
+    EVERY tap (move_slice_window_a incrementally bumps `v_addr_a` across a tap's K-loop, so it
+    must be restored before the next tap's K-loop starts fresh).
+
+    Tensor B (input) needs its existing per-iteration gather (`_emit_b_gather`, unchanged in
+    structure from Phase 5c) extended with a per-tap bias: `hi_idx = ho_idx*stride_h - pad_h +
+    iy*dilation_h` (same ADD sign as fwd's Phase 5d, since this is an output-index->input-index
+    gather via multiplication, not bwd's harder divide-based one). Since `_emit_b_gather` reads
+    the CURRENT `s_iy`/`s_ix` live every time it's invoked (from the prologue once per tap, and
+    from `move_slice_window_b` every K-iteration within that tap), no special-casing is needed
+    beyond adding the bias terms -- the existing call sites automatically pick up whichever tap
+    is currently active.
+
+    Output (grad_weight) is `[K_out][Y][X][C_in]` for a multi-tap filter (was plain
+    `[K_out][C_in]` for 1x1) -- so its row stride becomes `y*x*c` (`s_wei_row_c = gemm_n*x*y`,
+    same scalar fwd's Phase 5d/bwd's Phase 5e introduce for the weight tensor, reused here for
+    the OUTPUT tensor since grad_weight and weight share the same on-disk layout convention),
+    and each tap's C_in-column-block starts `(iy*x+ix)*c` elements into that row -- expressed as
+    a byte offset added to a FRESH per-tap base pointer `s_p_out_tap` (not a VGPR offset, since
+    `coalescing_store_wmma.py`'s `s_p_out` argument is the literal store base address for
+    EVERY thread in the block; adding the tap's constant offset to the base pointer once per
+    tap, rather than perturbing per-thread column indices, needed zero changes to that shared,
+    direction-agnostic epilogue helper).
 
     Unlike fwd/bwd, GEMM_K here (N*Ho*Wo) is spatial, not a channel count, so the gather this
     phase adds must be recomputed EVERY main-loop iteration (a fresh (n,ho,wo) triple each
@@ -159,6 +197,16 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self.s_hi          = sym_t('s_hi'          , sseq(1))    # bound for hi_idx
             self.s_wi          = sym_t('s_wi'          , sseq(1))    # bound for wi_idx, and multiplier for hi_idx*wi
             self.s_hi_wi       = sym_t('s_hi_wi'       , sseq(1))    # = s_hi*s_wi, computed on-device once
+            # Phase 5f (multi-tap + dilation) kernarg fields, contiguous, matching
+            # get_kernel_args()'s trailing layout.
+            self.s_y           = sym_t('s_y'           , sseq(1))
+            self.s_x           = sym_t('s_x'           , sseq(1))
+            self.s_dilation_h  = sym_t('s_dilation_h'  , sseq(1))
+            self.s_dilation_w  = sym_t('s_dilation_w'  , sseq(1))
+            self.s_wei_row_c   = sym_t('s_wei_row_c'   , sseq(1))    # = gemm_n*x*y, grad_weight's per-K_out-row element count
+            self.s_iy          = sym_t('s_iy'          , sseq(1))   # runtime tap-loop counters
+            self.s_ix          = sym_t('s_ix'          , sseq(1))
+            self.s_p_out_tap   = sym_t('s_p_out_tap'   , sseq(2, 2))   # p_out + this tap's column byte offset, recomputed every tap; even-aligned like s_p_out (used as a VADDR base)
             self.s_block_m_off = sym_t('s_block_m_off' , sseq(1))
             self.s_block_n_off = sym_t('s_block_n_off' , sseq(1))
             self.s_a_k_stride  = sym_t('s_a_k_stride'  , sseq(1))   # K_out*databyte*gemm_k_per_block: grad_output's per-K-block global stride
@@ -186,6 +234,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             # 64-bit VADDR pairs must be even-aligned on gfx1250 (verified with llvm-mc)
             self.v_addr_a      = sym_t('v_addr_a'      , vseq(2, 2))    # persistent global A address (64-bit)
             self.v_addr_b      = sym_t('v_addr_b'      , vseq(2, 2))
+            # Phase 5f: A's tap-independent base address (row_local/block_m_off/col_start only
+            # -- no Y,X dependence), reset into v_addr_a fresh at the start of every tap since
+            # move_slice_window_a incrementally bumps v_addr_a across a tap's own K-loop.
+            self.v_addr_a_base = sym_t('v_addr_a_base' , vseq(2, 2))
             self.v_addr_out    = sym_t('v_addr_out'    , vseq(2, 2))    # scratch used by coalescing_store_wmma
             self.v_sst_os      = sym_t('v_sst_os'      , vseq(1))    # shared store offset (same for A/B region)
             self.v_sld_a_os    = sym_t('v_sld_a_os'    , vseq(1))    # transposed byte offset (side='m')
@@ -227,6 +279,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         kas.append(amdgpu_kernel_arg_t('pad_w'     , 4, 56, 'by_value', 'i32'))
         kas.append(amdgpu_kernel_arg_t('hi'        , 4, 60, 'by_value', 'i32'))
         kas.append(amdgpu_kernel_arg_t('wi'        , 4, 64, 'by_value', 'i32'))
+        # Phase 5f (multi-tap + dilation)
+        kas.append(amdgpu_kernel_arg_t('y'         , 4, 68, 'by_value', 'i32'))
+        kas.append(amdgpu_kernel_arg_t('x'         , 4, 72, 'by_value', 'i32'))
+        kas.append(amdgpu_kernel_arg_t('dilation_h', 4, 76, 'by_value', 'i32'))
+        kas.append(amdgpu_kernel_arg_t('dilation_w', 4, 80, 'by_value', 'i32'))
         return kas
 
     def get_kernel_code(self):
@@ -236,7 +293,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             'enable_sgpr_workgroup_id_y'       :   1,
             'enable_vgpr_workitem_id'          :   0,
             'workgroup_group_segment_byte_size':   self.lds_a_size + self.lds_b_size,
-            'kernarg_segment_byte_size'         :   68,
+            'kernarg_segment_byte_size'         :   84,
             'wavefront_sgpr_count'              :   self.sgpr.s_end.value + 2 * 3,
             'workitem_vgpr_count'               :   self.vgpr.v_end.value,
             'wavefront_size'                    :   32,
@@ -287,17 +344,15 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_load_dword s[{s.s_pad_w()}], s[{s.s_ka()}:{s.s_ka(1)}], 56")
         self._emit(f"s_load_dword s[{s.s_hi()}], s[{s.s_ka()}:{s.s_ka(1)}], 60")
         self._emit(f"s_load_dword s[{s.s_wi()}], s[{s.s_ka()}:{s.s_ka(1)}], 64")
+        self._emit(f"s_load_dword s[{s.s_y()}], s[{s.s_ka()}:{s.s_ka(1)}], 68")
+        self._emit(f"s_load_dword s[{s.s_x()}], s[{s.s_ka()}:{s.s_ka(1)}], 72")
+        self._emit(f"s_load_dword s[{s.s_dilation_h()}], s[{s.s_ka()}:{s.s_ka(1)}], 76")
+        self._emit(f"s_load_dword s[{s.s_dilation_w()}], s[{s.s_ka()}:{s.s_ka(1)}], 80")
         self._emit(f"v_mov_b32 v[{v.v_tid()}], v0")
         # gfx1250 delivers workgroup id via ttmp9/ttmp7 -- see docs/gfx1250_wmma_layout.md.
         self._emit(f"s_mov_b32 s[{s.s_bx()}], ttmp9")
         self._emit(f"s_mov_b32 s[{s.s_by()}], ttmp7")
         self._emit(f"s_wait_kmcnt 0x0")
-        self._emit_empty_line()
-
-        # zero the accumulator -- v_wmma_* does D = A@B + C, and v_c is used as both C and D.
-        self._emit(f"; clear accumulator")
-        for i in range(self.tunable.num_vgpr_accumulate_c):
-            self._emit(f"v_mov_b32 v[{v.v_c(i)}], 0")
         self._emit_empty_line()
 
         self._emit(f"s_lshl_b32 s[{s.s_block_m_off()}], s[{s.s_bx()}], 7   ; *128")
@@ -309,13 +364,20 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # move_slice_window_b_functor), since the (n,ho,wo)->(hi,wi) gather changes every block.
         self._emit(f"s_lshl_b32 s[{s.s_a_k_stride()}], s[{s.s_gemm_m()}], {utility_log2(self.data_byte) + 5}   ; K_out * databyte * 32")
         self._emit(f"s_mul_i32 s[{s.s_hi_wi()}], s[{s.s_hi()}], s[{s.s_wi()}]")
+        # grad_weight's per-K_out-row element count is y*x*c (not just c as in the 1x1 case) --
+        # reused for the epilogue's row stride (Phase 5f). B (input) itself has no y/x
+        # dependence in its own storage, only in which pixel the per-iteration gather reads.
+        self._emit(f"s_mul_i32 s[{s.s_wei_row_c()}], s[{s.s_x()}], s[{s.s_y()}]")
+        self._emit(f"s_mul_i32 s[{s.s_wei_row_c()}], s[{s.s_wei_row_c()}], s[{s.s_gemm_n()}]")
         self._emit_empty_line()
 
         # ---- global address for this thread's chunk of the A tile (grad_output, natural [GEMM_K][GEMM_M]) ----
         # thread tid owns row_local=tid>>2 (one of 32 rows of this K-block), col_group=tid&3
         # (one of 4 32-wide chunks of the 128-wide K_out tile) -- same scheme bwd's B operand
-        # used, now applied to A since A also needs the transposed treatment here.
-        self._emit(f"; v_addr_a = p_in + (row_local*K_out + block_m_off + col_start) * databyte")
+        # used, now applied to A since A also needs the transposed treatment here. Tap-
+        # independent (grad_output has no Y,X extent), so computed once into the persistent
+        # v_addr_a_base and reset into v_addr_a fresh at the start of every tap (Phase 5f).
+        self._emit(f"; v_addr_a_base = p_in + (row_local*K_out + block_m_off + col_start) * databyte")
         self._emit(f"v_lshrrev_b32 v[{v.v_tmp()}], 2, v[{v.v_tid()}]        ; row_local = tid>>2")
         self._emit(f"v_mul_lo_u32 v[{v.v_tmp()}], s[{s.s_gemm_m()}], v[{v.v_tmp()}]  ; row_local * K_out")
         self._emit(f"v_and_b32 v[{v.v_tmp(1)}], 3, v[{v.v_tid()}]           ; col_group = tid&3")
@@ -323,9 +385,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"v_add_u32 v[{v.v_tmp()}], v[{v.v_tmp(1)}], v[{v.v_tmp()}]")
         self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_block_m_off()}], v[{v.v_tmp()}]")
         self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.data_byte)}, v[{v.v_tmp()}]")
-        self._emit(f"v_mov_b32 v[{v.v_addr_a(1)}], s[{s.s_p_in(1)}]")
-        self._emit(f"v_add_co_u32 v[{v.v_addr_a()}], vcc_lo, s[{s.s_p_in()}], v[{v.v_tmp()}]")
-        self._emit(f"v_add_co_ci_u32 v[{v.v_addr_a(1)}], vcc_lo, 0, v[{v.v_addr_a(1)}], vcc_lo")
+        self._emit(f"v_mov_b32 v[{v.v_addr_a_base(1)}], s[{s.s_p_in(1)}]")
+        self._emit(f"v_add_co_u32 v[{v.v_addr_a_base()}], vcc_lo, s[{s.s_p_in()}], v[{v.v_tmp()}]")
+        self._emit(f"v_add_co_ci_u32 v[{v.v_addr_a_base(1)}], vcc_lo, 0, v[{v.v_addr_a_base(1)}], vcc_lo")
         self._emit_empty_line()
 
         # ---- persistent setup for B's per-iteration gather (input, gathered through
@@ -336,10 +398,6 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], 5, v[{v.v_tmp()}]        ; col_start = col_group*32")
         self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_block_n_off()}], v[{v.v_tmp()}]")
         self._emit(f"v_lshlrev_b32 v[{v.v_b_col_off()}], {utility_log2(self.data_byte)}, v[{v.v_tmp()}]")
-        self._emit_empty_line()
-
-        # ---- initial (k_block_off=0) gather + address + flag for B's first global load ----
-        self._emit_b_gather(None)
         self._emit_empty_line()
 
         # ---- fixed per-thread shared-memory store offset: this thread owns byte-chunk tid*64 ----
@@ -367,9 +425,77 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"v_add_u32 v[{v.v_gemm_in()}], s[{s.s_block_n_off()}], v[{v.v_gemm_in()}]")
         self._emit_empty_line()
 
-        # ---- issue the first global loads (main loop expects this precondition) ----
+        # ---- Phase 5f: runtime tap-loop counter, initialized once before the loop ----
+        self._emit(f"s_mov_b32 s[{s.s_iy()}], 0")
+        self._emit_empty_line()
+
+    def emit_kernel_tap_loop(self):
+        '''
+        Runtime (not compile-time-unrolled) outer loop over the y*x filter taps -- see class
+        docstring for why wrw's version is structurally different from fwd/bwd's: each tap
+        produces a DIFFERENT, INDEPENDENT slice of the output (grad_weight), so v_c must be
+        zeroed and the epilogue must fire ONCE PER TAP, not once at the very end. The WMMA
+        K-main-loop is still emitted EXACTLY ONCE (the runtime branch at the bottom re-enters
+        it for every tap), same mechanism as fwd/bwd.
+        '''
+        s = self.sgpr
+        v = self.vgpr
+        label_tap_y = f"L_{self.name()}_tap_y"
+        label_tap_x = f"L_{self.name()}_tap_x"
+        self._emit_front(f"{label_tap_y}:")
+        self._emit(f"s_mov_b32 s[{s.s_ix()}], 0")
+        self._emit_front(f"{label_tap_x}:")
+
+        # ---- zero the accumulator fresh for this tap (grad_weight's [iy,ix] slice is an
+        # independent reduction, not a running sum across taps) ----
+        self._emit(f"; clear accumulator (fresh per tap, see class docstring)")
+        for i in range(self.tunable.num_vgpr_accumulate_c):
+            self._emit(f"v_mov_b32 v[{v.v_c(i)}], 0")
+        self._emit_empty_line()
+
+        # ---- reset A's address to its tap-independent base (move_slice_window_a bumped it
+        # across the PREVIOUS tap's K-loop) ----
+        self._emit(f"v_mov_b32 v[{v.v_addr_a()}], v[{v.v_addr_a_base()}]")
+        self._emit(f"v_mov_b32 v[{v.v_addr_a(1)}], v[{v.v_addr_a_base(1)}]")
+        self._emit_empty_line()
+
+        # ---- B's initial (k_block_off=0) gather for this tap's first global load -- reads
+        # the CURRENT s_iy/s_ix live, so no special-casing needed here ----
+        self._emit_b_gather(None)
+        self._emit_empty_line()
+
+        # ---- issue the first global loads for this tap (main loop expects this precondition) ----
         self._emit(self.global_load_a_functor()())
         self._emit(self.global_load_b_functor()())
+        self._emit_empty_line()
+
+        # ---- the WMMA K-main-loop over N*Ho*Wo, emitted EXACTLY ONCE here; the runtime
+        # branches below re-enter this same code for every tap ----
+        self.emit_kernel_fma_main_loop()
+        self._emit_empty_line()
+
+        # ---- store this tap's v_c to grad_weight's own [iy,ix] slice: row stride becomes
+        # wei_row_c (y*x*c) instead of plain c, and the tap's column-block offset is folded
+        # into a fresh per-tap base pointer (s_p_out_tap) rather than perturbing per-thread
+        # column indices, so coalescing_store_wmma.py itself needs no changes ----
+        self._emit(f"; s_p_out_tap = p_out + (iy*x+ix)*gemm_n*4 bytes (WMMA D-operand is always")
+        self._emit(f"; fp32/int32, 4 bytes, regardless of tunable->precision -- see coalescing_store_wmma.py)")
+        self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_iy()}], s[{s.s_x()}]")
+        self._emit(f"s_add_i32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], s[{s.s_ix()}]   ; tap linear index")
+        self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], s[{s.s_gemm_n()}]")
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], 2   ; tap byte offset")
+        self._emit(f"s_add_u32 s[{s.s_p_out_tap()}], s[{s.s_p_out()}], s[{s.s_tmp(2)}]")
+        self._emit(f"s_addc_u32 s[{s.s_p_out_tap(1)}], s[{s.s_p_out(1)}], 0")
+        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out.label))
+        self._emit(f"s_wait_storecnt 0x0")
+        self._emit_empty_line()
+
+        self._emit(f"s_add_u32 s[{s.s_ix()}], s[{s.s_ix()}], 1")
+        self._emit(f"s_cmp_lt_u32 s[{s.s_ix()}], s[{s.s_x()}]")
+        self._emit(f"s_cbranch_scc1 {label_tap_x}")
+        self._emit(f"s_add_u32 s[{s.s_iy()}], s[{s.s_iy()}], 1")
+        self._emit(f"s_cmp_lt_u32 s[{s.s_iy()}], s[{s.s_y()}]")
+        self._emit(f"s_cbranch_scc1 {label_tap_y}")
         self._emit_empty_line()
 
     def _emit_b_gather(self, s_k_block_off):
@@ -379,10 +505,12 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         (n_idx, ho_idx, wo_idx) [output/grad_output space, matching GEMM_K's own definition],
         gathers the corresponding (possibly out-of-bounds) input pixel (hi_idx, wi_idx) via the
         same stride/pad formula fwd's Phase 5a uses, sets v_flag, and writes v_addr_b. Called
-        once from the prologue (s_k_block_off=None, meaning k_block_off=0) and once per
-        main-loop iteration from move_slice_window_b_functor (s_k_block_off = the SGPR holding
-        the freshly-computed s_knum-s_kitr) -- see class docstring for why this must be
-        recomputed every iteration, unlike fwd/bwd's one-time prologue computation.
+        once from emit_kernel_tap_loop at the start of every tap (s_k_block_off=None, meaning
+        k_block_off=0) and once per main-loop iteration from move_slice_window_b_functor
+        (s_k_block_off = the SGPR holding the freshly-computed s_knum-s_kitr) -- see class
+        docstring for why this must be recomputed every iteration. Reads the CURRENT s_iy/s_ix
+        live (Phase 5f's tap bias), so no special-casing is needed for either call site to
+        pick up whichever tap is currently active.
         '''
         s = self.sgpr
         v = self.vgpr
@@ -397,11 +525,15 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"; v_gtc_tmp(3)=wo_idx (rem), v_gtc_tmp(4)=ho_idx (quo)")
         self._emit_empty_line()
 
-        self._emit(f"; hi_idx = ho_idx*stride_h - pad_h ; wi_idx = wo_idx*stride_w - pad_w")
+        self._emit(f"; hi_idx = ho_idx*stride_h - pad_h + iy*dilation_h ; wi_idx symmetric (Phase 5f tap bias)")
+        self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_iy()}], s[{s.s_dilation_h()}]")
+        self._emit(f"s_sub_i32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], s[{s.s_pad_h()}]   ; iy*dilation_h - pad_h")
+        self._emit(f"s_mul_i32 s[{s.s_tmp(3)}], s[{s.s_ix()}], s[{s.s_dilation_w()}]")
+        self._emit(f"s_sub_i32 s[{s.s_tmp(3)}], s[{s.s_tmp(3)}], s[{s.s_pad_w()}]   ; ix*dilation_w - pad_w")
         self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(4)}], s[{s.s_stride_h()}], v[{v.v_gtc_tmp(4)}]")
-        self._emit(f"v_sub_i32 v[{v.v_gtc_tmp(4)}], v[{v.v_gtc_tmp(4)}], s[{s.s_pad_h()}]   ; hi_idx")
+        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(4)}], v[{v.v_gtc_tmp(4)}], s[{s.s_tmp(2)}]   ; hi_idx")
         self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(3)}], s[{s.s_stride_w()}], v[{v.v_gtc_tmp(3)}]")
-        self._emit(f"v_sub_i32 v[{v.v_gtc_tmp(3)}], v[{v.v_gtc_tmp(3)}], s[{s.s_pad_w()}]   ; wi_idx")
+        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(3)}], v[{v.v_gtc_tmp(3)}], s[{s.s_tmp(3)}]   ; wi_idx")
         self._emit_empty_line()
 
         self._emit(f"; v_flag = 1 iff (hi_idx, wi_idx) in [0,hi)x[0,wi)")
@@ -603,18 +735,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.s_kitr    = sym_t(self.sgpr.s_kitr.label)
         ctrl.s_knum    = sym_t(self.sgpr.s_knum.label)
 
-        # first global load already issued by emit_kernel_prologue()
+        # first global load for this tap already issued by emit_kernel_tap_loop(), which is
+        # also the sole caller of this method and also emits the per-tap epilogue store
+        # (see class docstring, Phase 5f)
         wmma_main_loop_t(self.mc, ctrl).emit()
-
-    def emit_kernel_epilogue(self):
-        v = self.vgpr
-        s = self.sgpr
-        # s_gemm_m_stride bound to GEMM_N=C_in here -- grad_weight's row stride, same
-        # [K_out][C_in] layout the fwd kernel reads as its weight input.
-        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_gemm_n.label, v.v_addr_out.label))
-        self._emit(f"s_wait_storecnt 0x0")
 
     def emit_kernel_body(self):
         self.emit_kernel_prologue()
-        self.emit_kernel_fma_main_loop()
-        self.emit_kernel_epilogue()
+        self.emit_kernel_tap_loop()
