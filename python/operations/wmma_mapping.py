@@ -220,6 +220,13 @@ ctrl_wmma_mapping_table = {
     # tile / 4x4 wave_repeat shape carries over unchanged. Verified via hardware round-trip
     # probe (/tmp/wmma_probe/probe_int8.s, host_int8.cpp), see docs/gfx1250_wmma_layout.md.
     'int8': [ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_i32_16x16x64_iu8)],
+    # fp32: K=4 (much shorter than the others), num_v_a=num_v_b=2 (not 8 -- no packing at all,
+    # 1 fp32/dword, unlike fp16's 2/dword or int8's 4/dword). D operand (num_v_c=8) carries
+    # over unchanged, confirmed via hardware round-trip probe (/tmp/wmma_probe/probe_fp32.s,
+    # host_fp32.cpp, 6 random seeds), see docs/gfx1250_wmma_layout.md. Same 128x128 macro tile
+    # / 4x4 wave_repeat shape as every other precision -- only gemm_k_per_block (forced to 4,
+    # matching inst_wmma.k) and the resulting byte-width-per-thread-row differ.
+    'fp32': [ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x4_f32)],
 }
 
 def get_ctrl_wmma_mapping_from_wave_tile(macro_tile_m, macro_tile_n, wave_tile_m, wave_tile_n, wave_repeat_m, wave_repeat_n, waves, precision):

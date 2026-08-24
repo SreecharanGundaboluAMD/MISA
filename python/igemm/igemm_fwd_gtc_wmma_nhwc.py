@@ -147,7 +147,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
     def __init__(self, mc, tunable):
         mc_base_t.__init__(self, mc)
         assert tunable.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA
-        assert tunable.precision in ('fp16', 'bf16', 'int8'), f'unsupported precision:{tunable.precision}'
+        assert tunable.precision in ('fp16', 'bf16', 'int8', 'fp32'), f'unsupported precision:{tunable.precision}'
         assert tunable.tensor_layout == 'nhwc'
         assert tunable.gemm_m_per_block == 128 and tunable.gemm_n_per_block == 128
         assert tunable.wmma_tile_m == 16 and tunable.wmma_tile_n == 16
@@ -174,8 +174,14 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # int8 added: the only two byte-width-dependent literals (the A/B global-address
         # stride multiplier in emit_kernel_prologue) were generalized to self.data_byte; every
         # other literal shift (tid*64 store offset, k_half*32, row*64 stride, wave_repeat*1024)
-        # turned out precision-invariant per the class docstring, so no other changes were
-        # needed for int8 support.
+        # turned out precision-invariant for fp16/bf16/int8, since gemm_k_per_block*data_byte
+        # happens to equal 64 bytes for all three (32*2, 32*2, 64*1). fp32 breaks this
+        # coincidence (gemm_k_per_block is forced to 4, matching inst_wmma.k, so
+        # 4*4=16 bytes, not 64) -- every one of those literals is now derived from
+        # `self.bytes_per_row` instead, see their call sites below.
+        self.bytes_per_row = tunable.gemm_k_per_block * self.data_byte   # per-thread A/B row width
+        self.num_dwordx4   = self.bytes_per_row // 16   # global_load/shared_store loop bound (was hardcoded 4)
+        self.num_dwords    = self.bytes_per_row // 4    # v_gld_a/b zero-init loop bound (was hardcoded 16)
         self.lds_a_size = tunable.gemm_m_per_block * tunable.gemm_k_per_block * self.data_byte
         self.lds_b_size = tunable.gemm_n_per_block * tunable.gemm_k_per_block * self.data_byte
 
@@ -487,7 +493,9 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
 
 
         # ---- fixed per-thread shared-memory store offset: this thread owns row `tid` ----
-        self._emit(f"v_lshlrev_b32 v[{v.v_sst_os()}], 6, v[{v.v_tid()}]   ; tid*64 bytes")
+        # bytes_per_row (=gemm_k_per_block*data_byte) is 64 for fp16/bf16/int8, but 16 for
+        # fp32 (gemm_k_per_block forced to 4) -- see class docstring / self.bytes_per_row.
+        self._emit(f"v_lshlrev_b32 v[{v.v_sst_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_tid()}]   ; tid*{self.bytes_per_row} bytes")
         self._emit_empty_line()
 
         # ---- shared-memory load offsets (WMMA operand layout, see docs/gfx1250_wmma_layout.md) ----
@@ -497,10 +505,10 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix(v.v_sld_b_os(), v.v_sld_a_os(), v.v_tid(), v.v_tmp()))
         self._emit(f"v_lshrrev_b32 v[{v.v_tmp()}], 4, v[{v.v_tid()}]")
         self._emit(f"v_and_b32 v[{v.v_tmp()}], 1, v[{v.v_tmp()}]")
-        self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], 5, v[{v.v_tmp()}]      ; k_half * 32 bytes")
-        self._emit(f"v_lshlrev_b32 v[{v.v_sld_a_os()}], 6, v[{v.v_sld_a_os()}]  ; row * 64 byte row-stride")
+        self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.bytes_per_row // 2)}, v[{v.v_tmp()}]      ; k_half * {self.bytes_per_row // 2} bytes")
+        self._emit(f"v_lshlrev_b32 v[{v.v_sld_a_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_sld_a_os()}]  ; row * {self.bytes_per_row} byte row-stride")
         self._emit(f"v_add_u32 v[{v.v_sld_a_os()}], v[{v.v_tmp()}], v[{v.v_sld_a_os()}]")
-        self._emit(f"v_lshlrev_b32 v[{v.v_sld_b_os()}], 6, v[{v.v_sld_b_os()}]")
+        self._emit(f"v_lshlrev_b32 v[{v.v_sld_b_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_sld_b_os()}]")
         self._emit(f"v_add_u32 v[{v.v_sld_b_os()}], v[{v.v_tmp()}], v[{v.v_sld_b_os()}]")
         self._emit_empty_line()
 
@@ -614,15 +622,15 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    for i in range(16):
+                    for i in range(outer.num_dwords):
                         outer._emit(f"v_mov_b32 v[{v.v_gld_a(i)}], 0")
                     outer._emit(f"v_cmpx_le_u32 1, v[{v.v_flag()}]")
-                    for i in range(4):
+                    for i in range(outer.num_dwordx4):
                         outer._emit(f"global_load_dwordx4 v[{v.v_gld_a(i*4)}:{v.v_gld_a(i*4+3)}], v[{v.v_addr_a()}:{v.v_addr_a(1)}], off offset:{i*16}")
                     outer._emit(f"s_mov_b32 exec_lo, -1")
                 return outer._get_deferred()
             def get_issues(self):
-                return 4
+                return outer.num_dwordx4
         return functor_t()
 
     def global_load_b_functor(self):
@@ -631,11 +639,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    for i in range(4):
+                    for i in range(outer.num_dwordx4):
                         outer._emit(f"global_load_dwordx4 v[{v.v_gld_b(i*4)}:{v.v_gld_b(i*4+3)}], v[{v.v_addr_b()}:{v.v_addr_b(1)}], off offset:{i*16}")
                 return outer._get_deferred()
             def get_issues(self):
-                return 4
+                return outer.num_dwordx4
         return functor_t()
 
     def shared_store_a_functor(self):
@@ -644,11 +652,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    for i in range(4):
+                    for i in range(outer.num_dwordx4):
                         outer._emit(f"ds_write_b128 v[{v.v_sst_os()}], v[{v.v_gld_a(i*4)}:{v.v_gld_a(i*4+3)}] offset:{i*16}")
                 return outer._get_deferred()
             def get_issues(self):
-                return 4
+                return outer.num_dwordx4
         return functor_t()
 
     def shared_store_b_functor(self):
@@ -657,36 +665,60 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    for i in range(4):
+                    for i in range(outer.num_dwordx4):
                         outer._emit(f"ds_write_b128 v[{v.v_sst_os()}], v[{v.v_gld_b(i*4)}:{v.v_gld_b(i*4+3)}] offset:{outer.lds_a_size + i*16}")
                 return outer._get_deferred()
             def get_issues(self):
-                return 4
+                return outer.num_dwordx4
         return functor_t()
+
+    def _emit_ds_read_chunked(self, v_base_sym, v_os_sym, base_off, num_v):
+        '''
+        Reads `num_v` contiguous dwords from LDS starting at `base_off`, into
+        `v_base_sym(0..num_v-1)`, in the largest chunks ds_read_* supports (b128=4 dwords,
+        b64=2, b32=1). Generalizes the old fp16/bf16/int8-only "always 2x ds_read_b128 (8
+        dwords)" pattern, which hardcoded num_v_a/num_v_b=8 -- fp32 has num_v_a/num_v_b=2, so
+        this must read a different (smaller) chunk shape. See class docstring.
+        '''
+        remaining = num_v
+        idx = 0
+        off = 0
+        while remaining > 0:
+            if remaining >= 4:
+                self._emit(f"ds_read_b128 v[{v_base_sym(idx)}:{v_base_sym(idx+3)}], v[{v_os_sym()}] offset:{base_off+off}")
+                idx += 4; off += 16; remaining -= 4
+            elif remaining >= 2:
+                self._emit(f"ds_read_b64 v[{v_base_sym(idx)}:{v_base_sym(idx+1)}], v[{v_os_sym()}] offset:{base_off+off}")
+                idx += 2; off += 8; remaining -= 2
+            else:
+                self._emit(f"ds_read_b32 v[{v_base_sym(idx)}], v[{v_os_sym()}] offset:{base_off+off}")
+                idx += 1; off += 4; remaining -= 1
 
     def shared_load_a_functor(self):
         outer = self
+        num_v_a = outer.wmma_mapping.ctrl.inst_wmma.num_v_a
+        step_bytes = outer.tunable.wmma_tile_m * outer.bytes_per_row   # was hardcoded 1024
         class functor_t:
             def __call__(self, v_dst, v_os, extra_off):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    for i_rm in range(4):
-                        base = i_rm * 1024 + extra_off
-                        outer._emit(f"ds_read_b128 v[{v.v_a(i_rm*8)}:{v.v_a(i_rm*8+3)}], v[{v.v_sld_a_os()}] offset:{base}")
-                        outer._emit(f"ds_read_b128 v[{v.v_a(i_rm*8+4)}:{v.v_a(i_rm*8+7)}], v[{v.v_sld_a_os()}] offset:{base+16}")
+                    for i_rm in range(outer.tunable.wmma_repeat_m):
+                        base = i_rm * step_bytes + extra_off
+                        outer._emit_ds_read_chunked(lambda k, i_rm=i_rm: v.v_a(i_rm*num_v_a+k), v.v_sld_a_os, base, num_v_a)
                 return outer._get_deferred()
         return functor_t()
 
     def shared_load_b_functor(self):
         outer = self
+        num_v_b = outer.wmma_mapping.ctrl.inst_wmma.num_v_b
+        step_bytes = outer.tunable.wmma_tile_n * outer.bytes_per_row   # was hardcoded 1024
         class functor_t:
             def __call__(self, v_dst, v_os, extra_off):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    for i_rn in range(4):
-                        base = outer.lds_a_size + i_rn * 1024 + extra_off  # B region starts after A's region
-                        outer._emit(f"ds_read_b128 v[{v.v_b(i_rn*8)}:{v.v_b(i_rn*8+3)}], v[{v.v_sld_b_os()}] offset:{base}")
-                        outer._emit(f"ds_read_b128 v[{v.v_b(i_rn*8+4)}:{v.v_b(i_rn*8+7)}], v[{v.v_sld_b_os()}] offset:{base+16}")
+                    for i_rn in range(outer.tunable.wmma_repeat_n):
+                        base = outer.lds_a_size + i_rn * step_bytes + extra_off  # B region starts after A's region
+                        outer._emit_ds_read_chunked(lambda k, i_rn=i_rn: v.v_b(i_rn*num_v_b+k), v.v_sld_b_os, base, num_v_b)
                 return outer._get_deferred()
         return functor_t()
 
@@ -696,7 +728,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    outer._emit(f"v_add_co_u32 v[{v.v_addr_a()}], vcc_lo, 64, v[{v.v_addr_a()}]")
+                    outer._emit(f"v_add_co_u32 v[{v.v_addr_a()}], vcc_lo, {outer.bytes_per_row}, v[{v.v_addr_a()}]")
                     outer._emit(f"v_add_co_ci_u32 v[{v.v_addr_a(1)}], vcc_lo, 0, v[{v.v_addr_a(1)}], vcc_lo")
                 return outer._get_deferred()
         return functor_t()
@@ -707,7 +739,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    outer._emit(f"v_add_co_u32 v[{v.v_addr_b()}], vcc_lo, 64, v[{v.v_addr_b()}]")
+                    outer._emit(f"v_add_co_u32 v[{v.v_addr_b()}], vcc_lo, {outer.bytes_per_row}, v[{v.v_addr_b()}]")
                     outer._emit(f"v_add_co_ci_u32 v[{v.v_addr_b(1)}], vcc_lo, 0, v[{v.v_addr_b(1)}], vcc_lo")
                 return outer._get_deferred()
         return functor_t()
