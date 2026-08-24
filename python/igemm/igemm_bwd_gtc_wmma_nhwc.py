@@ -156,6 +156,10 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             self.s_wei_row_c   = sym_t('s_wei_row_c'   , sseq(1))    # = gemm_n*x*y, weight's per-K_out-row element count
             self.s_iy          = sym_t('s_iy'          , sseq(1))   # runtime tap-loop counters
             self.s_ix          = sym_t('s_ix'          , sseq(1))
+            self.s_group_idx   = sym_t('s_group_idx'   , sseq(1))   # decoded from s_by (group folded into grid_y)
+            self.s_group       = sym_t('s_group'       , sseq(1))   # kernarg: total group count
+            self.s_a_k_total   = sym_t('s_a_k_total'   , sseq(1))   # = gemm_k*group, A(grad_output)'s per-pixel row stride
+            self.s_out_c_total = sym_t('s_out_c_total' , sseq(1))   # = gemm_n*group, output(grad_input)'s per-pixel row stride
             self.s_block_m_off = sym_t('s_block_m_off' , sseq(1))
             self.s_block_n_off = sym_t('s_block_n_off' , sseq(1))
             self.s_wei_k_stride = sym_t('s_wei_k_stride', sseq(1))   # s_wei_row_c*databyte*gemm_k_per_block: weight's per-K-block global stride
@@ -235,6 +239,10 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         kas.append(amdgpu_kernel_arg_t('x'         , 4, 72, 'by_value', 'i32'))
         kas.append(amdgpu_kernel_arg_t('dilation_h', 4, 76, 'by_value', 'i32'))
         kas.append(amdgpu_kernel_arg_t('dilation_w', 4, 80, 'by_value', 'i32'))
+        # Phase 7 (group>1): the only new kernarg needed -- see fwd's Phase 7 docstring for the
+        # full rationale (A/output need the tensor's TOTAL channel count for their per-pixel
+        # row stride, which requires knowing group itself; weight needs no equivalent fix).
+        kas.append(amdgpu_kernel_arg_t('group'     , 4, 84, 'by_value', 'i32'))
         return kas
 
     def get_kernel_code(self):
@@ -244,7 +252,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             'enable_sgpr_workgroup_id_y'       :   1,
             'enable_vgpr_workitem_id'          :   0,
             'workgroup_group_segment_byte_size':   self.lds_a_size + self.lds_b_size,
-            'kernarg_segment_byte_size'         :   84,
+            'kernarg_segment_byte_size'         :   88,
             'wavefront_sgpr_count'              :   self.sgpr.s_end.value + 2 * 3,
             'workitem_vgpr_count'               :   self.vgpr.v_end.value,
             'wavefront_size'                    :   32,
@@ -299,11 +307,48 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_load_dword s[{s.s_x()}], s[{s.s_ka()}:{s.s_ka(1)}], 72")
         self._emit(f"s_load_dword s[{s.s_dilation_h()}], s[{s.s_ka()}:{s.s_ka(1)}], 76")
         self._emit(f"s_load_dword s[{s.s_dilation_w()}], s[{s.s_ka()}:{s.s_ka(1)}], 80")
+        self._emit(f"s_load_dword s[{s.s_group()}], s[{s.s_ka()}:{s.s_ka(1)}], 84")
         self._emit(f"v_mov_b32 v[{v.v_tid()}], v0")
         # gfx1250 delivers workgroup id via ttmp9/ttmp7 -- see docs/gfx1250_wmma_layout.md.
         self._emit(f"s_mov_b32 s[{s.s_bx()}], ttmp9")
         self._emit(f"s_mov_b32 s[{s.s_by()}], ttmp7")
         self._emit(f"s_wait_kmcnt 0x0")
+        self._emit_empty_line()
+
+        m_int_div_rem_vs = macro_int_div_rem_vs_gfx1250_t(self.mc)
+
+        # ---- group>1: decode group_idx out of s_by and correct s_by in place BEFORE
+        # s_block_n_off is computed from it below -- see igemm_fwd_gtc_wmma_nhwc_t's Phase 7
+        # docstring for the full rationale (grid_y folding, division-macro reuse). A
+        # (grad_output) and the output (grad_input) are NHWC tensors with group INTERLEAVED
+        # within each pixel's channel dimension, so their per-pixel row stride must be the
+        # TOTAL channel count (gemm_k*group / gemm_n*group), not the per-group gemm_k/gemm_n
+        # used for the K-reduction size and base-pointer offset. Weight needs no equivalent
+        # fix (its group split is the outermost/block-contiguous dimension). ----
+        self._emit(f"; --- group>1: decode group_idx, correct s_by, offset A/output base pointers ---")
+        self._emit(f"s_add_u32 s[{s.s_tmp(0)}], s[{s.s_gemm_n()}], 127")
+        self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], 7   ; blocks_per_group_n = ceil(gemm_n/128)")
+        self._emit(f"v_mov_b32 v[{v.v_gtc_tmp(0)}], s[{s.s_by()}]")
+        self._emit(m_int_div_rem_vs(v.v_gtc_tmp(1), v.v_gtc_tmp(2), v.v_gtc_tmp(0), s.s_tmp(0), v.v_tmp(), s.s_tmp(1)))
+        self._emit(f"v_readfirstlane_b32 s[{s.s_group_idx()}], v[{v.v_gtc_tmp(2)}]   ; group_idx")
+        self._emit(f"v_readfirstlane_b32 s[{s.s_by()}], v[{v.v_gtc_tmp(1)}]   ; s_by <- corrected within-group N-block index")
+        self._emit_empty_line()
+
+        self._emit(f"s_mul_i32 s[{s.s_a_k_total()}], s[{s.s_gemm_k()}], s[{s.s_group()}]")
+        self._emit(f"s_mul_i32 s[{s.s_out_c_total()}], s[{s.s_gemm_n()}], s[{s.s_group()}]")
+        self._emit_empty_line()
+
+        self._emit(f"; A (grad_output): group offset = group_idx * gemm_k elements")
+        self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group_idx()}], s[{s.s_gemm_k()}]")
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {utility_log2(self.data_byte)}")
+        self._emit(f"s_add_u32 s[{s.s_p_in()}], s[{s.s_p_in()}], s[{s.s_tmp(0)}]")
+        self._emit(f"s_addc_u32 s[{s.s_p_in(1)}], s[{s.s_p_in(1)}], 0")
+
+        self._emit(f"; output (grad_input): group offset = group_idx * gemm_n elements (D-operand always 4 bytes)")
+        self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group_idx()}], s[{s.s_gemm_n()}]")
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], 2")
+        self._emit(f"s_add_u32 s[{s.s_p_out()}], s[{s.s_p_out()}], s[{s.s_tmp(0)}]")
+        self._emit(f"s_addc_u32 s[{s.s_p_out(1)}], s[{s.s_p_out(1)}], 0")
         self._emit_empty_line()
 
         # zero the accumulator -- v_wmma_* does D = A@B + C, and v_c is used as both C and D.
@@ -325,9 +370,16 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_lshl_b32 s[{s.s_wei_k_stride()}], s[{s.s_wei_row_c()}], {utility_log2(self.data_byte * self.tunable.gemm_k_per_block)}   ; wei_row_c * databyte * {self.tunable.gemm_k_per_block}")
         self._emit_empty_line()
 
+        self._emit(f"; group>1: B (weight) group offset = group_idx * gemm_n * wei_row_c elements")
+        self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group_idx()}], s[{s.s_gemm_n()}]")
+        self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_wei_row_c()}]")
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {utility_log2(self.data_byte)}")
+        self._emit(f"s_add_u32 s[{s.s_p_wei()}], s[{s.s_p_wei()}], s[{s.s_tmp(0)}]")
+        self._emit(f"s_addc_u32 s[{s.s_p_wei(1)}], s[{s.s_p_wei(1)}], 0")
+        self._emit_empty_line()
+
         # ---- one-time decomposition of this thread's GEMM_M index into (n_idx, hi_idx,
         # wi_idx), kept persistent: every tap re-derives ho_idx/wo_idx/flag from these ----
-        m_int_div_rem_vs = macro_int_div_rem_vs_gfx1250_t(self.mc)
         self._emit(f"s_mul_i32 s[{s.s_ho_wo()}], s[{s.s_ho()}], s[{s.s_wo()}]")
         self._emit(f"; decode this thread's absolute GEMM_M index into (n_idx, hi_idx, wi_idx)")
         self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_block_m_off()}], v[{v.v_tid()}]   ; m_idx")
@@ -446,8 +498,9 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(8)}]")
         self._emit_empty_line()
 
-        self._emit(f"; v_addr_a = p_in + row_idx * gemm_k * databyte")
-        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_gemm_k()}], v[{v.v_gtc_tmp(0)}]")
+        self._emit(f"; v_addr_a = p_in + row_idx * a_k_total * databyte (a_k_total = gemm_k*group --")
+        self._emit(f"; grad_output's pixel-to-pixel stride is its TOTAL K_out count, not the per-group gemm_k, see class docstring)")
+        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_a_k_total()}], v[{v.v_gtc_tmp(0)}]")
         self._emit(f"v_lshlrev_b32 v[{v.v_gtc_tmp(0)}], {utility_log2(self.data_byte)}, v[{v.v_gtc_tmp(0)}]")
         self._emit(f"v_mov_b32 v[{v.v_addr_a(1)}], s[{s.s_p_in(1)}]   ; reset high half fresh -- this")
         self._emit(f"                                                ; tap's address is NOT a continuation of the previous tap's")
@@ -671,8 +724,9 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
     def emit_kernel_epilogue(self):
         v = self.vgpr
         s = self.sgpr
-        # s_gemm_m_stride bound to GEMM_N=C_in here (NOT K_out) -- grad_input's row stride.
-        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_gemm_n.label, v.v_addr_out.label))
+        # s_out_c_total (=gemm_n*group) is grad_input's TOTAL row stride (NOT K_out, and not
+        # just the per-group gemm_n either once group>1 -- see class docstring's Phase 7 note).
+        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_c_total.label, v.v_addr_out.label))
         self._emit(f"s_wait_storecnt 0x0")
 
     def emit_kernel_body(self):
