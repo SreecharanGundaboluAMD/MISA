@@ -50,19 +50,26 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
     assumptions that don't match WMMA's operand layout, and reconciling the two
     was judged riskier than writing new, small, auditable addressing logic here.
 
-    Supports exactly one tile shape: gemm_m_per_block == gemm_n_per_block == 128,
-    gemm_k_per_block == 32 (== wmma K for fp16/bf16), block_size == 128 (4 waves),
-    wmma_tile_m == wmma_tile_n == 16, wmma_repeat_m == wmma_repeat_n == 4.
-    gemm_k (total) must be a multiple of 32; gemm_m/gemm_n must be multiples of 128.
-    precision: 'fp16' or 'bf16' (both 2 bytes/element, same K=32 instruction shape --
-    see docs/gfx1250_wmma_layout.md for the empirically-verified per-lane layout of both).
+    Supports exactly one macro-tile shape: gemm_m_per_block == gemm_n_per_block == 128,
+    block_size == 128 (4 waves), wmma_tile_m == wmma_tile_n == 16, wmma_repeat_m ==
+    wmma_repeat_n == 4. gemm_k_per_block must equal the wired-up instruction's K (32 for
+    fp16/bf16, 64 for int8 -- see ctrl_wmma_mapping_table in wmma_mapping.py); gemm_k
+    (total) must be a multiple of that; gemm_m/gemm_n must be multiples of 128.
+    precision: 'fp16', 'bf16' (both 2 bytes/element, K=32), or 'int8' (1 byte/element, K=64,
+    int32 accumulate) -- see docs/gfx1250_wmma_layout.md for the empirically-verified
+    per-lane layout of all three. Despite int8's different K/element-width, almost none of
+    this kernel's byte-level address math needed a precision-specific branch: gemm_k_per_block
+    is always chosen to equal inst_wmma.k, and inst_wmma.num_v_a/num_v_b/num_v_c are 8/8/8 for
+    every wired-up instruction, so quantities like "bytes per tile row" (=64, always) and
+    "bytes per wave_repeat step" turn out precision-invariant. Only the A/B global-address
+    stride (gemm_k * data_byte) genuinely varies and is computed from self.data_byte.
     '''
     def __init__(self, mc, tunable):
         mc_base_t.__init__(self, mc)
         assert tunable.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA
-        assert tunable.precision in ('fp16', 'bf16'), f'unsupported precision:{tunable.precision}'
+        assert tunable.precision in ('fp16', 'bf16', 'int8'), f'unsupported precision:{tunable.precision}'
         assert tunable.tensor_layout == 'nhwc'
-        assert tunable.gemm_m_per_block == 128 and tunable.gemm_n_per_block == 128 and tunable.gemm_k_per_block == 32
+        assert tunable.gemm_m_per_block == 128 and tunable.gemm_n_per_block == 128
         assert tunable.wmma_tile_m == 16 and tunable.wmma_tile_n == 16
         assert tunable.wmma_repeat_m == 4 and tunable.wmma_repeat_n == 4
         assert tunable.block_size == 128
@@ -72,6 +79,10 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(tunable.gemm_m_per_block, tunable.gemm_n_per_block,
                 tunable.wmma_tile_m, tunable.wmma_tile_n, tunable.wmma_repeat_m, tunable.wmma_repeat_n,
                 tunable.block_size // tunable.wave_size, tunable.precision)
+        # gemm_k_per_block must equal the wired-up instruction's K (32 for fp16/bf16, 64 for
+        # int8) -- wmma_main_loop.py requires unroll_k == inst_wmma.k exactly (no k-sub-loop).
+        assert tunable.gemm_k_per_block == ctrl_wmma_mapping.inst_wmma.k, \
+            f"gemm_k_per_block({tunable.gemm_k_per_block}) must equal inst_wmma.k({ctrl_wmma_mapping.inst_wmma.k}) for precision {tunable.precision}"
         self.wmma_mapping = igemm_wmma_mapping_t(self.mc, ctrl_wmma_mapping)
 
         ctrl_coalescing_store_wmma = ctrl_coalescing_store_wmma_t()
@@ -80,11 +91,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_coalescing_store_wmma.precision = tunable.precision
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
 
-        # NOTE: the byte-level address math in emit_kernel_prologue/the shared-load/store/
-        # move-slice-window functors below is currently only re-derived from self.data_byte
-        # here; it still hardcodes "2 bytes/element" (via literal shifts/strides) elsewhere,
-        # which is correct for fp16/bf16 (both 2 bytes) but will need generalizing when a
-        # different-width precision (e.g. int8) is added.
+        # int8 added: the only two byte-width-dependent literals (the A/B global-address
+        # stride multiplier in emit_kernel_prologue) were generalized to self.data_byte; every
+        # other literal shift (tid*64 store offset, k_half*32, row*64 stride, wave_repeat*1024)
+        # turned out precision-invariant per the class docstring, so no other changes were
+        # needed for int8 support.
         self.lds_a_size = tunable.gemm_m_per_block * tunable.gemm_k_per_block * self.data_byte
         self.lds_b_size = tunable.gemm_n_per_block * tunable.gemm_k_per_block * self.data_byte
 
@@ -129,7 +140,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             self.v_c           = sym_t('v_c'           , vseq(outer.tunable.num_vgpr_accumulate_c))     # 128
             self.v_a           = sym_t('v_a'           , vseq(outer.tunable.num_vgpr_accumulate_a))     # 32
             self.v_b           = sym_t('v_b'           , vseq(outer.tunable.num_vgpr_accumulate_b))     # 32
-            self.v_gld_a       = sym_t('v_gld_a'       , vseq(16))   # 32 fp16 = 64B row, staged before LDS store
+            self.v_gld_a       = sym_t('v_gld_a'       , vseq(16))   # gemm_k_per_block*data_byte = 64B row (any precision), staged before LDS store
             self.v_gld_b       = sym_t('v_gld_b'       , vseq(16))
             self.v_tid         = sym_t('v_tid'         , vseq(1))
             # 64-bit VADDR pairs must be even-aligned on gfx1250 (verified with llvm-mc)
@@ -233,20 +244,20 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit_empty_line()
 
         # ---- global address for this thread's row of the A tile (input, [GEMM_M][GEMM_K]) ----
-        self._emit(f"; v_addr_a = p_in + (block_m_off + tid) * gemm_k * 2 bytes")
+        self._emit(f"; v_addr_a = p_in + (block_m_off + tid) * gemm_k * {self.data_byte} bytes")
         self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_block_m_off()}], v[{v.v_tid()}]")
         self._emit(f"v_mul_lo_u32 v[{v.v_tmp()}], s[{s.s_gemm_k()}], v[{v.v_tmp()}]")
-        self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], 1, v[{v.v_tmp()}]")
+        self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.data_byte)}, v[{v.v_tmp()}]")
         self._emit(f"v_mov_b32 v[{v.v_addr_a(1)}], s[{s.s_p_in(1)}]")
         self._emit(f"v_add_co_u32 v[{v.v_addr_a()}], vcc_lo, s[{s.s_p_in()}], v[{v.v_tmp()}]")
         self._emit(f"v_add_co_ci_u32 v[{v.v_addr_a(1)}], vcc_lo, 0, v[{v.v_addr_a(1)}], vcc_lo")
         self._emit_empty_line()
 
         # ---- global address for this thread's row of the B tile (weight, [GEMM_N][GEMM_K]) ----
-        self._emit(f"; v_addr_b = p_wei + (block_n_off + tid) * gemm_k * 2 bytes")
+        self._emit(f"; v_addr_b = p_wei + (block_n_off + tid) * gemm_k * {self.data_byte} bytes")
         self._emit(f"v_add_u32 v[{v.v_tmp(1)}], s[{s.s_block_n_off()}], v[{v.v_tid()}]")
         self._emit(f"v_mul_lo_u32 v[{v.v_tmp(1)}], s[{s.s_gemm_k()}], v[{v.v_tmp(1)}]")
-        self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], 1, v[{v.v_tmp(1)}]")
+        self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], {utility_log2(self.data_byte)}, v[{v.v_tmp(1)}]")
         self._emit(f"v_mov_b32 v[{v.v_addr_b(1)}], s[{s.s_p_wei(1)}]")
         self._emit(f"v_add_co_u32 v[{v.v_addr_b()}], vcc_lo, s[{s.s_p_wei()}], v[{v.v_tmp(1)}]")
         self._emit(f"v_add_co_ci_u32 v[{v.v_addr_b(1)}], vcc_lo, 0, v[{v.v_addr_b(1)}], vcc_lo")
@@ -384,7 +395,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
     def emit_kernel_fma_main_loop(self):
         ctrl = ctrl_wmma_main_loop_t()
         ctrl.wmma_m           = self.wmma_mapping.ctrl
-        ctrl.unroll_k         = 32
+        ctrl.unroll_k         = self.tunable.gemm_k_per_block
         ctrl.label_prefix     = self.name()
         ctrl.precision        = self.tunable.precision
         ctrl.lds_single_size  = self.lds_a_size + self.lds_b_size

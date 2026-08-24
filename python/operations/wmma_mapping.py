@@ -203,6 +203,11 @@ class igemm_wmma_mapping_t(mc_base_t):
 ctrl_wmma_mapping_table = {
     'fp16': [ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x32_f16)],
     'bf16': [ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x32_bf16)],
+    # int8: K=64 (not 32), but num_v_a/num_v_b/num_v_c are still 8/8/8 (same as fp16/bf16 --
+    # only elements/dword differs: 4 int8/dword vs 2 fp16/dword), so the same 128x128 macro
+    # tile / 4x4 wave_repeat shape carries over unchanged. Verified via hardware round-trip
+    # probe (/tmp/wmma_probe/probe_int8.s, host_int8.cpp), see docs/gfx1250_wmma_layout.md.
+    'int8': [ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_i32_16x16x64_iu8)],
 }
 
 def get_ctrl_wmma_mapping_from_wave_tile(macro_tile_m, macro_tile_n, wave_tile_m, wave_tile_n, wave_repeat_m, wave_repeat_n, waves, precision):

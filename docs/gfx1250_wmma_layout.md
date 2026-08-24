@@ -32,10 +32,40 @@ accepting `v_wmma_f32_16x16x32_f16 v[40:47], v[8:15], v[16:23], v[0:7]`.
 elements/dword packing). Confirmed via the same round-trip technique across 3 random-seed
 trials (`/tmp/wmma_probe/probe_bf16.s`, `host_bf16.cpp`).
 
+## `v_wmma_i32_16x16x64_iu8` (M=16, N=16, K=64, int8 in / int32 accum)
+
+**Verified** — same 8-VGPR/lane footprint as fp16/bf16, but 4 int8/dword (not 2), so each
+vgpr/lane covers 4 k-values instead of 2:
+
+- **A operand**: for vgpr index `a` (0..7), byte `s` (0..3): `row = l % 16`,
+  `k = (l/16)*32 + a*4 + s`
+- **B operand**: for vgpr index `a` (0..7), byte `s` (0..3): `col = l % 16`,
+  `k = (l/16)*32 + a*4 + s`
+- **D operand**: identical to the fp16/bf16 case (`row = (l/16)*8 + j, col = l % 16`), but the
+  32-bit accumulator elements are `int32`, not `fp32`.
+
+Confirmed via the same round-trip technique across 5 random-seed trials, using small
+**unsigned** (0..8) test values (`/tmp/wmma_probe/probe_int8.s`, `host_int8.cpp`) — sidesteps
+the `neg_lo` signedness modifier (confirmed via `llvm-mc`: the base encoding with no modifier
+has `neg_lo` bits all 0, i.e. defaults to unsigned interpretation of both A and B; `clamp` and
+`neg_lo:[a,b,c]` both assemble too, but haven't been exercised).
+
+A pleasant consequence of `gemm_k_per_block` always being chosen to equal `inst_wmma.k`, and
+`num_v_a`/`num_v_b`/`num_v_c` being 8/8/8 for every wired-up instruction so far: quantities like
+"bytes per LDS tile row" (`gemm_k_per_block * data_byte`) and "bytes per wave_repeat step" come
+out **precision-invariant** (always 64 bytes and 1024 bytes respectively) because element width
+and per-block element count scale inversely. `igemm_fwd_gtc_wmma_nhwc_t` needed exactly two
+literal-shift fixes (the A/B global-address stride multiplier) to add int8 support — see that
+file's class docstring.
+
+**Validated on real gfx1250 hardware** (`igemm_fwd_gtc_wmma_nhwc_t`, 128x128x64 tile): exact
+match against a CPU reference (int32, no tolerance needed) across single-block, multi-block,
+non-square, and multi-K-block configurations, multiple random seeds.
+
 ## Not yet re-verified for other instructions
 
-Only `v_wmma_f32_16x16x32_f16` and `v_wmma_f32_16x16x32_bf16` (both K=32, identical footprint)
-are verified. Do **not** assume the same formula for the K=64 (`v_wmma_i32_16x16x64_iu8`), K=128
+`v_wmma_f32_16x16x32_f16`, `v_wmma_f32_16x16x32_bf16` (K=32), and `v_wmma_i32_16x16x64_iu8`
+(K=64) are verified. Do **not** assume the same formula for K=128
 (`v_wmma_f32_16x16x128_fp8_fp8`, note its A/B footprint is 16 VGPRs/lane, not 8 — a structurally
 different layout, not just a wider `k` range), or K=4 (`v_wmma_f32_16x16x4_f32`) variants — the
 D-operand (output) layout is expected to carry over (M=N=16, `num_v_c=8` for all of them), but
