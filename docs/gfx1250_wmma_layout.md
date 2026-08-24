@@ -619,10 +619,66 @@ bwd and wrw, against `naive_conv_{bwd,wrw}_nhwc`: 1x1 regression, combined strid
 9-way (3 directions x 3 precisions) regression sweep at the simplest 1x1 configuration also
 passes.
 
-Remaining gaps: `group > 1` (all directions, all precisions) -- not attempted, a materially
-larger undertaking (new grid dimension or folded-grid decode, plus per-group channel-slice
-addressing across every operand in every direction). fp8/fp32 WMMA instruction layouts remain
-unverified (would need their own hardware round-trip probes before use, per the same discipline
-that caught the int8 signedness bug above -- do not assume any new instruction/precision is
-correct without independently re-verifying against real random (not just small positive)
-test data).
+## Phase 7: group>1 (grouped convolution), all three directions
+
+**Grid encoding**: group is folded into `grid_y` (`grid_y = group *
+ceil(gemm_n/gemm_n_per_block)`) rather than a genuine 3rd grid dimension, since no gfx1250
+kernel anywhere has a working `workgroup_id_z` delivery mechanism (only `ttmp9`/`ttmp7` for
+x/y are verified). The kernel decodes `group_idx` back out of `s_by` on-device:
+`blocks_per_group_n = ceil(gemm_n/128)` needs no division (`gemm_n_per_block=128` is a
+compile-time power of 2, just `(gemm_n+127)>>7`), but the `group_idx`/corrected-`s_by` split
+does need a genuine runtime division (`blocks_per_group_n` is only known at launch time) --
+this reuses the existing, already-hardware-verified `macro_int_div_rem_vs_gfx1250_t` via a
+broadcast-to-vgpr (`v_mov_b32`) + `v_readfirstlane_b32` round-trip, rather than introducing a
+new scalar-scalar division macro variant. `s_by` is overwritten in place with the corrected
+within-group N-block index, so `s_block_n_off` (computed right after) needed no changes.
+`gemm_m`/`gemm_n`/`gemm_k` were already per-group values in every kernel (the driver divides
+`c`/`k` by `group` before writing the karg, unchanged since Phase 5 prep) -- the only new
+kernarg field needed across all three kernels is `group` itself.
+
+**The real bug, caught by hardware validation on the very first attempt (fwd)**: group 0's
+per-operand address offset is always zero, so a kernel with a genuine bug in its group-offset
+math still produces CORRECT output for group 0 -- masking the bug until group 1+ is checked.
+The bug: NHWC tensors store their group split INTERLEAVED within each pixel's channel
+dimension (`[N,H,W,G*C_per_group]`), so the per-pixel/row memory stride between consecutive
+spatial positions must be the tensor's TOTAL channel count (`gemm_k*group`, `gemm_n*group`,
+etc, depending on which GEMM dimension that operand's channel axis plays), NOT the per-group
+value already used for the K-reduction size and the base-pointer offset -- an early draft
+reused the per-group value for the row stride too (correct only when `group=1`, where
+total==per-group), producing wrong, uncorrelated-looking output for every group past the
+first. Diagnosed by comparing the same test with `group=1` (grid_y>1 alone, no group, passed
+cleanly) against `group=2` (failed) to isolate that the bug was group-specific, then bisecting
+which pixel index the wrongness started at (exactly `k=gemm_n`, i.e. the group-1 boundary) via
+`PRINT_EVERY_PIXEL=1`, and ruling out the division-macro/`v_readfirstlane_b32` round-trip as
+the cause first (bypassing it with a hardcoded `group_idx=s_by` for the trivial
+`blocks_per_group_n=1` case still failed identically) before finding the real row-stride issue.
+
+Per direction, exactly one operand needs NO correction (the tensor whose group split is the
+OUTERMOST/block-contiguous dimension, `[G][K_per_group][Y][X][C_per_group]` -- confirmed
+against `driver/naive_conv.h` and the general XDLOPS kernel's own grouped-conv addressing);
+the other operand(s) (whose group split is interleaved per-pixel) need both a base-pointer
+offset (`group_idx * that operand's own per-group element count`) AND the total-channel-count
+row-stride fix above:
+- **fwd**: A (input) and output need the fix; B (weight) doesn't.
+- **bwd**: A (grad_output) and output (grad_input) need the fix; B (weight) doesn't.
+- **wrw**: A (grad_output) and B (input) BOTH need the fix (wrw is the one direction where
+  both GEMM_M and GEMM_N are group-affected, since GEMM_K=N*Ho*Wo is spatial, not a channel);
+  output (grad_weight) doesn't, but its group offset must be added directly to the persistent
+  `s_p_out` (not the existing per-tap `s_p_out_tap`, which is recomputed fresh every tap FROM
+  `s_p_out` -- see Phase 5f) so every tap's offset automatically inherits the group shift.
+  A's `move_slice_window` per-K-block stride (`s_a_k_stride`) also needed the same
+  total-vs-per-group correction, since it depends on the same row-width quantity.
+
+**Validated on real gfx1250 hardware** through `conv_driver.exe`, all three directions x all
+three precisions (fp16/bf16/int8), against `naive_conv_{fwd,bwd,wrw}_nhwc`: `group=1`
+regression (bit-identical to pre-Phase-7 behavior), `group=2`, `group=4`, combined with
+multi-tap+stride and multi-block M/N configs -- all exact matches. A full 9-way (3 directions
+x 3 precisions) x 2 group-counts regression sweep also passes.
+
+With Phase 7 complete, this milestone's ENTIRE originally-scoped surface (fwd/bwd/wrw x
+fp16/bf16/int8 x general stride/pad/multi-tap/dilation x group>1) is now COMPLETE.
+
+Remaining gaps: fp8/fp32 WMMA instruction layouts remain unverified (would need their own
+hardware round-trip probes before use, per the same discipline that caught the int8 signedness
+bug above -- do not assume any new instruction/precision is correct without independently
+re-verifying against real random (not just small positive) test data).
