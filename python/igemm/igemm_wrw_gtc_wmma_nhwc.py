@@ -139,7 +139,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
     def __init__(self, mc, tunable):
         mc_base_t.__init__(self, mc)
         assert tunable.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA
-        assert tunable.precision in ('fp16', 'bf16', 'int8'), f'unsupported precision:{tunable.precision}'
+        assert tunable.precision in ('fp16', 'bf16', 'int8', 'fp32'), f'unsupported precision:{tunable.precision}'
         assert tunable.tensor_layout == 'nhwc'
         assert tunable.gemm_m_per_block == 128 and tunable.gemm_n_per_block == 128
         assert tunable.wmma_tile_m == 16 and tunable.wmma_tile_n == 16
@@ -167,6 +167,14 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # contiguous] tiles -- same total byte size either way (32*128*databyte).
         self.lds_a_size = tunable.gemm_k_per_block * tunable.gemm_m_per_block * self.data_byte
         self.lds_b_size = tunable.gemm_k_per_block * tunable.gemm_n_per_block * self.data_byte
+
+        # gemm_k_per_block*data_byte happens to equal 64 bytes for fp16/bf16/int8 (32*2, 32*2,
+        # 64*1), but fp32 forces gemm_k_per_block=4 (matching inst_wmma.k), giving 4*4=16 --
+        # see igemm_fwd_gtc_wmma_nhwc_t's Phase 8 docstring for the full rationale. Every
+        # literal built on the 64-byte coincidence is now derived from these instead.
+        self.bytes_per_row = tunable.gemm_k_per_block * self.data_byte
+        self.num_dwordx4   = self.bytes_per_row // 16
+        self.num_dwords    = self.bytes_per_row // 4
 
         self.sgpr = self.kernel_sgpr_t(mc, self)
         self.vgpr = self.kernel_vgpr_t(mc, self)
@@ -475,10 +483,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"v_lshlrev_b32 v[{v.v_b_col_off()}], {utility_log2(self.data_byte)}, v[{v.v_tmp()}]")
         self._emit_empty_line()
 
-        # ---- fixed per-thread shared-memory store offset: this thread owns byte-chunk tid*64 ----
-        # (both A's and B's (row_local,col_group) 32-element chunk land at the same linear tid
-        # position, see class docstring)
-        self._emit(f"v_lshlrev_b32 v[{v.v_sst_os()}], 6, v[{v.v_tid()}]   ; tid*64 bytes")
+        # ---- fixed per-thread shared-memory store offset: this thread owns byte-chunk
+        # tid*bytes_per_row ---- (both A's and B's (row_local,col_group) gemm_k_per_block-
+        # element chunk land at the same linear tid position, see class docstring)
+        self._emit(f"v_lshlrev_b32 v[{v.v_sst_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_tid()}]   ; tid*{self.bytes_per_row} bytes")
         self._emit_empty_line()
 
         # ---- shared-memory load offset for A (TRANSPOSED -- grad_output is [K][M] in LDS) ----
@@ -641,11 +649,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    for i in range(4):
+                    for i in range(outer.num_dwordx4):
                         outer._emit(f"global_load_dwordx4 v[{v.v_gld_a(i*4)}:{v.v_gld_a(i*4+3)}], v[{v.v_addr_a()}:{v.v_addr_a(1)}], off offset:{i*16}")
                 return outer._get_deferred()
             def get_issues(self):
-                return 4
+                return outer.num_dwordx4
         return functor_t()
 
     def global_load_b_functor(self):
@@ -662,15 +670,15 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    for i in range(16):
+                    for i in range(outer.num_dwords):
                         outer._emit(f"v_mov_b32 v[{v.v_gld_b(i)}], 0")
                     outer._emit(f"v_cmpx_le_u32 1, v[{v.v_flag()}]")
-                    for i in range(4):
+                    for i in range(outer.num_dwordx4):
                         outer._emit(f"global_load_dwordx4 v[{v.v_gld_b(i*4)}:{v.v_gld_b(i*4+3)}], v[{v.v_addr_b()}:{v.v_addr_b(1)}], off offset:{i*16}")
                     outer._emit(f"s_mov_b32 exec_lo, -1")
                 return outer._get_deferred()
             def get_issues(self):
-                return 4
+                return outer.num_dwordx4
         return functor_t()
 
     def shared_store_a_functor(self):
@@ -679,11 +687,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    for i in range(4):
+                    for i in range(outer.num_dwordx4):
                         outer._emit(f"ds_write_b128 v[{v.v_sst_os()}], v[{v.v_gld_a(i*4)}:{v.v_gld_a(i*4+3)}] offset:{i*16}")
                 return outer._get_deferred()
             def get_issues(self):
-                return 4
+                return outer.num_dwordx4
         return functor_t()
 
     def shared_store_b_functor(self):
@@ -692,11 +700,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    for i in range(4):
+                    for i in range(outer.num_dwordx4):
                         outer._emit(f"ds_write_b128 v[{v.v_sst_os()}], v[{v.v_gld_b(i*4)}:{v.v_gld_b(i*4+3)}] offset:{outer.lds_a_size + i*16}")
                 return outer._get_deferred()
             def get_issues(self):
-                return 4
+                return outer.num_dwordx4
         return functor_t()
 
     def shared_load_a_functor(self):
@@ -705,28 +713,36 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         (row_pitch = gemm_m_per_block*databyte bytes). Same technique as bwd's
         shared_load_b_functor (see that file for the detailed explanation, including why
         int8's elem_per_dword=4 case processes one vgpr index `a` at a time with a small
-        scratch slice instead of batching all 8 reads before waiting), applied here to the A
+        scratch slice instead of batching all 8 reads before waiting, and why fp32 needs a
+        third ds_read_b32 read_instr branch plus a `num_v_a`-derived loop bound/index instead
+        of the hardcoded 8 that fp16/bf16/int8 all happen to share), applied here to the A
         operand instead of B, and with A's region based at LDS byte 0 (not lds_a_size).
         '''
         outer = self
         class functor_t:
             def __call__(self, v_dst, v_os, extra_off):
                 v = outer.vgpr
+                num_v_a = outer.wmma_mapping.ctrl.inst_wmma.num_v_a
                 row_pitch = outer.tunable.gemm_m_per_block * outer.data_byte
                 elem_per_dword = 4 // outer.data_byte
-                read_instr = 'ds_read_u16' if outer.data_byte == 2 else 'ds_read_u8'
+                if outer.data_byte == 2:
+                    read_instr = 'ds_read_u16'
+                elif outer.data_byte == 4:
+                    read_instr = 'ds_read_b32'   # fp32: full-dword read, no zero-extension needed
+                else:
+                    read_instr = 'ds_read_u8'
                 with outer._deferred_context():
                     for i_rm in range(4):
                         col_off = i_rm * outer.tunable.wmma_tile_m * outer.data_byte
-                        for a in range(8):
+                        for a in range(num_v_a):
                             for s in range(elem_per_dword):
                                 off = col_off + (a * elem_per_dword + s) * row_pitch
                                 outer._emit(f"{read_instr} v[{v.v_gld_a(s)}], v[{v.v_sld_a_os()}] offset:{extra_off + off}")
                             outer._emit(f"s_wait_dscnt 0x0")
-                            outer._emit(f"v_mov_b32 v[{v.v_a(i_rm*8+a)}], v[{v.v_gld_a(0)}]")
+                            outer._emit(f"v_mov_b32 v[{v.v_a(i_rm*num_v_a+a)}], v[{v.v_gld_a(0)}]")
                             for s in range(1, elem_per_dword):
                                 shift = s * 8 * outer.data_byte
-                                outer._emit(f"v_lshl_or_b32 v[{v.v_a(i_rm*8+a)}], v[{v.v_gld_a(s)}], {shift}, v[{v.v_a(i_rm*8+a)}]")
+                                outer._emit(f"v_lshl_or_b32 v[{v.v_a(i_rm*num_v_a+a)}], v[{v.v_gld_a(s)}], {shift}, v[{v.v_a(i_rm*num_v_a+a)}]")
                 return outer._get_deferred()
         return functor_t()
 
@@ -735,29 +751,36 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         Transposed read for input: LDS holds it as natural [K rows][N cols] (row_pitch =
         gemm_n_per_block*databyte bytes). Identical to bwd's shared_load_b_functor (same
         tensor shape/role: [K][C_in], contiguous over C_in) -- see that file for the
-        detailed explanation of the strided-read-and-pack technique.
+        detailed explanation of the strided-read-and-pack technique, including the
+        `num_v_b`-derived loop bound/index and the ds_read_b32 branch fp32 needs.
         '''
         outer = self
         class functor_t:
             def __call__(self, v_dst, v_os, extra_off):
                 v = outer.vgpr
+                num_v_b = outer.wmma_mapping.ctrl.inst_wmma.num_v_b
                 row_pitch = outer.tunable.gemm_n_per_block * outer.data_byte
                 elem_per_dword = 4 // outer.data_byte
-                read_instr = 'ds_read_u16' if outer.data_byte == 2 else 'ds_read_u8'
+                if outer.data_byte == 2:
+                    read_instr = 'ds_read_u16'
+                elif outer.data_byte == 4:
+                    read_instr = 'ds_read_b32'   # fp32: full-dword read, no zero-extension needed
+                else:
+                    read_instr = 'ds_read_u8'
                 with outer._deferred_context():
                     for i_rn in range(4):
                         col_off = i_rn * outer.tunable.wmma_tile_n * outer.data_byte
-                        for a in range(8):
+                        for a in range(num_v_b):
                             # B region starts at outer.lds_a_size within the shared LDS tile;
                             # v_sld_b_os only carries the offset local to B's own region.
                             for s in range(elem_per_dword):
                                 off = outer.lds_a_size + col_off + (a * elem_per_dword + s) * row_pitch
                                 outer._emit(f"{read_instr} v[{v.v_gld_b(s)}], v[{v.v_sld_b_os()}] offset:{extra_off + off}")
                             outer._emit(f"s_wait_dscnt 0x0")
-                            outer._emit(f"v_mov_b32 v[{v.v_b(i_rn*8+a)}], v[{v.v_gld_b(0)}]")
+                            outer._emit(f"v_mov_b32 v[{v.v_b(i_rn*num_v_b+a)}], v[{v.v_gld_b(0)}]")
                             for s in range(1, elem_per_dword):
                                 shift = s * 8 * outer.data_byte
-                                outer._emit(f"v_lshl_or_b32 v[{v.v_b(i_rn*8+a)}], v[{v.v_gld_b(s)}], {shift}, v[{v.v_b(i_rn*8+a)}]")
+                                outer._emit(f"v_lshl_or_b32 v[{v.v_b(i_rn*num_v_b+a)}], v[{v.v_gld_b(s)}], {shift}, v[{v.v_b(i_rn*num_v_b+a)}]")
                 return outer._get_deferred()
         return functor_t()
 
