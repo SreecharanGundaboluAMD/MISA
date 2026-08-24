@@ -267,6 +267,33 @@ needed for this phase, unlike the WMMA-layout probes of Phases 1-4).
 
 **Not yet done** (deliberately deferred, scoped as separate future steps): multi-tap filters
 (`y,x > 1`, needs a real K-loop-coupled tap iteration, unlike 1x1's single-input-pixel-per-
-output-pixel gather), dilation, `group > 1`, and replicating this same stride/pad extension to
-bwd and wrw (whose transposed-operand addressing would need the same division+masking
-treatment applied to a different operand).
+output-pixel gather), dilation, `group > 1`. Stride/pad for bwd and wrw are covered next.
+
+## Phase 5b: general stride/padding for bwd (still 1x1 filter, dilation=1, group=1)
+
+Same idea as Phase 5a, but with a genuinely harder validity condition. fwd's GEMM_M (n*ho*wo)
+enumerates *output* pixels, so its gather is a simple "is this input coordinate in bounds"
+check. bwd's GEMM_M (n*hi*wi) enumerates *input* pixels — grad_input's own size — while the A
+operand it reads (grad_output) is stored in grad_output's *different* pixel space (n*ho*wo),
+which is smaller than GEMM_M whenever `stride > 1`. Concretely: `ho_idx = (hi_idx+pad_h) /
+stride_h` is only meaningful when that division is *exact* — an input pixel that doesn't land
+on a stride multiple has no corresponding output pixel at all (a "stride gap"), independent of
+whether `ho_idx` would otherwise be in bounds. So each thread now runs 4 chained divisions
+(not fwd's 2): decompose GEMM_M into `(n_idx, hi_idx, wi_idx)` via `hi*wi` then `wi` (same
+shape as fwd's decomposition, just using the *input*'s own hi/wi as divisors instead of the
+*output*'s ho/wo), then `(hi_idx+pad_h)/stride_h` and `(wi_idx+pad_w)/stride_w`, checking both
+the remainder (must be exactly 0) and the quotient (must be `< ho`/`< wo`) — four conditions
+ANDed into one flag, same EXEC-masking mechanism as Phase 5a. Weight (B) and the grad_input
+output write are untouched, exactly as in fwd's case.
+
+Kernarg grew from 36 to 68 bytes (`hi_wi, wi, stride_h, stride_w, pad_h, pad_w, ho, wo`) — note
+`hi`/`wi` are needed as *divisors* here (unlike fwd, where they were *bounds*), while `ho`/`wo`
+are the *bounds* (the reverse of fwd's role assignment, since bwd's roles are already generally
+inverted relative to fwd — see the p_in/p_wei/p_out mapping note in the driver-integration
+section above).
+
+**Validated on real gfx1250 hardware** through `conv_driver.exe`: fp16 bwd, stride-1/pad-0
+regression plus stride (1/2/3) × padding (0/1/2), multi-block, asymmetric stride_h≠stride_w,
+and multi-K-block configs — all passed on the first hardware run (no bugs found this time,
+unlike wrw's `side='m'` bug in Phase 4) — against the driver's own `naive_conv_bwd_nhwc`
+reference.

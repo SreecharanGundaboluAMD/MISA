@@ -137,14 +137,14 @@ typedef struct {
 #endif
 } __attribute__((packed)) igemm_bwd_gtc_nhwc_karg_t;
 
-// Minimal karg for the gfx1250 WMMA degenerate-case kernel (igemm_bwd_gtc_wmma_nhwc_t):
-// 1x1 filter/stride1/no-pad only (nxe=0), no group>1, no split-K. Layout must match
-// get_kernel_args() in python/igemm/igemm_bwd_gtc_wmma_nhwc.py exactly (3 pointers + 3
-// ints, 36 bytes). NOTE the kernel's own field semantics: p_in=grad_output (READ),
-// p_wei=weight (READ), p_out=grad_input (WRITE) -- the OPPOSITE of what run()'s p_in/p_out
-// parameters conventionally hold for bwd (p_in=the "input" GPU buffer, which for bwd is the
-// WRITE target holding the computed grad_input; p_out=the "output" GPU buffer, holding the
-// grad_output read as bwd's input) -- see the WMMA branch in run() for the resulting swap.
+// Karg for the gfx1250 WMMA bwd kernel (igemm_bwd_gtc_wmma_nhwc_t): 1x1 filter only, but
+// Phase 5b added arbitrary stride/pad support. Layout must match get_kernel_args() in
+// python/igemm/igemm_bwd_gtc_wmma_nhwc.py exactly (3 pointers + 11 ints, 68 bytes). NOTE the
+// kernel's own field semantics: p_in=grad_output (READ), p_wei=weight (READ), p_out=grad_input
+// (WRITE) -- the OPPOSITE of what run()'s p_in/p_out parameters conventionally hold for bwd
+// (p_in=the "input" GPU buffer, which for bwd is the WRITE target holding the computed
+// grad_input; p_out=the "output" GPU buffer, holding the grad_output read as bwd's input) --
+// see the WMMA branch in run() for the resulting swap.
 typedef struct {
     void *p_in;
     void *p_wei;
@@ -152,6 +152,14 @@ typedef struct {
     int   gemm_m;
     int   gemm_n;
     int   gemm_k;
+    int   hi_wi;
+    int   wi;
+    int   stride_h;
+    int   stride_w;
+    int   pad_h;
+    int   pad_w;
+    int   ho;
+    int   wo;
 } __attribute__((packed)) igemm_bwd_gtc_wmma_nhwc_karg_t;
 
 #ifdef IGEMM_BWD_UPSAMPLING_USE_CUSTOM_KERNEL
@@ -497,10 +505,12 @@ public:
         bool unit_conv = (x==1)&&(y==1)&&(stride_h==1)&&(stride_w==1)&&(dilation_h==1)&&(dilation_w==1)&&(pad_h==0)&&(pad_w==0);
 
         if(tunable->fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA){
-            // igemm_bwd_gtc_wmma_nhwc_t only supports the degenerate 1x1/stride1/no-pad GEMM
-            // case, group==1, and a single fixed 128x128 macro-tile shape -- see
-            // igemm_fwd_gtc_driver.h's identical WMMA branch for the rationale.
-            if(tunable->tensor_layout != "nhwc" || !unit_conv || group != 1)
+            // igemm_bwd_gtc_wmma_nhwc_t requires a 1x1 filter, no dilation, group==1, and a
+            // single fixed 128x128 macro-tile shape -- see igemm_fwd_gtc_driver.h's identical
+            // WMMA branch for the rationale. Phase 5b added arbitrary stride/pad support, so
+            // (unlike unit_conv) stride_h/w and pad_h/w are NOT required to be 1/0 here.
+            bool unit_conv_1x1 = (x==1) && (y==1) && (dilation_h==1) && (dilation_w==1);
+            if(tunable->tensor_layout != "nhwc" || !unit_conv_1x1 || group != 1)
                 return false;
             int n = arg->get_int("batchsize") / splits;
             int gemm_m = n * hi * wi;
@@ -646,18 +656,36 @@ public:
             int k  = arg->get_int("out_channels");
             int c  = arg->get_int("in_channels");
             int group = arg->get_int("group_count");
+            int stride_h = arg->get_int("conv_stride_h");
+            int stride_w = arg->get_int("conv_stride_w");
+            int dilation_h = arg->get_int("dilation_h");
+            int dilation_w = arg->get_int("dilation_w");
+            int pad_h = arg->get_int("pad_h");
+            int pad_w = arg->get_int("pad_w");
+            int y = arg->get_int("fil_h");
+            int x = arg->get_int("fil_w");
+            int ho = conv_out_size(hi, pad_h, dilation_h, y, stride_h);
+            int wo = conv_out_size(wi, pad_w, dilation_w, x, stride_w);
 
             int gemm_m = n * hi * wi;
             int gemm_n = c / group;
             int gemm_k = k / group;
 
             igemm_bwd_gtc_wmma_nhwc_karg_t karg;
-            karg.p_in   = p_out;   // grad_output (read)
-            karg.p_wei  = p_wei;   // weight (read)
-            karg.p_out  = p_in;    // grad_input (write)
-            karg.gemm_m = gemm_m;
-            karg.gemm_n = gemm_n;
-            karg.gemm_k = gemm_k;
+            karg.p_in     = p_out;   // grad_output (read)
+            karg.p_wei    = p_wei;   // weight (read)
+            karg.p_out    = p_in;    // grad_input (write)
+            karg.gemm_m   = gemm_m;
+            karg.gemm_n   = gemm_n;
+            karg.gemm_k   = gemm_k;
+            karg.hi_wi    = hi * wi;
+            karg.wi       = wi;
+            karg.stride_h = stride_h;
+            karg.stride_w = stride_w;
+            karg.pad_h    = pad_h;
+            karg.pad_w    = pad_w;
+            karg.ho       = ho;
+            karg.wo       = wo;
             size_t karg_size = sizeof(karg);
 
             hipFunction_t kernel_func;

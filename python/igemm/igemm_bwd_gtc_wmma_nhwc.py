@@ -30,18 +30,46 @@ from .igemm_base import *
 
 class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
     '''
-    Correctness-first gfx1250 WMMA milestone kernel for backward-data (grad-input)
-    convolution -- degenerate case only (1x1 filter, stride 1, no padding, nxe=0),
-    same scope as igemm_fwd_gtc_wmma_nhwc_t, whose structure this closely mirrors.
+    gfx1250 WMMA kernel for backward-data (grad-input) convolution. Phase 5b extends this
+    beyond the original degenerate 1x1/stride1/no-pad GEMM to support arbitrary stride and
+    padding (still 1x1 filter, dilation=1, group=1) -- see igemm_fwd_gtc_wmma_nhwc_t's Phase
+    5a docstring for the sibling fwd extension this closely mirrors.
 
-        grad_input[m, n] = sum_k grad_output[m, k] * weight[k, n]
+        grad_input[n,hi,wi, c] = sum_k grad_output[n, (hi+pad_h)/stride_h, (wi+pad_w)/stride_w, k] * weight[k, c]
+                                  (0 if (hi+pad_h) isn't an exact multiple of stride_h, same
+                                   for w, or if the resulting ho/wo index is out of bounds --
+                                   a "stride gap": for stride>1, most input pixels have NO
+                                   corresponding output pixel at all)
 
-    where m enumerates (n_batch, h, w) pixels (GEMM_M = n*hi*wi), k enumerates output
-    channels (GEMM_K = k_out, the contraction dim -- swapped vs fwd, where GEMM_K was
+    where m enumerates (n_batch, hi, wi) INPUT pixels (GEMM_M = n*hi*wi -- this is
+    grad_input's own pixel count, note the input, not output, spatial extent), k enumerates
+    output channels (GEMM_K = k_out, the contraction dim -- swapped vs fwd, where GEMM_K was
     input channels), n enumerates input channels (GEMM_N = c_in).
 
-    Tensor A (grad_output) is naturally row-major [GEMM_M][GEMM_K] (NHWK pixel-major,
-    K_out-contiguous) -- identical orientation to fwd's A operand, reused verbatim.
+    Weight (B) and the output (grad_input) write are completely unaffected by stride/padding
+    (weight has no spatial extent for a 1x1 filter; every GEMM_M index is a real grad_input
+    pixel regardless of stride/pad) and stay exactly as in the degenerate-case kernel.
+
+    Tensor A (grad_output), however, needs the SAME kind of gather Phase 5a added to fwd's
+    input operand, but with a genuinely different (harder) validity condition: unlike fwd's
+    "in bounds or not" padding check, an input pixel here maps to a grad_output pixel only if
+    `(spatial_idx + pad) / stride` divides EXACTLY -- a "stride gap" position (when stride>1)
+    contributes zero regardless of bounds, since grad_output was never computed for it. GEMM_M
+    is decomposed into (n_idx, hi_idx, wi_idx) via two chained runtime divisions (by hi*wi then
+    wi -- see get_kernel_macros()/macro_int_div_rem_vs_gfx1250_t in operations/utility.py, the
+    wave32-safe plain-division primitive Phase 5a introduced), then TWO MORE division calls
+    compute `(hi_idx+pad_h)/stride_h` (quotient=ho_idx, remainder checked for exact
+    divisibility) and the w equivalent. The resulting flag ANDs four conditions (h divisible,
+    h in bounds, w divisible, w in bounds) and gates grad_output's global load via the same
+    EXEC-masking (`v_cmpx_le_u32`/restore around a pre-zeroed v_gld_a) Phase 5a used --
+    correct for the same reason: an input pixel's stride-gap/bounds status is a per-thread
+    constant for the whole kernel (1x1 filter, so it never depends on which K-out chunk is
+    loading).
+
+    Tensor A (grad_output) is naturally row-major [GEMM_M'][GEMM_K] where GEMM_M' is
+    grad_output's OWN pixel count (n*ho*wo) -- for the degenerate case GEMM_M'==GEMM_M
+    (identity gather), which is why the original kernel could reuse fwd's A-operand path
+    verbatim; for general stride/pad these differ in size and the gather above is required.
 
     Tensor B (weight) is physically stored [K_out][C_in] (same buffer/layout the
     forward kernel reads), which for THIS kernel's role assignment (GEMM_K=K_out,
@@ -98,7 +126,8 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         return igemm_gtc_encode_kernel_name(self.tunable, self.mc.arch_config.arch)
 
     def get_kernel_macros(self):
-        return []
+        # plain (non-magic) runtime u32 division, wave32-safe (see class docstring / Phase 5a).
+        return [macro_int_div_vs_gfx1250_t(self.mc), macro_int_div_rem_vs_gfx1250_t(self.mc)]
 
     class kernel_sgpr_t(mc_base_t):
         def __init__(self, mc, outer):
@@ -113,6 +142,16 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             self.s_gemm_m      = sym_t('s_gemm_m'      , sseq(1))    # N*Hi*Wi
             self.s_gemm_n      = sym_t('s_gemm_n'      , sseq(1))    # C_in
             self.s_gemm_k      = sym_t('s_gemm_k'      , sseq(1))    # K_out
+            # stride/pad kernarg fields (Phase 5b)
+            self.s_hi_wi       = sym_t('s_hi_wi'       , sseq(1))    # = hi*wi, divisor for (n, hi*wi) decomposition
+            self.s_wi          = sym_t('s_wi'          , sseq(1))    # divisor for (hi_idx, wi_idx) decomposition
+            self.s_stride_h    = sym_t('s_stride_h'    , sseq(1))
+            self.s_stride_w    = sym_t('s_stride_w'    , sseq(1))
+            self.s_pad_h       = sym_t('s_pad_h'       , sseq(1))
+            self.s_pad_w       = sym_t('s_pad_w'       , sseq(1))
+            self.s_ho          = sym_t('s_ho'          , sseq(1))    # bound + row-pitch factor for grad_output address
+            self.s_wo          = sym_t('s_wo'          , sseq(1))    # bound + divisor for grad_output address
+            self.s_ho_wo       = sym_t('s_ho_wo'       , sseq(1))    # = s_ho*s_wo, computed on-device once
             self.s_block_m_off = sym_t('s_block_m_off' , sseq(1))
             self.s_block_n_off = sym_t('s_block_n_off' , sseq(1))
             self.s_wei_k_stride = sym_t('s_wei_k_stride', sseq(1))   # C_in*databyte*gemm_k_per_block: weight's per-K-block global stride
@@ -146,6 +185,12 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             self.v_gemm_im     = sym_t('v_gemm_im'     , vseq(1))
             self.v_gemm_in     = sym_t('v_gemm_in'     , vseq(1))
             self.v_tmp         = sym_t('v_tmp'         , vseq(4))
+            # Phase 5b (stride/pad): v_flag is a per-thread CONSTANT (see class docstring),
+            # computed once in the prologue and reused by every main-loop reload of A.
+            # v_gtc_tmp is scratch for the one-time (n,hi,wi)->(ho,wo)-or-invalid decomposition
+            # (needs more registers than fwd's Phase 5a: 4 chained divisions here, not 2).
+            self.v_flag        = sym_t('v_flag'        , vseq(1))
+            self.v_gtc_tmp     = sym_t('v_gtc_tmp'     , vseq(9))
             self.v_end         = sym_t('v_end'         , vseq())
 
         def emit(self):
@@ -155,12 +200,22 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
 
     def get_kernel_args(self):
         kas = []
-        kas.append(amdgpu_kernel_arg_t('p_in'   , 8,  0, 'global_buffer', 'f32', address_space='global', is_const='false'))
-        kas.append(amdgpu_kernel_arg_t('p_wei'  , 8,  8, 'global_buffer', 'f32', address_space='global', is_const='false'))
-        kas.append(amdgpu_kernel_arg_t('p_out'  , 8, 16, 'global_buffer', 'f32', address_space='global', is_const='false'))
-        kas.append(amdgpu_kernel_arg_t('gemm_m' , 4, 24, 'by_value', 'i32'))
-        kas.append(amdgpu_kernel_arg_t('gemm_n' , 4, 28, 'by_value', 'i32'))
-        kas.append(amdgpu_kernel_arg_t('gemm_k' , 4, 32, 'by_value', 'i32'))
+        kas.append(amdgpu_kernel_arg_t('p_in'      , 8,  0, 'global_buffer', 'f32', address_space='global', is_const='false'))
+        kas.append(amdgpu_kernel_arg_t('p_wei'     , 8,  8, 'global_buffer', 'f32', address_space='global', is_const='false'))
+        kas.append(amdgpu_kernel_arg_t('p_out'     , 8, 16, 'global_buffer', 'f32', address_space='global', is_const='false'))
+        kas.append(amdgpu_kernel_arg_t('gemm_m'    , 4, 24, 'by_value', 'i32'))
+        kas.append(amdgpu_kernel_arg_t('gemm_n'    , 4, 28, 'by_value', 'i32'))
+        kas.append(amdgpu_kernel_arg_t('gemm_k'    , 4, 32, 'by_value', 'i32'))
+        # Phase 5b (stride/pad): declaration order here must exactly match kernel_sgpr_t's
+        # s_hi_wi..s_wo declaration order.
+        kas.append(amdgpu_kernel_arg_t('hi_wi'     , 4, 36, 'by_value', 'i32'))
+        kas.append(amdgpu_kernel_arg_t('wi'        , 4, 40, 'by_value', 'i32'))
+        kas.append(amdgpu_kernel_arg_t('stride_h'  , 4, 44, 'by_value', 'i32'))
+        kas.append(amdgpu_kernel_arg_t('stride_w'  , 4, 48, 'by_value', 'i32'))
+        kas.append(amdgpu_kernel_arg_t('pad_h'     , 4, 52, 'by_value', 'i32'))
+        kas.append(amdgpu_kernel_arg_t('pad_w'     , 4, 56, 'by_value', 'i32'))
+        kas.append(amdgpu_kernel_arg_t('ho'        , 4, 60, 'by_value', 'i32'))
+        kas.append(amdgpu_kernel_arg_t('wo'        , 4, 64, 'by_value', 'i32'))
         return kas
 
     def get_kernel_code(self):
@@ -170,7 +225,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             'enable_sgpr_workgroup_id_y'       :   1,
             'enable_vgpr_workitem_id'          :   0,
             'workgroup_group_segment_byte_size':   self.lds_a_size + self.lds_b_size,
-            'kernarg_segment_byte_size'         :   36,
+            'kernarg_segment_byte_size'         :   68,
             'wavefront_sgpr_count'              :   self.sgpr.s_end.value + 2 * 3,
             'workitem_vgpr_count'               :   self.vgpr.v_end.value,
             'wavefront_size'                    :   32,
@@ -212,6 +267,15 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_load_dwordx4 s[{s.s_p_in()}:{s.s_p_in(3)}], s[{s.s_ka()}:{s.s_ka(1)}], 0")
         self._emit(f"s_load_dwordx4 s[{s.s_p_out()}:{s.s_p_out(3)}], s[{s.s_ka()}:{s.s_ka(1)}], 16")
         self._emit(f"s_load_dword s[{s.s_gemm_k()}], s[{s.s_ka()}:{s.s_ka(1)}], 32")
+        # individual s_load_dword (not dwordx4) -- these SGPRs aren't guaranteed 4-aligned
+        self._emit(f"s_load_dword s[{s.s_hi_wi()}], s[{s.s_ka()}:{s.s_ka(1)}], 36")
+        self._emit(f"s_load_dword s[{s.s_wi()}], s[{s.s_ka()}:{s.s_ka(1)}], 40")
+        self._emit(f"s_load_dword s[{s.s_stride_h()}], s[{s.s_ka()}:{s.s_ka(1)}], 44")
+        self._emit(f"s_load_dword s[{s.s_stride_w()}], s[{s.s_ka()}:{s.s_ka(1)}], 48")
+        self._emit(f"s_load_dword s[{s.s_pad_h()}], s[{s.s_ka()}:{s.s_ka(1)}], 52")
+        self._emit(f"s_load_dword s[{s.s_pad_w()}], s[{s.s_ka()}:{s.s_ka(1)}], 56")
+        self._emit(f"s_load_dword s[{s.s_ho()}], s[{s.s_ka()}:{s.s_ka(1)}], 60")
+        self._emit(f"s_load_dword s[{s.s_wo()}], s[{s.s_ka()}:{s.s_ka(1)}], 64")
         self._emit(f"v_mov_b32 v[{v.v_tid()}], v0")
         # gfx1250 delivers workgroup id via ttmp9/ttmp7 -- see docs/gfx1250_wmma_layout.md.
         self._emit(f"s_mov_b32 s[{s.s_bx()}], ttmp9")
@@ -233,13 +297,51 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_lshl_b32 s[{s.s_wei_k_stride()}], s[{s.s_gemm_n()}], {utility_log2(self.data_byte) + 5}   ; C_in * databyte * 32")
         self._emit_empty_line()
 
-        # ---- global address for this thread's row of the A tile (grad_output, [GEMM_M][GEMM_K]) ----
-        self._emit(f"; v_addr_a = p_in + (block_m_off + tid) * gemm_k * databyte")
-        self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_block_m_off()}], v[{v.v_tid()}]")
-        self._emit(f"v_mul_lo_u32 v[{v.v_tmp()}], s[{s.s_gemm_k()}], v[{v.v_tmp()}]")
-        self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.data_byte)}, v[{v.v_tmp()}]")
+        # ---- global address for this thread's row of the A tile (grad_output, gathered
+        # through stride/pad -- see class docstring) ----
+        m_int_div_rem_vs = macro_int_div_rem_vs_gfx1250_t(self.mc)
+        self._emit(f"s_mul_i32 s[{s.s_ho_wo()}], s[{s.s_ho()}], s[{s.s_wo()}]")
+        self._emit(f"; decode this thread's absolute GEMM_M index into (n_idx, hi_idx, wi_idx)")
+        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_block_m_off()}], v[{v.v_tid()}]   ; m_idx")
+        self._emit(m_int_div_rem_vs(v.v_gtc_tmp(1), v.v_gtc_tmp(2), v.v_gtc_tmp(0), s.s_hi_wi(), v.v_tmp(), s.s_tmp()))
+        self._emit(f"; v_gtc_tmp(1)=hw_idx (rem), v_gtc_tmp(2)=n_idx (quo)")
+        self._emit(m_int_div_rem_vs(v.v_gtc_tmp(3), v.v_gtc_tmp(4), v.v_gtc_tmp(1), s.s_wi(), v.v_tmp(), s.s_tmp()))
+        self._emit(f"; v_gtc_tmp(3)=wi_idx (rem), v_gtc_tmp(4)=hi_idx (quo)")
+        self._emit_empty_line()
+
+        self._emit(f"; ho_idx = (hi_idx+pad_h)/stride_h (valid iff exact division & in bounds)")
+        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(4)}], v[{v.v_gtc_tmp(4)}], s[{s.s_pad_h()}]   ; numerator_h")
+        self._emit(m_int_div_rem_vs(v.v_gtc_tmp(5), v.v_gtc_tmp(6), v.v_gtc_tmp(4), s.s_stride_h(), v.v_tmp(), s.s_tmp()))
+        self._emit(f"; v_gtc_tmp(5)=rem_h, v_gtc_tmp(6)=ho_idx")
+        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(3)}], v[{v.v_gtc_tmp(3)}], s[{s.s_pad_w()}]   ; numerator_w")
+        self._emit(m_int_div_rem_vs(v.v_gtc_tmp(7), v.v_gtc_tmp(8), v.v_gtc_tmp(3), s.s_stride_w(), v.v_tmp(), s.s_tmp()))
+        self._emit(f"; v_gtc_tmp(7)=rem_w, v_gtc_tmp(8)=wo_idx")
+        self._emit_empty_line()
+
+        self._emit(f"; v_flag = 1 iff both divisions are exact AND (ho_idx,wo_idx) in bounds")
+        self._emit(f"v_cmp_eq_u32 vcc_lo, 0, v[{v.v_gtc_tmp(5)}]")
+        self._emit(f"v_cndmask_b32 v[{v.v_flag()}], 0, 1, vcc_lo")
+        self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_ho()}], v[{v.v_gtc_tmp(6)}]")
+        self._emit(f"v_cndmask_b32 v[{v.v_flag()}], 0, v[{v.v_flag()}], vcc_lo")
+        self._emit(f"v_cmp_eq_u32 vcc_lo, 0, v[{v.v_gtc_tmp(7)}]")
+        self._emit(f"v_cndmask_b32 v[{v.v_flag()}], 0, v[{v.v_flag()}], vcc_lo")
+        self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_wo()}], v[{v.v_gtc_tmp(8)}]")
+        self._emit(f"v_cndmask_b32 v[{v.v_flag()}], 0, v[{v.v_flag()}], vcc_lo")
+        self._emit_empty_line()
+
+        self._emit(f"; row_idx = n_idx*(ho*wo) + ho_idx*wo + wo_idx (meaningless but harmless if")
+        self._emit(f"; v_flag==0 -- that lane's global_load_a is EXEC-masked off, see global_load_a_functor)")
+        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_ho_wo()}], v[{v.v_gtc_tmp(2)}]")
+        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(2)}], s[{s.s_wo()}], v[{v.v_gtc_tmp(6)}]")
+        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(2)}]")
+        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(8)}]")
+        self._emit_empty_line()
+
+        self._emit(f"; v_addr_a = p_in + row_idx * gemm_k * databyte")
+        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_gemm_k()}], v[{v.v_gtc_tmp(0)}]")
+        self._emit(f"v_lshlrev_b32 v[{v.v_gtc_tmp(0)}], {utility_log2(self.data_byte)}, v[{v.v_gtc_tmp(0)}]")
         self._emit(f"v_mov_b32 v[{v.v_addr_a(1)}], s[{s.s_p_in(1)}]")
-        self._emit(f"v_add_co_u32 v[{v.v_addr_a()}], vcc_lo, s[{s.s_p_in()}], v[{v.v_tmp()}]")
+        self._emit(f"v_add_co_u32 v[{v.v_addr_a()}], vcc_lo, s[{s.s_p_in()}], v[{v.v_gtc_tmp(0)}]")
         self._emit(f"v_add_co_ci_u32 v[{v.v_addr_a(1)}], vcc_lo, 0, v[{v.v_addr_a(1)}], vcc_lo")
         self._emit_empty_line()
 
@@ -290,19 +392,33 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"v_add_u32 v[{v.v_gemm_in()}], s[{s.s_block_n_off()}], v[{v.v_gemm_in()}]")
         self._emit_empty_line()
 
+        # ---- pre-zero v_gld_a: a stride-gap/oob lane's global_load_a is EXEC-masked off on
+        # every call (including this first one), so without this it would carry garbage forever ----
+        for i in range(16):
+            self._emit(f"v_mov_b32 v[{v.v_gld_a(i)}], 0")
+        self._emit_empty_line()
+
         # ---- issue the first global loads (main loop expects this precondition) ----
         self._emit(self.global_load_a_functor()())
         self._emit(self.global_load_b_functor()())
         self._emit_empty_line()
 
     def global_load_a_functor(self):
+        '''
+        Padding/stride-gap lanes (v_flag==0) never execute the load (see class docstring):
+        this thread's v_gld_a is pre-zeroed once (emit_kernel_prologue) and, for such a lane,
+        simply never written again for the life of the kernel -- correct, since a 1x1-filter
+        stride-gap/oob input pixel contributes zero regardless of which K-out chunk is loaded.
+        '''
         outer = self
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
+                    outer._emit(f"v_cmpx_le_u32 1, v[{v.v_flag()}]")
                     for i in range(4):
                         outer._emit(f"global_load_dwordx4 v[{v.v_gld_a(i*4)}:{v.v_gld_a(i*4+3)}], v[{v.v_addr_a()}:{v.v_addr_a(1)}], off offset:{i*16}")
+                    outer._emit(f"s_mov_b32 exec_lo, -1")
                 return outer._get_deferred()
             def get_issues(self):
                 return 4
