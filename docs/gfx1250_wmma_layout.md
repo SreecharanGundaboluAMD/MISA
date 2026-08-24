@@ -58,6 +58,41 @@ non-clustered (default) case. Verified independently on real hardware via a mult
 atomic-slot dispatch test. No official documentation found for this — discovered purely by
 disassembly; re-verify if targeting a different ROCm/LLVM version.
 
+## LDS-transpose read for operands whose natural memory layout doesn't match the WMMA
+## operand orientation (bwd's weight operand, and wrw's grad_output/input operands)
+
+Some GEMM role-assignments store an operand `[gemm_k rows][gemm_m or gemm_n contiguous]`
+(k-major, row-contiguous in the non-contraction dim) instead of the `[gemm_m or
+gemm_n][gemm_k]` (row-major, k-contiguous) orientation the fwd kernel's operands happen to
+have naturally. bwd's weight operand is the first example: physically `[K_out][C_in]`
+(the same buffer/layout fwd reads), but bwd binds `GEMM_K=K_out`, `GEMM_N=C_in` — the
+opposite of what a WMMA B-operand load wants.
+
+Rather than transposing through an extra LDS pass, global load and LDS store are left
+completely unchanged (still contiguous, still writing the natural `[K][N]` layout into LDS);
+only the WMMA-consumption-time LDS **read** changes, from 2x `ds_read_b128` (contiguous) to
+16x `ds_read_u16` (strided, one per row, `row_pitch_bytes` apart) + 8x `v_lshl_or_b32` (pack
+pairs into dwords) per wave_repeat step. This trades LDS-instruction count for correctness/
+auditability — an explicitly deferred optimization, same tradeoff
+`coalescing_store_wmma.py` already documents for its own epilogue.
+
+New helper: `igemm_wmma_mapping_t.get_gemm_index_for_src_matrix_transposed()` in
+`wmma_mapping.py` — sibling to `get_gemm_index_for_src_matrix`, returns a ready-to-use BYTE
+offset (not an element-unit row/col left for the caller to scale, since the k-half
+contribution here is a `row_pitch_bytes`-scaled jump, not a small fixed 32-byte add). See
+`igemm_bwd_gtc_wmma_nhwc.py`'s `shared_load_b_functor` for the concrete worked example,
+including how the caller adds the two remaining compile-time-constant deltas
+(`i_rn * wave_tile_n * elem_bytes` for the wave_repeat step, `(a*2+s) * row_pitch_bytes` for
+which of the 16 rows within a k-half block).
+
+**Validated on real gfx1250 hardware** (`igemm_bwd_gtc_wmma_nhwc_t`, single-K-block config
+128x128x32): exact match against a CPU reference across single-block, multi-block (4x3 and
+other grids), and multi-K-block (2 and 4 iterations) configurations, multiple random seeds,
+and a config where GEMM_N (total C_in) differs from `gemm_n_per_block` (catches a stride
+computed from the wrong tunable field, since bwd's `move_slice_window_b` needs a
+**runtime** per-K-block stride — `s_gemm_n * databyte * gemm_k_per_block` — unlike fwd's
+compile-time-constant one, because C_in isn't known until kernel launch).
+
 ## Accumulator initialization
 
 `v_wmma_*` computes `D = A@B + C`. If a kernel reuses the same VGPR range for both the C and D

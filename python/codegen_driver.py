@@ -62,7 +62,9 @@ class codegen_driver_t(mc_base_t):
             for tdd in tunable_dicts:
                 assert tdd['direction'] == 'bwd'
             # gtc bwd
-            if 'tensor_layout' in tunable_dicts[0] and tunable_dicts[0]['tensor_layout'] == 'nhwc':
+            if 'wmma_tile_m' in tunable_dicts[0]:
+                kernel_list.extend([igemm_bwd_gtc_wmma_nhwc_t(mc_asm_printer_t(mc.emitter, mc.arch_config), igemm_gtc_tunable_parameter_t(td)) for td in tunable_dicts])
+            elif 'tensor_layout' in tunable_dicts[0] and tunable_dicts[0]['tensor_layout'] == 'nhwc':
                 kernel_list.extend([igemm_bwd_gtc_nhwc_t(mc_asm_printer_t(mc.emitter, mc.arch_config), igemm_gtc_tunable_parameter_t(td)) for td in tunable_dicts])
             else:
                 kernel_list.extend([igemm_bwd_gtc_t(mc_asm_printer_t(mc.emitter, mc.arch_config), igemm_gtc_tunable_parameter_t(td)) for td in tunable_dicts])
