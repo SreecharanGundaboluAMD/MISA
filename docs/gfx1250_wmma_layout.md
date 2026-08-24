@@ -362,4 +362,90 @@ straightforward parametrization of the same mechanism, not attempted yet — see
 
 **Not yet done**: multi-tap filters (`y,x > 1`), dilation, `group > 1`, and replicating
 stride/pad support to bf16/int8 for bwd/wrw (only fwd has all three precisions with general
-stride/pad so far).
+stride/pad so far). See Phase 5d below for multi-tap/dilation on fwd.
+
+## Phase 5d: multi-tap filters (y,x >= 1) and dilation for fwd
+
+`igemm_fwd_gtc_wmma_nhwc_t` was extended again (still 1x1-filter-only class from Phase 5a's
+perspective, now generalized) to support arbitrary filter height/width and dilation, on top
+of Phase 5a's stride/pad (`group=1` still required):
+
+```
+output[n,ho,wo,k] = sum_{iy,ix,c} input[n, ho*stride_h-pad_h+iy*dilation_h,
+                                          wo*stride_w-pad_w+ix*dilation_w, c] * weight[k,iy,ix,c]
+```
+
+Weight's standard conv layout is `[K_out][Y][X][C_in]` (`C_in` innermost — confirmed against
+`driver/naive_conv.h`'s `f_idx = k*fy*fx*c + iy*fx*c + ix*c + ic`), so its `K_out`-stride is
+`y*x*c` elements (not just `c` as in the 1x1 case), and a given tap's `C_in`-column-block
+starts `(iy*x+ix)*c` elements into that row.
+
+**Design choice**: rather than porting `igemm_fwd_gtc_nhwc.py`'s `merge_e` machinery (a single
+merged `GEMM_K = c*y*x` with carry-propagating address deltas for when the c-dimension
+overflows into x, and x into y — see that file's `move_slice_window_accumulate` and its dozen
+`s_diff_in_*` SGPRs), this kernel keeps `GEMM_K = c` unchanged from Phase 5a and wraps the
+*entire* WMMA K-main-loop in a new, small, **runtime** (not compile-time-unrolled) outer loop
+over the `y*x` taps:
+
+```
+s_iy = 0
+L_tap_y: s_ix = 0
+  L_tap_x: <recompute this tap's A address+flag, B address>
+           <issue first A/B loads>
+           <run the WMMA K-main-loop over C -- emitted EXACTLY ONCE; the runtime
+            branch below re-enters this same code for every tap>
+           s_ix++; branch to L_tap_x if s_ix < s_x
+  s_iy++; branch to L_tap_y if s_iy < s_y
+```
+
+`v_c` (the accumulator) is zeroed once at kernel entry and never reset between taps, so
+successive taps' `v_wmma_* D=A@B+C` calls accumulate naturally — the only thing that changes
+per tap is which A/B addresses feed the same, unchanged K-loop body. All four waves in a block
+execute this loop in lockstep (`s_iy`/`s_ix` and the `y`/`x` bounds are wave-uniform SGPR
+values, not thread-varying), so the existing single-buffered-LDS barrier scheme is unaffected.
+Emitting the K-main-loop's assembly only once (rather than once per tap) keeps code size
+independent of filter size, at the cost of a few extra scalar instructions and one branch per
+tap — a correctness-first tradeoff consistent with every other phase in this milestone.
+
+Per-tap addressing: A's (input) `hi_idx`/`wi_idx`/flag/address are fully recomputed every tap
+from this thread's *persistent* `n_idx`/`ho_idx`/`wo_idx` (decomposed from GEMM_M once, in the
+prologue, via the same runtime-division sequence Phase 5a introduced) plus the current
+`s_iy`/`s_ix`. Padding is masked the same way Phase 5a did (unsigned-wraparound bounds check +
+EXEC-masked global load), but the flag is no longer a per-thread constant for the whole kernel
+(it can flip between taps, since different taps look at different input pixels) —
+`global_load_a_functor` therefore re-zeros all 16 `v_gld_a` registers on **every** call, not
+just once (the same discipline Phase 5c/wrw established for its own per-iteration-varying
+gather), so a lane valid on one tap can never leak stale data into a tap where it's invalid.
+B's (weight) address has no padding concept — a tap index is always a real weight row as long
+as `0<=iy<y, 0<=ix<x`, which the loop bounds guarantee — so it's just a different fixed byte
+offset added to a per-thread base address (`v_addr_b_base`, computed once from the corrected
+`y*x*c` row stride) each tap.
+
+**Bug caught before hardware** (self-review, not a test failure): an early draft precomputed
+`v_addr_a`'s high 32 bits once in the prologue (`v_addr_a(1) = p_in_hi`) on the theory that a
+pointer's high half rarely changes. That's wrong here specifically because every tap computes
+a **fresh, independent** address rather than incrementally bumping the previous tap's address
+— reusing `v_addr_a(1)`'s value from the *previous* tap as an input to `v_add_co_ci_u32` would
+silently accumulate carries across taps, drifting the high half upward. Fixed by resetting
+`v_addr_a(1) = s_p_in(1)` fresh inside the per-tap gather, before every tap's carry-add pair
+(B's `v_addr_b_base(1)` was already correct, since it's a genuine loop-invariant base that
+per-tap code only ever reads from, never accumulates into).
+
+Kernarg grew from 68 to 84 bytes (`y, x, dilation_h, dilation_w`). `driver/igemm_fwd_gtc_driver.h`'s
+`tunable_is_valid()` dropped its `unit_conv_1x1` requirement entirely (now only `group==1` and
+`tensor_layout=="nhwc"` are checked before the tile-multiple checks) — no other driver-side
+mapping changes were needed since `y`/`x`/`dilation_h`/`dilation_w` were already being read
+out of `arg` for logging/dumpheader purposes, just not yet wired into the WMMA karg.
+
+**Validated on real gfx1250 hardware** through `conv_driver.exe`, fp16/bf16/int8, against the
+driver's own `naive_conv_fwd_nhwc` reference: 1x1 stride-1/pad-0 regression (bit-for-bit same
+kernel path, now going through one tap-loop iteration), 3x3 with and without padding, 3x3 with
+dilation=2, 3x3 combined with stride=2, 5x5 with dilation=2, non-square 3x5 filters with
+independent per-axis stride/pad/dilation, 7x7, multi-block M/N grids, and multi-K-block-per-tap
+(large `C_in`) — all exact matches, largest case: n=2, C=256 (multiple K-blocks per tap), 5x5
+filter, stride=2, pad=2, multi-block grid.
+
+**Still not done**: `group > 1`, and replicating multi-tap/dilation to bwd/wrw (which still
+only support 1x1 filters with general stride/pad, from Phases 5b/5c) — the same runtime-tap-
+loop pattern should transfer directly, since it only touches the K-loop wrapper and per-tap
+gather, not the transpose/LDS mechanism bwd/wrw already have working.
