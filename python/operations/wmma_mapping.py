@@ -157,7 +157,14 @@ class igemm_wmma_mapping_t(mc_base_t):
             self._emit(f"v_and_b32 v[{v_byte_offset}], 15, v[{v_thread_id}]   ; lane % 16 -> local index")
             self._emit(f"v_lshrrev_b32 v[{v_tmp2}], 5, v[{v_thread_id}]       ; wave id")
             if waves_per_side != 1:
-                self._emit(f"v_and_b32 v[{v_tmp2}+1], {waves_per_side - 1}, v[{v_tmp2}]  ; waves_per_{side} index")
+                # wave_id's bits are n-major-low/m-major-high (wave_id = m_idx*waves_per_n +
+                # n_idx), matching get_gemm_index_for_dst_matrix's convention -- side='n' wants
+                # the low bits (mask), side='m' wants the high bits (shift right by
+                # log2(waves_per_n)), NOT the same mask reused for both.
+                if side == 'n':
+                    self._emit(f"v_and_b32 v[{v_tmp2}+1], {waves_per_side - 1}, v[{v_tmp2}]  ; waves_per_n index")
+                else:
+                    self._emit(f"v_lshrrev_b32 v[{v_tmp2}+1], {utility_log2(ctrl.waves_per_n())}, v[{v_tmp2}]  ; waves_per_m index")
                 self._emit(f"v_lshl_or_b32 v[{v_byte_offset}], v[{v_tmp2}+1], {utility_log2(wave_tile_side * wave_repeat_side)}, v[{v_byte_offset}]")
             self._emit(f"v_lshlrev_b32 v[{v_byte_offset}], {utility_log2(elem_bytes)}, v[{v_byte_offset}]   ; local index * elem_bytes")
             self._emit(f"v_lshrrev_b32 v[{v_tmp2}], 4, v[{v_thread_id}]")

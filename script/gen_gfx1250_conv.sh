@@ -9,8 +9,10 @@ mkdir -p $KERNELS/fwd_fp16
 mkdir -p $KERNELS/fwd_bf16
 mkdir -p $KERNELS/fwd_int8
 mkdir -p $KERNELS/bwd_fp16
+mkdir -p $KERNELS/wrw_fp16
 
 python3 igemm_codegen.py -s config/igemm_fwd_gtc_gfx1250_nhwc_fp16.config ; cp $OUT/*.s $OUT/*.inc $KERNELS/fwd_fp16
 python3 igemm_codegen.py -s config/igemm_fwd_gtc_gfx1250_nhwc_bf16.config ; cp $OUT/*.s $OUT/*.inc $KERNELS/fwd_bf16
 python3 igemm_codegen.py -s config/igemm_fwd_gtc_gfx1250_nhwc_int8.config ; cp $OUT/*.s $OUT/*.inc $KERNELS/fwd_int8
 python3 igemm_codegen.py -s config/igemm_bwd_gtc_gfx1250_nhwc_fp16.config ; cp $OUT/*.s $OUT/*.inc $KERNELS/bwd_fp16
+python3 igemm_codegen.py -s config/igemm_wrw_gtc_gfx1250_nhwc_fp16.config ; cp $OUT/*.s $OUT/*.inc $KERNELS/wrw_fp16

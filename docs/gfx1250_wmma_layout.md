@@ -123,6 +123,29 @@ computed from the wrong tunable field, since bwd's `move_slice_window_b` needs a
 **runtime** per-K-block stride — `s_gemm_n * databyte * gemm_k_per_block` — unlike fwd's
 compile-time-constant one, because C_in isn't known until kernel launch).
 
+**wrw (grad-weight)** extends this to BOTH operands (`igemm_wrw_gtc_wmma_nhwc_t`): grad_output
+is naturally `[GEMM_K][GEMM_M]` (K_out-major from the M side's perspective, needs
+`side='m'`), input is naturally `[GEMM_K][GEMM_N]` (needs `side='n'`, same tensor shape as
+bwd's weight operand). This surfaced a real bug in
+`get_gemm_index_for_src_matrix_transposed`: the wave-index extraction for `side='m'` was
+reusing `side='n'`'s formula (`wave_id & (waves_per_side-1)`, a low-bit mask), but
+`get_gemm_index_for_dst_matrix`'s established convention encodes `wave_id` as
+`m_idx*waves_per_n + n_idx` (m in the *high* bits, n in the *low* bits) — so `side='m'` needs
+`wave_id >> log2(waves_per_n)` (a shift), not a mask. Since bwd only ever exercises `side='n'`
+(where the mask happens to be correct), this was invisible until wrw's `side='m'` A operand
+exposed it: symptom was a clean 64x64 quadrant swap in the output (waves whose true `m_idx`
+happened to coincide with the buggy mask-derived value were accidentally correct; the other
+two waves computed using the wrong operand's 64-column M-half). Fixed by branching the wave
+index computation on `side` instead of reusing one formula for both. Re-verified bwd (only
+uses `side='n'`, unaffected) and fwd (doesn't use this function at all) show no regression.
+
+**Validated on real gfx1250 hardware** (`igemm_wrw_gtc_wmma_nhwc_t`, single-K-block config
+128x128x32): exact match across single-block, multi-block (including non-square
+`GEMM_M != GEMM_N` grids, which catch an A/B tensor swap), and multi-K-block configurations
+(including a config with `GEMM_M != GEMM_N != gemm_*_per_block`, which distinguishes the two
+independent per-K-block strides `s_a_k_stride`/`s_b_k_stride` from each other), multiple
+random seeds.
+
 ## Accumulator initialization
 
 `v_wmma_*` computes `D = A@B + C`. If a kernel reuses the same VGPR range for both the C and D
