@@ -651,6 +651,16 @@ int main(int argc, char **argv) {
     }
     // printf("tunables:%d, hsaco:%s\n", tunables.size(), hsaco);
 
+    // The gfx1250 WMMA milestone kernels always accumulate/store the D operand at full
+    // width (fp32, or int32 for int8 -- see e.g. igemm_fwd_gtc_wmma_nhwc_t's docstring)
+    // regardless of tunable->precision, unlike the XDLOPS/DLOPS/MAC kernels below which
+    // natively write "precision"-width output. The generic *_dtype buffers are sized by
+    // `data_byte` (precision width) everywhere else in this file; for WMMA tunables the
+    // buffer that plays the "kernel-native-width" role for whichever direction is under
+    // test (output for fwd, input for bwd, weight for wrw) must instead be sized/read/
+    // compared at 4 bytes/element, or a real WMMA kernel would silently overrun it.
+    bool is_wmma = tunables.size() > 0 && tunables[0].fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA;
+
     hipModule_t module;
 #ifndef IGEMM_SPLIT_KERNEL
     HIP_CALL(hipModuleLoad(&module, hsaco.c_str()));
@@ -741,13 +751,17 @@ int main(int argc, char **argv) {
     void *device_weight_dtype;
     void *device_output_dtype;
 #if defined(USE_HALF) || defined(USE_INT8) || defined(USE_BF16) || defined(USE_INT4)
-    host_input_dtype  = malloc(n * c * hi * wi * data_byte);
-    host_weight_dtype = malloc(k * c * y * x * data_byte);
-    host_output_dtype = malloc(n * k * ho * wo * data_byte);
+    // over-allocate to fp32 width for WMMA (see is_wmma comment above) -- harmless for the
+    // roles that stay native-precision, since only the actually-used prefix of each buffer
+    // is ever read/written.
+    size_t dtype_alloc_byte = is_wmma ? sizeof(float) : data_byte;
+    host_input_dtype  = malloc(n * c * hi * wi * dtype_alloc_byte);
+    host_weight_dtype = malloc(k * c * y * x * dtype_alloc_byte);
+    host_output_dtype = malloc(n * k * ho * wo * dtype_alloc_byte);
 
-    HIP_CALL(hipMalloc(&device_input_dtype, n * c * hi * wi * data_byte));
-    HIP_CALL(hipMalloc(&device_weight_dtype, k * c * y * x * data_byte));
-    HIP_CALL(hipMalloc(&device_output_dtype, n * k * ho * wo * data_byte));
+    HIP_CALL(hipMalloc(&device_input_dtype, n * c * hi * wi * dtype_alloc_byte));
+    HIP_CALL(hipMalloc(&device_weight_dtype, k * c * y * x * dtype_alloc_byte));
+    HIP_CALL(hipMalloc(&device_output_dtype, n * k * ho * wo * dtype_alloc_byte));
 #endif
 
 
@@ -909,7 +923,7 @@ int main(int argc, char **argv) {
             else
                 assert(0);
 #endif
-            if(driver_data_type != driverHalf){
+            if(driver_data_type != driverHalf && !is_wmma){
                 device_output_to_host = malloc((static_cast<size_t>(n) * k * ho * wo * data_byte + 3) / 4 * 4);
             }
             else{
@@ -945,7 +959,7 @@ int main(int argc, char **argv) {
         auto fwd_pre = [&](){
             if (need_verify)
                 HIP_CALL(hipMemset(driver_data_type == driverFloat ? device_output : device_output_dtype,
-                    0, static_cast<size_t>(n) * k * ho * wo * data_byte));
+                    0, static_cast<size_t>(n) * k * ho * wo * (is_wmma ? sizeof(float) : data_byte)));
         };
 
         auto fwd_post = [&](){
@@ -957,6 +971,18 @@ int main(int argc, char **argv) {
                                    static_cast<size_t>(n) * k * ho * wo * data_byte,
                                    hipMemcpyDeviceToHost));
                     is_valid = valid_vector<float>(host_output, static_cast<float*>(device_output_to_host),
+                                            static_cast<size_t>(n) * k * ho * wo, nrms);
+                }else if(is_wmma){
+                    // WMMA always accumulates/stores D at full width (fp32, or int32 for
+                    // int8) regardless of tunable->precision -- see comment near is_wmma.
+                    HIP_CALL(hipMemcpy(device_output_to_host, device_output_dtype,
+                                   static_cast<size_t>(n) * k * ho * wo * sizeof(float),
+                                   hipMemcpyDeviceToHost));
+                    if(driver_data_type == driverInt8)
+                        is_valid = valid_vector<int32_t>(host_output, static_cast<int32_t*>(device_output_to_host),
+                                            static_cast<size_t>(n) * k * ho * wo, nrms);
+                    else
+                        is_valid = valid_vector<float>(host_output, static_cast<float*>(device_output_to_host),
                                             static_cast<size_t>(n) * k * ho * wo, nrms);
                 }else{
                     HIP_CALL(hipMemcpy(device_output_to_host, device_output_dtype,
@@ -1054,7 +1080,7 @@ int main(int argc, char **argv) {
             else
                 assert(0);
 #endif
-            if(driver_data_type != driverFloat){
+            if(driver_data_type != driverFloat && !is_wmma){
                 device_input_to_host = malloc((static_cast<size_t>(n) * c * hi * wi * data_byte + 3) / 4 * 4 );
             }
             else{
@@ -1081,7 +1107,7 @@ int main(int argc, char **argv) {
         auto bwd_pre = [&](){
             if (need_verify)
                 HIP_CALL(hipMemset(driver_data_type == driverFloat ? device_input : device_input_dtype,
-                    0x7f, static_cast<size_t>(n) * c * hi * wi * data_byte)); // 0x7f7f7f7f ~= 7.41e+28, a very large number
+                    0x7f, static_cast<size_t>(n) * c * hi * wi * (is_wmma ? sizeof(float) : data_byte))); // 0x7f7f7f7f ~= 7.41e+28, a very large number
         };
 
         auto bwd_post = [&](){
@@ -1093,6 +1119,17 @@ int main(int argc, char **argv) {
                                     static_cast<size_t>(n) * c * hi * wi * data_byte,
                                     hipMemcpyDeviceToHost));
                     is_valid = valid_vector<float>(host_input, static_cast<float*>(device_input_to_host),
+                                                static_cast<size_t>(n) * c * hi * wi, nrms);
+                } else if(is_wmma){
+                    // WMMA always writes grad_input at full width (fp32, or int32 for int8).
+                    HIP_CALL(hipMemcpy(device_input_to_host, device_input_dtype,
+                                    static_cast<size_t>(n) * c * hi * wi * sizeof(float),
+                                    hipMemcpyDeviceToHost));
+                    if(driver_data_type == driverInt8)
+                        is_valid = valid_vector<int32_t>(host_input, static_cast<int32_t*>(device_input_to_host),
+                                                static_cast<size_t>(n) * c * hi * wi, nrms);
+                    else
+                        is_valid = valid_vector<float>(host_input, static_cast<float*>(device_input_to_host),
                                                 static_cast<size_t>(n) * c * hi * wi, nrms);
                 } else {
                     HIP_CALL(hipMemcpy(device_input_to_host, device_input_dtype,
@@ -1180,7 +1217,7 @@ int main(int argc, char **argv) {
             else
                 assert(0);
 #endif
-            if(driver_data_type == driverHalf){
+            if(driver_data_type == driverHalf && !is_wmma){
                 device_weight_to_host = malloc((static_cast<size_t>(k) * c * y * x * data_byte + 3) / 4 * 4);
             }
             else{
@@ -1231,7 +1268,7 @@ int main(int argc, char **argv) {
         auto wrw_pre = [&](){
             if (need_verify)
                 HIP_CALL(hipMemset(driver_data_type == driverFloat ? device_weight : device_weight_dtype,
-                    0, static_cast<size_t>(k) * c * y * x * data_byte));
+                    0, static_cast<size_t>(k) * c * y * x * (is_wmma ? sizeof(float) : data_byte)));
         };
 
         auto wrw_post = [&](){
@@ -1240,6 +1277,14 @@ int main(int argc, char **argv) {
                 bool is_valid;
                 if(driver_data_type == driverFloat){
                     HIP_CALL(hipMemcpy(device_weight_to_host, device_weight,
+                                   static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x * sizeof(float),
+                                   hipMemcpyDeviceToHost));
+                    is_valid = valid_vector<float>(host_weight, static_cast<float*>(device_weight_to_host),
+                                    static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x, nrms);
+                }else if(is_wmma){
+                    // WMMA always writes grad_weight at full fp32 width (wrw has no int8
+                    // WMMA kernel, so no int32 case to handle here).
+                    HIP_CALL(hipMemcpy(device_weight_to_host, device_weight_dtype,
                                    static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x * sizeof(float),
                                    hipMemcpyDeviceToHost));
                     is_valid = valid_vector<float>(host_weight, static_cast<float*>(device_weight_to_host),

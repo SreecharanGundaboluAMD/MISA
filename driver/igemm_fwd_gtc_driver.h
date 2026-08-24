@@ -120,6 +120,19 @@ typedef struct {
 #endif
 } __attribute__((packed)) igemm_fwd_gtc_nhwc_karg_t;
 
+// Minimal karg for the gfx1250 WMMA degenerate-case kernel (igemm_fwd_gtc_wmma_nhwc_t):
+// 1x1 filter/stride1/no-pad only (nxe=0), no group>1, no split-K -- see that class's
+// docstring in python/igemm/igemm_fwd_gtc_wmma_nhwc.py. Layout must match its
+// get_kernel_args() exactly (3 pointers + 3 ints, 36 bytes total, no padding).
+typedef struct {
+    void *p_in;
+    void *p_wei;
+    void *p_out;
+    int   gemm_m;
+    int   gemm_n;
+    int   gemm_k;
+} __attribute__((packed)) igemm_fwd_gtc_wmma_nhwc_karg_t;
+
 typedef struct {
     void    *p_in;
     void    *p_wei;
@@ -282,6 +295,13 @@ public:
             int waves_per_m = tunable->gemm_m_per_block / (tunable->wave_tile_m * tunable->wave_step_m * tunable->wave_repeat_m);
             int waves_per_n = tunable->gemm_n_per_block / (tunable->wave_tile_n * tunable->wave_step_n * tunable->wave_repeat_n);
             return waves_per_m * waves_per_n * AMDGPU_WAVE_SIZE;
+        }else if(tunable->fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA){
+            // wave_tile_m/n, wave_repeat_m/n hold wmma_tile_m/n, wmma_repeat_m/n (see union
+            // comment in igemm_gtc_base.h). No wave_step concept for WMMA. gfx1250 WMMA is
+            // always wave32, not AMDGPU_WAVE_SIZE(64).
+            int waves_per_m = tunable->gemm_m_per_block / (tunable->wave_tile_m * tunable->wave_repeat_m);
+            int waves_per_n = tunable->gemm_n_per_block / (tunable->wave_tile_n * tunable->wave_repeat_n);
+            return waves_per_m * waves_per_n * 32;
         }
         assert(false);
     }
@@ -398,6 +418,22 @@ public:
             b = nxe == 0 ? (ho * wo) : ((ho * wo + nxb - 1) / nxb) * nxb;   // pad to nxb modulo when nxe != 0
 
         bool unit_conv = (x==1)&&(y==1)&&(stride_h==1)&&(stride_w==1)&&(dilation_h==1)&&(dilation_w==1)&&(pad_h==0)&&(pad_w==0);
+
+        if(tunable->fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA){
+            // igemm_fwd_gtc_wmma_nhwc_t only supports the degenerate 1x1/stride1/no-pad GEMM
+            // case, group==1, and a single fixed 128x128 macro-tile shape -- checked directly
+            // here rather than falling through the XDLOPS/DLOPS-oriented nhwc checks below
+            // (vector-writeout divisibility, merge_e, gemm_k_global_split) which don't apply
+            // to this kernel's addressing scheme at all.
+            if(tunable->tensor_layout != "nhwc" || !unit_conv || group != 1)
+                return false;
+            int gemm_m = n * ho * wo;
+            int gemm_n = k / group;
+            int gemm_k = c / group;
+            if(gemm_m % gemm_m_per_block != 0 || gemm_n % gemm_n_per_block != 0 || gemm_k % gemm_k_per_block != 0)
+                return false;
+            return true;
+        }
 
         if(tunable->tensor_layout == "nchw"){
             int gemm_m = ((k/group + gemm_m_per_block -1)/gemm_m_per_block) * gemm_m_per_block;
@@ -536,7 +572,107 @@ public:
             //printf("this kernel can not support this config\n");
             return result;
         }
-        
+
+        if(tunable->fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA){
+            // Self-contained launch path: no split-K, no workspace, no magic division, no
+            // nchw/nhwc/nchwc karg tree -- see igemm_fwd_gtc_wmma_nhwc_karg_t's comment.
+            // Crucially, this kernel decodes a genuine 2D (workgroup_id_x, workgroup_id_y)
+            // grid (M-block, N-block) rather than the flattened single-dimension-plus-magic-
+            // division-decode scheme the general kernels below use, so grid_x/grid_y are
+            // dispatched as independent HIP grid dimensions instead of being folded together.
+            int hi = arg->get_int("in_h");
+            int wi = arg->get_int("in_w");
+            int n  = arg->get_int("batchsize");
+            int k  = arg->get_int("out_channels");
+            int c  = arg->get_int("in_channels");
+            int group      = arg->get_int("group_count");
+            int stride_h   = arg->get_int("conv_stride_h");
+            int stride_w   = arg->get_int("conv_stride_w");
+            int dilation_h = arg->get_int("dilation_h");
+            int dilation_w = arg->get_int("dilation_w");
+            int pad_h      = arg->get_int("pad_h");
+            int pad_w      = arg->get_int("pad_w");
+            int y = arg->get_int("fil_h");
+            int x = arg->get_int("fil_w");
+            int ho = conv_out_size(hi, pad_h, dilation_h, y, stride_h);
+            int wo = conv_out_size(wi, pad_w, dilation_w, x, stride_w);
+
+            int gemm_m = n * ho * wo;
+            int gemm_n = k / group;
+            int gemm_k = c / group;
+
+            igemm_fwd_gtc_wmma_nhwc_karg_t karg;
+            karg.p_in   = p_in;
+            karg.p_wei  = p_wei;
+            karg.p_out  = p_out;
+            karg.gemm_m = gemm_m;
+            karg.gemm_n = gemm_n;
+            karg.gemm_k = gemm_k;
+            size_t karg_size = sizeof(karg);
+
+            hipFunction_t kernel_func;
+            std::string kernel_name = get_kernel_name(tunable);
+#ifdef IGEMM_SPLIT_KERNEL
+            hipModule_t cur_kernel_module;
+            std::string cur_kernel_hsaco = kernel_name + ".hsaco";
+            HIP_CALL(hipModuleLoad(&cur_kernel_module, cur_kernel_hsaco.c_str()));
+            HIP_CALL(hipModuleGetFunction(&kernel_func, cur_kernel_module, kernel_name.c_str()));
+#else
+            HIP_CALL(hipModuleGetFunction(&kernel_func, module, kernel_name.c_str()));
+#endif
+
+            size_t block_size = get_block_size(tunable);
+            size_t grid_x = utility_integer_divide_ceil(gemm_m, tunable->gemm_m_per_block);
+            size_t grid_y = utility_integer_divide_ceil(gemm_n, tunable->gemm_n_per_block);
+
+            result_t result;
+            result.kernel_name = kernel_name;
+            result.dumpdata.clear();
+            memset(&result.dumpheader, 0, sizeof(result.dumpheader));
+            result.dumpheader.conv.hi = hi;
+            result.dumpheader.conv.wi = wi;
+            result.dumpheader.conv.n  = n;
+            result.dumpheader.conv.k  = k;
+            result.dumpheader.conv.c  = c;
+            result.dumpheader.conv.ho = ho;
+            result.dumpheader.conv.wo = wo;
+            result.dumpheader.conv.stride_h = stride_h;
+            result.dumpheader.conv.stride_w = stride_w;
+            result.dumpheader.conv.ddilation_h = 1;
+            result.dumpheader.conv.ddilation_w = 1;
+            result.dumpheader.conv.fdilation_h = dilation_h;
+            result.dumpheader.conv.fdilation_w = dilation_w;
+            result.dumpheader.conv.pad_h = pad_h;
+            result.dumpheader.conv.pad_w = pad_w;
+            result.dumpheader.conv.y = y;
+            result.dumpheader.conv.x = x;
+            result.dumpheader.conv.group = group;
+            result.dumpheader.conv.dir = convdir_t::FWD;
+            result.dumpheader.conv.dtype = dtype(tunable->precision);
+
+            std::vector<igemm_launch_kernel_t> kernel_launchers;
+            kernel_launchers.push_back({kernel_func, &karg, karg_size, {grid_x * block_size, grid_y, 1}, {block_size, 1, 1}});
+            result.dumpheader.n_dispatches = kernel_launchers.size();
+            result.dumpheader.gks = 0;
+            result.dumpdata.push_back(kernel_launchers.back());
+            result.dumpdata.back().ktype = kargtype_t::igemm_fwd_gtc_wmma_nhwc_karg_t;
+
+            auto noop = std::function<float()>{[&]() -> float { return .0; }};
+            float duration = igemm_launch_kernels(kernel_launchers, noop, noop, this->warmup, this->repeat);
+
+            std::string dump_dir = env_get_str("IGEMM_DUMPDIR_ALL", "");
+            if (dump_dir.size())
+                dump_shader_args(dump_dir, result.dumpheader, result.dumpdata, result.kernel_name);
+
+            result.return_code = 0;
+            result.duration_ms = duration;
+            result.gks = 0;
+#ifdef IGEMM_SPLIT_KERNEL
+            HIP_CALL(hipModuleUnload(cur_kernel_module));
+#endif
+            return result;
+        }
+
         int hi = arg->get_int("in_h");
         int wi = arg->get_int("in_w");
         int n = arg->get_int("batchsize");

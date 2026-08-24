@@ -165,3 +165,53 @@ looks plausible but silently accumulates onto garbage VGPR contents.
   the vendor-less `amdgcn--amdhsa` triple used in some older MISA test scripts
   (`test/persistent_workgroup/build.sh`) produces a target-id mismatch against the
   `.amdgcn_target` directive and fails to assemble.
+
+## Driver-side WMMA integration (`driver/conv_driver.cpp` and `igemm_{fwd,bwd,wrw}_gtc_driver.h`)
+
+All three WMMA milestone kernels (fwd fp16/bf16/int8, bwd fp16, wrw fp16) are now dispatchable
+through the real `conv_driver.exe`, not just the standalone `/tmp/wmma_probe/` harnesses used
+during Phases 1-4. Each direction's driver class gained: a `fma_type == WMMA` branch in
+`get_block_size()` (wave32, no `wave_step`), an early WMMA branch in `tunable_is_valid()`
+(degenerate-case-only checks, bypassing the XDLOPS/DLOPS-oriented nhwc checks entirely), a
+minimal 36-byte karg struct (`igemm_{fwd,bwd,wrw}_gtc_wmma_nhwc_karg_t`), and a self-contained
+`run()` branch that builds the karg and launches directly via `igemm_launch_kernels()` with a
+genuine 2D `(grid_x, grid_y)` dispatch — unlike the general kernels, which flatten the block
+index into one dimension and decode it via magic division inside the kernel, this kernel reads
+`workgroup_id_x`/`workgroup_id_y` directly as the M-block/N-block indices (see the "Workgroup ID
+delivery" section above), so `get_grid_size()` (which returns a single flattened count) is
+reused for other purposes but NOT for the actual launch geometry.
+
+Two non-obvious pitfalls hit during this integration, both fixed:
+
+- **Output-buffer width.** The WMMA kernels always accumulate/store the D operand at full
+  width (fp32, or int32 for int8) regardless of `tunable->precision` — a deliberate
+  correctness-first simplification (see each kernel's docstring). But `conv_driver.cpp`'s
+  generic `*_dtype` buffers (`device_input_dtype`/`device_weight_dtype`/`device_output_dtype`)
+  are sized at `data_byte` (the tunable's precision width, e.g. 2 bytes for fp16) everywhere
+  else in the file. Passing a 2-byte-per-element buffer to a kernel that writes 4 bytes/element
+  is a real heap buffer overflow, not just a wrong-answer bug. Fixed by computing
+  `is_wmma = tunables[0].fma_type == WMMA` once in `main()` and widening the three `*_dtype`
+  allocations (host and device) to `sizeof(float)` when `is_wmma` — over-allocating is harmless
+  for whichever buffers stay native-precision-width in practice — and by branching the
+  memset/memcpy-back/comparison call for whichever buffer plays the "kernel-native-width
+  output" role for that direction (output for fwd, input for bwd, weight for wrw) to use the
+  wide size and (for int8) an `int32_t` comparison instead of `int8_t`.
+- **p_in/p_wei/p_out role mapping differs per direction.** `run(arg, tunable, p_in, p_wei,
+  p_out, gks)`'s parameter names follow the *general* NHWC kernels' convention, where `p_in`
+  always refers to the GPU buffer conventionally called "input" in conv terminology (the
+  computed/written tensor for bwd — grad_input) and `p_out` to the "output" buffer (the
+  read-only tensor for bwd — grad_output). The Python WMMA kernels' own kernarg field names
+  (`p_in`/`p_wei`/`p_out`) instead describe each operand's *role within that specific kernel*
+  (A operand/B operand/output), which for bwd is the OPPOSITE of run()'s convention
+  (`karg.p_in`=grad_output read, `karg.p_out`=grad_input write) and for wrw is a 3-way
+  ROTATION (`karg.p_in`=grad_output read ← run()'s `p_out`; `karg.p_wei`=input read ← run()'s
+  `p_in`; `karg.p_out`=grad_weight write ← run()'s `p_wei`). Getting this backwards produces a
+  kernel that runs without error but silently reads/writes the wrong buffers — caught by
+  cross-checking pointer values (not just contents) between `main()` and `run()` when hardware
+  results didn't match the reference.
+
+**Validated on real gfx1250 hardware** through `conv_driver.exe` itself (not just the
+standalone harnesses): fwd (fp16/bf16/int8), bwd (fp16), and wrw (fp16), each across
+single-block and multi-block/multi-K-block configurations, using the driver's own
+`naive_conv_*_nhwc`/`gpu_naive_conv_*_nhwc_fp32` CPU/GPU reference and `valid_vector<T>`
+comparison — no bespoke verification code, unlike Phases 1-4.

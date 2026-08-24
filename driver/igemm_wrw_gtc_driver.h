@@ -65,6 +65,22 @@ typedef struct {
     int gemm_k_per_wg;
 } __attribute__((packed)) igemm_wrw_gtc_karg_t;
 
+// Minimal karg for the gfx1250 WMMA degenerate-case kernel (igemm_wrw_gtc_wmma_nhwc_t):
+// 1x1 filter/stride1/no-pad only (nxe=0), no group>1, no split-K. Layout must match
+// get_kernel_args() in python/igemm/igemm_wrw_gtc_wmma_nhwc.py exactly (3 pointers + 3
+// ints, 36 bytes). NOTE the kernel's own field semantics: p_in=grad_output (READ),
+// p_wei=input (READ), p_out=grad_weight (WRITE) -- run()'s conventional p_in/p_wei/p_out
+// for wrw are p_in=input(READ), p_wei=grad_weight(WRITE), p_out=grad_output(READ), so the
+// mapping is a 3-way ROTATION, not a simple swap -- see the WMMA branch in run().
+typedef struct {
+    void *p_in;
+    void *p_wei;
+    void *p_out;
+    int   gemm_m;
+    int   gemm_n;
+    int   gemm_k;
+} __attribute__((packed)) igemm_wrw_gtc_wmma_nhwc_karg_t;
+
 static void dump_wrw_karg(igemm_wrw_gtc_karg_t * karg){
     std::cout<<"p_in:"         <<karg->p_in<<",";
     std::cout<<"p_wei:"        <<karg->p_wei<<",";
@@ -105,6 +121,11 @@ public:
             int waves_per_m = tunable->gemm_m_per_block / (tunable->wave_tile_m * tunable->wave_step_m * tunable->wave_repeat_m);
             int waves_per_n = tunable->gemm_n_per_block / (tunable->wave_tile_n * tunable->wave_step_n * tunable->wave_repeat_n);
             return waves_per_m * waves_per_n * AMDGPU_WAVE_SIZE;
+        }
+        else if(tunable->fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA){
+            int waves_per_m = tunable->gemm_m_per_block / (tunable->wave_tile_m * tunable->wave_repeat_m);
+            int waves_per_n = tunable->gemm_n_per_block / (tunable->wave_tile_n * tunable->wave_repeat_n);
+            return waves_per_m * waves_per_n * 32;
         }
         else{
             std::cout << "not valid fma_type: " << tunable->fma_type << std::endl;
@@ -240,6 +261,20 @@ public:
 
         int nxe = tunable->nxe == 0 ? 1 : tunable->nxe;
         bool unit_conv = (x==1)&&(y==1)&&(stride_h==1)&&(stride_w==1)&&(dilation_h==1)&&(dilation_w==1)&&(pad_h==0)&&(pad_w==0);
+
+        if(tunable->fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA){
+            // igemm_wrw_gtc_wmma_nhwc_t only supports the degenerate 1x1/stride1/no-pad GEMM
+            // case, group==1, and a single fixed 128x128 macro-tile shape -- see
+            // igemm_fwd_gtc_driver.h's identical WMMA branch for the rationale.
+            if(tunable->tensor_layout != "nhwc" || !unit_conv || group != 1)
+                return false;
+            int wmma_gemm_m = k / group;
+            int wmma_gemm_n = c / group;
+            int wmma_gemm_k = n * ho * wo;
+            if(wmma_gemm_m % gemm_m_per_block != 0 || wmma_gemm_n % gemm_n_per_block != 0 || wmma_gemm_k % gemm_k_per_block != 0)
+                return false;
+            return true;
+        }
 
         if(splits > 1 && gemm_k_global_split == 0)
         {
@@ -628,6 +663,91 @@ public:
             result_t result;
             result.return_code = -1;
             // std::cout << "not valid tunable config." << std::endl;
+            return result;
+        }
+
+        if(tunable->fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA){
+            // Self-contained launch path, mirroring igemm_fwd_gtc_driver.h's WMMA branch.
+            // p_in/p_wei/p_out must be ROTATED relative to their names -- see the
+            // igemm_wrw_gtc_wmma_nhwc_karg_t struct comment above.
+            int hi = arg->get_int("in_h");
+            int wi = arg->get_int("in_w");
+            int n  = arg->get_int("batchsize");
+            int k  = arg->get_int("out_channels");
+            int c  = arg->get_int("in_channels");
+            int group = arg->get_int("group_count");
+            int y = arg->get_int("fil_h");
+            int x = arg->get_int("fil_w");
+            int stride_h = arg->get_int("conv_stride_h");
+            int stride_w = arg->get_int("conv_stride_w");
+            int dilation_h = arg->get_int("dilation_h");
+            int dilation_w = arg->get_int("dilation_w");
+            int pad_h = arg->get_int("pad_h");
+            int pad_w = arg->get_int("pad_w");
+            int ho = conv_out_size(hi, pad_h, dilation_h, y, stride_h);
+            int wo = conv_out_size(wi, pad_w, dilation_w, x, stride_w);
+
+            int gemm_m = k / group;
+            int gemm_n = c / group;
+            int gemm_k = n * ho * wo;
+
+            igemm_wrw_gtc_wmma_nhwc_karg_t karg;
+            karg.p_in   = p_out;   // grad_output (read)
+            karg.p_wei  = p_in;    // input (read)
+            karg.p_out  = p_wei;   // grad_weight (write)
+            karg.gemm_m = gemm_m;
+            karg.gemm_n = gemm_n;
+            karg.gemm_k = gemm_k;
+            size_t karg_size = sizeof(karg);
+
+            hipFunction_t kernel_func;
+            std::string kernel_name = get_kernel_name(tunable);
+#ifdef IGEMM_SPLIT_KERNEL
+            hipModule_t cur_kernel_module;
+            std::string cur_kernel_hsaco = kernel_name + ".hsaco";
+            HIP_CALL(hipModuleLoad(&cur_kernel_module, cur_kernel_hsaco.c_str()));
+            HIP_CALL(hipModuleGetFunction(&kernel_func, cur_kernel_module, kernel_name.c_str()));
+#else
+            HIP_CALL(hipModuleGetFunction(&kernel_func, module, kernel_name.c_str()));
+#endif
+
+            size_t block_size = get_block_size(tunable);
+            size_t grid_x = utility_integer_divide_ceil(gemm_m, tunable->gemm_m_per_block);
+            size_t grid_y = utility_integer_divide_ceil(gemm_n, tunable->gemm_n_per_block);
+
+            result_t result;
+            result.kernel_name = kernel_name;
+            result.dumpdata.clear();
+            memset(&result.dumpheader, 0, sizeof(result.dumpheader));
+            result.dumpheader.conv.hi = hi;
+            result.dumpheader.conv.wi = wi;
+            result.dumpheader.conv.n  = n;
+            result.dumpheader.conv.k  = k;
+            result.dumpheader.conv.c  = c;
+            result.dumpheader.conv.group = group;
+            result.dumpheader.conv.dir = convdir_t::WRW;
+            result.dumpheader.conv.dtype = dtype(tunable->precision);
+
+            std::vector<igemm_launch_kernel_t> kernel_launchers;
+            kernel_launchers.push_back({kernel_func, &karg, karg_size, {grid_x * block_size, grid_y, 1}, {block_size, 1, 1}});
+            result.dumpheader.n_dispatches = kernel_launchers.size();
+            result.dumpheader.gks = 0;
+            result.dumpdata.push_back(kernel_launchers.back());
+            result.dumpdata.back().ktype = kargtype_t::igemm_wrw_gtc_wmma_nhwc_karg_t;
+
+            auto noop = std::function<float()>{[&]() -> float { return .0; }};
+            float duration = igemm_launch_kernels(kernel_launchers, noop, noop, this->warmup, this->repeat);
+
+            std::string dump_dir = env_get_str("IGEMM_DUMPDIR_ALL", "");
+            if (dump_dir.size())
+                dump_shader_args(dump_dir, result.dumpheader, result.dumpdata, result.kernel_name);
+
+            result.return_code = 0;
+            result.duration_ms = duration;
+            result.gks = 0;
+#ifdef IGEMM_SPLIT_KERNEL
+            HIP_CALL(hipModuleUnload(cur_kernel_module));
+#endif
             return result;
         }
 

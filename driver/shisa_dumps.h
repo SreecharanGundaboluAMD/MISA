@@ -27,7 +27,10 @@ enum class kargtype_t : int {
     igemm_fwd_gtc_nchwc_karg_t = 3,
     igemm_bwd_gtc_karg_t       = 4,
     igemm_bwd_gtc_nhwc_karg_t  = 5,
-    igemm_wrw_gtc_karg_t       = 6
+    igemm_wrw_gtc_karg_t       = 6,
+    igemm_fwd_gtc_wmma_nhwc_karg_t = 7,
+    igemm_bwd_gtc_wmma_nhwc_karg_t = 8,
+    igemm_wrw_gtc_wmma_nhwc_karg_t = 9
 };
 
 enum class convdir_t : int { FWD = 1, BWD = 2, WRW = 3 };
