@@ -445,7 +445,54 @@ independent per-axis stride/pad/dilation, 7x7, multi-block M/N grids, and multi-
 (large `C_in`) — all exact matches, largest case: n=2, C=256 (multiple K-blocks per tap), 5x5
 filter, stride=2, pad=2, multi-block grid.
 
-**Still not done**: `group > 1`, and replicating multi-tap/dilation to bwd/wrw (which still
-only support 1x1 filters with general stride/pad, from Phases 5b/5c) — the same runtime-tap-
-loop pattern should transfer directly, since it only touches the K-loop wrapper and per-tap
-gather, not the transpose/LDS mechanism bwd/wrw already have working.
+**Still not done**: `group > 1`, and replicating multi-tap/dilation to wrw (bwd got this in
+Phase 5e below) — the same runtime-tap-loop pattern should transfer directly to wrw too, since
+it only touches the K-loop wrapper and per-tap gather, not the transpose/LDS mechanism wrw
+already has working.
+
+## Phase 5e: multi-tap filters (y,x >= 1) and dilation for bwd
+
+Mirrors fwd's Phase 5d exactly in structure (same runtime, not compile-time-unrolled, outer
+loop over the y*x taps wrapping a single static WMMA K-main-loop emission), applied to bwd's A
+operand (grad_output) and B operand (weight) instead of fwd's A/B:
+
+```
+grad_input[n,hi,wi,c] = sum_{iy,ix,k} grad_output[n, (hi+pad_h-iy*dilation_h)/stride_h,
+                                                    (wi+pad_w-ix*dilation_w)/stride_w, k]
+                                     * weight[k,iy,ix,c]
+```
+
+**A operand (grad_output)**: needs the harder per-tap gather. This thread's `(n_idx, hi_idx,
+wi_idx)` are decomposed from GEMM_M exactly once (persistent VGPRs), then every tap recomputes
+`numerator_h = hi_idx + pad_h - iy*dilation_h` — note the **subtract**, the opposite sign from
+fwd's per-tap `+iy*dilation_h`, since bwd's formula is fwd's algebraically inverted relation
+(confirmed against `driver/naive_conv.h`'s `cur_oh = ih + py - dy*ir` before dividing by `sy`).
+A negative numerator wraps to a huge `u32`; the subsequent division's bounds check
+(`ho_idx < s_ho`) naturally rejects it via quotient overflow, so no separate sign check is
+needed — the same "unsigned wraparound rejects invalid" trick used everywhere else in this
+milestone, just one division removed from the direct comparison. Since the flag can now flip
+between taps, `global_load_a_functor` re-zeros all 16 `v_gld_a` registers on every call.
+
+**B operand (weight)**: same treatment as fwd's Phase 5d — weight's `[K_out][Y][X][C_in]`
+layout means the per-K_out-row element count becomes `y*x*c` instead of plain `c`. Since bwd
+addresses weight via `row_local`/`col_group` (not a decomposed GEMM index like fwd), the new
+`s_wei_row_c = gemm_n*x*y` scalar replaces the old plain `gemm_n` (=C_in) everywhere it was
+used as a row multiplier: both the fixed `row_local*wei_row_c` base address AND
+`move_slice_window_b`'s per-K-iteration stride (`s_wei_k_stride = wei_row_c*databyte*32`,
+unchanged formula shape, just fed the corrected row-count). A given tap's C_in-column-block
+still starts `(iy*x+ix)*c` elements into that row — a fixed byte offset added to a per-thread
+base (`v_addr_b_base`) fresh every tap, identical idiom to fwd.
+
+Weight's transposed LDS read and the grad_input output write are **unaffected** by taps — they
+only ever see LDS-local byte offsets within whichever slice of the weight tile is currently
+resident, populated correctly regardless of which absolute tap the global address pointed to.
+
+Kernarg grew from 68 to 84 bytes (`y, x, dilation_h, dilation_w`, identical field additions to
+fwd's Phase 5d). Driver's `tunable_is_valid()` dropped its `unit_conv_1x1` requirement.
+
+**Validated on real gfx1250 hardware** through `conv_driver.exe` (fp16) against
+`naive_conv_bwd_nhwc`: 1x1 stride-1/pad-0 regression, 3x3 with padding, 3x3 with dilation=2,
+3x3 combined with stride=2 (exercising the stride-gap divide together with the per-tap
+dilation subtraction for the first time), non-square 3x5 with independent per-axis
+stride/pad, and a multi-block/multi-K-block 5x5 stride=2 case (C=256, spanning multiple
+K-blocks per tap) — all exact matches, all passing on the first hardware run.
