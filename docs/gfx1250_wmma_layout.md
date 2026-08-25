@@ -919,3 +919,538 @@ hand-scheduled interleaved variants than to a simple buffer-switch. Explicitly n
 this phase; the double-buffering infrastructure landed here (LDS allocation, correct addressing
 across taps, hardware-confirmed 64KB budget) is the necessary PREREQUISITE for it, not a
 substitute.
+
+## Phase 12 (2026-08-24): ISA probes for `global_load_async_to_lds_b128` and `global_load_tr16_b128`
+
+User asked to investigate whether newer gfx1250 ISA instructions could eliminate the actual
+root cause behind Phase 9's fwd regression: the VGPR-limited `v_gld_a`/`v_gld_b` staging buffer
+that forces chunked, serialized global-tile loads (fp16/bf16/int8 kernels already sit at
+252-256/256 VGPRs, zero headroom to grow it). Two candidate instructions, surfaced from an MI400
+Shader Programming Guide excerpt (later cross-checked against AMD's public CDNA5 ISA manual --
+both confirmed applicable to gfx1250):
+- `global_load_async_to_lds_b128`: moves data global memory -> LDS directly, with **no VGPR ever
+  holding the transferred data** -- if it works, it eliminates the staging buffer entirely rather
+  than working around it.
+- `global_load_tr16_b128`: loads a 16x16 tile of 16-bit data and transposes row-major<->
+  column-major in the load itself -- could replace bwd/wrw's expensive "strided read-and-pack"
+  LDS technique for transposed operands.
+
+Both are brand-new to this codebase and unverified on real gfx1250 hardware. Following the same
+standalone-probe discipline established during the original WMMA bring-up (hand-written `.s` +
+a HIP host harness, `/tmp/wmma_probe/`), each was tested independently before any production
+kernel changes.
+
+### `global_load_async_to_lds_b128` + `s_wait_asynccnt`: CONFIRMED WORKING
+
+Both mnemonics assemble on gfx1250 (`llvm-mc -mcpu=gfx1250 -show-encoding`) with the operand
+form `global_load_async_to_lds_b128 VDST, VADDR, SADDR [offset:N]` -- VDST = per-lane LDS byte
+address, VADDR = per-lane 32-bit global byte offset, SADDR = mandatory SGPR-pair 64-bit base
+(an `off`/no-SADDR form was tried and rejected by the assembler). Exact pseudocode later
+confirmed via AMD's public CDNA5 manual (section 10.8), matching the probe design exactly:
+`LDS[VGPR[VDST][lane]+byte] = GLOBAL_MEMORY[VGPR[VADDR][lane]*ScaleFactor + SGPR[SADDR]+byte]`
+(GVS mode, `ScaleFactor=1` since `SO` defaults to 0).
+
+Probe files: `/tmp/wmma_probe/async_ld_probe.s`, `host_async_probe.cpp`. Kernel: each of 32 (or
+64, spanning 2 waves) lanes computes `v1 = lane*16` (global byte offset, doubling as the LDS
+byte address `v2`), issues `global_load_async_to_lds_b128 v2, v1, s[in_ptr]`, waits via
+`s_wait_asynccnt 0x0`, barriers, reads back via `ds_read_b128`, and stores to an output buffer.
+Host fills input with a sequential per-element-distinguishable pattern and poisons the output
+before each launch.
+
+**A self-inflicted false alarm, caught before it wasted the user's time re-reading the
+manual for nothing**: the first two debugging attempts showed near-100%-failure with
+structured-looking (not random) garbage. Root cause: the probe was missing `s_wait_dscnt 0x0`
+between `ds_read_b128` and the `global_store_dwordx4` that consumes its result -- an unrelated,
+mundane bug in the probe itself (LDS reads are asynchronous too, tracked by a *different*
+counter, DSCnt, not ASYNCcnt), nothing to do with the new instruction at all. A control kernel
+using plain `ds_write_b128`/`ds_read_b128` (no async load involved) with the SAME missing-wait
+bug reproduced the identical failure pattern, confirming the diagnosis before touching the real
+probe.
+
+**Once fixed, fully confirmed on real hardware** across 100 trials each of: 32-lane/SADDR=buffer
+start, 32-lane/SADDR=buffer start+400 (nonzero base, isolating SADDR's contribution from
+VADDR's), and 64-lane/2-wave (no cross-wave hazard) -- 0/100 failures each. A negative control
+(identical kernel, `s_wait_asynccnt` deleted) showed 6/100 failures with genuinely random
+(not structured) garbage, confirming the wait is load-bearing rather than merely-decorative.
+
+**This is a real, hardware-confirmed win**: the instruction moves data global-memory -> LDS
+with zero VGPR cost, exactly as documented. This is the necessary building block for eliminating
+Phase 9's VGPR-staging-buffer bottleneck -- **not yet integrated into the real kernel codegen**;
+that integration is separate, larger follow-on work (needs to replace `wmma_main_loop.py`'s
+`v_gld_a`/`v_gld_b`-staged global-load functors, re-run the full regression/hardware-validation
+battery, and re-benchmark fwd's Phase 9 regression to see if it's actually fixed).
+
+### `global_load_tr16_b128`: CONFIRMED WORKING (formula fully reverse-engineered)
+
+Confirmed via `llvm-mc`: `global_load_tr16_b128 v[a:a+3], VADDR, SADDR` -- unlike the async
+instruction, this one **writes 4 VGPRs** (128 bits = 8 packed fp16 elements), tracked by ordinary
+`LOADcnt` (`s_wait_loadcnt`), not `ASYNCcnt`. Also confirmed a second valid operand form,
+`v[a:a+3], v[b:b+1], off` (VADDR as a full 64-bit address, no SADDR) -- both forms work; the
+SADDR+32-bit-offset form is what's used below.
+
+**Getting here took several wrong turns worth recording** so the next person doesn't repeat
+them. Section 10.9.2's lane-mapping diagram (read as a rendered page image, since it's
+graphical, not extractable as text) gives a clean per-lane picture, but cross-checking it
+against real hardware kept producing self-consistent-but-wrong results -- three different
+VADDR hypotheses (shared address, `k(lane)*32` "column byte offset", plain `lane*32` linear)
+each gave a different, deterministic, but non-matching pattern. The breakthrough came from two
+directions at once:
+1. Finding the actual LLVM/MLIR source (`GlobalTransposeLoadOpLowering` in
+   `mlir/lib/Conversion/AMDGPUToROCDL/AMDGPUToROCDL.cpp`) confirmed the addressing itself is a
+   completely ordinary strided-memref pointer -- no hidden bit-tricks, no special scaling. This
+   ruled out an entire class of "maybe VADDR needs a weird scale factor" hypotheses.
+2. Re-reading section 7.12.2 ("Matrix Element Storage in VGPRs") more carefully -- and noticing
+   7.12.3 explicitly says sparse-matrix transpose loads work "the same as the 16x16 matrix
+   load" -- revealed that 7.12.2's table (not the 10.9.2 diagram) is the actual authoritative
+   VGPR output layout: **lane number maps DIRECTLY to the matrix row (M = lane & 15, no folding
+   with `&7`)**, with the K (column) dimension spread across the 4 VGPRs, K=0-7 for lanes 0-15
+   and K=8-15 for lanes 16-31 -- i.e. exactly the standard WMMA A-operand storage format
+   (matching gfx1250 WMMA's own hardware-verified formulas from the original bring-up, see
+   [[gfx1250-wmma-bringup]]), since that's the entire point of this instruction: feed WMMA
+   operands straight from column-major memory.
+
+**Confirmed formula** (source matrix stored **column-major**: `mem[col*16+row] = value(row,col)`):
+```
+k(lane)    = (lane & 7) | ((lane & 16) >> 1)
+bit3(lane) = (lane >> 3) & 1
+VADDR_bytes(lane) = k(lane)*32 + 16*bit3(lane)
+```
+Reading 8 contiguous elements from that address (a completely ordinary, non-strided burst read
+-- there is no hardware crossbar shuffling data between lanes) gives, for lane `L` and VGPR
+element `e` (0..7): `M = L & 15` (row, direct), `K = e + 8*(L >= 16)` (column). **Verified
+against real hardware with 0/256 mismatches** across all 32 lanes x 8 elements, using a
+column-major 16x16 fp16 test matrix with distinguishable values (`value(row,col)=row*16+col`).
+
+This means: for a real kernel, computing `k(lane)` and the `+16*bit3(lane)` adjustment (5-6
+cheap VALU instructions) is all that's needed to load a WMMA A/B-operand tile directly from
+column-major memory in one instruction, in exactly the layout WMMA already expects -- no LDS
+round-trip, no multi-instruction strided read-and-pack (the technique bwd/wrw currently use for
+transposed operands, see the class docstrings in `igemm_bwd_gtc_wmma_nhwc.py`/
+`igemm_wrw_gtc_wmma_nhwc.py`). **Ready for integration**, pending the same kind of
+regression-safety discipline used for every other main-loop change (byte-identical `.s` diff +
+full hardware battery) once a concrete integration plan is written.
+
+### Probe artifacts and toolchain (for reproducing or extending this work)
+
+All probe `.s`/`.cpp` files live in `/tmp/wmma_probe/` (ephemeral -- copy out anything worth
+keeping before the session/machine cycles). The winning kernels are `async_ld_probe.s`
+(Probe 1) and `tr16_probe_g.s` (Probe 2, symbol `tr16_probe_g` -- the confirmed-working
+formula; earlier `tr16_probe*.s` files in the same directory are the dead-end variants kept
+for the historical record above, not for reuse). Toolchain, confirmed working: assemble with
+`/opt/rocm/llvm/bin/clang++ -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 <probe>.s -o
+<probe>.hsaco` (single step, no separate link -- the full vendor triple `amdgcn-amd-amdhsa` is
+required, the vendor-less `amdgcn--amdhsa` form causes a target-id mismatch on gfx1250); host
+harness via `/opt/rocm/bin/hipcc -std=c++17 <host>.cpp -o <host>`, run as `./<host>
+<probe>.hsaco`. `llvm-mc -arch=amdgcn -mcpu=gfx1250 -show-encoding` is a fast, no-hardware-needed
+first gate for checking whether a candidate mnemonic/operand-form is recognized at all before
+writing a full probe.
+
+## Phase 13 (2026-08-25): `global_load_async_to_lds_b128` integrated into fwd (A+B) and bwd (A)
+
+User asked to integrate and benchmark Phase 12's two confirmed instructions. Instruction 2
+(`global_load_tr16_b128`) carries extra structural risk (address-formula generalization to
+non-packed real tensors never probed, a wave-cooperative SADDR-sharing model that doesn't
+obviously compose with wrw's B-operand padding) and was explicitly deferred by the user to its
+own later phase, gated behind its own hardware micro-probes. This phase covers **only**
+`global_load_async_to_lds_b128`, wired into the untransposed operands: fwd's A (input) + B
+(weight), bwd's A (grad_output). bwd's B and wrw stay on the existing technique (transposed,
+out of scope -- that's Instruction 2's job).
+
+### Design
+
+New per-operand `ctrl.async_global_to_lds_a`/`_b` flags in `wmma_main_loop.py` (independent,
+not a single combined flag -- bwd needs A async while B stays on the old technique). A new
+tunable `async_global_load` (`igemm_base.py`, default 0) gates a from-scratch functor,
+`_emit_gld_async_all_chunks`, that issues all `num_k_chunks` chunks' worth of
+`global_load_async_to_lds_b128` directly (no VGPR staging buffer at all -- the load *is* the
+LDS write), waited once via `s_wait_asynccnt 0x0` in the restructured main loop instead of the
+old chunk-by-chunk `global_load_dwordx4`+`ds_write_b128`+`s_wait_loadcnt` dance. Address
+computation simplifies too: the old design merged a 64-bit VGPR address (SGPR base +
+per-lane offset, via `v_add_co_u32`/`v_add_co_ci_u32`) for use with `global_load_dwordx4`'s
+`off` form; the new design keeps only the per-lane byte offset (`v_off_a`/`v_off_b`, 1 VGPR)
+and passes the SGPR base directly as SADDR. VGPR count drops from 252 to 220 for fwd/fp16
+128x128 as a result.
+
+Padding masking (fwd's A, bwd's A -- the only operands with `v_flag`): a masked-off lane's
+async load simply never touches its LDS destination (confirmed via a dedicated Stage 0
+EXEC-masking probe, extending `/tmp/wmma_probe/async_ld_probe.s` -- 100/100 trials, 0 mismatches
+either direction). Since load+store are now fused into one instruction, this needs an explicit
+zero-fill: invert EXEC after the masked loads and `ds_write_b128` a persistent all-zero `v_zero`
+quad into the same destinations for the now-active (previously masked-off) lanes.
+
+### A real bug found only by full-kernel hardware testing, not by any isolated probe
+
+The new fwd/fp16 config passed assembly and looked structurally correct on inspection, but
+produced **exactly zero** output for every element on real hardware. Four escalating isolated
+probes (masked-load semantics, cross-wave LDS visibility, 8-outstanding-ops-per-wait with mixed
+masked/unmasked SADDR bases) all **passed** -- the bug was in none of the mechanisms those
+probes exercised. A debug patch that overwrote the kernel's first accumulator register with
+`v_a`'s or `v_b`'s raw loaded contents (bypassing WMMA compute entirely, to see what actually
+landed) showed **A had real data, B was exactly zero** -- despite both operands using the
+identical instruction pattern.
+
+The difference: `_emit_gld_async_all_chunks` folded a compile-time constant
+(`sst_extra_off`, e.g. B's `lds_a_size=8192` LDS-region shift) directly into the shared
+per-chunk immediate: `offset:{sst_extra_off + idx*16}`. This is safe for the *old* design
+(separate `global_load_dwordx4` + `ds_write_b128` instructions, where the store's offset never
+touches the load's source address) but **not** for this fused instruction. A dedicated probe
+(`offset_semantics.s`, `/tmp/wmma_probe/`) proved conclusively that
+`global_load_async_to_lds_b128`'s immediate `offset:N` shifts **both** the LDS destination
+(VDST) *and* the global source address (VADDR+SADDR) by the same `N` -- confirmed by writing
+with `offset:0` then `offset:512` from a fixed VDST/VADDR against a source buffer with distinct
+16-byte patterns at bytes 0 and 512: the second write's *destination* landed at LDS+512 as
+expected, but it also read from `src[512:528)` rather than `src[0:16)`, proving the source
+shifted too. For A (`sst_extra_off=0`) this coincidentally caused no visible bug; for B
+(`sst_extra_off=8192`), it silently redirected every read 8192 bytes past the intended weight
+address -- an out-of-bounds/garbage read that this hardware/driver combination happens to
+return as zero.
+
+**Fix**: bake `sst_extra_off` into the VDST *register* once (a single `v_add_u32` into a new
+scratch register, `v_sst_tmp`), leaving the shared per-chunk immediate as pure `idx*16` for
+both operands. Applied to both `igemm_fwd_gtc_wmma_nhwc.py` (where it's live, both A and B) and
+`igemm_bwd_gtc_wmma_nhwc.py` (where A's `sst_extra_off` is always 0 today, so the bug never
+manifested there -- fixed anyway for parity/future-proofing, in case a later variant ever needs
+a nonzero shift for that operand).
+
+### Validated on real hardware (fwd/fp16 128x128, all 6 battery cases)
+
+After the fix: degenerate 1x1/no-pad (single K-block), multi-K-block, stride+pad,
+multi-tap+dilation, group=2, group=4 -- all `valid:y` against `naive_conv_fwd_nhwc`. Byte-
+identical regression check: all 48 existing gfx1250 configs regenerate with zero failures
+(the new code only executes inside `if tunable.async_global_load:` branches, which default to
+0 and are never reached by any existing config).
+
+### Benchmark: CORRECTED -- a consistent regression, not a win (initial "+3-5%" finding was a measurement artifact)
+
+**This section was originally written with `IGEMM_WARMUP=3 IGEMM_REPEAT=8` (Phase 9's exact
+methodology) and reported a "+3-5% win" for fwd/fp16 at the single-tile-block size. That number
+does not hold up.** Re-measuring the identical comparison at `IGEMM_REPEAT=20-30` (interleaving
+old/new runs to rule out clock-drift bias) flips the result: old is consistently *faster* than
+new. `REPEAT=8` was simply too few samples for a workload this fast (~0.1ms) to average out
+run-to-run scheduling/clock noise -- a real methodology gap, not a hardware fluke. Lesson for
+any future benchmark on this machine: don't trust a `tflops` delta smaller than the driver's own
+reported noise percentage without re-running at higher repeat and, ideally, interleaved order.
+
+Corrected numbers, `c=k=2048`, 1x1, `IGEMM_WARMUP=5 IGEMM_REPEAT=20-30`, old (VGPR-staged) vs
+new (async) config, matching 128x128 kernel only in each config:
+
+| direction/precision | shape | old tflops | new tflops | delta |
+|---|---|---|---|---|
+| fwd/fp16 | single-block (`n=1`) | 10.15-10.44 | 9.56-9.85 | **-6%** |
+| fwd/fp16 | GPU-saturating (`n=8`) | 84.8 | 81.8 | **-3.6%** |
+| fwd/bf16 | single-block | 10.40 | 9.82 | **-5.6%** |
+| fwd/bf16 | GPU-saturating | 84.4 | 81.6 | **-3.3%** |
+| fwd/int8 | single-block | 17.61 | 15.85 | **-10%** |
+| fwd/int8 | GPU-saturating | 149.5 | 132.7 | **-11.2%** |
+| fwd/fp32 | single-block | 3.70 | 3.30 | **-11%** |
+| fwd/fp32 | GPU-saturating | 29.7 | 27.0 | **-9.1%** |
+| bwd/fp16 | single-block | 4.06 | 3.95 | **-2.9%** |
+| bwd/fp16 | GPU-saturating | 33.1 | 32.2 | **-2.6%** |
+
+**Consistent regression, every precision, both directions tested, both problem sizes.** No
+combination measured showed a real win. fwd's int8/fp32 are hit hardest (~9-11%); fp16/bf16
+(structurally near-identical load paths, same `data_byte`) regress similarly to each other
+(~3-6%); bwd/fp16's smaller regression (~3%) likely reflects that only its A operand (not both
+A and B) goes async.
+
+**Why, when the mechanism removes VGPR-staging serialization entirely**: not conclusively
+diagnosed -- plausible candidates, none yet tested in isolation: (1) `global_load_async_to_lds_b128`
+itself may simply have higher per-instruction latency than `global_load_dwordx4` on this
+hardware, independent of the staging-buffer serialization it replaces; (2) freeing VGPRs
+(252->220 for fwd/fp16) doesn't help if occupancy was never the bottleneck at this tile size,
+while the old design's now-removed instructions may have given the scheduler more to overlap
+with; (3) `s_wait_asynccnt`'s cross-wave completion semantics (a new counter, no prior tuning
+history on this hardware) could have different/worse latency characteristics than the
+well-understood `s_wait_loadcnt`/`s_wait_dscnt` pair. Not investigated further -- out of scope
+for this phase, which was integration + honest benchmarking, not root-causing a regression in a
+newly-adopted instruction.
+
+**Net**: the instruction works exactly as documented and every hardware-correctness battery
+passes, but it is not a performance win anywhere tested. Since `async_global_load` defaults to
+0 and lives only in new, separate `_async` config files, this doesn't regress anything already
+shipped -- but it also doesn't deliver the speedup this integration was undertaken for.
+**Explicit user decision**: keep the implementation anyway -- gfx1250 is pre-production
+hardware, so the instruction's relative cost could improve on future silicon revisions; a
+correct, validated, default-off implementation costs nothing to leave in place and could become
+a real win later with zero code changes, just a re-benchmark.
+
+### bf16/int8/fp32 extension (2026-08-25): correctness confirmed, same regression pattern
+
+Extended to fwd (A+B) and bwd (A) for bf16/int8/fp32, plus a bwd/fp16 config that hadn't been
+written yet -- purely mechanical, the load-path code (`_emit_gld_async_all_chunks`,
+`chunk_num_dwordx4`/`num_k_chunks`) was already precision-generic from Phase 1's k-sub-loop
+work, no kernel-file changes needed. New files: `igemm_{fwd,bwd}_gtc_gfx1250_nhwc_{bf16,int8,
+fp32}_async.config`, `igemm_bwd_gtc_gfx1250_nhwc_fp16_async.config`. All 7 pass the full 6-case
+hardware battery against `naive_conv_{fwd,bwd}_nhwc` (int8's `gemm_k_per_block=64` and fp32's
+`gemm_k_per_block=4` needed shape-adjusted test cases, e.g. `c`/`k` multiples of the per-
+precision block size rather than fwd/fp16's 32 -- no code changes, just correctly-sized test
+inputs). One dead end during battery validation: initial bwd group=2/4 test shapes (chosen by
+guessing `gemm_n=c/group`, `gemm_k=k/group` from the class docstring) gave `valid:n` for **both**
+old and new configs identically -- proven pre-existing/unrelated to Phase 13 by reproducing on
+the untouched old config, then resolved by using round per-group values (`gemm_n=gemm_k=128`)
+instead of the original odd split (`gemm_n=128,gemm_k=64`); not investigated further since it
+reproduces without any Phase 13 change. Benchmark: same consistent regression pattern as fp16
+(see table above) -- no precision or direction showed a win.
+
+### Deferred (per user's original request, sequenced as instructed)
+
+Instruction 2 (`global_load_tr16_b128`) integration into bwd's B and wrw's A -- needs its own
+hardware micro-probes first (address-formula generalization to non-packed real tensors; a
+wave-cooperative SADDR-broadcast scheme). Also deferred: the full tile-shape-diversity backlog
+from Phase 11 (64x64 port to bwd/wrw, asymmetric 64x128/128x64 shapes, generalizing the
+`v_tid`-as-row-index mapping) -- explicitly sequenced by the user to resume after instruction
+integration+benchmarking finished (now done, with a negative result -- see above).
+
+### Critical files
+
+- `python/operations/wmma_main_loop.py` -- per-operand `async_global_to_lds_a`/`_b` control
+  flags, restructured `emit()`
+- `python/igemm/igemm_fwd_gtc_wmma_nhwc.py` -- `_emit_gld_async_all_chunks`, `v_sst_tmp`,
+  address simplification (both A and B)
+- `python/igemm/igemm_bwd_gtc_wmma_nhwc.py` -- same pattern, A operand only
+- `config/igemm_fwd_gtc_gfx1250_nhwc_fp16_async.config` -- new async-enabled config (separate
+  file, not appended to the shared fp16 config -- the kernel-name mangling doesn't fold
+  `async_global_load` into the symbol name, so two same-shape sections in one file collide)
+- `/tmp/wmma_probe/offset_semantics.s`, `async_deep.s`, `async_crosswave.s`, `async_multi.s` --
+  the escalating probes used to isolate this phase's bug (ephemeral, copy out before reuse)
+
+## Phase 14 (2026-08-25): `global_load_tr16_b128` into bwd's B -- implemented, hardware-tested, found architecturally incompatible, reverted
+
+Following Phase 12's two confirming probes (stride generalization to `STRIDE=128`, wave-
+cooperative SADDR broadcast via `v_readfirstlane_b32`), attempted the integration into bwd's B
+(weight) operand per the approved plan: a new `tr16_load_b` tunable, an `_emit_tr16_load_b_all`
+functor replacing B's entire global-load+LDS-store+LDS-read pipeline (2 `global_load_tr16_b128`
+calls per `wave_repeat_n` step, one per K-half, writing directly into `v_b`), `move_slice_window_b`
+reduced to a scalar SGPR bump. Implemented, then hardware-tested against the simplest possible
+case (`n1c128H16W8k32y1x1`, single K-block, no padding).
+
+**First hardware failure** (`nrms=0.280` vs threshold `0.0082`): `PRINT_EVERY_PIXEL=1` showed a
+clean "groups of 8 channels repeat with an offset-by-one-group" pattern. Root cause: the
+K-half SADDR shift (`s_wei_khalf_stride`, meant to advance the read by "16 K_out positions") used
+`utility_log2(data_byte) + 4` as the shift amount (`*32` for fp16) -- but Phase 12's confirmed
+`VADDR_bytes = k(lane)*STRIDE + 16*bit3(lane)` formula's "16" is a **fixed byte constant**, not an
+element count needing `data_byte` scaling. Fixed to a plain shift of 4 (`*16`).
+
+**Second hardware failure, after the fix** (`nrms=0.124`, improved but still ~15x over
+threshold): per-channel errors were now close-but-wrong throughout, with no obvious repeating
+structure (unlike the first failure). Working through the full per-lane address/output mapping
+by hand (not just re-checking the formula, but tracing exactly which physical lane produces which
+`(N, K)` output value) surfaced a **structural incompatibility**, not a further addressing bug:
+
+- `get_gemm_index_for_src_matrix_transposed` (the proven-correct LDS-based technique this was
+  replacing) requires each lane's **entire** `v_b(i_rn*8 : i_rn*8+7)` register range (all 8, not a
+  sub-range) to hold **16 consecutive K values, entirely from that one lane** -- `k_half=0` lanes
+  own K=0-15 in full, `k_half=1` lanes own K=16-31 in full, for the *same* N-column (`lane%16`).
+  This is WMMA hardware's own fixed per-lane K-reduction convention (every existing operand/
+  precision already relies on it); it is not a free software choice that TR16 could satisfy some
+  other, equally-valid way.
+- `global_load_tr16_b128`'s own per-lane output, worked out fully from Phase 12's confirmed
+  formula (`SOURCE_ROW = (K>>3)*8 + (M&7)`, `SOURCE_COL = (M>>3)*8 + (K&7)`, derived by tabulating
+  all 32 lanes), gives each lane's dwordx4 an **8-element slice whose K-range is hard-wired by
+  that lane's own wave-half** (`K=e` for lanes 0-15, `K=e+8` for lanes 16-31) -- lane 3 can
+  *never* produce output labeled `K=8-15` no matter what SADDR is chosen (SADDR only changes
+  *which real source row* gets that fixed label, never the label itself), and lane 19 can never
+  produce `K=16-31`.
+- These are two genuinely different "upper/lower half of the wave" splits that do not compose:
+  WMMA needs lane 3 to independently hold *all* of K=0-15 for N=3, while TR16 structurally forces
+  K=0-15 for N=3 to be split *across* lanes 3 and 19. No amount of extra `global_load_tr16_b128`
+  calls or SADDR arithmetic can move lane 19's data into lane 3's own VGPRs -- that requires an
+  explicit cross-lane exchange (e.g. `ds_permute`/`v_permute_b32` or a small LDS bounce),
+  which was explicitly out of scope for the user's "simplest first: no LDS, measure it" framing
+  and would need a materially larger redesign (doubling the call count and adding a permute step)
+  to even attempt.
+
+**Decision: reverted.** This is a "measure, don't assume" negative result like Phase 9/13's
+performance findings, just discovered analytically instead of by benchmark -- the two Phase 12
+probes remain true, hardware-confirmed facts about `global_load_tr16_b128` in isolation, they are
+just insufficient (on their own) to populate a K=32-wide WMMA B-operand under the current
+per-lane k_half convention. The `tr16_load_b` tunable, `_emit_tr16_load_b_all`, and the
+`_tr16.config` file were all removed; `igemm_bwd_gtc_wmma_nhwc.py`/`igemm_base.py` are back to
+exactly Phase 13's shape (byte-identical `.s` regression re-confirmed for all 12 default
+fwd/bwd/wrw x fp16/bf16/int8/fp32 configs, ignoring one cosmetic comment-text change from an
+unrelated earlier edit). wrw's A was not attempted separately: it is the same K=32-wide WMMA
+operand consumption pattern, so it would hit the identical incompatibility.
+
+Any future attempt at this instruction for a >16-wide K operand needs to design the cross-lane
+redistribution step first (and benchmark whether the extra permute/LDS-bounce cost still beats
+the existing strided-read-and-pack technique it would replace) rather than assuming a direct
+global-to-`v_b` path works.
+
+### Critical files (Phase 14, reverted -- listed for anyone revisiting this)
+
+- `/tmp/wmma_probe/tr16_stride_probe.s`, `tr16_saddr_probe.s` -- the two Phase 12 follow-on
+  probes confirming stride generalization and wave-cooperative SADDR broadcast (still valid,
+  ephemeral, copy out before reuse)
+- `docs/gfx1250_wmma_layout.md`'s Phase 12 section -- the base `global_load_tr16_b128` formula
+  and the `SOURCE_ROW`/`SOURCE_COL` per-lane derivation this phase's finding depends on
+
+## Phase 11 (2026-08-24): tile-shape diversity, mechanism + first new shape (fwd/fp16 only)
+
+User asked to prioritize coverage (tile-shape diversity) over further interleaving-perf work.
+All three kernel files were pinned to exactly one macro-tile shape (128x128, wmma_repeat 4x4,
+block_size=128) -- a real coverage gap, since convolution shapes whose `gemm_m`/`gemm_n`
+(`n*ho*wo` / `k/group`) don't land on a multiple of 128 have no valid WMMA kernel today even
+when they divide evenly into something smaller.
+
+**Mechanism (all 3 directions, zero new configs, byte-identical for every existing config)**:
+1. Relaxed the 4 hard `assert tunable.gemm_m_per_block == 128 ...` shape-pinning asserts in
+   each kernel's `__init__` (fwd:152-155, bwd:89-92, wrw:144-147 pre-change) to real validity
+   checks matching `igemm_base.py:289-295`'s own formula (`gemm_m_per_block % (wmma_tile_m *
+   wmma_repeat_m) == 0`, `block_size == waves_per_m*waves_per_n*32`) -- redundant with that
+   upstream check by design, not the sole gatekeeper.
+2. Generalized the `*128`/shift-by-7 address math (group-decode's `blocks_per_group_n = ceil
+   (gemm_n/128)` and the `s_block_m_off`/`s_block_n_off` computation, 3 call sites x 3 files)
+   to `utility_log2(tunable.gemm_m_per_block/gemm_n_per_block)` and `gemm_n_per_block - 1`.
+3. Fixed 2 literal `range(4)` loops in `igemm_wrw_gtc_wmma_nhwc.py`'s `shared_load_a/b_functor`
+   (lines 821/857 pre-change) to `range(outer.tunable.wmma_repeat_m/n)` -- fwd/bwd's equivalent
+   loops were already generic.
+
+Verified byte-identical (modulo comment text) for all 48 existing gfx1250 configs (`.inc` diff
+against a pre-change baseline), matching the discipline established in Phase 9/10.
+
+**A real, previously-undiscovered constraint, found only by testing a new shape on hardware**:
+the fwd/bwd/wrw kernels' GLOBAL-LOAD thread mapping is a *separate* indexing system from the
+WMMA compute/epilogue indexing in `wmma_mapping.py` (which IS fully generic, confirmed by
+static audit). The global-load functors use `v_tid` **directly** as the per-thread
+`gemm_m`/`gemm_n` row index within the block (e.g. fwd: `v_add_u32 v[v_gtc_tmp(0)],
+s[s_block_m_off], v[v_tid]   ; m_idx`) -- this silently requires `block_size ==
+gemm_m_per_block == gemm_n_per_block` exactly, true for the existing 128x128/block_size=128
+shape only by coincidence of all three being 128. A first attempt at a symmetric 64x64/
+wave_repeat-2x2/block_size=128 shape (chosen because it kept the same 4-wave grid as the
+existing config) **assembled and ran but produced all-zero output** on real hardware --
+`PER_PIXEL_CHECK=1`'s per-pixel diff showed `pred:0.000000` at every index, meaning roughly
+half the threads (`v_tid` 64..127) computed `m_idx`/`n_idx` values 64..127 that fall entirely
+outside the intended 64-row block, corrupting/missing the actual global-memory read and the
+LDS write it feeds. This bug is invisible to a purely static audit (it's not a literal `128`
+anywhere) -- only exercising a genuinely different shape on hardware surfaced it.
+
+**The fix**: with `wave_tile` fixed at 16 (only verified value), the only way to hit
+`block_size == macro_tile_m == macro_tile_n` for a tile smaller than 128 is an ASYMMETRIC wave
+grid, since `block_size = waves_per_m*waves_per_n*32` forces `waves_per_m*waves_per_n = 2` for
+`block_size=64`, i.e. `(waves_per_m, waves_per_n) = (2,1)` or `(1,2)`, never `(1,1)`(->32x32)
+or `(2,2)`(->128x128, the existing shape). Landed shape: `wave_repeat_m=2, wave_repeat_n=4,
+waves=2` (`waves_per_m=2, waves_per_n=1`, `block_size=64=gemm_m_per_block=gemm_n_per_block`).
+`accumulate_c = wave_repeat_m*wave_repeat_n*num_v_c = 2*4*8 = 64` (down from 128 at 4x4),
+`accumulate_a = wave_repeat_m*num_v_a = 16`, `accumulate_b = wave_repeat_n*num_v_b = 32` --
+total 112 VGPRs vs the existing shape's 192 for fp16/bf16/int8, a real but more modest
+reduction than a (invalid) naive symmetric 2x2/block_size=128 split would have suggested.
+
+New `ctrl_wmma_mapping_t(64, 64, 16, 16, 2, 2, 4, ...)` table entries added for all four
+precisions in `wmma_mapping.py` (data only, `get_ctrl_wmma_mapping_from_wave_tile`'s filter
+logic is unchanged). One new `[igemm_fwd_gtc]` config section added to
+`config/igemm_fwd_gtc_gfx1250_nhwc_fp16.config` (`gemm_m/n_per_block=64, gemm_k_per_block=32,
+wmma_repeat_m=2, wmma_repeat_n=4, tensor_a/b_thread_lengths=[1,32,1,1] (unchanged from the
+128x128 config -- gemm_k_per_block didn't change), tensor_a/b_cluster_lengths=[1,1,1,64]`
+(block_size=64, not 128)). `.vgpr_count: 172` for the new kernel (confirmed empirically from
+the assembled `.s`), comfortably under the 256/wave ceiling.
+
+**Validated on real gfx1250 hardware** through `conv_driver.exe`, fwd/fp16 only, against the
+driver's own `naive_conv_fwd_nhwc` reference, using shapes with `gemm_m`/`gemm_n` chosen as
+multiples of 64 but not 128 (so only the new tunable is valid/exercised): degenerate 1x1/
+stride-1/no-pad, multi-K-block (`gemm_k=96`, three 32-blocks), stride+padding, multi-tap+
+dilation, and `group=2` -- all `valid:y`. A control shape with `gemm_m=gemm_n=128` (divisible
+by both 64 and 128) confirmed both the existing 128x128 kernel and the new 64x64 kernel
+independently produce correct output side by side, with zero change to the 128x128 kernel's
+generated assembly.
+
+### Phase 11 continued (2026-08-25): bwd/wrw port + bf16/int8/fp32, all 12 combos hardware-validated
+
+Ported the 64x64 shape to bwd and wrw, then to bf16/int8/fp32 for all three directions --
+config-only work, exactly as predicted: bwd's global-load uses `v_tid` directly for its M side
+and an already-generic `row_local`/`col_group` decomposition for N (same algebraic constraint,
+different-looking code); wrw uses the `row_local`/`col_group` decomposition for both operands.
+Neither needed kernel-file changes -- the `wmma_mapping.py` table already had all 4 precisions'
+`ctrl_wmma_mapping_t(64, 64, 16, 16, 2, 2, 4, ...)` entries from the original Phase 11 work, and
+`num_vgpr_accumulate_{a,b,c}` is computed identically across all three kernel files from the
+same tunable fields. New config sections: 64x64 added to all 12 `igemm_{fwd,bwd,wrw}_gtc_
+gfx1250_nhwc_{fp16,bf16,int8,fp32}.config` files (fwd/fp16 already had it). VGPR counts:
+bwd/fp16 176, wrw/fp16 171 (both comfortably under the 256/wave ceiling, similar to fwd's 172).
+
+**All 12 (direction x precision) combos pass the full 6-case hardware battery** (degenerate,
+multi-K-block, stride+pad, multi-tap+dilation, group=2, group=4) against `naive_conv_{fwd,bwd,
+wrw}_nhwc`, plus a control shape confirming the 128x128 kernel in each file is untouched.
+
+**A pre-existing, orthogonal quirk found while validating group>1** (not a Phase 11/13 bug):
+bwd's group>1 support is sensitive to the exact `gemm_n`/`gemm_k` split chosen for the test --
+some shape choices (e.g. `gemm_n=128,gemm_k=64`) give `valid:n`, while "round" splits with
+`gemm_n==gemm_k` reliably pass. Proven unrelated to any change in this session by reproducing
+the exact same failure on the untouched, pre-Phase-11 128x128 bwd/bf16 config. Not investigated
+further -- outside the scope of tile-shape-diversity work, flagged here so a future session
+doesn't waste time re-discovering it. Every hardware battery test in this phase was run with
+round splits specifically to route around it.
+
+**Still not done at this point**: the asymmetric 64x128/128x64 shapes, and generalizing the
+global-load functors' `v_tid`-as-row-index thread mapping. These two are linked more tightly
+than the original Phase 11 backlog implied: `block_size` must simultaneously equal
+`gemm_m_per_block` (for A's one-row-per-thread load) AND `gemm_n_per_block` (for B's), which is
+only possible when they're equal -- an asymmetric tile shape (`gemm_m_per_block !=
+gemm_n_per_block`) is **not reachable at all** without first changing at least one operand's
+load functor to handle more than one row per thread. See the next section for how this was
+resolved.
+
+### Phase 11 continued again (2026-08-25): first asymmetric shape (128x64, fwd/fp16), `row_repeat` mechanism
+
+Researched whether gfx950's mature XDLOPS kernels (`igemm_fwd_gtc_nhwc.py`, no `_wmma_`) already
+solve this: they do, via cluster-length-based thread dispatch
+(`igemm_thread_cluster_index_dispatcher_t`/`_accumulator_t`, `igemm_base.py:961-993`) where each
+operand's `tensor_{a,b}_cluster_lengths`/`thread_lengths` independently determine how many rows
+each thread owns. WMMA's config format already carries these fields (unused, dead weight for
+address generation today). Rather than port the full generic multi-dimensional dispatcher,
+implemented a much simpler WMMA-specific equivalent: **the WMMA compute side
+(`wmma_mapping.get_gemm_index_for_src_matrix`) has zero dependence on which thread loaded which
+global row into LDS** -- it only requires LDS byte offset `R*bytes_per_row` to hold global row
+`R`'s data, for every `R` in `[0, gemm_m_per_block)`, written by *some* thread exactly once. So:
+let `row_repeat_a = gemm_m_per_block // block_size` (generalizing the old `==` requirement to
+`%==0`); thread `tid` owns rows `tid, tid+block_size, tid+2*block_size, ...` (`row_repeat_a` of
+them). `tensor_a_cluster_lengths`/`thread_lengths` in the config only need to satisfy
+`igemm_base.py`'s generic validation asserts (`product(cluster)==block_size`,
+`product(thread)*block_size==gemm_m_per_block*gemm_k_per_block`) -- they're not read by the
+kernel's address generation, same as before.
+
+**First target**: `gemm_m_per_block=128, gemm_n_per_block=64`, fwd/fp16 only (matching Phase
+11's own "first new shape" precedent). Wave/repeat choice (`waves_per_m=2, wave_repeat_m=4,
+waves_per_n=1, wave_repeat_n=4, waves=2` -> `block_size=64`) means `gemm_n_per_block(64) ==
+block_size(64)` already -- **B needs zero changes**; only A needs `row_repeat_a=2`, confining
+the entire change to one operand's load pipeline in `igemm_fwd_gtc_wmma_nhwc.py`. Deliberately
+kept separate from Phase 13's async-load path for this first pass (`async_global_load=0`).
+
+**VGPR budget was tighter than expected**: a first implementation persisted
+`row_repeat_a`-sized copies of `v_flag`/`v_n_idx`/`v_ho_idx`/`v_wo_idx`/`v_addr_a`, landing at
+258 VGPRs -- 2 over the 256/wave hardware ceiling (assembler: "register index is out of
+range"). Fixed by NOT persisting `v_n_idx`/`v_ho_idx`/`v_wo_idx` for extra rows at all: row 0
+keeps its persistent registers exactly as today; rows 1..row_repeat_a-1 recompute their own
+`(n_idx, ho_idx, wo_idx)` FRESH every tap from `v_tid+i*block_size`, reusing the existing 5-slot
+`v_gtc_tmp` scratch pool (sequenced so each division-macro output is fully consumed before being
+overwritten by the next stage) -- landing the results in the SAME registers
+(`v_gtc_tmp(0)/(1)/(2)`) the unchanged downstream hi_idx/wi_idx/flag/row_idx code already reads
+its input from, so that code is shared, byte-for-byte, between every row. Final cost: 255 VGPRs
+(+3 total: `v_flag` +1, `v_addr_a` +2), not +6.
+
+**A real bug found only on hardware, not by any static check**: the fixed-VGPR version compiled
+and looked structurally sound, but produced results with `nrms=0.137` against a `0.0082`
+threshold (`valid:n`) on every test. Per-pixel diagnosis (`PRINT_EVERY_PIXEL=1`, comparing
+*absolute* not relative error to avoid a red herring -- relative error blows up trivially near
+zero-crossings and initially made the bug look like uniform fp16 rounding noise) showed the
+first 64 of 128 output rows (row-repeat-set 0, the untouched code path) were correct to
+fp16-rounding precision, while the second 64 (row-repeat-set 1, the new fresh-recompute path)
+were substantially wrong. Root cause: the fresh-recompute code passed `s.s_tmp()` (== `s_tmp(0)`)
+as the division macro's scalar scratch argument -- but `s_tmp(0)`/`s_tmp(1)` were ALSO holding
+the shared `iy*dilation-pad` values computed once at the top of `_emit_tap_gather` and read
+again immediately after, for every row's hi_idx/wi_idx computation.
+`macro_int_div_rem_vs_gfx1250_t` writes to `s[\s_tmp4+0]` internally (confirmed by reading the
+macro's `emit()`), silently corrupting that shared pad offset for row 1's (and only row 1's)
+subsequent hi_idx/wi_idx math. The prologue's identical-looking division calls (row 0, computed
+once before any pad-offset value exists yet) never hit this, which is why the bug was invisible
+there. Fixed by using `s.s_tmp(2)` (free at that point in the function, not needed until the
+B-side computation after the row loop) as the division macro's scratch instead.
+
+**Validated on real hardware**, fwd/fp16/128x64, full 6-case battery (degenerate, multi-K-block,
+stride+pad, multi-tap+dilation, group=2, group=4) against `naive_conv_fwd_nhwc` -- all `valid:y`.
+Byte-identical regression check: all 57 existing gfx1250 configs regenerate identically (the new
+`row_repeat_a`/`row_repeat_b` logic only activates when `block_size` doesn't already equal
+`gemm_m_per_block`/`gemm_n_per_block`, which is never true for any existing config).
+
+**Not yet done**: 64x128 (the mirror shape, generalizing B instead of A), bwd/wrw at 128x64,
+bf16/int8/fp32 at 128x64, combining `row_repeat` with Phase 13's async-load path, and the fully
+general `v_tid`-decoupled mapping (arbitrary, non-power-of-2-multiple tile ratios) that XDLOPS's
+cluster dispatcher supports and this `row_repeat` mechanism deliberately does not attempt.

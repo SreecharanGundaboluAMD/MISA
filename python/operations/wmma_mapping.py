@@ -212,21 +212,57 @@ class igemm_wmma_mapping_t(mc_base_t):
 #   macro_tile_m = wave_tile_m(16) * wave_repeat_m(4) * waves_per_m(2) = 128  (same for n)
 # fp16/bf16 share the same K=32, 8-VGPR/lane instruction footprint (both verified, see
 # docs/gfx1250_wmma_layout.md) so they share the same tile-shape table.
+#
+# A second, smaller 64x64 entry was added for tile-shape-diversity coverage: convolution
+# shapes whose gemm_m/gemm_n aren't a multiple of 128 have no valid 128x128 kernel today even
+# when they divide evenly into 64. IMPORTANT constraint discovered while adding this: the fwd/
+# bwd/wrw kernels' GLOBAL-LOAD thread mapping (separate from this file's wave/repeat compute
+# indexing, which is already fully generic) uses v_tid directly as the per-thread gemm_m/n row
+# index within the block -- i.e. it requires block_size == gemm_m_per_block == gemm_n_per_block
+# exactly (true for the existing 128x128/block_size=128 entry only by coincidence of both being
+# 128). With wave_tile fixed at 16 (only verified shape), this forces an ASYMMETRIC wave grid
+# for any smaller square macro-tile: waves_per_m*waves_per_n*32 (=block_size) must equal
+# macro_tile_m (=macro_tile_n), which for macro_tile=64 means waves_per_m/n=(2,1) or (1,2), not
+# (1,1)(->32x32) or (2,2)(->128x128, the existing shape). Chosen here: waves_per_m=2,
+# waves_per_n=1 -> wave_repeat_m=2 (macro_tile_m=16*2*2=64), wave_repeat_n=4
+# (macro_tile_n=16*4*1=64), waves=2 (block_size=64). accumulate_c=2*4*8=64 (down from 128),
+# accumulate_a=2*8=16, accumulate_b=4*8=32 -- total 112 VGPRs vs 192 for fp16/bf16/int8's
+# existing 128x128/4x4 shape, a real if more modest reduction than a naive symmetric 2x2 split
+# would have given (which is NOT valid here -- see above).
 ctrl_wmma_mapping_table = {
-    'fp16': [ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x32_f16)],
-    'bf16': [ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x32_bf16)],
+    'fp16': [
+        ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x32_f16),
+        ctrl_wmma_mapping_t(64,  64,  16, 16, 2, 2, 4, v_wmma_f32_16x16x32_f16),
+        # Asymmetric first shape (2026-08-25): waves_per_m=2 (128/(4*16)), waves_per_n=1
+        # (64/(4*16)), waves=2 -> block_size=64. block_size == gemm_n_per_block(64) already
+        # (B needs zero changes), but block_size < gemm_m_per_block(128) -- A's global-load
+        # needs the new row_repeat_a=2 generalization (see igemm_fwd_gtc_wmma_nhwc.py). Same
+        # accumulate_a/b/c magnitudes as the 128x128 entry (same wave_repeat_m/n=4/4), just a
+        # different waves_per_n split.
+        ctrl_wmma_mapping_t(128, 64,  16, 16, 2, 4, 4, v_wmma_f32_16x16x32_f16),
+    ],
+    'bf16': [
+        ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x32_bf16),
+        ctrl_wmma_mapping_t(64,  64,  16, 16, 2, 2, 4, v_wmma_f32_16x16x32_bf16),
+    ],
     # int8: K=64 (not 32), but num_v_a/num_v_b/num_v_c are still 8/8/8 (same as fp16/bf16 --
     # only elements/dword differs: 4 int8/dword vs 2 fp16/dword), so the same 128x128 macro
     # tile / 4x4 wave_repeat shape carries over unchanged. Verified via hardware round-trip
     # probe (/tmp/wmma_probe/probe_int8.s, host_int8.cpp), see docs/gfx1250_wmma_layout.md.
-    'int8': [ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_i32_16x16x64_iu8)],
+    'int8': [
+        ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_i32_16x16x64_iu8),
+        ctrl_wmma_mapping_t(64,  64,  16, 16, 2, 2, 4, v_wmma_i32_16x16x64_iu8),
+    ],
     # fp32: K=4 (much shorter than the others), num_v_a=num_v_b=2 (not 8 -- no packing at all,
     # 1 fp32/dword, unlike fp16's 2/dword or int8's 4/dword). D operand (num_v_c=8) carries
     # over unchanged, confirmed via hardware round-trip probe (/tmp/wmma_probe/probe_fp32.s,
     # host_fp32.cpp, 6 random seeds), see docs/gfx1250_wmma_layout.md. Same 128x128 macro tile
     # / 4x4 wave_repeat shape as every other precision -- only gemm_k_per_block (forced to 4,
     # matching inst_wmma.k) and the resulting byte-width-per-thread-row differ.
-    'fp32': [ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x4_f32)],
+    'fp32': [
+        ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x4_f32),
+        ctrl_wmma_mapping_t(64,  64,  16, 16, 2, 2, 4, v_wmma_f32_16x16x4_f32),
+    ],
 }
 
 def get_ctrl_wmma_mapping_from_wave_tile(macro_tile_m, macro_tile_n, wave_tile_m, wave_tile_n, wave_repeat_m, wave_repeat_n, waves, precision):

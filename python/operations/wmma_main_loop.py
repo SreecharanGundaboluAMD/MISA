@@ -64,6 +64,18 @@ class ctrl_wmma_main_loop_t(object):
         self.lds_single_size             = 0       # in byte, should be power of 2
         self.lds_buffer_num              = 1        # single-buffered for this milestone
 
+        # Phase 13: per-operand (independent, since e.g. bwd's A goes async while its B
+        # stays on the old technique -- B is transposed, out of scope for this phase).
+        # When True for an operand, that operand's global_load_a/b_functor issues its data
+        # global-memory -> LDS directly via global_load_async_to_lds_b128 (no VGPR staging
+        # buffer, no separate shared_store step -- the load IS the LDS write), and that
+        # operand's shared_store_a/b_functor is never called. Completion is tracked by
+        # ASYNCcnt; s_wait_asynccnt is emitted (alongside s_wait_dscnt, if the OTHER
+        # operand still uses the old ds_write_b128-based technique) right before the
+        # barrier. Default False for both = today's exact byte-identical behavior.
+        self.async_global_to_lds_a       = False
+        self.async_global_to_lds_b       = False
+
         # Phase 1 (k-sub-loop): byte offset between consecutive inst_wmma.k-wide K-slices
         # within one already-in-LDS tile, one value per operand since transposed vs
         # untransposed operands advance through LDS differently (contiguous-within-a-row
@@ -170,10 +182,25 @@ class wmma_main_loop_t(mc_base_t):
         # last (or only) tile is always consumed, unlike a naive "check-then-loop"
         # structure which would skip compute entirely for a single-k-block problem.
         self._emit(f"; start WMMA loop, unroll_k:{ctrl.unroll_k}")
-        self._emit(f"s_wait_loadcnt 0x0")
-        self._emit(f_sst_a())
-        self._emit(f_sst_b())
-        self._emit_empty_line()
+
+        async_a = ctrl.async_global_to_lds_a
+        async_b = ctrl.async_global_to_lds_b
+        any_async = async_a or async_b
+        any_old   = (not async_a) or (not async_b)
+
+        # Phase 13: an operand on the async path already issued its first tile's data
+        # straight into LDS (global_load_async_to_lds_b128, no VGPR staging, no separate
+        # store step) -- nothing to wait on or store here for it; that wait happens at
+        # the top of label_body, same slot as every other iteration's wait for the
+        # PREVIOUS iteration's prefetch. An operand still on the old path needs its
+        # usual s_wait_loadcnt + deferred store, same as always.
+        if any_old:
+            self._emit(f"s_wait_loadcnt 0x0")
+            if not async_a:
+                self._emit(f_sst_a())
+            if not async_b:
+                self._emit(f_sst_b())
+            self._emit_empty_line()
 
         if double_buffer:
             # Phase 2: the tile just stored above landed in buffer 0 (v_sst_a_os's
@@ -188,7 +215,15 @@ class wmma_main_loop_t(mc_base_t):
         self._emit_empty_line()
 
         self._emit_front(f"{label_body}:")
-        self._emit(f"s_wait_dscnt 0x0")
+        # Gates THIS wave's own writes into the tiles about to be read below -- an async
+        # operand's LDS write (ASYNCcnt) and/or an old-path operand's ds_write_b128
+        # (DSCnt) -- before this wave tells the workgroup it's safe to cross the barrier
+        # and read. Both waits coexist when one operand is async and the other isn't
+        # (e.g. bwd: A async, B still on the old technique).
+        if any_async:
+            self._emit(f"s_wait_asynccnt 0x0")
+        if any_old:
+            self._emit(f"s_wait_dscnt 0x0")
         self._emit(f"s_barrier_signal -1")
         self._emit(f"s_barrier_wait -1")
         self._emit_empty_line()
@@ -205,17 +240,32 @@ class wmma_main_loop_t(mc_base_t):
 
         self._emit(f_move_slice_window_a())
         self._emit(f_move_slice_window_b())
-        self._emit(f_gld_a())
-        self._emit(f_gld_b())
+        if not async_a:
+            self._emit(f_gld_a())
+        if not async_b:
+            self._emit(f_gld_b())
         self._emit_empty_line()
 
         emit_wmma_tile()
         emit_extra_substeps()
         self._emit_empty_line()
 
-        self._emit(f"s_wait_loadcnt 0x0")
-        self._emit(f_sst_a())
-        self._emit(f_sst_b())
+        # Phase 13: an async operand's NEXT-tile load-to-LDS is issued only now, after
+        # this tile's ds_reads (f_sld_a/f_sld_b above) are fully consumed -- the async
+        # load IS the LDS write, so (unlike the old design's chunk-0 early-issue trick)
+        # there is no safe-to-start-early sub-step to preserve; deferring ALL of it is
+        # what keeps the cross-wave LDS-write-visibility invariant from Phase 9 intact.
+        # An old-path operand keeps its usual s_wait_loadcnt + deferred store.
+        if any_old:
+            self._emit(f"s_wait_loadcnt 0x0")
+            if not async_a:
+                self._emit(f_sst_a())
+            if not async_b:
+                self._emit(f_sst_b())
+        if async_a:
+            self._emit(f_gld_a())
+        if async_b:
+            self._emit(f_gld_b())
         if double_buffer:
             emit_buffer_switch()
         self._emit(f"s_branch {label_body}")

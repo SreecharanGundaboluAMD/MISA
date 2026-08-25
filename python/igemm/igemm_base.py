@@ -213,6 +213,11 @@ class igemm_gtc_tunable_parameter_t(object):
             # Phase 2 (gfx1250 WMMA LDS double-buffering): optional, defaults to 0
             # (single-buffered, every existing config) so old configs are unaffected.
             self.lds_double_buffer              = utility_dict_with_default_t(tunable_dict)('lds_double_buffer', 0)
+            # Phase 13: optional, defaults to 0 (today's VGPR-staged global_load_dwordx4 +
+            # ds_write_b128 path, every existing config unaffected). When 1, untransposed
+            # operands (fwd A/B, bwd A) use global_load_async_to_lds_b128 instead -- no VGPR
+            # staging buffer, global memory -> LDS directly.
+            self.async_global_load              = utility_dict_with_default_t(tunable_dict)('async_global_load', 0)
         else:
             assert False
 

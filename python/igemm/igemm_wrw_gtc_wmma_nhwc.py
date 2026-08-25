@@ -141,10 +141,16 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         assert tunable.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA
         assert tunable.precision in ('fp16', 'bf16', 'int8', 'fp32'), f'unsupported precision:{tunable.precision}'
         assert tunable.tensor_layout == 'nhwc'
-        assert tunable.gemm_m_per_block == 128 and tunable.gemm_n_per_block == 128
-        assert tunable.wmma_tile_m == 16 and tunable.wmma_tile_n == 16
-        assert tunable.wmma_repeat_m == 4 and tunable.wmma_repeat_n == 4
-        assert tunable.block_size == 128
+        # tile shape is not pinned to 128x128/4x4/block_size=128 -- any shape is accepted as
+        # long as it is internally consistent. igemm_gtc_tunable_parameter_t.__init__
+        # (igemm_base.py) already derives/validates tunable.block_size generically from these
+        # same fields before we ever get here; this is a second, kernel-local check with the
+        # same formula (gfx1250 WMMA is always wave32).
+        assert tunable.gemm_m_per_block % (tunable.wmma_tile_m * tunable.wmma_repeat_m) == 0
+        assert tunable.gemm_n_per_block % (tunable.wmma_tile_n * tunable.wmma_repeat_n) == 0
+        waves_per_m = tunable.gemm_m_per_block // (tunable.wmma_tile_m * tunable.wmma_repeat_m)
+        waves_per_n = tunable.gemm_n_per_block // (tunable.wmma_tile_n * tunable.wmma_repeat_n)
+        assert tunable.block_size == waves_per_m * waves_per_n * 32
         self.tunable = tunable
         self.data_byte = amdgpu_precision_data_byte(tunable.precision)
 
@@ -430,8 +436,8 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # used for the base-pointer offset. Output (grad_weight) needs no equivalent fix --
         # its group split is the outermost/block-contiguous dimension. ----
         self._emit(f"; --- group>1: decode group_idx, correct s_by, offset A/B base pointers ---")
-        self._emit(f"s_add_u32 s[{s.s_tmp(0)}], s[{s.s_gemm_n()}], 127")
-        self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], 7   ; blocks_per_group_n = ceil(gemm_n/128)")
+        self._emit(f"s_add_u32 s[{s.s_tmp(0)}], s[{s.s_gemm_n()}], {self.tunable.gemm_n_per_block - 1}")
+        self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {utility_log2(self.tunable.gemm_n_per_block)}   ; blocks_per_group_n = ceil(gemm_n/gemm_n_per_block)")
         self._emit(f"v_mov_b32 v[{v.v_gtc_tmp(0)}], s[{s.s_by()}]")
         self._emit(m_int_div_rem_vs(v.v_gtc_tmp(1), v.v_gtc_tmp(2), v.v_gtc_tmp(0), s.s_tmp(0), v.v_tmp(), s.s_tmp(1)))
         self._emit(f"v_readfirstlane_b32 s[{s.s_group_idx()}], v[{v.v_gtc_tmp(2)}]   ; group_idx")
@@ -455,8 +461,8 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_addc_u32 s[{s.s_p_wei(1)}], s[{s.s_p_wei(1)}], 0")
         self._emit_empty_line()
 
-        self._emit(f"s_lshl_b32 s[{s.s_block_m_off()}], s[{s.s_bx()}], 7   ; *128")
-        self._emit(f"s_lshl_b32 s[{s.s_block_n_off()}], s[{s.s_by()}], 7   ; *128")
+        self._emit(f"s_lshl_b32 s[{s.s_block_m_off()}], s[{s.s_bx()}], {utility_log2(self.tunable.gemm_m_per_block)}   ; *gemm_m_per_block")
+        self._emit(f"s_lshl_b32 s[{s.s_block_n_off()}], s[{s.s_by()}], {utility_log2(self.tunable.gemm_n_per_block)}   ; *gemm_n_per_block")
         self._emit(f"s_mov_b32 s[{s.s_knum()}], s[{s.s_gemm_k()}]")
         # A's per-K-block (32 rows) global stride depends on a runtime tensor extent (K_out) --
         # unlike fwd's compile-time-constant +64 bytes. B has no equivalent constant stride
@@ -818,7 +824,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 else:
                     read_instr = 'ds_read_u8'
                 with outer._deferred_context():
-                    for i_rm in range(4):
+                    for i_rm in range(outer.tunable.wmma_repeat_m):
                         col_off = i_rm * outer.tunable.wmma_tile_m * outer.data_byte
                         for a in range(num_v_a):
                             for s in range(elem_per_dword):
@@ -854,7 +860,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 else:
                     read_instr = 'ds_read_u8'
                 with outer._deferred_context():
-                    for i_rn in range(4):
+                    for i_rn in range(outer.tunable.wmma_repeat_n):
                         col_off = i_rn * outer.tunable.wmma_tile_n * outer.data_byte
                         for a in range(num_v_b):
                             # B region starts at outer.lds_a_size within the shared LDS tile;

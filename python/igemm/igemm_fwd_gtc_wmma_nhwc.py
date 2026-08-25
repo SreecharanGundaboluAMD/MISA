@@ -149,12 +149,43 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         assert tunable.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA
         assert tunable.precision in ('fp16', 'bf16', 'int8', 'fp32'), f'unsupported precision:{tunable.precision}'
         assert tunable.tensor_layout == 'nhwc'
-        assert tunable.gemm_m_per_block == 128 and tunable.gemm_n_per_block == 128
-        assert tunable.wmma_tile_m == 16 and tunable.wmma_tile_n == 16
-        assert tunable.wmma_repeat_m == 4 and tunable.wmma_repeat_n == 4
-        assert tunable.block_size == 128
+        # tile shape is not pinned to 128x128/4x4/block_size=128 -- any shape is accepted as
+        # long as it is internally consistent. igemm_gtc_tunable_parameter_t.__init__
+        # (igemm_base.py) already derives/validates tunable.block_size generically from these
+        # same fields before we ever get here; this is a second, kernel-local check with the
+        # same formula (gfx1250 WMMA is always wave32).
+        assert tunable.gemm_m_per_block % (tunable.wmma_tile_m * tunable.wmma_repeat_m) == 0
+        assert tunable.gemm_n_per_block % (tunable.wmma_tile_n * tunable.wmma_repeat_n) == 0
+        waves_per_m = tunable.gemm_m_per_block // (tunable.wmma_tile_m * tunable.wmma_repeat_m)
+        waves_per_n = tunable.gemm_n_per_block // (tunable.wmma_tile_n * tunable.wmma_repeat_n)
+        assert tunable.block_size == waves_per_m * waves_per_n * 32
         self.tunable = tunable
         self.data_byte = amdgpu_precision_data_byte(tunable.precision)
+
+        # Asymmetric tile shapes (2026-08-25): the global-load thread mapping historically
+        # required block_size == gemm_m_per_block == gemm_n_per_block (one row per thread,
+        # addressed directly by v_tid). Generalized here to allow block_size to merely DIVIDE
+        # both evenly -- each thread then owns `row_repeat_{a,b}` rows, strided by block_size
+        # (thread `tid` owns global rows `tid, tid+block_size, tid+2*block_size, ...`). The
+        # WMMA *compute* side (wmma_mapping.get_gemm_index_for_src_matrix) has no dependence on
+        # which thread loaded which row -- it only requires LDS byte offset R*bytes_per_row to
+        # hold global row R's data, regardless of which thread wrote it -- so this is purely a
+        # load-side change. For every existing config block_size==gemm_m/n_per_block exactly,
+        # so row_repeat_a==row_repeat_b==1 and every row-repeat loop below degenerates to
+        # exactly today's single-iteration code (byte-identical).
+        assert tunable.gemm_m_per_block % tunable.block_size == 0, \
+            f"gemm_m_per_block({tunable.gemm_m_per_block}) must be a multiple of block_size({tunable.block_size})"
+        assert tunable.gemm_n_per_block % tunable.block_size == 0, \
+            f"gemm_n_per_block({tunable.gemm_n_per_block}) must be a multiple of block_size({tunable.block_size})"
+        self.row_repeat_a = tunable.gemm_m_per_block // tunable.block_size
+        self.row_repeat_b = tunable.gemm_n_per_block // tunable.block_size
+        # row_repeat > 1 combined with Phase 13's async load is deliberately out of scope for
+        # now (kept separate to isolate correctness of each mechanism) -- B's row_repeat_b > 1
+        # is also not yet implemented (this phase only targets gemm_m_per_block > gemm_n_per_block
+        # shapes, e.g. 128x64; a mirrored 64x128 shape would need the B-side equivalent).
+        assert not (tunable.async_global_load and (self.row_repeat_a > 1 or self.row_repeat_b > 1)), \
+            "row_repeat > 1 is not yet supported together with async_global_load"
+        assert self.row_repeat_b == 1, "row_repeat_b > 1 (B needing multiple rows/thread) is not yet implemented"
 
         ctrl_wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(tunable.gemm_m_per_block, tunable.gemm_n_per_block,
                 tunable.wmma_tile_m, tunable.wmma_tile_n, tunable.wmma_repeat_m, tunable.wmma_repeat_n,
@@ -274,20 +305,46 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             self.v_c           = sym_t('v_c'           , vseq(outer.tunable.num_vgpr_accumulate_c))     # 128
             self.v_a           = sym_t('v_a'           , vseq(outer.tunable.num_vgpr_accumulate_a))     # 32
             self.v_b           = sym_t('v_b'           , vseq(outer.tunable.num_vgpr_accumulate_b))     # 32
-            # Phase 1 (k-sub-loop): sized to outer.chunk_num_dwords (one inst_wmma.k-worth),
-            # NOT outer.num_dwords (the whole, possibly multi-substep, row) -- global_load/
-            # shared_store are now chunked and reuse this same small buffer across chunks,
-            # since growing it to hold the whole row would exceed the 256-VGPR/wave limit
-            # for fp16/bf16/int8. See self.chunk_num_dwords in __init__.
-            self.v_gld_a       = sym_t('v_gld_a'       , vseq(outer.chunk_num_dwords))
-            self.v_gld_b       = sym_t('v_gld_b'       , vseq(outer.chunk_num_dwords))
+            if outer.tunable.async_global_load:
+                # Phase 13: no VGPR staging buffer needed at all -- global_load_async_to_lds_b128
+                # writes straight to LDS. v_zero is a persistent all-zero quad used to explicitly
+                # zero-fill padding lanes' LDS destinations (see global_load_a_functor).
+                self.v_zero    = sym_t('v_zero'        , vseq(4))
+            else:
+                # Phase 1 (k-sub-loop): sized to outer.chunk_num_dwords (one inst_wmma.k-worth),
+                # NOT outer.num_dwords (the whole, possibly multi-substep, row) -- global_load/
+                # shared_store are now chunked and reuse this same small buffer across chunks,
+                # since growing it to hold the whole row would exceed the 256-VGPR/wave limit
+                # for fp16/bf16/int8. See self.chunk_num_dwords in __init__.
+                self.v_gld_a   = sym_t('v_gld_a'       , vseq(outer.chunk_num_dwords))
+                self.v_gld_b   = sym_t('v_gld_b'       , vseq(outer.chunk_num_dwords))
             self.v_tid         = sym_t('v_tid'         , vseq(1))
-            # 64-bit VADDR pairs must be even-aligned on gfx1250 (verified with llvm-mc)
-            self.v_addr_a      = sym_t('v_addr_a'      , vseq(2, 2))    # persistent global A address (64-bit)
-            self.v_addr_b      = sym_t('v_addr_b'      , vseq(2, 2))
-            # Phase 5d: B's fixed per-thread row base (before this tap's column offset is
-            # added) -- computed once from the *y*x*c* row stride, reused every tap.
-            self.v_addr_b_base = sym_t('v_addr_b_base' , vseq(2, 2))
+            if outer.tunable.async_global_load:
+                # Phase 13: global_load_async_to_lds_b128's VADDR is a plain 32-bit per-lane
+                # byte OFFSET (SADDR carries the 64-bit base separately) -- no need for a
+                # 2-VGPR-aligned full address pair like the old global_load_dwordx4 path.
+                self.v_off_a      = sym_t('v_off_a'      , vseq(1))
+                self.v_off_b      = sym_t('v_off_b'      , vseq(1))
+                self.v_off_b_base = sym_t('v_off_b_base' , vseq(1))
+                # Phase 13 bugfix: global_load_async_to_lds_b128's immediate `offset:N` shifts
+                # BOTH the LDS destination (VDST) and the global source address (VADDR+SADDR)
+                # by the same N (verified on real hardware -- unlike the old design's separate
+                # global_load+ds_write, where the store's offset never touched the load's
+                # source). So a nonzero sst_extra_off (e.g. B's lds_a_size region shift) must be
+                # baked into the VDST *register* once, not the shared per-chunk immediate --
+                # otherwise it also shifts the source read address, reading garbage/OOB memory.
+                self.v_sst_tmp    = sym_t('v_sst_tmp'    , vseq(1))
+            else:
+                # 64-bit VADDR pairs must be even-aligned on gfx1250 (verified with llvm-mc).
+                # row_repeat_a copies (one pair per row this thread owns -- see __init__'s
+                # row_repeat_a docstring); vseq(2*row_repeat_a, 2) keeps EVERY pair
+                # (v_addr_a(i*2), v_addr_a(i*2+1)) even-aligned since the whole block starts
+                # even-aligned. row_repeat_a==1 for every existing config (byte-identical).
+                self.v_addr_a      = sym_t('v_addr_a'      , vseq(2 * outer.row_repeat_a, 2))    # persistent global A address(es) (64-bit each)
+                self.v_addr_b      = sym_t('v_addr_b'      , vseq(2, 2))
+                # Phase 5d: B's fixed per-thread row base (before this tap's column offset is
+                # added) -- computed once from the *y*x*c* row stride, reused every tap.
+                self.v_addr_b_base = sym_t('v_addr_b_base' , vseq(2, 2))
             self.v_addr_out    = sym_t('v_addr_out'    , vseq(2, 2))    # scratch used by coalescing_store_wmma
             self.v_sst_os      = sym_t('v_sst_os'      , vseq(1))    # shared store offset (same for A/B region)
             self.v_sld_a_os    = sym_t('v_sld_a_os'    , vseq(1))
@@ -301,7 +358,15 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             # are this thread's GEMM_M decomposition, computed once and kept persistent (every
             # tap re-derives hi_idx/wi_idx from the SAME ho_idx/wo_idx). v_gtc_tmp is scratch
             # reused fresh every tap for the hi_idx/wi_idx/flag/row_idx computation.
-            self.v_flag        = sym_t('v_flag'        , vseq(1))
+            # v_flag: row_repeat_a copies (must persist across the K-loop for every row this
+            # thread owns -- see __init__'s row_repeat_a docstring). ==1 for every existing
+            # config (byte-identical). v_n_idx/v_ho_idx/v_wo_idx stay SINGLE registers even
+            # for row_repeat_a>1 -- only row 0's decomposition is persisted (exactly as
+            # today); rows 1..row_repeat_a-1 recompute their own (n_idx,ho_idx,wo_idx) FRESH
+            # every tap inside _emit_tap_gather, reusing v_gtc_tmp's existing 5 scratch slots
+            # (no extra persistent VGPRs) -- see that function's docstring. This keeps the
+            # asymmetric shape's VGPR cost to +3 total (v_flag +1, v_addr_a +2) instead of +6.
+            self.v_flag        = sym_t('v_flag'        , vseq(outer.row_repeat_a))
             self.v_n_idx       = sym_t('v_n_idx'       , vseq(1))
             self.v_ho_idx      = sym_t('v_ho_idx'      , vseq(1))
             self.v_wo_idx      = sym_t('v_wo_idx'      , vseq(1))
@@ -467,8 +532,8 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # gemm_k/gemm_n, already loaded); B's offset is applied further below, once
         # s_wei_k_stride is available. ----
         self._emit(f"; --- group>1: decode group_idx, correct s_by, offset A/output base pointers ---")
-        self._emit(f"s_add_u32 s[{s.s_tmp(0)}], s[{s.s_gemm_n()}], 127")
-        self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], 7   ; blocks_per_group_n = ceil(gemm_n/128)")
+        self._emit(f"s_add_u32 s[{s.s_tmp(0)}], s[{s.s_gemm_n()}], {self.tunable.gemm_n_per_block - 1}")
+        self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {utility_log2(self.tunable.gemm_n_per_block)}   ; blocks_per_group_n = ceil(gemm_n/gemm_n_per_block)")
         self._emit(f"v_mov_b32 v[{v.v_gtc_tmp(0)}], s[{s.s_by()}]")
         self._emit(m_int_div_rem_vs(v.v_gtc_tmp(1), v.v_gtc_tmp(2), v.v_gtc_tmp(0), s.s_tmp(0), v.v_tmp(), s.s_tmp(1)))
         self._emit(f"v_readfirstlane_b32 s[{s.s_group_idx()}], v[{v.v_gtc_tmp(2)}]   ; group_idx")
@@ -508,13 +573,25 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"v_mov_b32 v[{v.v_c(i)}], 0")
         self._emit_empty_line()
 
-        self._emit(f"s_lshl_b32 s[{s.s_block_m_off()}], s[{s.s_bx()}], 7   ; *128")
-        self._emit(f"s_lshl_b32 s[{s.s_block_n_off()}], s[{s.s_by()}], 7   ; *128")
+        if self.tunable.async_global_load:
+            self._emit(f"; Phase 13: persistent zero quad, used to zero-fill padding lanes' LDS")
+            self._emit(f"; destinations after a masked global_load_async_to_lds_b128 (see global_load_a_functor)")
+            for i in range(4):
+                self._emit(f"v_mov_b32 v[{v.v_zero(i)}], 0")
+            self._emit_empty_line()
+
+        self._emit(f"s_lshl_b32 s[{s.s_block_m_off()}], s[{s.s_bx()}], {utility_log2(self.tunable.gemm_m_per_block)}   ; *gemm_m_per_block")
+        self._emit(f"s_lshl_b32 s[{s.s_block_n_off()}], s[{s.s_by()}], {utility_log2(self.tunable.gemm_n_per_block)}   ; *gemm_n_per_block")
         self._emit(f"s_mov_b32 s[{s.s_knum()}], s[{s.s_gemm_k()}]")
         self._emit_empty_line()
 
         # ---- one-time decomposition of this thread's GEMM_M index into (n_idx, ho_idx, wo_idx),
-        # kept persistent: every tap re-derives hi_idx/wi_idx from the SAME ho_idx/wo_idx ----
+        # kept persistent: every tap re-derives hi_idx/wi_idx from the SAME ho_idx/wo_idx.
+        # row_repeat_a>1 (asymmetric tile shapes): this is ONLY row 0's decomposition --
+        # rows 1..row_repeat_a-1 have no persistent registers of their own (to keep VGPR cost
+        # down) and instead recompute their own (n_idx, ho_idx, wo_idx) FRESH every tap
+        # inside _emit_tap_gather, using v_tid+i*block_size -- see that function's docstring.
+        # row_repeat_a==1 for every existing config, so this is exactly today's code ----
         self._emit(f"s_mul_i32 s[{s.s_hi_wi()}], s[{s.s_hi()}], s[{s.s_wi()}]")
         self._emit(f"; decode this thread's absolute GEMM_M index into (n_idx, ho_idx, wo_idx)")
         self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_block_m_off()}], v[{v.v_tid()}]   ; m_idx")
@@ -544,14 +621,22 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
 
         # ---- B's fixed per-thread row base (this tap's column offset is added fresh every
         # tap in _emit_tap_gather -- see class docstring) ----
-        self._emit(f"; v_addr_b_base = p_wei + (block_n_off + tid) * wei_k_stride * {self.data_byte} bytes")
-        self._emit(f"v_add_u32 v[{v.v_tmp(1)}], s[{s.s_block_n_off()}], v[{v.v_tid()}]")
-        self._emit(f"v_mul_lo_u32 v[{v.v_tmp(1)}], s[{s.s_wei_k_stride()}], v[{v.v_tmp(1)}]")
-        self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], {utility_log2(self.data_byte)}, v[{v.v_tmp(1)}]")
-        self._emit(f"v_mov_b32 v[{v.v_addr_b_base(1)}], s[{s.s_p_wei(1)}]")
-        self._emit(f"v_add_co_u32 v[{v.v_addr_b_base()}], vcc_lo, s[{s.s_p_wei()}], v[{v.v_tmp(1)}]")
-        self._emit(f"v_add_co_ci_u32 v[{v.v_addr_b_base(1)}], vcc_lo, 0, v[{v.v_addr_b_base(1)}], vcc_lo")
-        self._emit_empty_line()
+        if self.tunable.async_global_load:
+            self._emit(f"; v_off_b_base = (block_n_off + tid) * wei_k_stride * {self.data_byte} bytes")
+            self._emit(f"; (Phase 13: byte OFFSET only -- s_p_wei is passed separately as SADDR)")
+            self._emit(f"v_add_u32 v[{v.v_off_b_base()}], s[{s.s_block_n_off()}], v[{v.v_tid()}]")
+            self._emit(f"v_mul_lo_u32 v[{v.v_off_b_base()}], s[{s.s_wei_k_stride()}], v[{v.v_off_b_base()}]")
+            self._emit(f"v_lshlrev_b32 v[{v.v_off_b_base()}], {utility_log2(self.data_byte)}, v[{v.v_off_b_base()}]")
+            self._emit_empty_line()
+        else:
+            self._emit(f"; v_addr_b_base = p_wei + (block_n_off + tid) * wei_k_stride * {self.data_byte} bytes")
+            self._emit(f"v_add_u32 v[{v.v_tmp(1)}], s[{s.s_block_n_off()}], v[{v.v_tid()}]")
+            self._emit(f"v_mul_lo_u32 v[{v.v_tmp(1)}], s[{s.s_wei_k_stride()}], v[{v.v_tmp(1)}]")
+            self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], {utility_log2(self.data_byte)}, v[{v.v_tmp(1)}]")
+            self._emit(f"v_mov_b32 v[{v.v_addr_b_base(1)}], s[{s.s_p_wei(1)}]")
+            self._emit(f"v_add_co_u32 v[{v.v_addr_b_base()}], vcc_lo, s[{s.s_p_wei()}], v[{v.v_tmp(1)}]")
+            self._emit(f"v_add_co_ci_u32 v[{v.v_addr_b_base(1)}], vcc_lo, 0, v[{v.v_addr_b_base(1)}], vcc_lo")
+            self._emit_empty_line()
 
 
         self._emit_lds_offset_setup()
@@ -574,53 +659,104 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         Called once per tap iteration (see emit_kernel_tap_loop) -- NOT a compile-time-unrolled
         helper, so its emitted instructions execute y*x times via the runtime branch, not y*x
         times in the binary.
+
+        A's computation is looped row_repeat_a times (once per row this thread owns -- see
+        __init__'s row_repeat_a docstring). Row 0 uses the persistent v_n_idx/v_ho_idx/
+        v_wo_idx exactly as today. Rows 1..row_repeat_a-1 have no persistent registers of
+        their own -- they recompute (n_idx, ho_idx, wo_idx) FRESH here from
+        v_tid+i*block_size, using v_gtc_tmp(3)/(4) as scratch for the two division-macro
+        calls, landing the results in v_gtc_tmp(0)/(1)/(2) -- the SAME registers the
+        unchanged downstream hi_idx/wi_idx/flag/row_idx code already reads its
+        ho_idx/wo_idx/n_idx input from, just substituting the source symbol per row (an
+        in-place read-then-write on gtc_tmp(0)/(1)/(2) for rows 1+, a fresh write from the
+        persistent registers for row 0) -- so the entire downstream sequence is shared,
+        unmodified, between all rows. This keeps VGPR cost to +3 total for row_repeat_a=2
+        (v_flag +1, v_addr_a +2) instead of +6 (no extra persistent n_idx/ho_idx/wo_idx
+        registers). row_repeat_a==1 for every existing config, so this loop runs once with
+        i=0 and takes the row-0 branch (byte-identical). B is untouched -- row_repeat_b==1
+        always for this phase (see __init__'s assert).
         '''
         s = self.sgpr
         v = self.vgpr
+        m_int_div_rem_vs = macro_int_div_rem_vs_gfx1250_t(self.mc)
         self._emit(f"; --- per-tap gather: hi_idx = ho_idx*stride_h - pad_h + iy*dilation_h ---")
         self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_iy()}], s[{s.s_dilation_h()}]")
         self._emit(f"s_sub_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_pad_h()}]   ; iy*dilation_h - pad_h")
         self._emit(f"s_mul_i32 s[{s.s_tmp(1)}], s[{s.s_ix()}], s[{s.s_dilation_w()}]")
         self._emit(f"s_sub_i32 s[{s.s_tmp(1)}], s[{s.s_tmp(1)}], s[{s.s_pad_w()}]   ; ix*dilation_w - pad_w")
-        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_stride_h()}], v[{v.v_ho_idx()}]")
-        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], s[{s.s_tmp(0)}]   ; hi_idx")
-        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(1)}], s[{s.s_stride_w()}], v[{v.v_wo_idx()}]")
-        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(1)}], v[{v.v_gtc_tmp(1)}], s[{s.s_tmp(1)}]   ; wi_idx")
-        self._emit_empty_line()
 
-        self._emit(f"; v_flag = 1 iff (hi_idx, wi_idx) in [0,hi)x[0,wi)")
-        self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_hi()}], v[{v.v_gtc_tmp(0)}]")
-        self._emit(f"v_cndmask_b32 v[{v.v_flag()}], 0, 1, vcc_lo")
-        self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_wi()}], v[{v.v_gtc_tmp(1)}]")
-        self._emit(f"v_cndmask_b32 v[{v.v_flag()}], 0, v[{v.v_flag()}], vcc_lo")
-        self._emit_empty_line()
+        for i in range(self.row_repeat_a):
+            tag = '' if i == 0 else f'({i})'
+            if i == 0:
+                ho_src, wo_src, n_src = v.v_ho_idx(), v.v_wo_idx(), v.v_n_idx()
+            else:
+                self._emit(f"v_add_u32 v[{v.v_gtc_tmp(4)}], {i * self.tunable.block_size}, v[{v.v_tid()}]")
+                self._emit(f"v_add_u32 v[{v.v_gtc_tmp(4)}], s[{s.s_block_m_off()}], v[{v.v_gtc_tmp(4)}]   ; m_idx (row {i})")
+                # NOTE: scalar scratch here MUST NOT be s.s_tmp()/s.s_tmp(1) (==s_tmp(0)/(1)) --
+                # those hold the shared iy*dilation-pad values computed once above and read
+                # again below for hi_idx/wi_idx (bug found on real hardware: the division
+                # macro internally overwrites its passed s_tmp4+0, silently corrupting the
+                # pad offset for every row using this fresh-recompute path). s.s_tmp(2) is
+                # free until the B computation after this loop, so it's safe scratch here.
+                self._emit(m_int_div_rem_vs(v.v_gtc_tmp(3), v.v_gtc_tmp(2), v.v_gtc_tmp(4), s.s_ho_wo(), v.v_tmp(), s.s_tmp(2)))
+                self._emit(m_int_div_rem_vs(v.v_gtc_tmp(1), v.v_gtc_tmp(0), v.v_gtc_tmp(3), s.s_wo(), v.v_tmp(), s.s_tmp(2)))
+                self._emit(f"; v_gtc_tmp(0)=ho_idx({i}), v_gtc_tmp(1)=wo_idx({i}), v_gtc_tmp(2)=n_idx({i})")
+                ho_src, wo_src, n_src = v.v_gtc_tmp(0), v.v_gtc_tmp(1), v.v_gtc_tmp(2)
+            self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_stride_h()}], v[{ho_src}]")
+            self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], s[{s.s_tmp(0)}]   ; hi_idx{tag}")
+            self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(1)}], s[{s.s_stride_w()}], v[{wo_src}]")
+            self._emit(f"v_add_u32 v[{v.v_gtc_tmp(1)}], v[{v.v_gtc_tmp(1)}], s[{s.s_tmp(1)}]   ; wi_idx{tag}")
+            self._emit_empty_line()
 
-        self._emit(f"; row_idx = n_idx*(hi*wi) + hi_idx*wi + wi_idx (meaningless but harmless if")
-        self._emit(f"; v_flag==0 -- that lane's global_load_a is EXEC-masked off, see global_load_a_functor)")
-        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(2)}], s[{s.s_hi_wi()}], v[{v.v_n_idx()}]")
-        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(3)}], s[{s.s_wi()}], v[{v.v_gtc_tmp(0)}]")
-        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(2)}], v[{v.v_gtc_tmp(2)}], v[{v.v_gtc_tmp(3)}]")
-        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(2)}], v[{v.v_gtc_tmp(2)}], v[{v.v_gtc_tmp(1)}]")
-        self._emit_empty_line()
+            self._emit(f"; v_flag{tag} = 1 iff (hi_idx, wi_idx) in [0,hi)x[0,wi)")
+            self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_hi()}], v[{v.v_gtc_tmp(0)}]")
+            self._emit(f"v_cndmask_b32 v[{v.v_flag(i)}], 0, 1, vcc_lo")
+            self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_wi()}], v[{v.v_gtc_tmp(1)}]")
+            self._emit(f"v_cndmask_b32 v[{v.v_flag(i)}], 0, v[{v.v_flag(i)}], vcc_lo")
+            self._emit_empty_line()
 
-        self._emit(f"; v_addr_a = p_in + row_idx * in_c_total * {self.data_byte} bytes (in_c_total = gemm_k*group --")
-        self._emit(f"; the pixel-to-pixel stride is the TENSOR's total channel count, not the per-group gemm_k, see class docstring)")
-        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(2)}], s[{s.s_in_c_total()}], v[{v.v_gtc_tmp(2)}]")
-        self._emit(f"v_lshlrev_b32 v[{v.v_gtc_tmp(2)}], {utility_log2(self.data_byte)}, v[{v.v_gtc_tmp(2)}]")
-        self._emit(f"v_mov_b32 v[{v.v_addr_a(1)}], s[{s.s_p_in(1)}]   ; reset high half fresh -- this")
-        self._emit(f"                                                ; tap's address is NOT a continuation of the previous tap's")
-        self._emit(f"v_add_co_u32 v[{v.v_addr_a()}], vcc_lo, s[{s.s_p_in()}], v[{v.v_gtc_tmp(2)}]")
-        self._emit(f"v_add_co_ci_u32 v[{v.v_addr_a(1)}], vcc_lo, 0, v[{v.v_addr_a(1)}], vcc_lo")
-        self._emit_empty_line()
+            self._emit(f"; row_idx = n_idx*(hi*wi) + hi_idx*wi + wi_idx (meaningless but harmless if")
+            self._emit(f"; v_flag==0 -- that lane's global_load_a is EXEC-masked off, see global_load_a_functor)")
+            self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(2)}], s[{s.s_hi_wi()}], v[{n_src}]")
+            self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(3)}], s[{s.s_wi()}], v[{v.v_gtc_tmp(0)}]")
+            self._emit(f"v_add_u32 v[{v.v_gtc_tmp(2)}], v[{v.v_gtc_tmp(2)}], v[{v.v_gtc_tmp(3)}]")
+            self._emit(f"v_add_u32 v[{v.v_gtc_tmp(2)}], v[{v.v_gtc_tmp(2)}], v[{v.v_gtc_tmp(1)}]")
+            self._emit_empty_line()
 
-        self._emit(f"; --- per-tap B address: v_addr_b = v_addr_b_base + (iy*x+ix)*gemm_k*{self.data_byte} bytes ---")
-        self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_iy()}], s[{s.s_x()}]")
-        self._emit(f"s_add_i32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], s[{s.s_ix()}]   ; tap linear index")
-        self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], s[{s.s_gemm_k()}]")
-        self._emit(f"s_lshl_b32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], {utility_log2(self.data_byte)}   ; tap byte offset")
-        self._emit(f"v_add_co_u32 v[{v.v_addr_b()}], vcc_lo, s[{s.s_tmp(2)}], v[{v.v_addr_b_base()}]")
-        self._emit(f"v_add_co_ci_u32 v[{v.v_addr_b(1)}], vcc_lo, 0, v[{v.v_addr_b_base(1)}], vcc_lo")
-        self._emit_empty_line()
+            if self.tunable.async_global_load:
+                self._emit(f"; v_off_a = row_idx * in_c_total * {self.data_byte} bytes (Phase 13: byte OFFSET only --")
+                self._emit(f"; s_p_in is passed separately as SADDR; in_c_total = gemm_k*group, see class docstring)")
+                self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(2)}], s[{s.s_in_c_total()}], v[{v.v_gtc_tmp(2)}]")
+                self._emit(f"v_lshlrev_b32 v[{v.v_off_a()}], {utility_log2(self.data_byte)}, v[{v.v_gtc_tmp(2)}]")
+                self._emit_empty_line()
+            else:
+                self._emit(f"; v_addr_a{tag} = p_in + row_idx * in_c_total * {self.data_byte} bytes (in_c_total = gemm_k*group --")
+                self._emit(f"; the pixel-to-pixel stride is the TENSOR's total channel count, not the per-group gemm_k, see class docstring)")
+                self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(2)}], s[{s.s_in_c_total()}], v[{v.v_gtc_tmp(2)}]")
+                self._emit(f"v_lshlrev_b32 v[{v.v_gtc_tmp(2)}], {utility_log2(self.data_byte)}, v[{v.v_gtc_tmp(2)}]")
+                self._emit(f"v_mov_b32 v[{v.v_addr_a(i*2+1)}], s[{s.s_p_in(1)}]   ; reset high half fresh -- this")
+                self._emit(f"                                                ; tap's address is NOT a continuation of the previous tap's")
+                self._emit(f"v_add_co_u32 v[{v.v_addr_a(i*2)}], vcc_lo, s[{s.s_p_in()}], v[{v.v_gtc_tmp(2)}]")
+                self._emit(f"v_add_co_ci_u32 v[{v.v_addr_a(i*2+1)}], vcc_lo, 0, v[{v.v_addr_a(i*2+1)}], vcc_lo")
+                self._emit_empty_line()
+
+        if self.tunable.async_global_load:
+            self._emit(f"; --- per-tap B offset: v_off_b = v_off_b_base + (iy*x+ix)*gemm_k*{self.data_byte} bytes ---")
+            self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_iy()}], s[{s.s_x()}]")
+            self._emit(f"s_add_i32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], s[{s.s_ix()}]   ; tap linear index")
+            self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], s[{s.s_gemm_k()}]")
+            self._emit(f"s_lshl_b32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], {utility_log2(self.data_byte)}   ; tap byte offset")
+            self._emit(f"v_add_u32 v[{v.v_off_b()}], s[{s.s_tmp(2)}], v[{v.v_off_b_base()}]")
+            self._emit_empty_line()
+        else:
+            self._emit(f"; --- per-tap B address: v_addr_b = v_addr_b_base + (iy*x+ix)*gemm_k*{self.data_byte} bytes ---")
+            self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_iy()}], s[{s.s_x()}]")
+            self._emit(f"s_add_i32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], s[{s.s_ix()}]   ; tap linear index")
+            self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], s[{s.s_gemm_k()}]")
+            self._emit(f"s_lshl_b32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], {utility_log2(self.data_byte)}   ; tap byte offset")
+            self._emit(f"v_add_co_u32 v[{v.v_addr_b()}], vcc_lo, s[{s.s_tmp(2)}], v[{v.v_addr_b_base()}]")
+            self._emit(f"v_add_co_ci_u32 v[{v.v_addr_b(1)}], vcc_lo, 0, v[{v.v_addr_b_base(1)}], vcc_lo")
+            self._emit_empty_line()
 
     def emit_kernel_tap_loop(self):
         '''
@@ -704,6 +840,65 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"s_wait_loadcnt 0x0")
             self._emit_sst_chunk(v_gld, v_sst_os, sst_extra_off, c)
 
+    def _emit_sst_all_chunks_row(self, v_gld, v_addr, v_sst_os, sst_extra_off, v_flag=None):
+        '''
+        Like _emit_sst_remaining_chunks, but loads+stores chunk 0 too (no early-issue
+        precondition) -- used for row_repeat_a's "extra" rows (1..row_repeat_a-1, see
+        __init__'s row_repeat_a docstring), which have no early-overlap slot of their own
+        (only row 0 does, matching today's exact single-row code path -- see
+        global_load_a_functor's docstring for why giving a second row its own early slot
+        would reuse v_gld_a while row 0's early load is still in flight). Fully sequential:
+        each chunk is loaded, waited, and stored before the next starts, exactly like
+        _emit_sst_remaining_chunks's chunks 1..N-1 -- just starting from chunk 0 instead.
+        Only reached for row_repeat_a > 1 (non-async only), never for any existing config.
+        '''
+        for c in range(self.num_k_chunks):
+            self._emit_gld_chunk_load(v_gld, v_addr, c, v_flag=v_flag)
+            self._emit(f"s_wait_loadcnt 0x0")
+            self._emit_sst_chunk(v_gld, v_sst_os, sst_extra_off, c)
+
+    def _emit_gld_async_all_chunks(self, v_off, v_sst_os, sst_extra_off, s_saddr, v_flag=None):
+        '''
+        Phase 13: issues ALL num_k_chunks worth of global_load_async_to_lds_b128 for this
+        operand directly (no VGPR staging, no separate store step -- the load IS the LDS
+        write). Since there's no small reused buffer to serialize on (unlike the old
+        _emit_gld_chunk_load/_emit_sst_remaining_chunks split), every chunk fires
+        independently; the caller waits once via s_wait_asynccnt (see wmma_main_loop.py).
+
+        Masking (v_flag, A operand only): a masked-off (EXEC-inactive) lane's async load
+        simply never touches its LDS destination -- confirmed on real hardware via a
+        dedicated probe (see docs/gfx1250_wmma_layout.md's Phase 13 section) -- so unlike
+        the old design (which pre-zeroed v_gld_a so an unconditional store would write
+        zero), here we must explicitly zero-fill the SAME destinations for the
+        now-inactive lanes with an inverted-EXEC ds_write_b128 from the persistent
+        v_zero quad, after the masked async loads.
+
+        sst_extra_off (e.g. B's lds_a_size region shift) is folded into the VDST register
+        once via v_sst_tmp, NOT into the per-chunk immediate -- see v_sst_tmp's declaration
+        for why (the immediate shifts the global source address too, on this instruction).
+        '''
+        v = self.vgpr
+        if sst_extra_off != 0:
+            self._emit(f"v_add_u32 v[{v.v_sst_tmp()}], {sst_extra_off}, v[{v_sst_os()}]")
+            dst = v.v_sst_tmp
+        else:
+            dst = v_sst_os
+        if v_flag is not None:
+            self._emit(f"v_cmpx_le_u32 1, v[{v_flag()}]")
+        for c in range(self.num_k_chunks):
+            for i in range(self.chunk_num_dwordx4):
+                idx = c * self.chunk_num_dwordx4 + i
+                self._emit(f"global_load_async_to_lds_b128 v[{dst()}], v[{v_off()}], "
+                           f"s[{s_saddr()}:{s_saddr(1)}] offset:{idx*16}")
+        if v_flag is not None:
+            self._emit(f"s_xor_b32 exec_lo, exec_lo, -1")
+            for c in range(self.num_k_chunks):
+                for i in range(self.chunk_num_dwordx4):
+                    idx = c * self.chunk_num_dwordx4 + i
+                    self._emit(f"ds_write_b128 v[{dst()}], v[{v.v_zero(0)}:{v.v_zero(3)}] "
+                               f"offset:{idx*16}")
+            self._emit(f"s_mov_b32 exec_lo, -1")
+
     def global_load_a_functor(self):
         '''
         Zeros v_gld_a on EVERY call (not just once, since Phase 5d's per-tap flag can flip
@@ -722,38 +917,73 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         schedule (pairing each chunk's load with a DIFFERENT substep's compute, not yet
         implemented) could change that. Double buffering here exists purely so a
         future interleaved schedule has a safe place to land its early stores.
+
+        Phase 13 (async_global_load=1): entirely different design -- issues ALL chunks
+        directly to LDS via global_load_async_to_lds_b128 (see _emit_gld_async_all_chunks),
+        no scratch buffer, no early/overlapped chunk-0 trick (there's nothing to overlap
+        with -- the load is the store). shared_store_a_functor is not called at all in
+        this mode; wmma_main_loop.py only invokes this functor, at a different position
+        than the non-async path (after the current tile's compute, not before).
+
+        row_repeat_a > 1 (asymmetric tile shapes, non-async only -- see __init__'s
+        row_repeat_a docstring and its assert forbidding this combined with async):
+        ONLY row 0 gets this early-issue/overlap treatment, using v_addr_a/v_flag exactly as
+        before (row_repeat_a==1's code path, unchanged). Rows 1..row_repeat_a-1 have no early
+        slot of their own -- reusing v_gld_a for a second in-flight early load before row 0's
+        is stored would be exactly the kind of scratch-buffer lifetime conflict Phase 1's
+        bug #3 already found the hard way (see docs/gfx1250_wmma_layout.md's Phase 9 section)
+        -- so they are handled entirely inside shared_store_a_functor instead (fully
+        deferred, no overlap, via _emit_sst_all_chunks_row).
         '''
         outer = self
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    outer._emit_gld_chunk_load(v.v_gld_a, v.v_addr_a, 0, v_flag=v.v_flag)
+                    if outer.tunable.async_global_load:
+                        outer._emit_gld_async_all_chunks(v.v_off_a, v.v_sst_os, 0, outer.sgpr.s_p_in, v_flag=v.v_flag)
+                    else:
+                        outer._emit_gld_chunk_load(v.v_gld_a, v.v_addr_a, 0, v_flag=v.v_flag)
                 return outer._get_deferred()
             def get_issues(self):
                 return outer.chunk_num_dwordx4
         return functor_t()
 
     def global_load_b_functor(self):
-        ''' See global_load_a_functor's docstring -- B is untransposed too, same treatment. '''
+        ''' See global_load_a_functor's docstring -- B is untransposed too, same treatment
+        (Phase 13: no masking needed for B, mirrors the non-async path's v_flag=None). '''
         outer = self
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    outer._emit_gld_chunk_load(v.v_gld_b, v.v_addr_b, 0, v_flag=None)
+                    if outer.tunable.async_global_load:
+                        outer._emit_gld_async_all_chunks(v.v_off_b, v.v_sst_os, outer.lds_a_size, outer.sgpr.s_p_wei, v_flag=None)
+                    else:
+                        outer._emit_gld_chunk_load(v.v_gld_b, v.v_addr_b, 0, v_flag=None)
                 return outer._get_deferred()
             def get_issues(self):
                 return outer.chunk_num_dwordx4
         return functor_t()
 
     def shared_store_a_functor(self):
+        ''' row_repeat_a > 1: row 0 uses the exact row_repeat_a==1 code path (unchanged);
+        rows 1..row_repeat_a-1 (no early-issue slot of their own -- see global_load_a_functor's
+        docstring) are fully deferred via _emit_sst_all_chunks_row, storing into LDS shifted
+        by i*block_size*bytes_per_row (a pure destination-immediate shift -- ds_write_b128's
+        offset never touches the load's source address, unlike Phase 13's async instruction,
+        so no v_sst_tmp-style register trick is needed here). '''
         outer = self
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
                     outer._emit_sst_remaining_chunks(v.v_gld_a, v.v_addr_a, v.v_sst_os, 0, v_flag=v.v_flag)
+                    for i in range(1, outer.row_repeat_a):
+                        row_addr = lambda idx=0, i=i: v.v_addr_a(i * 2 + idx)
+                        row_flag = lambda i=i: v.v_flag(i)
+                        row_off  = i * outer.tunable.block_size * outer.bytes_per_row
+                        outer._emit_sst_all_chunks_row(v.v_gld_a, row_addr, v.v_sst_os, row_off, v_flag=row_flag)
                 return outer._get_deferred()
             def get_issues(self):
                 return outer.chunk_num_dwordx4
@@ -822,13 +1052,24 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         return functor_t()
 
     def move_slice_window_a_functor(self):
+        ''' row_repeat_a > 1: every row's v_addr_a pair is advanced independently by the
+        same per-K-substep stride (no early/deferred asymmetry here -- this is pure address
+        bookkeeping, needed for every row every K-substep regardless of row 0 vs "extra"
+        rows). row_repeat_a==1 for every existing config: the loop runs once with i=0,
+        producing v_addr_a(0)/v_addr_a(1) == v_addr_a()/v_addr_a(1), byte-identical. '''
         outer = self
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    outer._emit(f"v_add_co_u32 v[{v.v_addr_a()}], vcc_lo, {outer.bytes_per_row}, v[{v.v_addr_a()}]")
-                    outer._emit(f"v_add_co_ci_u32 v[{v.v_addr_a(1)}], vcc_lo, 0, v[{v.v_addr_a(1)}], vcc_lo")
+                    if outer.tunable.async_global_load:
+                        # Phase 13: v_off_a is a plain 32-bit byte OFFSET (no base pointer
+                        # folded in), so advancing it is a single add, no carry chain needed.
+                        outer._emit(f"v_add_u32 v[{v.v_off_a()}], {outer.bytes_per_row}, v[{v.v_off_a()}]")
+                    else:
+                        for i in range(outer.row_repeat_a):
+                            outer._emit(f"v_add_co_u32 v[{v.v_addr_a(i*2)}], vcc_lo, {outer.bytes_per_row}, v[{v.v_addr_a(i*2)}]")
+                            outer._emit(f"v_add_co_ci_u32 v[{v.v_addr_a(i*2+1)}], vcc_lo, 0, v[{v.v_addr_a(i*2+1)}], vcc_lo")
                 return outer._get_deferred()
         return functor_t()
 
@@ -838,8 +1079,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    outer._emit(f"v_add_co_u32 v[{v.v_addr_b()}], vcc_lo, {outer.bytes_per_row}, v[{v.v_addr_b()}]")
-                    outer._emit(f"v_add_co_ci_u32 v[{v.v_addr_b(1)}], vcc_lo, 0, v[{v.v_addr_b(1)}], vcc_lo")
+                    if outer.tunable.async_global_load:
+                        outer._emit(f"v_add_u32 v[{v.v_off_b()}], {outer.bytes_per_row}, v[{v.v_off_b()}]")
+                    else:
+                        outer._emit(f"v_add_co_u32 v[{v.v_addr_b()}], vcc_lo, {outer.bytes_per_row}, v[{v.v_addr_b()}]")
+                        outer._emit(f"v_add_co_ci_u32 v[{v.v_addr_b(1)}], vcc_lo, 0, v[{v.v_addr_b(1)}], vcc_lo")
                 return outer._get_deferred()
         return functor_t()
 
@@ -851,6 +1095,8 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.precision        = self.tunable.precision
         ctrl.lds_single_size  = self.lds_single_size
         ctrl.lds_buffer_num   = self.lds_buffer_num
+        ctrl.async_global_to_lds_a = self.tunable.async_global_load
+        ctrl.async_global_to_lds_b = self.tunable.async_global_load
         # Phase 1 (k-sub-loop): both A and B are untransposed here (K contiguous within
         # an LDS row), so advancing inst_wmma.k K-elements is just inst_wmma.k*data_byte.
         ctrl.k_substep_stride_bytes_a    = self.wmma_mapping.ctrl.inst_wmma.k * self.data_byte
