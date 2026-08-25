@@ -1128,28 +1128,32 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
     def shared_load_a_functor(self):
         outer = self
         num_v_a = outer.wmma_mapping.ctrl.inst_wmma.num_v_a
+        num_v_a_total = outer.tunable.wmma_repeat_m * num_v_a   # Phase 22: one local_prefetch_num slot's worth
         step_bytes = outer.tunable.wmma_tile_m * outer.bytes_per_row   # was hardcoded 1024
         class functor_t:
-            def __call__(self, v_dst, v_os, extra_off):
+            def __call__(self, v_dst, v_os, extra_off, slot=0):
                 v = outer.vgpr
+                slot_off = slot * num_v_a_total
                 with outer._deferred_context():
                     for i_rm in range(outer.tunable.wmma_repeat_m):
                         base = i_rm * step_bytes + extra_off
-                        outer._emit_ds_read_chunked(lambda k, i_rm=i_rm: v.v_a(i_rm*num_v_a+k), v.v_sld_a_os, base, num_v_a)
+                        outer._emit_ds_read_chunked(lambda k, i_rm=i_rm: v.v_a(slot_off+i_rm*num_v_a+k), v.v_sld_a_os, base, num_v_a)
                 return outer._get_deferred()
         return functor_t()
 
     def shared_load_b_functor(self):
         outer = self
         num_v_b = outer.wmma_mapping.ctrl.inst_wmma.num_v_b
+        num_v_b_total = outer.tunable.wmma_repeat_n * num_v_b   # Phase 22: one local_prefetch_num slot's worth
         step_bytes = outer.tunable.wmma_tile_n * outer.bytes_per_row   # was hardcoded 1024
         class functor_t:
-            def __call__(self, v_dst, v_os, extra_off):
+            def __call__(self, v_dst, v_os, extra_off, slot=0):
                 v = outer.vgpr
+                slot_off = slot * num_v_b_total
                 with outer._deferred_context():
                     for i_rn in range(outer.tunable.wmma_repeat_n):
                         base = outer.lds_a_size + i_rn * step_bytes + extra_off  # B region starts after A's region
-                        outer._emit_ds_read_chunked(lambda k, i_rn=i_rn: v.v_b(i_rn*num_v_b+k), v.v_sld_b_os, base, num_v_b)
+                        outer._emit_ds_read_chunked(lambda k, i_rn=i_rn: v.v_b(slot_off+i_rn*num_v_b+k), v.v_sld_b_os, base, num_v_b)
                 return outer._get_deferred()
         return functor_t()
 
@@ -1205,6 +1209,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.async_global_to_lds_a = self.tunable.async_global_load
         ctrl.async_global_to_lds_b = self.tunable.async_global_load
         ctrl.interleave = self.tunable.main_loop_interleave
+        ctrl.local_prefetch_num = self.tunable.local_prefetch_num
         # Phase 1 (k-sub-loop): both A and B are untransposed here (K contiguous within
         # an LDS row), so advancing inst_wmma.k K-elements is just inst_wmma.k*data_byte.
         ctrl.k_substep_stride_bytes_a    = self.wmma_mapping.ctrl.inst_wmma.k * self.data_byte

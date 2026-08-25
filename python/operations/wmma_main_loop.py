@@ -121,6 +121,18 @@ class ctrl_wmma_main_loop_t(object):
         self.shared_store_chunk_a_functor = None
         self.shared_store_chunk_b_functor = None
 
+        # Phase 22 (VGPR-level prefetch): 1 (default, unchanged) or 2. When 2, v_a/v_b hold
+        # TWO disjoint slots back-to-back (slot 1 starts at VGPR offset
+        # wave_repeat_m/n*inst_wmma.num_v_a/b -- see igemm_base.py's num_vgpr_accumulate_a/b
+        # formula, doubled to match). Each k-substep's shared_load is issued into the NEXT
+        # substep's slot BEFORE the CURRENT substep's compute consumes the slot it already
+        # holds -- classic 2-slot software pipelining, intra-K-substep only (mirrors
+        # mfma_main_loop.py's local_prefetch_num=2 exactly, one level down at the LDS-read
+        # layer instead of the global-load layer that Phase 15's interleave already covers).
+        # Mutually exclusive with ctrl.interleave for this first implementation -- both
+        # rewrite the same k-substep drain loop, and composing them isn't validated yet.
+        self.local_prefetch_num          = 1
+
         # symbol type
         self.v_a                         = None
         self.v_b                         = None
@@ -153,6 +165,15 @@ class wmma_main_loop_t(mc_base_t):
                 "interleave requires num_k_substeps>1 (Phase 1's k-sub-loop) -- nothing to interleave otherwise"
             assert not (ctrl.async_global_to_lds_a or ctrl.async_global_to_lds_b), \
                 "interleave is not supported together with async_global_to_lds_a/b (no staging buffer to interleave around)"
+        assert ctrl.local_prefetch_num in (1, 2), "wmma main loop supports local_prefetch_num of 1 or 2 only"
+        prefetch = ctrl.local_prefetch_num == 2
+        if prefetch:
+            assert num_k_substeps > 1, \
+                "local_prefetch_num=2 requires num_k_substeps>1 (Phase 1's k-sub-loop) -- nothing to prefetch into otherwise"
+            assert not ctrl.interleave, \
+                "local_prefetch_num=2 is not supported together with interleave (both rewrite the k-substep drain loop)"
+        num_v_a_total = wmma_m.wave_repeat_m * inst_wmma.num_v_a   # one local_prefetch_num slot's worth
+        num_v_b_total = wmma_m.wave_repeat_n * inst_wmma.num_v_b
 
         label_body     = f'L_{ctrl.label_prefix}_wmma_body'
         label_end      = f'L_{ctrl.label_prefix}_wmma_end'
@@ -175,13 +196,15 @@ class wmma_main_loop_t(mc_base_t):
         v_sst_b_os, v_sld_b_os = ctrl.v_sst_b_os, ctrl.v_sld_b_os
         s_kitr, s_knum = ctrl.s_kitr, ctrl.s_knum
 
-        def emit_wmma_tile():
+        def emit_wmma_tile(slot=0):
             self._emit(f"; wmma compute, {wmma_m.wave_repeat_m}x{wmma_m.wave_repeat_n} instruction issues")
+            a_slot_off = slot * num_v_a_total
+            b_slot_off = slot * num_v_b_total
             for i_rm in range(wmma_m.wave_repeat_m):
                 for i_rn in range(wmma_m.wave_repeat_n):
                     c_index = (i_rm * wmma_m.wave_repeat_n + i_rn) * inst_wmma.num_v_c
-                    a_index = i_rm * inst_wmma.num_v_a
-                    b_index = i_rn * inst_wmma.num_v_b
+                    a_index = a_slot_off + i_rm * inst_wmma.num_v_a
+                    b_index = b_slot_off + i_rn * inst_wmma.num_v_b
                     self._emit(inst_wmma(
                         v_c((c_index, c_index + inst_wmma.num_v_c - 1)),
                         v_a((a_index, a_index + inst_wmma.num_v_a - 1)),
@@ -202,6 +225,35 @@ class wmma_main_loop_t(mc_base_t):
                 self._emit(f_sld_b(v_b(), v_sld_b_os(), off_b))
                 self._emit(f"s_wait_dscnt 0x0")
                 emit_wmma_tile()
+
+        def emit_extra_substeps_prefetched():
+            '''
+            Phase 22: replaces emit_wmma_tile()+emit_extra_substeps() (both the mid-loop
+            call and the `_last` tail's) when ctrl.local_prefetch_num==2. Substep 0's
+            shared_load already landed in slot 0 (the unconditional prologue load, issued
+            and waited on above, before this function is ever called). At each step ks,
+            issue substep (ks+1)'s shared_load into the OTHER slot BEFORE computing on
+            substep ks's already-in-hand slot, then wait once for (ks+1)'s data -- so its
+            LDS-read latency overlaps substep ks's WMMA issue instead of blocking on it.
+            Only 2 physical slots exist regardless of num_k_substeps; reusing slot (ks-1)%2
+            for substep ks+1 needs no extra wait beyond the one already emitted for it:
+            the wmma instruction reading that slot for substep ks-1 was already ISSUED (in
+            program order) before this ds_read is issued, and GCN/RDNA's in-order-per-wave
+            issue model guarantees a VALU/WMMA read happens before a later same-register
+            LDS write completes, regardless of the LDS read's own completion latency --
+            the same guarantee mfma_main_loop.py's local_prefetch_num=2 already relies on.
+            '''
+            lp = ctrl.local_prefetch_num
+            for ks in range(num_k_substeps):
+                nxt = ks + 1
+                if nxt < num_k_substeps:
+                    off_a = nxt * ctrl.k_substep_stride_bytes_a
+                    off_b = nxt * ctrl.k_substep_stride_bytes_b
+                    self._emit(f_sld_a(v_a(), v_sld_a_os(), off_a, slot=nxt % lp))
+                    self._emit(f_sld_b(v_b(), v_sld_b_os(), off_b, slot=nxt % lp))
+                emit_wmma_tile(slot=ks % lp)
+                if nxt < num_k_substeps:
+                    self._emit(f"s_wait_dscnt 0x0")
 
         def emit_interleaved_substeps():
             '''
@@ -323,8 +375,11 @@ class wmma_main_loop_t(mc_base_t):
                 self._emit(f_gld_b())
             self._emit_empty_line()
 
-            emit_wmma_tile()
-            emit_extra_substeps()
+            if prefetch:
+                emit_extra_substeps_prefetched()
+            else:
+                emit_wmma_tile()
+                emit_extra_substeps()
             self._emit_empty_line()
 
             # Phase 13: an async operand's NEXT-tile load-to-LDS is issued only now, after
@@ -349,8 +404,11 @@ class wmma_main_loop_t(mc_base_t):
         self._emit_empty_line()
 
         self._emit_front(f"{label_body}_last:")
-        emit_wmma_tile()
-        emit_extra_substeps()
+        if prefetch:
+            emit_extra_substeps_prefetched()
+        else:
+            emit_wmma_tile()
+            emit_extra_substeps()
         self._emit_empty_line()
 
         self._emit_front(f"{label_end}:")

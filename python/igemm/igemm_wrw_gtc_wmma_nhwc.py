@@ -853,9 +853,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         '''
         outer = self
         class functor_t:
-            def __call__(self, v_dst, v_os, extra_off):
+            def __call__(self, v_dst, v_os, extra_off, slot=0):
                 v = outer.vgpr
                 num_v_a = outer.wmma_mapping.ctrl.inst_wmma.num_v_a
+                num_v_a_total = outer.tunable.wmma_repeat_m * num_v_a   # Phase 22: one local_prefetch_num slot's worth
+                slot_off = slot * num_v_a_total
                 row_pitch = outer.tunable.gemm_m_per_block * outer.data_byte
                 elem_per_dword = 4 // outer.data_byte
                 if outer.data_byte == 2:
@@ -872,10 +874,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                                 off = col_off + (a * elem_per_dword + s) * row_pitch
                                 outer._emit(f"{read_instr} v[{v.v_gld_a(s)}], v[{v.v_sld_a_os()}] offset:{extra_off + off}")
                             outer._emit(f"s_wait_dscnt 0x0")
-                            outer._emit(f"v_mov_b32 v[{v.v_a(i_rm*num_v_a+a)}], v[{v.v_gld_a(0)}]")
+                            outer._emit(f"v_mov_b32 v[{v.v_a(slot_off+i_rm*num_v_a+a)}], v[{v.v_gld_a(0)}]")
                             for s in range(1, elem_per_dword):
                                 shift = s * 8 * outer.data_byte
-                                outer._emit(f"v_lshl_or_b32 v[{v.v_a(i_rm*num_v_a+a)}], v[{v.v_gld_a(s)}], {shift}, v[{v.v_a(i_rm*num_v_a+a)}]")
+                                outer._emit(f"v_lshl_or_b32 v[{v.v_a(slot_off+i_rm*num_v_a+a)}], v[{v.v_gld_a(s)}], {shift}, v[{v.v_a(slot_off+i_rm*num_v_a+a)}]")
                 return outer._get_deferred()
         return functor_t()
 
@@ -889,9 +891,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         '''
         outer = self
         class functor_t:
-            def __call__(self, v_dst, v_os, extra_off):
+            def __call__(self, v_dst, v_os, extra_off, slot=0):
                 v = outer.vgpr
                 num_v_b = outer.wmma_mapping.ctrl.inst_wmma.num_v_b
+                num_v_b_total = outer.tunable.wmma_repeat_n * num_v_b   # Phase 22: one local_prefetch_num slot's worth
+                slot_off = slot * num_v_b_total
                 row_pitch = outer.tunable.gemm_n_per_block * outer.data_byte
                 elem_per_dword = 4 // outer.data_byte
                 if outer.data_byte == 2:
@@ -910,10 +914,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                                 off = outer.lds_a_size + col_off + (a * elem_per_dword + s) * row_pitch
                                 outer._emit(f"{read_instr} v[{v.v_gld_b(s)}], v[{v.v_sld_b_os()}] offset:{extra_off + off}")
                             outer._emit(f"s_wait_dscnt 0x0")
-                            outer._emit(f"v_mov_b32 v[{v.v_b(i_rn*num_v_b+a)}], v[{v.v_gld_b(0)}]")
+                            outer._emit(f"v_mov_b32 v[{v.v_b(slot_off+i_rn*num_v_b+a)}], v[{v.v_gld_b(0)}]")
                             for s in range(1, elem_per_dword):
                                 shift = s * 8 * outer.data_byte
-                                outer._emit(f"v_lshl_or_b32 v[{v.v_b(i_rn*num_v_b+a)}], v[{v.v_gld_b(s)}], {shift}, v[{v.v_b(i_rn*num_v_b+a)}]")
+                                outer._emit(f"v_lshl_or_b32 v[{v.v_b(slot_off+i_rn*num_v_b+a)}], v[{v.v_gld_b(s)}], {shift}, v[{v.v_b(slot_off+i_rn*num_v_b+a)}]")
                 return outer._get_deferred()
         return functor_t()
 
@@ -957,6 +961,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.precision        = self.tunable.precision
         ctrl.lds_single_size  = self.lds_single_size
         ctrl.lds_buffer_num   = self.lds_buffer_num
+        ctrl.local_prefetch_num = self.tunable.local_prefetch_num
         # Phase 1 (k-sub-loop): both A (grad_output) and B (input) are TRANSPOSED here
         # ([K rows][M or N cols] in LDS), so advancing inst_wmma.k K-elements means
         # advancing inst_wmma.k whole K-rows, i.e. inst_wmma.k * row_pitch, matching each

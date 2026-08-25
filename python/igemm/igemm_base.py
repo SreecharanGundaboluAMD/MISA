@@ -226,6 +226,10 @@ class igemm_gtc_tunable_parameter_t(object):
             # own conclusion. Requires gemm_k_per_block > inst_wmma.k (k-sub-loop in use) and
             # is mutually exclusive with async_global_load.
             self.main_loop_interleave            = utility_dict_with_default_t(tunable_dict)('main_loop_interleave', 0)
+            # Phase 22 (VGPR-level prefetch): local_prefetch_num is read further below,
+            # in the num_vgpr_accumulate_a/b section -- this __init__ has a later, shared
+            # `self.local_prefetch_num = 1` default (for every fma_type) that runs AFTER
+            # this point and would otherwise clobber a value read here.
         else:
             assert False
 
@@ -397,12 +401,25 @@ class igemm_gtc_tunable_parameter_t(object):
             self.num_vgpr_accumulate_b          = self.wave_step_n * self.wave_repeat_n * xdlops_mapping.inst_mfma.num_v_b * self.local_prefetch_num
 
         elif self.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA:
-            self.local_prefetch_num             = 1   # single-buffered main loop for this milestone, no local prefetch
+            # Phase 22 (VGPR-level prefetch): optional, defaults to 1 (today's exact
+            # byte-identical single-buffered v_a/v_b, every existing config unaffected).
+            # When 2, doubles num_vgpr_accumulate_a/b below, and wmma_main_loop.py issues
+            # the NEXT k-substep's shared_load into the other slot before the CURRENT
+            # substep's compute -- mirrors XDLOPS's local_prefetch_num=2, but intra-K-
+            # substep, not cross-main-loop-iteration (see docs/gfx1250_wmma_layout.md).
+            # Only meaningful when gemm_k_per_block > inst_wmma.k (k-sub-loop in use);
+            # each kernel file's wmma_main_loop.py emit() asserts this at codegen time.
+            # Read here (not where main_loop_interleave/async_global_load are, above) since
+            # this __init__'s later shared `self.local_prefetch_num = 1` default (every
+            # fma_type) runs in between and would otherwise clobber an earlier read.
+            self.local_prefetch_num = utility_dict_with_default_t(tunable_dict)('local_prefetch_num', 1)
+            if self.local_prefetch_num == 2:
+                assert self.main_loop_interleave == 0, "local_prefetch_num=2 and main_loop_interleave are mutually exclusive for now"
             wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(self.gemm_m_per_block, self.gemm_n_per_block, self.wmma_tile_m, self.wmma_tile_n,
                     self.wmma_repeat_m, self.wmma_repeat_n, self.block_size // self.wave_size, self.precision)
             self.num_vgpr_accumulate_c          = wmma_mapping.total_acc_c()
-            self.num_vgpr_accumulate_a          = self.wmma_repeat_m * wmma_mapping.inst_wmma.num_v_a
-            self.num_vgpr_accumulate_b          = self.wmma_repeat_n * wmma_mapping.inst_wmma.num_v_b
+            self.num_vgpr_accumulate_a          = self.wmma_repeat_m * wmma_mapping.inst_wmma.num_v_a * self.local_prefetch_num
+            self.num_vgpr_accumulate_b          = self.wmma_repeat_n * wmma_mapping.inst_wmma.num_v_b * self.local_prefetch_num
 
         self.global_prefetch_a_num              = 2 if self.tensor_a_pass_through and not self.tensor_a_pass_through_interleave_gld else 1
         self.global_prefetch_b_num              = 2 if self.tensor_b_pass_through and not self.tensor_b_pass_through_interleave_gld else 1

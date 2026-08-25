@@ -2131,3 +2131,130 @@ regression was.
   declaration bumped to `max(main-loop LDS, full output tile)`, call sites pass
   `s_block_m_off`/`s_block_n_off` and reuse `v_c` as gather scratch (always 4-aligned, dead
   by gather time -- no new VGPR allocation needed)
+
+## Phase 22: VGPR-level (register) prefetch for v_a/v_b, then a VGPR-budget audit
+
+Next item after the rocke/CK research turn (wavelet pipeline, OOB-check-with-fewer-
+registers): the dotx/mfma paths already do `local_prefetch_num=2` -- intra-K-substep
+software pipelining of the LDS->VGPR read -- but WMMA never has
+(`igemm_base.py` unconditionally pinned it to 1, "single-buffered main loop for this
+milestone, no local prefetch"). This phase ports the mechanism, applies it wherever the
+VGPR budget allows today, and treats the configs where it doesn't fit as the entry point
+into a VGPR-budget audit (the "look at #3" half of the same request).
+
+### Design
+
+Mirrors mfma_main_loop.py's local_prefetch_num=2 exactly, one level down (LDS-read instead
+of global-load -- Phase 15's interleave already covers the global-load layer). `v_a`/`v_b`
+now hold up to 2 disjoint slots back-to-back (slot 1 starts at VGPR offset
+`wave_repeat_m/n * inst_wmma.num_v_a/b`). At each k-substep `ks`, the NEXT substep's
+shared_load is issued into the other slot BEFORE the CURRENT substep's `v_wmma_*` consumes
+the slot it already holds, so the LDS-read latency for `ks+1` overlaps `ks`'s WMMA issue
+instead of blocking on it. Slot selection is plain compile-time `% 2` arithmetic (no
+runtime toggle register), same style as dotx/mfma. Only meaningful when
+`gemm_k_per_block > inst_wmma.k` (Phase 1's k-sub-loop in use, i.e. `num_k_substeps > 1`)
+-- `wmma_main_loop.py`'s `emit()` asserts this at codegen time. Mutually exclusive with
+Phase 15's `main_loop_interleave` for this first implementation (both rewrite the same
+k-substep drain loop; composing them isn't validated).
+
+**Correctness note on 2-slot reuse**: reusing slot `(ks-1)%2` for substep `ks+1`'s load
+needs no extra wait beyond the one already emitted for it -- the `v_wmma_*` instruction
+reading that slot for substep `ks-1` was already ISSUED (in program order) before the new
+`ds_read` targeting the same registers is issued, and GCN/RDNA's in-order-per-wave issue
+model guarantees a VALU/WMMA register READ happens before a later same-register LDS WRITE
+completes, regardless of the LDS read's own completion latency. This is the same guarantee
+mfma_main_loop.py's own `local_prefetch_num=2` already relies on -- not a new assumption.
+
+**VGPR formula**: `num_vgpr_accumulate_a/b = wmma_repeat_m/n * inst_wmma.num_v_a/b *
+local_prefetch_num` (mirrors XDLOPS's formula exactly; WMMA previously had no
+`local_prefetch_num` multiplier at all). Config-driven via a new `local_prefetch_num` key
+(default 1, byte-identical for every existing config), read in `igemm_base.py`'s WMMA
+branch -- **not** where `async_global_load`/`main_loop_interleave` are read a few lines
+earlier, because this `__init__` has a later, shared `self.local_prefetch_num = 1` default
+(applies to every `fma_type`, runs in between) that would otherwise clobber an earlier
+read. Caught exactly this way during implementation: the first version read the config key
+in the "early" WMMA field block, and the codegen for a `local_prefetch_num=2` config
+silently produced byte-identical output to the `local_prefetch_num=1` case -- no error, no
+crash, just the flag having zero effect. Only noticed because `v_end`/`.vgpr_count` was
+checked directly in the generated `.s`/`.inc` (180 both before and after, when +16 was
+expected) rather than assuming a clean compile meant the feature worked. **Lesson**: for a
+`utility_dict_with_default_t(tunable_dict)(...)` read to actually stick, it must be the
+LAST write to that field before it's consumed, not merely present somewhere in `__init__`.
+
+The 6 `shared_load_a/b_functor` implementations (fwd/bwd/wrw x A/B) needed a `slot=0`
+kwarg added to their `__call__` and every `v.v_a(...)`/`v.v_b(...)` destination index
+offset by `slot * num_v_a/b_total` -- discovered these functors **ignore their `v_dst`
+call argument entirely** (`wmma_main_loop.py` passes one, but ignores it internally, always
+addressing `outer.vgpr.v_a`/`v_b` directly), so simply passing a different value from the
+main loop's call site would have had no effect; the destination addressing logic lives
+inside each kernel file's functor, not in the shared main-loop driver.
+
+### VGPR-budget audit (compile-only, no GPU launch -- see Verification below)
+
+Doubling costs `wmma_repeat_m*num_v_a + wmma_repeat_n*num_v_b` VGPRs total. Confirmed via
+actual generated `.vgpr_count`/`v_end` (not just the formula) for the 128x128, fp32,
+k-sub-loop (`_k2x`) config: 180 -> 196 (+16), exactly as predicted (fp32's `num_v_a=
+num_v_b=2`). Landed as `config/igemm_{fwd,bwd,wrw}_gtc_gfx1250_nhwc_fp32_k2x_lp2.config`.
+
+For fp16/bf16/int8 at 128x128 (`num_v_a=num_v_b=8`), the existing `_k2x` config already
+compiles to **252/256 VGPRs** (confirmed directly, all three precisions, fwd) -- doubling
+would need +64, landing at 316, wildly over the 256 limit. A full breakdown of those 252
+(`igemm_fwd_gtc_gfx1250_nhwc_fp16_k2x_128x128x064.inc`):
+
+| Pool | VGPRs | Notes |
+|---|---|---|
+| `v_c` | 128 | accumulate tile, fixed by `gemm_m_per_block*gemm_n_per_block/block_size` |
+| `v_a` | 32 | `wave_repeat_m(4) * num_v_a(8)` |
+| `v_b` | 32 | `wave_repeat_n(4) * num_v_b(8)` |
+| `v_gld_a` + `v_gld_b` | 16 + 16 | old-path global-load staging buffers (chunked) |
+| everything else (addr/offset/scratch/epilogue) | 28 | `v_tid`, `v_addr_a/b`, `v_addr_out`, `v_sst/sld_os`, `v_gemm_im/in`, `v_tmp`, `v_flag`, `v_n/ho/wo_idx`, `v_gtc_tmp` |
+
+`v_c` is fixed (it's the actual output tile). The one real lever: `v_gld_a`/`v_gld_b` (32
+total) only exist because this config uses the OLD global-load path; Phase 13's
+`async_global_load=1` replaces them with a persistent 4-VGPR `v_zero` quad (global load
+writes straight to LDS, no staging), reclaiming roughly 28 net VGPRs. That's real but not
+enough on its own (252 - 28 + 64 = 288, still 32 over). Combining that reclaim with an
+**asymmetric** prefetch (only double one of `v_a`/`v_b`, +32 instead of +64, mirroring how
+dotx's `local_prefetch_num_m`/`local_prefetch_num` are already independent per-axis knobs)
+lands at 252 - 28 + 32 = 256 -- exactly at the limit, zero margin. That's too marginal to
+ship blind: a 1-VGPR miscalculation anywhere (or a slightly different config's scratch
+needs) overflows it. **Conclusion: no clean fit exists yet for 128x128 fp16/bf16/int8** --
+either shrink the "everything else" scratch pool further (28 VGPRs across ~10 small
+allocations, no single obvious cut) or accept async_global_load as a hard prerequisite and
+still be at zero margin. Not attempted further this phase -- flagging rather than forcing a
+marginal, unvalidated change.
+
+The 64x64 tile shape has real headroom (172/256 base, fp16/bf16/int8) but has no existing
+k-sub-loop (`_k2x`-style) config to extend -- would need a brand-new
+`tensor_a/b_thread_lengths`/`cluster_lengths` derivation for `gemm_k_per_block>16` at that
+tile shape, which is exactly the class of address-math derivation this branch has gotten
+subtly wrong before (Phase 21's two bugs). Deferred rather than guessed at without the
+ability to validate on real hardware in this pass.
+
+### Verification (this phase only -- GPU deferred)
+
+GPU was busy with another workload this session, so only compile-only checks ran (codegen
++ `clang++ -x assembler` -> `.hsaco`, no kernel launch): fp32 128x128 `_k2x_lp2` for
+fwd/bwd/wrw assembles cleanly, `.vgpr_count` matches the predicted +16 exactly, and the
+emitted schedule was inspected directly in the `.inc` (the `ds_read`/`v_wmma_*`/
+`s_wait_dscnt` sequence matches the intended 2-slot pipelining exactly: substep 0's data
+already in hand, substep 1's load issued and waited before substep 0 computes, cycling
+slots 0/1 thereafter, no dangling prefetch after the final substep). **Actual on-GPU
+correctness (`-V 1`) and the full regression sweep/benchmark are NOT done yet** -- deferred
+until the GPU is free, per explicit instruction this session. Don't treat "assembles
+cleanly with the right VGPR count" as "correct" -- it only rules out the classes of bugs
+that show up as reject-at-assemble-time or gross register-arithmetic mistakes, not
+addressing/data correctness.
+
+### Critical files (Phase 22)
+
+- `python/igemm/igemm_base.py` -- config-driven `local_prefetch_num` for WMMA (read in the
+  authoritative spot, see Lesson above), VGPR formula
+- `python/operations/wmma_main_loop.py` -- `emit_wmma_tile(slot=...)`, new
+  `emit_extra_substeps_prefetched()`, wired into both the mid-loop body and the `_last`
+  tail
+- `python/igemm/igemm_{fwd,bwd,wrw}_gtc_wmma_nhwc.py` -- `slot=0` kwarg + slot-offset
+  addressing added to all 6 `shared_load_a/b_functor`s; `ctrl.local_prefetch_num` wired
+  through `emit_kernel_fma_main_loop()`
+- `config/igemm_{fwd,bwd,wrw}_gtc_gfx1250_nhwc_fp32_k2x_lp2.config` -- new, the only
+  configs confirmed to fit the VGPR budget today
