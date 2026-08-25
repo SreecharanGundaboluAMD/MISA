@@ -53,8 +53,14 @@ class ctrl_coalescing_store_wmma_t(object):
         # docs/gfx1250_wmma_layout.md -- correct for every precision because the WMMA output
         # buffer is always allocated fp32 regardless of the tunable's nominal precision
         # (conv_driver.cpp's is_wmma dtype_alloc_byte override), so there is no fp16/bf16
-        # atomic-add precision concern and no workspace/cast step needed.
+        # atomic-add precision concern and no workspace/cast step needed. Atomic-add has no
+        # wide/packed fp32 variant on this ISA (confirmed against the CDNA5 ISA doc), so this
+        # path stays scalar regardless of vector_write_out -- see docs/gfx1250_wmma_layout.md.
         self.gemm_k_global_split = False
+        # non-atomic path only: target width (in elements) for the vectorized global store
+        # after the LDS reshuffle. 4 = global_store_dwordx4. See docs/gfx1250_wmma_layout.md's
+        # LDS-reshuffle phase for the derivation.
+        self.vector_write_out = 4
 
 
 class igemm_coalescing_store_wmma_t(mc_base_t):
@@ -63,7 +69,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         assert type(ctrl) is ctrl_coalescing_store_wmma_t
         self.ctrl = ctrl
 
-    def __call__(self, v_c, v_gemm_im, v_gemm_in, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1):
+    def __call__(self, v_c, v_gemm_im, v_gemm_in, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1, v_tid=None, v_gather=None, s_block_m_off=None, s_block_n_off=None):
         '''
         v_gemm_im/v_gemm_in: this thread's base (row, col) within the macro tile, from
             igemm_wmma_mapping_t.get_gemm_index_for_dst_matrix (row/col of wave_repeat
@@ -72,24 +78,31 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
             part) -- v_tmp1/v_tmp2 need 1 scratch VGPR each, s_tmp1 needs 1 scratch SGPR.
         s_gemm_m_stride: row stride of the output tensor, in elements (typically
             gemm_n, i.e. the full N extent, not just macro_tile_n).
+        v_tid/v_gather: only needed for the non-atomic (LDS-reshuffle) path -- v_tid is the
+            kernel's persistent flat thread id, v_gather is a vector_write_out-wide scratch
+            VGPR range (unused by the atomic path).
 
-        Emits one global_store_dword/global_atomic_add_f32 per accumulator element --
-        num_v_c * wave_repeat_m * wave_repeat_n per thread, no LDS traffic. Column offset
-        within a wave_repeat_m row (0/64/128/192 bytes for wave_tile_n=16) is folded into
-        the store's immediate offset instead of a per-store address add; consecutive rows
-        within a wave_repeat_m tile are reached by a precomputed byte row-stride add
-        instead of re-deriving the address with a (quarter-rate) multiply.
+        ctrl.gemm_k_global_split selects between two structurally different epilogues:
 
-        v_tmp1/v_tmp2 ping-pong as the "current row" / "next row" address: the next row's
-        address is computed into the register NOT currently being read by this row's
-        stores/atomics, so that add has no data dependency on the in-flight stores at all
-        (different register) and can be issued/scheduled independently of them, instead of
-        serializing through a single reused address register. Neither instruction blocks
-        on atomic completion either way (the wave doesn't wait for the RMW round-trip
-        merely by issuing the next instruction) -- this only removes the same-register
-        WAR hazard between "advance the address" and "the previous stores/atomics that
-        just read it", which otherwise chains all `wave_repeat_m * num_v_c` row addresses
-        into one serial dependency through a single register.
+        Atomic path (gemm_k_global_split=True): unchanged from before -- one
+        global_atomic_add_f32 per accumulator element, no LDS traffic. There is no wide/
+        packed fp32 atomic-add on this ISA (confirmed against the CDNA5 ISA doc), so this
+        can't be vectorized; v_tmp1/v_tmp2 ping-pong as the "current row"/"next row"
+        address so the row-advance add has no data dependency on the in-flight atomics
+        (different register), instead of serializing all row addresses through one
+        register. Column offset is folded into the atomic's immediate offset.
+
+        Non-atomic path (gemm_k_global_split=False): LDS-reshuffle coalescing store, see
+        docs/gfx1250_wmma_layout.md's LDS-reshuffle phase for the full derivation. A single
+        lane only ever owns one column (per docs/gfx1250_wmma_layout.md: col = lane % 16,
+        fixed across every accumulator index), so no per-lane vectorized store is possible
+        directly -- stage the whole macro-tile through LDS in true tile-linear order
+        (scatter, one ds_write_b32 per element, same addressing style as the atomic path's
+        row/col derivation just retargeted to LDS with shifts instead of a stride multiply),
+        barrier, then every lane reads back `vector_write_out` contiguous elements via a
+        flat tid-indexed mapping (gather) and issues one global_store_dwordN -- 4x fewer
+        global stores and address multiplies than the direct/atomic path, using cheap
+        on-chip LDS traffic to get there.
         '''
         ctrl = self.ctrl
         cxm = ctrl.cxm
@@ -97,34 +110,116 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         assert cxm.wave_tile_m == 16 and cxm.wave_tile_n == 16
 
         with self._deferred_context():
-            self._emit(f"; wmma direct store epilogue, {cxm.wave_repeat_m}x{cxm.wave_repeat_n} tiles, "
-                       f"{inst_wmma.num_v_c} rows/tile")
-            self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], 2   ; row-to-row byte stride")
-            for i_rm in range(cxm.wave_repeat_m):
-                row_off = i_rm * cxm.wave_tile_m
-                cur, nxt = v_tmp1, v_tmp2
-                # cur = byte address of (row_off, col 0), i.e. row = v_gemm_im + row_off
-                self._emit(f"v_add_u32 v[{cur}], {row_off}, v[{v_gemm_im}]" if row_off != 0 else f"v_mov_b32 v[{cur}], v[{v_gemm_im}]")
-                self._emit(f"v_mul_lo_u32 v[{cur}], s[{s_gemm_m_stride}], v[{cur}]")
-                self._emit(f"v_add_u32 v[{cur}], v[{v_gemm_in}], v[{cur}]")
-                self._emit(f"v_lshlrev_b32 v[{cur}], 2, v[{cur}]  ; byte address, row {row_off}, col 0")
-                for j in range(inst_wmma.num_v_c):
-                    if j != inst_wmma.num_v_c - 1:
-                        self._emit(f"v_add_u32 v[{nxt}], v[{cur}], s[{s_tmp1}]   ; precompute row {row_off + j + 1} address")
-                    for i_rn in range(cxm.wave_repeat_n):
-                        c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
-                        col_off = i_rn * cxm.wave_tile_n * 4
-                        offset_str = f" offset:{col_off}" if col_off != 0 else ""
-                        inst = "global_atomic_add_f32" if ctrl.gemm_k_global_split else "global_store_dword"
-                        # scope:SCOPE_SYS is load-bearing, not decoration: a bare
-                        # global_atomic_add_f32 defaults to a narrower (CU/WGP-local) cache
-                        # scope on gfx1250, which silently drops updates when the two
-                        # accumulating workgroups land on different compute units --
-                        # confirmed on hardware (small tiles, which pack more workgroups per
-                        # CU, "happened" to pass without it; large tiles, spread across more
-                        # CUs, lost updates). See docs/gfx1250_wmma_layout.md.
-                        scope_str = " scope:SCOPE_SYS" if ctrl.gemm_k_global_split else ""
-                        self._emit(f"{inst} v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str}{scope_str}")
-                    cur, nxt = nxt, cur
-            self._emit_empty_line()
+            if ctrl.gemm_k_global_split:
+                self._emit(f"; wmma direct atomic-add epilogue, {cxm.wave_repeat_m}x{cxm.wave_repeat_n} tiles, "
+                           f"{inst_wmma.num_v_c} rows/tile")
+                self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], 2   ; row-to-row byte stride")
+                for i_rm in range(cxm.wave_repeat_m):
+                    row_off = i_rm * cxm.wave_tile_m
+                    cur, nxt = v_tmp1, v_tmp2
+                    # cur = byte address of (row_off, col 0), i.e. row = v_gemm_im + row_off
+                    self._emit(f"v_add_u32 v[{cur}], {row_off}, v[{v_gemm_im}]" if row_off != 0 else f"v_mov_b32 v[{cur}], v[{v_gemm_im}]")
+                    self._emit(f"v_mul_lo_u32 v[{cur}], s[{s_gemm_m_stride}], v[{cur}]")
+                    self._emit(f"v_add_u32 v[{cur}], v[{v_gemm_in}], v[{cur}]")
+                    self._emit(f"v_lshlrev_b32 v[{cur}], 2, v[{cur}]  ; byte address, row {row_off}, col 0")
+                    for j in range(inst_wmma.num_v_c):
+                        if j != inst_wmma.num_v_c - 1:
+                            self._emit(f"v_add_u32 v[{nxt}], v[{cur}], s[{s_tmp1}]   ; precompute row {row_off + j + 1} address")
+                        for i_rn in range(cxm.wave_repeat_n):
+                            c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
+                            col_off = i_rn * cxm.wave_tile_n * 4
+                            offset_str = f" offset:{col_off}" if col_off != 0 else ""
+                            # scope:SCOPE_SYS is load-bearing, not decoration: a bare
+                            # global_atomic_add_f32 defaults to a narrower (CU/WGP-local)
+                            # cache scope on gfx1250, which silently drops updates when the
+                            # two accumulating workgroups land on different compute units --
+                            # confirmed on hardware. See docs/gfx1250_wmma_layout.md.
+                            self._emit(f"global_atomic_add_f32 v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str} scope:SCOPE_SYS")
+                        cur, nxt = nxt, cur
+                self._emit_empty_line()
+            else:
+                # ---- non-atomic: LDS-reshuffle coalescing store ----
+                assert v_tid is not None and v_gather is not None and s_block_m_off is not None and s_block_n_off is not None
+                vwo = ctrl.vector_write_out
+                macro_tile_m = cxm.macro_tile_m
+                macro_tile_n = cxm.macro_tile_n
+                assert macro_tile_n % vwo == 0, f"macro_tile_n:{macro_tile_n} not divisible by vector_write_out:{vwo}"
+                total_elements = macro_tile_m * macro_tile_n
+                elements_per_thread = total_elements // ctrl.block_size
+                assert elements_per_thread % vwo == 0, f"elements_per_thread:{elements_per_thread} not divisible by vector_write_out:{vwo}"
+                num_passes = elements_per_thread // vwo
+                elems_per_pass = ctrl.block_size * vwo
+                assert elems_per_pass % macro_tile_n == 0, f"elems_per_pass:{elems_per_pass} not divisible by macro_tile_n:{macro_tile_n}"
+                row_step_per_pass = elems_per_pass // macro_tile_n
+                log2_n = utility_log2(macro_tile_n)
+                ds_read_inst = {1: "ds_read_b32", 2: "ds_read_b64", 4: "ds_read_b128"}[vwo]
+                gst_inst = {1: "global_store_dword", 2: "global_store_dwordx2", 4: "global_store_dwordx4"}[vwo]
+                v_gather_range = f"{v_gather}:{v_gather}+{vwo - 1}" if vwo > 1 else v_gather
+
+                self._emit(f"; wmma LDS-reshuffle coalescing store, tile {macro_tile_m}x{macro_tile_n}, "
+                           f"vector_write_out={vwo}, {num_passes} passes")
+                # barrier: the main loop's own LDS traffic must be fully retired before we reuse
+                # this same physical LDS region for the reshuffle -- otherwise a fast wave could
+                # start overwriting it while a slow wave in this workgroup is still reading it.
+                self._emit(f"s_wait_dscnt 0x0")
+                self._emit(f"s_barrier_signal -1")
+                self._emit(f"s_barrier_wait -1")
+
+                # ---- scatter: same (i_rm,i_rn,j) addressing as the atomic path above, retargeted
+                # to a tile-linear LDS address via shifts (macro_tile_n is a compile-time power of
+                # 2) instead of a runtime-stride multiply -- cheaper than the global-memory case.
+                # v_gemm_im/v_gemm_in are GLOBAL (gemm-space) positions -- the caller adds
+                # s_block_m_off/s_block_n_off once, persistently, right after computing them (see
+                # e.g. igemm_fwd_gtc_wmma_nhwc.py's emit_kernel_prologue) -- so they must be masked
+                # back down to tile-local (0..macro_tile_m/n-1) before use as an LDS address: since
+                # block_m_off/n_off are always exact multiples of macro_tile_m/n, `& (macro_tile-1)`
+                # strips exactly that high part and leaves the tile-local component unchanged. ----
+                self._emit(f"v_and_b32 v[{v_tmp2}], {macro_tile_n - 1}, v[{v_gemm_in}]   ; tile-local col (persistent)")
+                for i_rm in range(cxm.wave_repeat_m):
+                    row_off = i_rm * cxm.wave_tile_m
+                    self._emit(f"v_add_u32 v[{v_tmp1}], {row_off}, v[{v_gemm_im}]" if row_off != 0 else f"v_mov_b32 v[{v_tmp1}], v[{v_gemm_im}]")
+                    self._emit(f"v_and_b32 v[{v_tmp1}], {macro_tile_m - 1}, v[{v_tmp1}]   ; tile-local row")
+                    self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {log2_n}, v[{v_tmp1}]   ; row << log2(macro_tile_n)")
+                    self._emit(f"v_add_u32 v[{v_tmp1}], v[{v_tmp2}], v[{v_tmp1}]   ; + col -> tile-linear index, row {row_off}")
+                    self._emit(f"v_lshlrev_b32 v[{v_tmp1}], 2, v[{v_tmp1}]   ; byte address")
+                    for j in range(inst_wmma.num_v_c):
+                        if j != 0:
+                            self._emit(f"v_add_u32 v[{v_tmp1}], {macro_tile_n * 4}, v[{v_tmp1}]   ; advance to row {row_off + j}")
+                        for i_rn in range(cxm.wave_repeat_n):
+                            c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
+                            col_off = i_rn * cxm.wave_tile_n * 4
+                            offset_str = f" offset:{col_off}" if col_off != 0 else ""
+                            self._emit(f"ds_write_b32 v[{v_tmp1}], v[{v_c}+{c_index}]{offset_str}")
+                self._emit_empty_line()
+
+                # ---- barrier: all scatter writes must be visible to every lane before any gather read ----
+                self._emit(f"s_wait_dscnt 0x0")
+                self._emit(f"s_barrier_signal -1")
+                self._emit(f"s_barrier_wait -1")
+
+                # ---- gather: lane `tid` owns `vwo` contiguous elements per pass, starting at
+                # tile-linear index tid*vwo (+ a compile-time pass offset folded into the ds_read's
+                # immediate). row0/col0 (this lane's position for pass 0) are derived from that same
+                # index via shift/mask (macro_tile_n is a power of 2) -- col never changes across
+                # passes since elems_per_pass is a multiple of macro_tile_n by construction, so only
+                # the row (and therefore the global memory address) advances, by one scalar add of a
+                # precomputed per-pass stride. ----
+                self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {utility_log2(vwo)}, v[{v_tid}]   ; tid*{vwo}, tile-linear index for pass 0")
+                self._emit(f"v_and_b32 v[{v_gather}], {macro_tile_n - 1}, v[{v_tmp1}]   ; col0 (tile-local)")
+                self._emit(f"v_add_u32 v[{v_gather}], s[{s_block_n_off}], v[{v_gather}]   ; + block_n_off -> global col")
+                self._emit(f"v_lshrrev_b32 v[{v_tmp2}], {log2_n}, v[{v_tmp1}]   ; row0 (tile-local)")
+                self._emit(f"v_add_u32 v[{v_tmp2}], s[{s_block_m_off}], v[{v_tmp2}]   ; + block_m_off -> global row")
+                self._emit(f"v_mul_lo_u32 v[{v_tmp2}], s[{s_gemm_m_stride}], v[{v_tmp2}]")
+                self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_gather}], v[{v_tmp2}]")
+                self._emit(f"v_lshlrev_b32 v[{v_tmp2}], 2, v[{v_tmp2}]   ; global memory byte address for pass 0")
+                self._emit(f"v_lshlrev_b32 v[{v_tmp1}], 2, v[{v_tmp1}]   ; LDS byte address (invariant across passes)")
+                self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], {utility_log2(row_step_per_pass) + 2}   ; per-pass memory stride")
+                self._emit_empty_line()
+                for it in range(num_passes):
+                    self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * elems_per_pass * 4}")
+                    self._emit(f"s_wait_dscnt 0x0")
+                    self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
+                    if it != num_passes - 1:
+                        self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_tmp2}], s[{s_tmp1}]   ; advance to pass {it + 1}")
+                self._emit_empty_line()
         return self._get_deferred()

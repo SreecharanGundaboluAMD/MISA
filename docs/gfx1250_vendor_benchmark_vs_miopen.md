@@ -324,3 +324,25 @@ path (fwd/bwd/non-split wrw — the atomic path's fp32 atomic-add has no wide in
 exploit, confirmed via the CDNA5 ISA doc in Phase 19). That work was deliberately deferred, not
 attempted in this session — see `docs/gfx1250_wmma_layout.md`'s Phase 19 "Critical files" note
 and this doc's own conclusion above for where to pick it back up.
+
+## Update (2026-08-25): LDS-reshuffle epilogue implemented (`docs/gfx1250_wmma_layout.md`'s Phase 21)
+
+Implemented the deferred item above: fwd/bwd/non-split-wrw's direct epilogue (128 scalar
+`global_store_dword` for a 128x128 tile) replaced with an LDS-reshuffle coalescing store —
+confirmed 128 → 32 `global_store_dwordx4` (the predicted 4x) via instruction count on the
+generated `.inc`. Wall-clock impact is modest and shape-dependent (0-14% faster, one shape
+flat-to-slightly-slower within noise) because fwd/bwd are compute-bound for the large-K
+shapes in this trace — the epilogue is a small fraction of total kernel time regardless of
+how much cheaper it gets. A synthetic single-K-block shape (built specifically to make the
+epilogue a large fraction of total time) showed the clearest win, 7-14% faster. Non-split
+wrw showed almost nothing (~1%) — its bottleneck is occupancy (too few workgroups, fixed by
+Phase 17's K-split, not this change), not epilogue cost. Full numbers and the two real bugs
+found while building this (a masking bug from `v_gemm_im`/`v_gemm_in` being global rather
+than tile-local addresses, and a deferred-context return-placement bug that silently zeroed
+out the *atomic* path's output during regression testing) are in the layout doc's Phase 21.
+
+This is likely close to the ceiling for epilogue-side optimization on fwd/bwd/non-split-wrw
+given how little of their total time the epilogue represents. Further gains on this branch
+would need to target the main loop itself (LDS bank conflicts, register double-buffering,
+graduated waitcnt — all flagged but not attempted in the original code review this session)
+rather than the epilogue.

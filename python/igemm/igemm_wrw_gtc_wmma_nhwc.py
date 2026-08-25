@@ -345,12 +345,17 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         return kas
 
     def get_kernel_code(self):
+        # see igemm_fwd_gtc_wmma_nhwc_t's identically-named field for the rationale. Only
+        # the non-atomic (non-split) epilogue uses the LDS reshuffle -- the gemm_k_global_split
+        # atomic path never touches LDS in the epilogue, so it doesn't need the boost.
+        epilogue_lds_bytes = 0 if self.tunable.gemm_k_global_split else \
+            self.tunable.gemm_m_per_block * self.tunable.gemm_n_per_block * 4
         kernel_code_dict = {
             'enable_sgpr_kernarg_segment_ptr'  :   1,
             'enable_sgpr_workgroup_id_x'       :   1,
             'enable_sgpr_workgroup_id_y'       :   1,
             'enable_vgpr_workitem_id'          :   0,
-            'workgroup_group_segment_byte_size':   self.lds_single_size * self.lds_buffer_num,
+            'workgroup_group_segment_byte_size':   max(self.lds_single_size * self.lds_buffer_num, epilogue_lds_bytes),
             'kernarg_segment_byte_size'         :   92,
             'wavefront_sgpr_count'              :   self.sgpr.s_end.value + 2 * 3,
             'workitem_vgpr_count'               :   self.vgpr.v_end.value,
@@ -639,7 +644,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_lshl_b32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], 2   ; tap byte offset")
         self._emit(f"s_add_u32 s[{s.s_p_out_tap()}], s[{s.s_p_out()}], s[{s.s_tmp(2)}]")
         self._emit(f"s_addc_u32 s[{s.s_p_out_tap(1)}], s[{s.s_p_out(1)}], 0")
-        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp()))
+        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off()))
         self._emit(f"s_wait_storecnt 0x0")
         self._emit_empty_line()
 

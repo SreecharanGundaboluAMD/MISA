@@ -428,12 +428,18 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         return kas
 
     def get_kernel_code(self):
+        # the LDS-reshuffle epilogue (coalescing_store_wmma.py) reuses the main loop's LDS
+        # region for the whole output tile (post-barrier, temporally disjoint use) -- needs
+        # more than the main loop alone if the tile is bigger than what the main loop reserved
+        # (always true here: main-loop LDS is sized by A/B *input* staging, epilogue LDS by the
+        # *output* tile, which is a fixed 4 bytes/element regardless of precision).
+        epilogue_lds_bytes = self.tunable.gemm_m_per_block * self.tunable.gemm_n_per_block * 4
         kernel_code_dict = {
             'enable_sgpr_kernarg_segment_ptr'  :   1,
             'enable_sgpr_workgroup_id_x'       :   1,
             'enable_sgpr_workgroup_id_y'       :   1,
             'enable_vgpr_workitem_id'          :   0,
-            'workgroup_group_segment_byte_size':   self.lds_single_size * self.lds_buffer_num,
+            'workgroup_group_segment_byte_size':   max(self.lds_single_size * self.lds_buffer_num, epilogue_lds_bytes),
             'kernarg_segment_byte_size'         :   88,
             'wavefront_sgpr_count'              :   self.sgpr.s_end.value + 2 * 3,
             'workitem_vgpr_count'               :   self.vgpr.v_end.value,
@@ -1235,7 +1241,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         s = self.sgpr
         # s_out_k_total (=gemm_n*group) is the output tensor's TOTAL row stride (see class
         # docstring's group>1 note) -- s_gemm_n alone (per-group) is only correct for group=1.
-        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_k_total.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp()))
+        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_k_total.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off()))
         self._emit(f"s_wait_storecnt 0x0")
 
     def emit_kernel_body(self):

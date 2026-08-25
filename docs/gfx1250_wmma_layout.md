@@ -2016,3 +2016,118 @@ see that doc's "revisit later" note).
 
 - `driver/igemm_wrw_gtc_driver.h` -- full divisor enumeration, `time_split` lambda, the
   ternary search + cached final confirm, and the `IGEMM_GSPLIT_SWEEP` research override
+
+## Phase 21 (2026-08-25): LDS-reshuffle coalescing store for the non-atomic epilogue path
+
+Implemented the deliberately-deferred item from Phase 19: fwd, bwd, and non-split wrw all
+still used the direct scalar epilogue (one `global_store_dword` per accumulator element,
+128 for a 128x128 tile) because a single WMMA lane only ever owns one output column (`col =
+lane % 16`, fixed across every accumulator index -- confirmed against
+`wmma_mapping.py:195-198`'s `get_gemm_index_for_dst_matrix`), so no per-lane vectorized store
+is directly possible. The mature XDLOPS epilogue (`coalescing_store.py`) solves the same
+class of problem via an LDS reshuffle; ported the equivalent for WMMA.
+
+### Design (only the `vector_write_out != 1` case applies)
+
+Read `coalescing_store.py`'s actual addressing code (`init_co_lds_offset`) rather than
+working from a summary, since Phase 12/14's tr16 investigation already showed how costly a
+wrong lane-mapping guess is here. Two address schemes coexist in that file: a granularity
+trick (`vector_write_out == 1`) that bounces AGPR data through LDS efficiently but does NOT
+enable a vectorized global store, and a much simpler scheme (`vector_write_out != 1`, what
+was ported) that scatters in **true tile-linear order** (`(row * macro_tile_n + col) *
+data_byte`) and gathers via a **flat tid-indexed** read (`tid * vector_write_out *
+data_byte`). WMMA needed the second one -- no granularity trick, since WMMA has no
+AGPR-vs-VGPR distinction to begin with.
+
+Single-pass, full-tile LDS (no coalescing-group loop): the D-operand output tile is always
+4 bytes/element regardless of nominal precision (existing behavior), so total tile size is
+65536 bytes for every 128x128 config (any precision) and 16384 for every 64x64 config.
+65536 is exactly gfx1250's 64KB per-workgroup LDS limit with zero headroom -- verified this
+actually loads and runs *before* implementing the rest (`hipModuleLoad`/
+`hipModuleGetFunction` succeed with a kernel declaring exactly 64KB). This avoids the
+multi-group LDS partitioning XDLOPS needs, which turned out to have a real complication:
+compile-time-loop-index grouping doesn't give a compact address range once
+`waves_per_m/waves_per_n > 1`, since different waves' row contributions land in
+non-adjacent bands within any single group -- a correct multi-group version would need
+XDLOPS's own "decompose and reassemble the M-index" dance. Deferred; single-pass fits every
+config that exists today.
+
+Scatter is scalar (`ds_write_b32`, one per element, reusing the exact same `(i_rm,i_rn,j)`
+loop and `v_gemm_im`/`v_gemm_in` address derivation the direct-store path already used --
+just retargeted to LDS via shifts instead of a stride multiply, which is cheaper since
+`macro_tile_n` is a compile-time power of 2). Gather batches `vector_write_out=4` contiguous
+elements per thread per pass via `ds_read_b128` + `global_store_dwordx4`: `128 -> 32` store
+instructions for a 128x128 tile, confirmed by instruction count in the generated `.inc`.
+
+### Two real bugs found and fixed before this worked, both worth recording
+
+1. **`v_gemm_im`/`v_gemm_in` are GLOBAL (gemm-space) positions, not tile-local.** Every
+   kernel adds `s_block_m_off`/`s_block_n_off` to them once, persistently, right after
+   `get_gemm_index_for_dst_matrix` (e.g. `igemm_fwd_gtc_wmma_nhwc.py:683-684`) -- correct
+   for the direct-store path (which needs the global address anyway) but silently wrong for
+   an LDS address, which must be tile-local. First attempt produced values that were
+   essentially zero everywhere (`pred≈0.0001` against real reference values) -- reading from
+   the wrong, effectively out-of-tile-range LDS offset for every shape tested, including the
+   trivial single-tile case, which ruled out an edge-case bug and pointed at something
+   structurally wrong in the address itself. Fixed by masking: since `block_m_off`/`n_off`
+   are always exact multiples of `macro_tile_m`/`n`, `& (macro_tile_m/n - 1)` strips exactly
+   the block-level high bits and leaves the tile-local component unchanged, for both the
+   scatter's LDS address (needs masking) and the gather's global memory address (needs the
+   block offset added *back*, since the gather's `tid`-derived row/col are pure tile-local
+   and never had it).
+2. **Returning inside a `with self._deferred_context():` block reads `deferred_buffer`
+   before `__exit__` populates it.** `_get_deferred()` just returns
+   `self.outter.deferred_buffer`, which `deferred_context_t.__exit__` sets -- so a `return
+   self._get_deferred()` *inside* the `with` block (as the atomic-path branch had, before
+   this was caught) reads whatever `deferred_buffer` held from the *previous* call, not the
+   current one. Went unnoticed at first because the reshuffle (non-atomic) path's `return`
+   was already correctly placed after the `with` block exits, and every non-atomic
+   correctness test passed -- it was the **atomic** (`gemm_k_global_split`) path's own
+   already-existing early return, exposed only when re-testing it after this session's
+   refactor. Regression testing the atomic path (not just the new non-atomic path) caught
+   it immediately: previously-passing shapes started reporting `valid:n` with the exact
+   symptom of "the epilogue emitted nothing" (visible directly in the generated `.inc` --
+   the coalescing_store call site's surrounding code was there, the epilogue's own content
+   was entirely absent). Fixed by restructuring both branches under one `if/else` inside the
+   `with` block, with a single `return self._get_deferred()` after it exits. **Lesson**: any
+   time a function has multiple return points inside a deferred-emit context manager, check
+   every one is actually outside the `with` block, not just the one you're actively editing.
+
+### Results
+
+Instruction count (128x128 fp16, confirmed via `grep -c` on the generated `.inc`, same
+technique as the Task-1 epilogue rewrite): 128 `global_store_dword` -> 32
+`global_store_dwordx4`, exactly the predicted 4x.
+
+Wall-clock, fp16, same GPU-contention caveat as everywhere else in this doc:
+
+| Shape | Direction | Before (ms) | After (ms) | Change |
+|---|---|---|---|---|
+| 128,120,160,128,3x3 (n=42) | fwd 128x128/64x64 | 0.369 / 0.502 | 0.362 / 0.480 | ~2-4% faster |
+| 64,60,80,256,1x1 (n=42) | fwd 128x128/64x64 | 0.041 / 0.046 | 0.037 / 0.043 | ~7-10% faster |
+| 192,60,80,64,1x1 (n=42) | fwd 64x64 only | 0.027 | 0.030 | ~11% slower (noise -- ~0.03ms absolute) |
+| n=8,c=32,H=W=128,k=128 (single K-block, epilogue-dominated) | fwd 128x128/64x64 | 0.014 / 0.015 | 0.012 / 0.014 | 7-14% faster |
+| 128,120,160,128,3x3 (n=42) | bwd 128x128/64x64 | 0.586 / 0.773 | 0.587 / 0.770 | flat (noise) |
+| 128,30,40,128,1x1 (n=42) | non-split wrw 128x128/64x64 | 5.377 / 4.351 | 5.312 / 4.294 | ~1% faster |
+
+**Honest read, not oversold**: gains are modest (0-14%) and scale with how much of total
+kernel time the epilogue actually represents. fwd/bwd are compute-bound for large-K shapes
+(main loop dominates, epilogue is a small slice regardless of how much cheaper it gets) --
+the single-K-block case shows the clearest win because the epilogue is a much larger
+fraction of total time there. Non-split wrw shows almost nothing, for the same reason Phase
+17 fixed with a *different* mechanism (K-split): wrw's occupancy problem is about too few
+*workgroups*, which this change doesn't touch at all -- it only makes each workgroup's own
+epilogue cheaper, and non-split wrw was never epilogue-bound to begin with (a single,
+massive main loop dominates it completely). This is a real, confirmed-correct optimization
+with a clear mechanism (4x fewer, wider global stores + cheaper on-chip LDS traffic instead
+of direct global memory ops), it just isn't the shape of problem this codebase's wrw
+regression was.
+
+### Critical files (Phase 21)
+
+- `python/operations/coalescing_store_wmma.py` -- the new reshuffle branch (scatter, dual
+  barrier, gather+vectorized store), restructured `if/else` to fix the deferred-context bug
+- `python/igemm/igemm_{fwd,bwd,wrw}_gtc_wmma_nhwc.py` -- `get_kernel_code()`'s LDS
+  declaration bumped to `max(main-loop LDS, full output tile)`, call sites pass
+  `s_block_m_off`/`s_block_n_off` and reuse `v_c` as gather scratch (always 4-aligned, dead
+  by gather time -- no new VGPR allocation needed)

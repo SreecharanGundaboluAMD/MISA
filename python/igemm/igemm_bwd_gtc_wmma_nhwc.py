@@ -326,12 +326,16 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         return kas
 
     def get_kernel_code(self):
+        # see igemm_fwd_gtc_wmma_nhwc_t's identically-named field for the rationale: the
+        # LDS-reshuffle epilogue needs the whole output tile's worth of LDS, which can exceed
+        # what the main loop alone reserved.
+        epilogue_lds_bytes = self.tunable.gemm_m_per_block * self.tunable.gemm_n_per_block * 4
         kernel_code_dict = {
             'enable_sgpr_kernarg_segment_ptr'  :   1,
             'enable_sgpr_workgroup_id_x'       :   1,
             'enable_sgpr_workgroup_id_y'       :   1,
             'enable_vgpr_workitem_id'          :   0,
-            'workgroup_group_segment_byte_size':   self.lds_single_size * self.lds_buffer_num,
+            'workgroup_group_segment_byte_size':   max(self.lds_single_size * self.lds_buffer_num, epilogue_lds_bytes),
             'kernarg_segment_byte_size'         :   88,
             'wavefront_sgpr_count'              :   self.sgpr.s_end.value + 2 * 3,
             'workitem_vgpr_count'               :   self.vgpr.v_end.value,
@@ -1031,7 +1035,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         s = self.sgpr
         # s_out_c_total (=gemm_n*group) is grad_input's TOTAL row stride (NOT K_out, and not
         # just the per-group gemm_n either once group>1 -- see class docstring's Phase 7 note).
-        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_c_total.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp()))
+        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_c_total.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off()))
         self._emit(f"s_wait_storecnt 0x0")
 
     def emit_kernel_body(self):
