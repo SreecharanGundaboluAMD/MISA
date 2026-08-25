@@ -1454,3 +1454,47 @@ Byte-identical regression check: all 57 existing gfx1250 configs regenerate iden
 bf16/int8/fp32 at 128x64, combining `row_repeat` with Phase 13's async-load path, and the fully
 general `v_tid`-decoupled mapping (arbitrary, non-power-of-2-multiple tile ratios) that XDLOPS's
 cluster dispatcher supports and this `row_repeat` mechanism deliberately does not attempt.
+
+### Phase 11 continued yet again (2026-08-25): mirror shape (64x128, fwd/fp16) via `row_repeat_b`
+
+Ported the `row_repeat` mechanism to B (weight) for the mirror shape:
+`gemm_m_per_block=64, gemm_n_per_block=128`, `waves_per_m=1, wave_repeat_m=4, waves_per_n=2,
+wave_repeat_n=4, waves=2` -> `block_size=64`. Since `block_size(64) == gemm_m_per_block(64)`
+already, **A needs zero changes**; only B needs `row_repeat_b=2`.
+
+**Materially simpler than the 128x64 shape's A-side work, for a structural reason specific to
+fwd's B operand**: A (grad_output/input) needs a per-tap *spatial gather* -- each row's
+`(n_idx, ho_idx, wo_idx)` decomposition, re-derived every tap via 2 chained divisions, plus
+a bounds `v_flag` (a pixel can be out-of-bounds padding). B (weight) has neither: its row is
+just `block_n_off + tid + i*block_size` (a K_out channel index, no spatial decomposition at
+all) and weight is never out-of-bounds, so no flag/masking logic exists for B in the first
+place. This meant the B-side mirror needed no scratch-register-reuse subtlety, no persistent-
+vs-fresh-recompute split, and hit no analogous scratch-aliasing bug -- each of B's
+`row_repeat_b` rows is simply its own fully independent base address
+(`v_addr_b_base(i)`/`v_addr_b(i)`), computed and advanced exactly like row 0, just parameterized
+by `i`. Same early-issue-only-for-row-0 discipline as A's rows (row_repeat_a's rows 1+ have no
+early-issue slot of their own -- reusing the single small `v_gld_b` buffer for a second
+in-flight early load before row 0's own load is stored would hit the exact same scratch-buffer
+lifetime bug Phase 1 already found the hard way).
+
+**Process discovery, not a kernel bug, that cost real time**: `igemm_codegen.py -s
+config/<name>.config` (the invocation this whole gfx1250 effort had been using) failed to
+assemble with `unknown directive .v_u32_div_rem_vs_gfx1250` -- reproduced identically on
+completely untouched baseline code. Root cause: `-s`/`--split_kernel` mode deletes the "origin"
+`.s` file (where gfx1250's kernel-specific division macros get emitted via
+`get_kernel_macros()`) after splitting per-tile-shape files out of it, and the per-split-file
+macro re-emission path only re-emits a fixed *generic* (non-gfx1250) macro set, never re-asking
+the kernel for its own macros -- so the gfx1250-specific ones are silently lost in split mode,
+for every current config, not just this one. **Fix: don't pass `-s`** -- plain `python3
+igemm_codegen.py config/<name>.config` assembles correctly. See [[gfx1250-isa-quirks]] for the
+full root-cause writeup; flagging here too since it could easily be mistaken for a correctness
+regression in future kernel-body work if not known in advance.
+
+**Validated on real hardware**, fwd/fp16/64x128, full 6-case battery (degenerate, multi-K-block,
+stride+pad, multi-tap+dilation, group=2, group=4) against `naive_conv_fwd_nhwc` -- all `valid:y`
+on the first attempt (no bugs found this time, unlike the A-side mirror). Byte-identical
+regression check: all 58 existing gfx1250 configs (including the 128x64 shape) regenerate
+identically.
+
+**Not yet done**: bwd/wrw at 128x64 and 64x128, bf16/int8/fp32 at both asymmetric shapes,
+combining `row_repeat` with Phase 13's async-load path.

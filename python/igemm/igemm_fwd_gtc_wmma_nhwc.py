@@ -180,12 +180,9 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self.row_repeat_a = tunable.gemm_m_per_block // tunable.block_size
         self.row_repeat_b = tunable.gemm_n_per_block // tunable.block_size
         # row_repeat > 1 combined with Phase 13's async load is deliberately out of scope for
-        # now (kept separate to isolate correctness of each mechanism) -- B's row_repeat_b > 1
-        # is also not yet implemented (this phase only targets gemm_m_per_block > gemm_n_per_block
-        # shapes, e.g. 128x64; a mirrored 64x128 shape would need the B-side equivalent).
+        # now (kept separate to isolate correctness of each mechanism).
         assert not (tunable.async_global_load and (self.row_repeat_a > 1 or self.row_repeat_b > 1)), \
             "row_repeat > 1 is not yet supported together with async_global_load"
-        assert self.row_repeat_b == 1, "row_repeat_b > 1 (B needing multiple rows/thread) is not yet implemented"
 
         ctrl_wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(tunable.gemm_m_per_block, tunable.gemm_n_per_block,
                 tunable.wmma_tile_m, tunable.wmma_tile_n, tunable.wmma_repeat_m, tunable.wmma_repeat_n,
@@ -341,10 +338,14 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 # (v_addr_a(i*2), v_addr_a(i*2+1)) even-aligned since the whole block starts
                 # even-aligned. row_repeat_a==1 for every existing config (byte-identical).
                 self.v_addr_a      = sym_t('v_addr_a'      , vseq(2 * outer.row_repeat_a, 2))    # persistent global A address(es) (64-bit each)
-                self.v_addr_b      = sym_t('v_addr_b'      , vseq(2, 2))
-                # Phase 5d: B's fixed per-thread row base (before this tap's column offset is
-                # added) -- computed once from the *y*x*c* row stride, reused every tap.
-                self.v_addr_b_base = sym_t('v_addr_b_base' , vseq(2, 2))
+                # row_repeat_b copies, mirroring v_addr_a/row_repeat_a above -- B needs no
+                # flag/masking (weight is never out of bounds), so this is the whole story:
+                # each row's address pair just advances independently. row_repeat_b==1 for
+                # every existing config (byte-identical).
+                self.v_addr_b      = sym_t('v_addr_b'      , vseq(2 * outer.row_repeat_b, 2))
+                # Phase 5d: B's fixed per-thread row base(s) (before this tap's column offset
+                # is added) -- computed once from the *y*x*c* row stride, reused every tap.
+                self.v_addr_b_base = sym_t('v_addr_b_base' , vseq(2 * outer.row_repeat_b, 2))
             self.v_addr_out    = sym_t('v_addr_out'    , vseq(2, 2))    # scratch used by coalescing_store_wmma
             self.v_sst_os      = sym_t('v_sst_os'      , vseq(1))    # shared store offset (same for A/B region)
             self.v_sld_a_os    = sym_t('v_sld_a_os'    , vseq(1))
@@ -629,14 +630,26 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"v_lshlrev_b32 v[{v.v_off_b_base()}], {utility_log2(self.data_byte)}, v[{v.v_off_b_base()}]")
             self._emit_empty_line()
         else:
-            self._emit(f"; v_addr_b_base = p_wei + (block_n_off + tid) * wei_k_stride * {self.data_byte} bytes")
-            self._emit(f"v_add_u32 v[{v.v_tmp(1)}], s[{s.s_block_n_off()}], v[{v.v_tid()}]")
-            self._emit(f"v_mul_lo_u32 v[{v.v_tmp(1)}], s[{s.s_wei_k_stride()}], v[{v.v_tmp(1)}]")
-            self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], {utility_log2(self.data_byte)}, v[{v.v_tmp(1)}]")
-            self._emit(f"v_mov_b32 v[{v.v_addr_b_base(1)}], s[{s.s_p_wei(1)}]")
-            self._emit(f"v_add_co_u32 v[{v.v_addr_b_base()}], vcc_lo, s[{s.s_p_wei()}], v[{v.v_tmp(1)}]")
-            self._emit(f"v_add_co_ci_u32 v[{v.v_addr_b_base(1)}], vcc_lo, 0, v[{v.v_addr_b_base(1)}], vcc_lo")
-            self._emit_empty_line()
+            # row_repeat_b>1 (asymmetric tile shapes, B side): thread tid owns rows
+            # tid, tid+block_size, tid+2*block_size, ... -- B needs no flag/masking (weight
+            # is never out of bounds), so each row is simply its own independent base
+            # address, no persistent decomposition or scratch-reuse subtlety like A's rows
+            # needed. row_repeat_b==1 for every existing config: the loop runs once with
+            # i=0, producing v_addr_b_base(0)/(1) == v_addr_b_base()/(1), byte-identical.
+            for i in range(self.row_repeat_b):
+                tag = '' if i == 0 else f'({i})'
+                self._emit(f"; v_addr_b_base{tag} = p_wei + (block_n_off + tid + {i}*block_size) * wei_k_stride * {self.data_byte} bytes")
+                if i == 0:
+                    self._emit(f"v_add_u32 v[{v.v_tmp(1)}], s[{s.s_block_n_off()}], v[{v.v_tid()}]")
+                else:
+                    self._emit(f"v_add_u32 v[{v.v_tmp(1)}], {i * self.tunable.block_size}, v[{v.v_tid()}]")
+                    self._emit(f"v_add_u32 v[{v.v_tmp(1)}], s[{s.s_block_n_off()}], v[{v.v_tmp(1)}]")
+                self._emit(f"v_mul_lo_u32 v[{v.v_tmp(1)}], s[{s.s_wei_k_stride()}], v[{v.v_tmp(1)}]")
+                self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], {utility_log2(self.data_byte)}, v[{v.v_tmp(1)}]")
+                self._emit(f"v_mov_b32 v[{v.v_addr_b_base(i*2+1)}], s[{s.s_p_wei(1)}]")
+                self._emit(f"v_add_co_u32 v[{v.v_addr_b_base(i*2)}], vcc_lo, s[{s.s_p_wei()}], v[{v.v_tmp(1)}]")
+                self._emit(f"v_add_co_ci_u32 v[{v.v_addr_b_base(i*2+1)}], vcc_lo, 0, v[{v.v_addr_b_base(i*2+1)}], vcc_lo")
+                self._emit_empty_line()
 
 
         self._emit_lds_offset_setup()
@@ -749,13 +762,14 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"v_add_u32 v[{v.v_off_b()}], s[{s.s_tmp(2)}], v[{v.v_off_b_base()}]")
             self._emit_empty_line()
         else:
-            self._emit(f"; --- per-tap B address: v_addr_b = v_addr_b_base + (iy*x+ix)*gemm_k*{self.data_byte} bytes ---")
+            self._emit(f"; --- per-tap B address(es): v_addr_b = v_addr_b_base + (iy*x+ix)*gemm_k*{self.data_byte} bytes ---")
             self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_iy()}], s[{s.s_x()}]")
             self._emit(f"s_add_i32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], s[{s.s_ix()}]   ; tap linear index")
             self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], s[{s.s_gemm_k()}]")
             self._emit(f"s_lshl_b32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], {utility_log2(self.data_byte)}   ; tap byte offset")
-            self._emit(f"v_add_co_u32 v[{v.v_addr_b()}], vcc_lo, s[{s.s_tmp(2)}], v[{v.v_addr_b_base()}]")
-            self._emit(f"v_add_co_ci_u32 v[{v.v_addr_b(1)}], vcc_lo, 0, v[{v.v_addr_b_base(1)}], vcc_lo")
+            for i in range(self.row_repeat_b):
+                self._emit(f"v_add_co_u32 v[{v.v_addr_b(i*2)}], vcc_lo, s[{s.s_tmp(2)}], v[{v.v_addr_b_base(i*2)}]")
+                self._emit(f"v_add_co_ci_u32 v[{v.v_addr_b(i*2+1)}], vcc_lo, 0, v[{v.v_addr_b_base(i*2+1)}], vcc_lo")
             self._emit_empty_line()
 
     def emit_kernel_tap_loop(self):
@@ -951,7 +965,13 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
 
     def global_load_b_functor(self):
         ''' See global_load_a_functor's docstring -- B is untransposed too, same treatment
-        (Phase 13: no masking needed for B, mirrors the non-async path's v_flag=None). '''
+        (Phase 13: no masking needed for B, mirrors the non-async path's v_flag=None).
+
+        row_repeat_b > 1 (non-async only, asserted mutually exclusive in __init__): only row
+        0 gets this early-issue/overlap slot -- rows 1..row_repeat_b-1 have no v_gld_b of
+        their own to reuse safely while row 0's early load is still in flight (same reasoning
+        as row_repeat_a's rows 1+, see global_load_a_functor's docstring), so they are handled
+        entirely inside shared_store_b_functor instead. '''
         outer = self
         class functor_t:
             def __call__(self):
@@ -990,12 +1010,20 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         return functor_t()
 
     def shared_store_b_functor(self):
+        ''' row_repeat_b > 1: row 0 uses the exact row_repeat_b==1 code path (unchanged);
+        rows 1..row_repeat_b-1 (no early-issue slot of their own -- see global_load_b_functor's
+        docstring) are fully deferred via _emit_sst_all_chunks_row, storing into LDS shifted
+        by i*block_size*bytes_per_row past B's own region base (lds_a_size). '''
         outer = self
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
                     outer._emit_sst_remaining_chunks(v.v_gld_b, v.v_addr_b, v.v_sst_os, outer.lds_a_size, v_flag=None)
+                    for i in range(1, outer.row_repeat_b):
+                        row_addr = lambda idx=0, i=i: v.v_addr_b(i * 2 + idx)
+                        row_off  = outer.lds_a_size + i * outer.tunable.block_size * outer.bytes_per_row
+                        outer._emit_sst_all_chunks_row(v.v_gld_b, row_addr, v.v_sst_os, row_off, v_flag=None)
                 return outer._get_deferred()
             def get_issues(self):
                 return outer.chunk_num_dwordx4
@@ -1074,6 +1102,10 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         return functor_t()
 
     def move_slice_window_b_functor(self):
+        ''' row_repeat_b > 1: every row's v_addr_b pair advances independently by the same
+        per-K-substep stride -- see move_slice_window_a_functor's docstring for the identical
+        reasoning on the A side. row_repeat_b==1 for every existing config: the loop runs
+        once with i=0, byte-identical. '''
         outer = self
         class functor_t:
             def __call__(self):
@@ -1082,8 +1114,9 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                     if outer.tunable.async_global_load:
                         outer._emit(f"v_add_u32 v[{v.v_off_b()}], {outer.bytes_per_row}, v[{v.v_off_b()}]")
                     else:
-                        outer._emit(f"v_add_co_u32 v[{v.v_addr_b()}], vcc_lo, {outer.bytes_per_row}, v[{v.v_addr_b()}]")
-                        outer._emit(f"v_add_co_ci_u32 v[{v.v_addr_b(1)}], vcc_lo, 0, v[{v.v_addr_b(1)}], vcc_lo")
+                        for i in range(outer.row_repeat_b):
+                            outer._emit(f"v_add_co_u32 v[{v.v_addr_b(i*2)}], vcc_lo, {outer.bytes_per_row}, v[{v.v_addr_b(i*2)}]")
+                            outer._emit(f"v_add_co_ci_u32 v[{v.v_addr_b(i*2+1)}], vcc_lo, 0, v[{v.v_addr_b(i*2+1)}], vcc_lo")
                 return outer._get_deferred()
         return functor_t()
 

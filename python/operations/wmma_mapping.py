@@ -240,6 +240,12 @@ ctrl_wmma_mapping_table = {
         # accumulate_a/b/c magnitudes as the 128x128 entry (same wave_repeat_m/n=4/4), just a
         # different waves_per_n split.
         ctrl_wmma_mapping_t(128, 64,  16, 16, 2, 4, 4, v_wmma_f32_16x16x32_f16),
+        # Mirror shape (2026-08-25): waves_per_m=1, waves_per_n=2, waves=2 -> block_size=64.
+        # block_size == gemm_m_per_block(64) already (A needs zero changes), but block_size <
+        # gemm_n_per_block(128) -- B's global-load needs the row_repeat_b=2 generalization
+        # (see igemm_fwd_gtc_wmma_nhwc.py). B needs no flag/masking (weight is never OOB), so
+        # this mirror was materially simpler to implement than the 128x64 entry's A-side work.
+        ctrl_wmma_mapping_t(64,  128, 16, 16, 2, 4, 4, v_wmma_f32_16x16x32_f16),
     ],
     'bf16': [
         ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x32_bf16),
