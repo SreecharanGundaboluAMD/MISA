@@ -287,7 +287,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             # -- no Y,X dependence), reset into v_addr_a fresh at the start of every tap since
             # move_slice_window_a incrementally bumps v_addr_a across a tap's own K-loop.
             self.v_addr_a_base = sym_t('v_addr_a_base' , vseq(2, 2))
-            self.v_addr_out    = sym_t('v_addr_out'    , vseq(1))    # scratch used by coalescing_store_wmma
+            self.v_addr_out    = sym_t('v_addr_out'    , vseq(2))    # scratch used by coalescing_store_wmma (ping-pong pair)
             self.v_sst_os      = sym_t('v_sst_os'      , vseq(1))    # shared store offset (same for A/B region)
             self.v_sld_a_os    = sym_t('v_sld_a_os'    , vseq(1))    # transposed byte offset (side='m')
             self.v_sld_b_os    = sym_t('v_sld_b_os'    , vseq(1))    # transposed byte offset (side='n')
@@ -639,7 +639,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_lshl_b32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], 2   ; tap byte offset")
         self._emit(f"s_add_u32 s[{s.s_p_out_tap()}], s[{s.s_p_out()}], s[{s.s_tmp(2)}]")
         self._emit(f"s_addc_u32 s[{s.s_p_out_tap(1)}], s[{s.s_p_out(1)}], 0")
-        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out.label, s.s_tmp()))
+        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp()))
         self._emit(f"s_wait_storecnt 0x0")
         self._emit_empty_line()
 

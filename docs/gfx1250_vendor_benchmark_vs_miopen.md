@@ -273,3 +273,13 @@ lever. A wider search (more candidates, or an adaptive bracket instead of a fixe
 is very likely to close more of the remaining gap; see the layout doc's Phase 18 for the
 tradeoff (search cost scales with candidate count, same as it does for the mature XDLOPS path's
 own `gks_iterative`). Same GPU-contention caveat as the rest of this doc applies throughout.
+
+## Update (2026-08-25): epilogue address double-buffering tried, no measured change
+
+Also tried double-buffering the epilogue's address computation (`docs/gfx1250_wmma_layout.md`'s
+Phase 19), after confirming via the CDNA5 ISA doc that fp32 atomic-add can't be vectorized/
+widened at the instruction level on this hardware. Re-ran all 10 shapes — numbers were
+indistinguishable from the Phase 18 table above (within normal run-to-run noise). Kept the
+change (it's correctness-neutral and removes a real hazard) but it isn't the lever that matters
+here: the atomic RMW round-trip latency, not the surrounding address arithmetic, is almost
+certainly what dominates the atomic epilogue's cost.

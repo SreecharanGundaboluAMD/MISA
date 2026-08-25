@@ -1896,3 +1896,40 @@ of this gap needs closing, at the cost of more `run()` wall-clock time per tunin
 
 - `driver/igemm_wrw_gtc_driver.h` -- `largest_divisor_leq`, the `gsplit_candidates` list, and
   the per-candidate launch-and-keep-best loop in the WMMA `run()` branch
+
+## Phase 19 (2026-08-25): epilogue address double-buffering -- correctness-neutral, no measured perf change
+
+Investigated "vectorize/batch the atomic epilogue" as a further lever after Phase 18. First
+checked the ISA directly (`amd-instinct-cdna5-instruction-set-architecture.md`, this session's
+first use of it): gfx1250/CDNA5 has **no wide/packed fp32 atomic-add** -- only single-dword
+`GLOBAL_ATOMIC_ADD_F32`, plus `GLOBAL_ATOMIC_PK_ADD_F16`/`PK_ADD_BF16` (packed 2x16-bit), which
+don't apply since the WMMA accumulator (and therefore every atomic-add here) is always fp32.
+So literal vectorization -- fewer, wider atomic instructions -- isn't available; each output
+element needs its own atomic no matter what.
+
+What *is* available: `coalescing_store_wmma.py`'s address computation reused a single VGPR
+(`v_tmp1`) across the whole epilogue, so advancing to the next row (`v_tmp1 += row_stride`) had
+a WAR dependency on every store/atomic that had just read the old value -- serializing all
+`wave_repeat_m * num_v_c` row addresses through one register. Changed to a 2-register ping-pong
+(`v_tmp1`/`v_tmp2`): each row's address is precomputed into the register the *current* row's
+stores/atomics are NOT reading, so the address-advance and the in-flight stores/atomics touch
+different registers and have no data dependency on each other. Costs one extra VGPR
+(`v_addr_out` back to 2 registers, same as before the Phase 1 epilogue rewrite that shrank it
+to 1).
+
+**Result: no measurable difference** across all 10 vendor-benchmark shapes (within normal
+run-to-run noise both directions) -- see `docs/gfx1250_vendor_benchmark_vs_miopen.md`. Kept the
+change anyway since it's correctness-neutral (re-verified `valid:y` for fwd/bwd/non-split-wrw/
+gsplit-wrw) and removes a real (if apparently already-hidden) hazard, but the honest conclusion
+is that address-computation overhead was never the bottleneck here -- the atomic RMW round-trip
+latency (L2 and back) almost certainly dominates the epilogue's cost regardless of how cheaply
+the handful of surrounding VALU instructions are scheduled. Confirms the split-count search
+(Phase 18) and, likely, an LDS-reshuffle epilogue for the *non-atomic* store path (fwd/bwd/
+non-split wrw, not attempted here) are better uses of further effort than further epilogue
+micro-optimization on the atomic path specifically.
+
+### Critical files (Phase 19)
+
+- `python/operations/coalescing_store_wmma.py` -- the `v_tmp1`/`v_tmp2` ping-pong
+- `python/igemm/igemm_{fwd,bwd,wrw}_gtc_wmma_nhwc.py` -- `v_addr_out` back to 2 registers,
+  call sites pass both

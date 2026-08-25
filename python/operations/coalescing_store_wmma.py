@@ -63,24 +63,33 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         assert type(ctrl) is ctrl_coalescing_store_wmma_t
         self.ctrl = ctrl
 
-    def __call__(self, v_c, v_gemm_im, v_gemm_in, s_p_out, s_gemm_m_stride, v_tmp1, s_tmp1):
+    def __call__(self, v_c, v_gemm_im, v_gemm_in, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1):
         '''
         v_gemm_im/v_gemm_in: this thread's base (row, col) within the macro tile, from
             igemm_wmma_mapping_t.get_gemm_index_for_dst_matrix (row/col of wave_repeat
             iteration (0,0), vgpr index 0). Byte-address computation and the global
             block offset are left to the caller (this emits only the intra-macro-tile
-            part) -- v_tmp1 needs 1 scratch VGPR, s_tmp1 needs 1 scratch SGPR.
+            part) -- v_tmp1/v_tmp2 need 1 scratch VGPR each, s_tmp1 needs 1 scratch SGPR.
         s_gemm_m_stride: row stride of the output tensor, in elements (typically
             gemm_n, i.e. the full N extent, not just macro_tile_n).
 
-        Emits one global_store_dword per accumulator element -- num_v_c * wave_repeat_m
-        * wave_repeat_n stores per thread, no LDS traffic. Column offset within a
-        wave_repeat_m row (0/64/128/192 bytes for wave_tile_n=16) is folded into the
-        store's immediate offset instead of a per-store address add; consecutive rows
-        within a wave_repeat_m tile are reached by adding a precomputed byte row-stride
-        instead of re-deriving the address with a (quarter-rate) multiply -- so the
-        multiply and the row-base add/shift run once per wave_repeat_m tile (not once
-        per stored element), and the per-i_rn address add is eliminated entirely.
+        Emits one global_store_dword/global_atomic_add_f32 per accumulator element --
+        num_v_c * wave_repeat_m * wave_repeat_n per thread, no LDS traffic. Column offset
+        within a wave_repeat_m row (0/64/128/192 bytes for wave_tile_n=16) is folded into
+        the store's immediate offset instead of a per-store address add; consecutive rows
+        within a wave_repeat_m tile are reached by a precomputed byte row-stride add
+        instead of re-deriving the address with a (quarter-rate) multiply.
+
+        v_tmp1/v_tmp2 ping-pong as the "current row" / "next row" address: the next row's
+        address is computed into the register NOT currently being read by this row's
+        stores/atomics, so that add has no data dependency on the in-flight stores at all
+        (different register) and can be issued/scheduled independently of them, instead of
+        serializing through a single reused address register. Neither instruction blocks
+        on atomic completion either way (the wave doesn't wait for the RMW round-trip
+        merely by issuing the next instruction) -- this only removes the same-register
+        WAR hazard between "advance the address" and "the previous stores/atomics that
+        just read it", which otherwise chains all `wave_repeat_m * num_v_c` row addresses
+        into one serial dependency through a single register.
         '''
         ctrl = self.ctrl
         cxm = ctrl.cxm
@@ -93,14 +102,15 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
             self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], 2   ; row-to-row byte stride")
             for i_rm in range(cxm.wave_repeat_m):
                 row_off = i_rm * cxm.wave_tile_m
-                # v_tmp1 = byte address of (row_off, col 0), i.e. row = v_gemm_im + row_off
-                self._emit(f"v_add_u32 v[{v_tmp1}], {row_off}, v[{v_gemm_im}]" if row_off != 0 else f"v_mov_b32 v[{v_tmp1}], v[{v_gemm_im}]")
-                self._emit(f"v_mul_lo_u32 v[{v_tmp1}], s[{s_gemm_m_stride}], v[{v_tmp1}]")
-                self._emit(f"v_add_u32 v[{v_tmp1}], v[{v_gemm_in}], v[{v_tmp1}]")
-                self._emit(f"v_lshlrev_b32 v[{v_tmp1}], 2, v[{v_tmp1}]  ; byte address, row {row_off}, col 0")
+                cur, nxt = v_tmp1, v_tmp2
+                # cur = byte address of (row_off, col 0), i.e. row = v_gemm_im + row_off
+                self._emit(f"v_add_u32 v[{cur}], {row_off}, v[{v_gemm_im}]" if row_off != 0 else f"v_mov_b32 v[{cur}], v[{v_gemm_im}]")
+                self._emit(f"v_mul_lo_u32 v[{cur}], s[{s_gemm_m_stride}], v[{cur}]")
+                self._emit(f"v_add_u32 v[{cur}], v[{v_gemm_in}], v[{cur}]")
+                self._emit(f"v_lshlrev_b32 v[{cur}], 2, v[{cur}]  ; byte address, row {row_off}, col 0")
                 for j in range(inst_wmma.num_v_c):
-                    if j != 0:
-                        self._emit(f"v_add_u32 v[{v_tmp1}], v[{v_tmp1}], s[{s_tmp1}]   ; advance to row {row_off + j}")
+                    if j != inst_wmma.num_v_c - 1:
+                        self._emit(f"v_add_u32 v[{nxt}], v[{cur}], s[{s_tmp1}]   ; precompute row {row_off + j + 1} address")
                     for i_rn in range(cxm.wave_repeat_n):
                         c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
                         col_off = i_rn * cxm.wave_tile_n * 4
@@ -114,6 +124,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                         # CU, "happened" to pass without it; large tiles, spread across more
                         # CUs, lost updates). See docs/gfx1250_wmma_layout.md.
                         scope_str = " scope:SCOPE_SYS" if ctrl.gemm_k_global_split else ""
-                        self._emit(f"{inst} v[{v_tmp1}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str}{scope_str}")
+                        self._emit(f"{inst} v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str}{scope_str}")
+                    cur, nxt = nxt, cur
             self._emit_empty_line()
         return self._get_deferred()
