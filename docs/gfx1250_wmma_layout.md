@@ -1684,3 +1684,48 @@ why interleaving regresses rather than wins, if a future session wants to pursue
 - `python/igemm/igemm_base.py` -- new `main_loop_interleave` tunable (WMMA branch)
 - `config/igemm_fwd_gtc_gfx1250_nhwc_fp16_interleave.config` -- new config (k-sub-loop +
   double-buffer + interleave combined)
+
+### Phase 16 (2026-08-25): fold `lds_double_buffer`/`async_global_load`/`main_loop_interleave` into the mangled kernel name
+
+Flagged by the user: none of these three WMMA-only optional-mechanism tunables were folded
+into the mangled kernel symbol name (Phase 13's own docstring had already noted this for
+`async_global_load`, just never fixed it). Practical consequence: the interleaved and
+non-interleaved builds of the SAME tile shape (e.g. 128x128x64 fp16) produced an IDENTICAL
+kernel name -- they couldn't coexist as distinct, auto-discoverable kernels in one combined
+kernel object/library the way gfx950/942's many named tile variants do for their auto-tuning
+search; each variant had to be built as a separate artifact and chosen by the caller.
+
+**Fix**: `igemm_gtc_encode_kernel_name` (both the Python side, `igemm_base.py`, and the C++
+driver side, `driver/igemm_gtc_base.h`) now appends `_dbuf`/`_async`/`_interleave` suffixes
+when the corresponding tunable is set -- matching the config-file-naming convention already in
+use (`_dbuf.config`, `_async.config`, `_interleave.config`). Only added when the tunable is
+non-zero, so every existing config (all three at their default 0) gets the exact same name as
+before -- byte-identical regression confirmed for all 15 unaffected configs tested (12 base +
+2 asymmetric shapes + `_k2x`).
+
+**Two-sided fix, not just Python**: the C++ driver (`conv_driver.cpp`, via `host_driver()`'s
+`-DIGEMM_CONFIG_FILE` build-time define) independently RE-PARSES the same `.config` file and
+RE-COMPUTES the kernel name at runtime via its own `igemm_gtc_encode_kernel_name` in
+`driver/igemm_gtc_base.h`, then looks the kernel up by that computed name via
+`hipModuleGetFunction`. Before this phase, `igemm_gtc_tunable_t` (the C++ struct) didn't even
+have fields for these three tunables, so the C++ side would keep computing the OLD (un-suffixed)
+name while Python's `.s` output now had the NEW (suffixed) symbol -- a name mismatch that would
+break `hipModuleGetFunction` outright. Fixed by adding the three fields to the struct, parsing
+them from the config section (mirroring the existing `sec.count(...) > 0 ? ... : 0` pattern
+used for `vector_store`/`gemm_k_global_split`/etc.), and mirroring the exact same suffix logic
+in the C++ encode function. **Any future WMMA tunable that should be name-mangled needs this
+same two-sided treatment** -- a Python-only fix would silently break the driver for any config
+that sets the tunable.
+
+**Validated on real hardware, end-to-end**: rebuilt and re-ran the `_interleave` config (now
+named `..._dbuf_interleave`) through the full degenerate + multi-K-block battery -- both
+`valid:y`, confirming `hipModuleGetFunction` correctly resolves the new suffixed name. Spot-
+checked `_async` (fwd) the same way. Confirmed via `.globl` inspection that `_dbuf`, `_k2x_dbuf`,
+`_async` (fwd and bwd) each now produce a distinct, correctly-suffixed symbol name.
+
+### Critical files (Phase 16)
+
+- `python/igemm/igemm_base.py` -- `igemm_gtc_encode_kernel_name`'s new suffix block
+- `driver/igemm_gtc_base.h` -- `igemm_gtc_tunable_t`'s three new fields, their parsing in
+  `igemm_gtc_tunable_from_config`, and the mirrored suffix block in
+  `igemm_gtc_encode_kernel_name`

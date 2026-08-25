@@ -149,6 +149,14 @@ typedef struct {
     int gemm_k_global_split;
     int merge_e;
     int vector_c;
+    // gfx1250 WMMA-only optional mechanisms (Phase 13/15) -- default 0, unused/ignored for
+    // every other fma_type. Must be folded into igemm_gtc_encode_kernel_name below (mirroring
+    // igemm_base.py's igemm_gtc_encode_kernel_name) so the C++ driver's name computation
+    // agrees with what the Python codegen actually named the kernel symbol -- otherwise
+    // hipModuleGetFunction looks up the wrong (un-suffixed) name and fails to find it.
+    int lds_double_buffer;
+    int async_global_load;
+    int main_loop_interleave;
 } igemm_gtc_tunable_t;
 
 static inline std::string get_igemm_gtc_fma_type(std::string arch_string, const config_section_t &sec){
@@ -209,6 +217,9 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.wave_step_n              = 0;
                 tunable.wave_repeat_n            = sec.at("wmma_repeat_n").get_int();
                 tunable.wave_tile_k              = 0;
+                tunable.lds_double_buffer        = sec.count("lds_double_buffer") > 0 ? sec.at("lds_double_buffer").get_int() : 0;
+                tunable.async_global_load        = sec.count("async_global_load") > 0 ? sec.at("async_global_load").get_int() : 0;
+                tunable.main_loop_interleave     = sec.count("main_loop_interleave") > 0 ? sec.at("main_loop_interleave").get_int() : 0;
             }
             else{
                 tunable.wave_tile_m              = sec.at("wave_tile_m").get_int();
@@ -394,11 +405,21 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
     }
 
     kernel_name +=
-            "ta" + utility_int_list_to_string(tensor_a_thread_lengths) + "_" + 
-                    utility_int_list_to_string(tensor_a_cluster_lengths)+ "_" + 
-            "tb" + utility_int_list_to_string(tensor_b_thread_lengths) + "_" + 
+            "ta" + utility_int_list_to_string(tensor_a_thread_lengths) + "_" +
+                    utility_int_list_to_string(tensor_a_cluster_lengths)+ "_" +
+            "tb" + utility_int_list_to_string(tensor_b_thread_lengths) + "_" +
                     utility_int_list_to_string(tensor_b_cluster_lengths);
     // printf("[%s]\n",kernel_name.c_str());
+    // Phase 16: mirrors igemm_base.py's igemm_gtc_encode_kernel_name -- must stay in sync,
+    // see this struct's lds_double_buffer/async_global_load/main_loop_interleave comment.
+    if(tunable->fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA){
+        if(tunable->lds_double_buffer)
+            kernel_name += std::string("_dbuf");
+        if(tunable->async_global_load)
+            kernel_name += std::string("_async");
+        if(tunable->main_loop_interleave)
+            kernel_name += std::string("_interleave");
+    }
     if(tensor_a_pass_through)
         kernel_name += std::string("_pta");
     if(tensor_b_pass_through)

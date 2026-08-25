@@ -875,6 +875,24 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
     kernel_name +=       "ta" + lengths_str(tunable.tensor_a_thread_lengths) + "_" + lengths_str(tunable.tensor_a_cluster_lengths) + "_" +\
                          "tb" + lengths_str(tunable.tensor_b_thread_lengths) + "_" + lengths_str(tunable.tensor_b_cluster_lengths)
 
+    # Phase 16: gfx1250 WMMA optional-mechanism tunables were previously NOT folded into the
+    # mangled kernel name (Phase 13's own docstring already flagged this for async_global_load)
+    # -- meaning e.g. the interleaved and non-interleaved builds of the SAME tile shape produced
+    # IDENTICAL kernel names, so they couldn't coexist as distinct, auto-discoverable kernels in
+    # one combined kernel object the way gfx950/942's many named tile variants do. Suffixes
+    # match the established _dbuf/_async/_interleave config-file-naming convention already in
+    # use. Only added when the tunable is actually set (every existing config has all three at
+    # their default 0), so every existing kernel name is unaffected -- this only changes the
+    # name for configs that opt into one of these mechanisms, which by construction (Phase 13/
+    # 15's docstrings) is only the small number of _dbuf/_async/_k2x_dbuf/_interleave configs.
+    if tunable.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA:
+        if tunable.lds_double_buffer:
+            kernel_name += "_dbuf"
+        if tunable.async_global_load:
+            kernel_name += "_async"
+        if tunable.main_loop_interleave:
+            kernel_name += "_interleave"
+
     if tunable.tensor_a_pass_through:
         kernel_name += "_pta"
 
