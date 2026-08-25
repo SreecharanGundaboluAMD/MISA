@@ -46,6 +46,15 @@ class ctrl_coalescing_store_wmma_t(object):
         self.cxm = None              # ctrl_wmma_mapping_t
         self.block_size = 256
         self.precision = 'fp32'      # accumulator precision as stored to global memory
+        # when set, this thread's macro tile is only a PARTIAL sum over a slice of the
+        # reduction (K) axis -- other workgroups hold the other slices and atomically add
+        # into the same output elements, so the store must accumulate (global_atomic_add_f32)
+        # rather than overwrite (global_store_dword). See gemm_k_global_split in
+        # docs/gfx1250_wmma_layout.md -- correct for every precision because the WMMA output
+        # buffer is always allocated fp32 regardless of the tunable's nominal precision
+        # (conv_driver.cpp's is_wmma dtype_alloc_byte override), so there is no fp16/bf16
+        # atomic-add precision concern and no workspace/cast step needed.
+        self.gemm_k_global_split = False
 
 
 class igemm_coalescing_store_wmma_t(mc_base_t):
@@ -54,18 +63,24 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         assert type(ctrl) is ctrl_coalescing_store_wmma_t
         self.ctrl = ctrl
 
-    def __call__(self, v_c, v_gemm_im, v_gemm_in, s_p_out, s_gemm_m_stride, v_tmp2):
+    def __call__(self, v_c, v_gemm_im, v_gemm_in, s_p_out, s_gemm_m_stride, v_tmp1, s_tmp1):
         '''
         v_gemm_im/v_gemm_in: this thread's base (row, col) within the macro tile, from
             igemm_wmma_mapping_t.get_gemm_index_for_dst_matrix (row/col of wave_repeat
             iteration (0,0), vgpr index 0). Byte-address computation and the global
             block offset are left to the caller (this emits only the intra-macro-tile
-            part) -- v_tmp2 needs 2 scratch VGPRs.
+            part) -- v_tmp1 needs 1 scratch VGPR, s_tmp1 needs 1 scratch SGPR.
         s_gemm_m_stride: row stride of the output tensor, in elements (typically
             gemm_n, i.e. the full N extent, not just macro_tile_n).
 
         Emits one global_store_dword per accumulator element -- num_v_c * wave_repeat_m
-        * wave_repeat_n stores per thread, no LDS traffic.
+        * wave_repeat_n stores per thread, no LDS traffic. Column offset within a
+        wave_repeat_m row (0/64/128/192 bytes for wave_tile_n=16) is folded into the
+        store's immediate offset instead of a per-store address add; consecutive rows
+        within a wave_repeat_m tile are reached by adding a precomputed byte row-stride
+        instead of re-deriving the address with a (quarter-rate) multiply -- so the
+        multiply and the row-base add/shift run once per wave_repeat_m tile (not once
+        per stored element), and the per-i_rn address add is eliminated entirely.
         '''
         ctrl = self.ctrl
         cxm = ctrl.cxm
@@ -75,19 +90,30 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         with self._deferred_context():
             self._emit(f"; wmma direct store epilogue, {cxm.wave_repeat_m}x{cxm.wave_repeat_n} tiles, "
                        f"{inst_wmma.num_v_c} rows/tile")
+            self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], 2   ; row-to-row byte stride")
             for i_rm in range(cxm.wave_repeat_m):
-                for i_rn in range(cxm.wave_repeat_n):
-                    c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c
-                    for j in range(inst_wmma.num_v_c):
-                        # row = v_gemm_im + i_rm*wave_tile_m + j ; col = v_gemm_in + i_rn*wave_tile_n
-                        row_off = i_rm * cxm.wave_tile_m + j
-                        col_off = i_rn * cxm.wave_tile_n
-                        self._emit(f"v_add_u32 v[{v_tmp2}], {row_off}, v[{v_gemm_im}]" if row_off != 0 else f"v_mov_b32 v[{v_tmp2}], v[{v_gemm_im}]")
-                        self._emit(f"v_mul_lo_u32 v[{v_tmp2}], s[{s_gemm_m_stride}], v[{v_tmp2}]")
-                        if col_off != 0:
-                            self._emit(f"v_add_u32 v[{v_tmp2}], {col_off}, v[{v_tmp2}]")
-                        self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_gemm_in}], v[{v_tmp2}]")
-                        self._emit(f"v_lshlrev_b32 v[{v_tmp2}], 2, v[{v_tmp2}]  ; *4 bytes (fp32 out)")
-                        self._emit(f"global_store_dword v[{v_tmp2}], v[{v_c}+{c_index + j}], s[{s_p_out}:{s_p_out}+1]")
+                row_off = i_rm * cxm.wave_tile_m
+                # v_tmp1 = byte address of (row_off, col 0), i.e. row = v_gemm_im + row_off
+                self._emit(f"v_add_u32 v[{v_tmp1}], {row_off}, v[{v_gemm_im}]" if row_off != 0 else f"v_mov_b32 v[{v_tmp1}], v[{v_gemm_im}]")
+                self._emit(f"v_mul_lo_u32 v[{v_tmp1}], s[{s_gemm_m_stride}], v[{v_tmp1}]")
+                self._emit(f"v_add_u32 v[{v_tmp1}], v[{v_gemm_in}], v[{v_tmp1}]")
+                self._emit(f"v_lshlrev_b32 v[{v_tmp1}], 2, v[{v_tmp1}]  ; byte address, row {row_off}, col 0")
+                for j in range(inst_wmma.num_v_c):
+                    if j != 0:
+                        self._emit(f"v_add_u32 v[{v_tmp1}], v[{v_tmp1}], s[{s_tmp1}]   ; advance to row {row_off + j}")
+                    for i_rn in range(cxm.wave_repeat_n):
+                        c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
+                        col_off = i_rn * cxm.wave_tile_n * 4
+                        offset_str = f" offset:{col_off}" if col_off != 0 else ""
+                        inst = "global_atomic_add_f32" if ctrl.gemm_k_global_split else "global_store_dword"
+                        # scope:SCOPE_SYS is load-bearing, not decoration: a bare
+                        # global_atomic_add_f32 defaults to a narrower (CU/WGP-local) cache
+                        # scope on gfx1250, which silently drops updates when the two
+                        # accumulating workgroups land on different compute units --
+                        # confirmed on hardware (small tiles, which pack more workgroups per
+                        # CU, "happened" to pass without it; large tiles, spread across more
+                        # CUs, lost updates). See docs/gfx1250_wmma_layout.md.
+                        scope_str = " scope:SCOPE_SYS" if ctrl.gemm_k_global_split else ""
+                        self._emit(f"{inst} v[{v_tmp1}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str}{scope_str}")
             self._emit_empty_line()
         return self._get_deferred()

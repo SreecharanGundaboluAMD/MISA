@@ -364,7 +364,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 # Phase 5d: B's fixed per-thread row base(s) (before this tap's column offset
                 # is added) -- computed once from the *y*x*c* row stride, reused every tap.
                 self.v_addr_b_base = sym_t('v_addr_b_base' , vseq(2 * outer.row_repeat_b, 2))
-            self.v_addr_out    = sym_t('v_addr_out'    , vseq(2, 2))    # scratch used by coalescing_store_wmma
+            self.v_addr_out    = sym_t('v_addr_out'    , vseq(1))    # scratch used by coalescing_store_wmma
             self.v_sst_os      = sym_t('v_sst_os'      , vseq(1))    # shared store offset (same for A/B region)
             self.v_sld_a_os    = sym_t('v_sld_a_os'    , vseq(1))
             self.v_sld_b_os    = sym_t('v_sld_b_os'    , vseq(1))
@@ -1235,7 +1235,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         s = self.sgpr
         # s_out_k_total (=gemm_n*group) is the output tensor's TOTAL row stride (see class
         # docstring's group>1 note) -- s_gemm_n alone (per-group) is only correct for group=1.
-        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_k_total.label, v.v_addr_out.label))
+        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_k_total.label, v.v_addr_out.label, s.s_tmp()))
         self._emit(f"s_wait_storecnt 0x0")
 
     def emit_kernel_body(self):

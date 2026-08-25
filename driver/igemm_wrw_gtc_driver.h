@@ -95,6 +95,9 @@ typedef struct {
     int   dilation_h;
     int   dilation_w;
     int   group;
+    int   gemm_k_per_wg;    // gemm_k_global_split: this workgroup's K-slice length. Always
+                             // present (even for non-split kernels, which never read it) --
+                             // see python/igemm/igemm_wrw_gtc_wmma_nhwc.py's karg comment.
 } __attribute__((packed)) igemm_wrw_gtc_wmma_nhwc_karg_t;
 
 static void dump_wrw_karg(igemm_wrw_gtc_karg_t * karg){
@@ -715,6 +718,41 @@ public:
             int gemm_n = c / group;
             int gemm_k = n * ho * wo;
 
+            size_t grid_x = utility_integer_divide_ceil(gemm_m, tunable->gemm_m_per_block);
+            // group is folded into grid_y, decoded on-device -- see igemm_fwd_gtc_driver.h's
+            // identical WMMA branch for the rationale.
+            size_t grid_y = static_cast<size_t>(group) * utility_integer_divide_ceil(gemm_n, tunable->gemm_n_per_block);
+
+            // gemm_k_global_split: split the reduction axis across grid.z, atomically
+            // accumulating partial sums (see igemm_wrw_gtc_wmma_nhwc.py / docs/
+            // gfx1250_wmma_layout.md). `largest_divisor_leq` finds the largest divisor of
+            // num_k_blocks <= a target split count (so every split gets an identical, exact
+            // multiple of gemm_k_per_block -- the WMMA main loop has no K-tail handling).
+            // Rather than trusting one heuristic target, we bracket it with a small runtime
+            // search (mirroring the XDLOPS path's gks_iterative, just over a handful of
+            // candidates instead of a full sweep) and time each candidate for real, keeping
+            // whichever actually ran fastest.
+            auto largest_divisor_leq = [](int num_k_blocks, int target) -> int {
+                for (int s = std::min(std::max(target, 1), num_k_blocks); s >= 1; s--) {
+                    if (num_k_blocks % s == 0) return s;
+                }
+                return 1;
+            };
+            std::vector<int> gsplit_candidates;
+            if (tunable->gemm_k_global_split) {
+                int num_k_blocks = gemm_k / tunable->gemm_k_per_block;
+                int target_splits = static_cast<int>(utility_integer_divide_ceil(
+                    this->num_cu, static_cast<int>(grid_x * grid_y)));
+                std::vector<int> targets = {target_splits, target_splits / 2, target_splits * 2};
+                for (int t : targets) {
+                    int s = largest_divisor_leq(num_k_blocks, t);
+                    if (std::find(gsplit_candidates.begin(), gsplit_candidates.end(), s) == gsplit_candidates.end())
+                        gsplit_candidates.push_back(s);
+                }
+            } else {
+                gsplit_candidates.push_back(1);
+            }
+
             igemm_wrw_gtc_wmma_nhwc_karg_t karg;
             karg.p_in     = p_out;   // grad_output (read)
             karg.p_wei    = p_in;    // input (read)
@@ -749,14 +787,9 @@ public:
 #endif
 
             size_t block_size = get_block_size(tunable);
-            size_t grid_x = utility_integer_divide_ceil(gemm_m, tunable->gemm_m_per_block);
-            // group is folded into grid_y, decoded on-device -- see igemm_fwd_gtc_driver.h's
-            // identical WMMA branch for the rationale.
-            size_t grid_y = static_cast<size_t>(group) * utility_integer_divide_ceil(gemm_n, tunable->gemm_n_per_block);
 
             result_t result;
             result.kernel_name = kernel_name;
-            result.dumpdata.clear();
             memset(&result.dumpheader, 0, sizeof(result.dumpheader));
             result.dumpheader.conv.hi = hi;
             result.dumpheader.conv.wi = wi;
@@ -767,23 +800,48 @@ public:
             result.dumpheader.conv.dir = convdir_t::WRW;
             result.dumpheader.conv.dtype = dtype(tunable->precision);
 
-            std::vector<igemm_launch_kernel_t> kernel_launchers;
-            kernel_launchers.push_back({kernel_func, &karg, karg_size, {grid_x * block_size, grid_y, 1}, {block_size, 1, 1}});
-            result.dumpheader.n_dispatches = kernel_launchers.size();
-            result.dumpheader.gks = 0;
-            result.dumpdata.push_back(kernel_launchers.back());
-            result.dumpdata.back().ktype = kargtype_t::igemm_wrw_gtc_wmma_nhwc_karg_t;
-
             auto noop = std::function<float()>{[&]() -> float { return .0; }};
-            float duration = igemm_launch_kernels(kernel_launchers, noop, noop, this->warmup, this->repeat);
+            // Atomics accumulate rather than overwrite -- the output must be re-zeroed before
+            // EVERY dispatch (warmup and each timed repeat), not just once before the whole
+            // benchmark loop, or the 2nd+ iteration's atomic-adds land on top of the 1st
+            // iteration's already-written result. WMMA output is always allocated/written as
+            // fp32 regardless of the tunable's nominal precision (conv_driver.cpp's is_wmma
+            // dtype_alloc_byte override, and this kernel's D-operand-always-4-bytes epilogue),
+            // so zero by element count * sizeof(float), not data_byte.
+            auto wrw_gsplit_prolog = std::function<float()>{[&]() -> float {
+                if (tunable->gemm_k_global_split)
+                    HIP_CALL(hipMemset(p_wei, 0, static_cast<size_t>(group) * (k / group) * (c / group) * y * x * sizeof(float)));
+                return .0;
+            }};
 
             std::string dump_dir = env_get_str("IGEMM_DUMPDIR_ALL", "");
-            if (dump_dir.size())
-                dump_shader_args(dump_dir, result.dumpheader, result.dumpdata, result.kernel_name);
+            int num_k_blocks = gemm_k / tunable->gemm_k_per_block;
+            float min_duration = FLT_MAX;
+            int selected_splits = 1;
+            for (int splits : gsplit_candidates) {
+                karg.gemm_k_per_wg = (num_k_blocks / splits) * tunable->gemm_k_per_block;
+                size_t grid_z = static_cast<size_t>(splits);
+
+                result.dumpdata.clear();
+                std::vector<igemm_launch_kernel_t> kernel_launchers;
+                kernel_launchers.push_back({kernel_func, &karg, karg_size, {grid_x * block_size, grid_y, grid_z}, {block_size, 1, 1}});
+                result.dumpheader.n_dispatches = kernel_launchers.size();
+                result.dumpheader.gks = splits;
+                result.dumpdata.push_back(kernel_launchers.back());
+                result.dumpdata.back().ktype = kargtype_t::igemm_wrw_gtc_wmma_nhwc_karg_t;
+
+                float duration = igemm_launch_kernels(kernel_launchers, wrw_gsplit_prolog, noop, this->warmup, this->repeat);
+                if (dump_dir.size())
+                    dump_shader_args(dump_dir, result.dumpheader, result.dumpdata, result.kernel_name);
+                if (duration < min_duration) {
+                    min_duration = duration;
+                    selected_splits = splits;
+                }
+            }
 
             result.return_code = 0;
-            result.duration_ms = duration;
-            result.gks = 0;
+            result.duration_ms = min_duration;
+            result.gks = selected_splits;
 #ifdef IGEMM_SPLIT_KERNEL
             HIP_CALL(hipModuleUnload(cur_kernel_module));
 #endif

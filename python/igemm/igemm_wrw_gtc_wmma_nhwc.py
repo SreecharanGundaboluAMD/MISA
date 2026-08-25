@@ -168,6 +168,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_coalescing_store_wmma.cxm = ctrl_wmma_mapping
         ctrl_coalescing_store_wmma.block_size = tunable.block_size
         ctrl_coalescing_store_wmma.precision = tunable.precision
+        ctrl_coalescing_store_wmma.gemm_k_global_split = tunable.gemm_k_global_split
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
 
         # A-region (grad_output) and B-region (input): both natural [GEMM_K rows][M or N
@@ -250,6 +251,13 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self.s_a_k_stride  = sym_t('s_a_k_stride'  , sseq(1))   # K_out*databyte*gemm_k_per_block: grad_output's per-K-block global stride
             self.s_kitr        = sym_t('s_kitr'        , sseq(1))
             self.s_knum        = sym_t('s_knum'        , sseq(1))
+            # gemm_k_global_split (K-split across grid.z): only loaded/used when
+            # outer.tunable.gemm_k_global_split is set, but always declared for a uniform
+            # register layout between split and non-split kernel variants -- see class
+            # docstring / docs/gfx1250_wmma_layout.md.
+            self.s_bz             = sym_t('s_bz'             , sseq(1))   # workgroup_id_z -> this workgroup's K-slice index
+            self.s_gemm_k_per_wg  = sym_t('s_gemm_k_per_wg'  , sseq(1))   # kernarg: this workgroup's K-slice length
+            self.s_gemm_k_wg_off  = sym_t('s_gemm_k_wg_off'  , sseq(1))   # = s_bz * s_gemm_k_per_wg
             self.s_tmp         = sym_t('s_tmp'         , sseq(4))
             self.s_end         = sym_t('s_end'         , sseq())
 
@@ -279,7 +287,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             # -- no Y,X dependence), reset into v_addr_a fresh at the start of every tap since
             # move_slice_window_a incrementally bumps v_addr_a across a tap's own K-loop.
             self.v_addr_a_base = sym_t('v_addr_a_base' , vseq(2, 2))
-            self.v_addr_out    = sym_t('v_addr_out'    , vseq(2, 2))    # scratch used by coalescing_store_wmma
+            self.v_addr_out    = sym_t('v_addr_out'    , vseq(1))    # scratch used by coalescing_store_wmma
             self.v_sst_os      = sym_t('v_sst_os'      , vseq(1))    # shared store offset (same for A/B region)
             self.v_sld_a_os    = sym_t('v_sld_a_os'    , vseq(1))    # transposed byte offset (side='m')
             self.v_sld_b_os    = sym_t('v_sld_b_os'    , vseq(1))    # transposed byte offset (side='n')
@@ -329,6 +337,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # the full rationale (A/B need the tensor's TOTAL channel count for their per-pixel
         # row stride, which requires knowing group itself; output needs no equivalent fix).
         kas.append(amdgpu_kernel_arg_t('group'     , 4, 84, 'by_value', 'i32'))
+        # gemm_k_global_split: this workgroup's K-slice length (N*Ho*Wo/splits, an exact
+        # multiple of gemm_k_per_block by construction -- see driver-side split-count
+        # policy). Always present in the karg layout (even for non-split kernels, which
+        # simply never load it) so both variants share one struct on the driver side.
+        kas.append(amdgpu_kernel_arg_t('gemm_k_per_wg', 4, 88, 'by_value', 'i32'))
         return kas
 
     def get_kernel_code(self):
@@ -338,7 +351,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             'enable_sgpr_workgroup_id_y'       :   1,
             'enable_vgpr_workitem_id'          :   0,
             'workgroup_group_segment_byte_size':   self.lds_single_size * self.lds_buffer_num,
-            'kernarg_segment_byte_size'         :   88,
+            'kernarg_segment_byte_size'         :   92,
             'wavefront_sgpr_count'              :   self.sgpr.s_end.value + 2 * 3,
             'workitem_vgpr_count'               :   self.vgpr.v_end.value,
             'wavefront_size'                    :   32,
@@ -417,11 +430,26 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_load_dword s[{s.s_dilation_h()}], s[{s.s_ka()}:{s.s_ka(1)}], 76")
         self._emit(f"s_load_dword s[{s.s_dilation_w()}], s[{s.s_ka()}:{s.s_ka(1)}], 80")
         self._emit(f"s_load_dword s[{s.s_group()}], s[{s.s_ka()}:{s.s_ka(1)}], 84")
+        if self.tunable.gemm_k_global_split:
+            self._emit(f"s_load_dword s[{s.s_gemm_k_per_wg()}], s[{s.s_ka()}:{s.s_ka(1)}], 88")
         self._emit(f"v_mov_b32 v[{v.v_tid()}], v0")
         # gfx1250 delivers workgroup id via ttmp9/ttmp7 -- see docs/gfx1250_wmma_layout.md.
+        # ttmp9 is a clean, unpacked blockIdx.x. ttmp7 PACKS blockIdx.y (low 16 bits) and
+        # blockIdx.z (high 16 bits) -- confirmed by an inline-asm probe comparing raw ttmp
+        # reads against the compiler's own blockIdx ground truth on real hardware (see
+        # docs/gfx1250_wmma_layout.md's gemm_k_global_split phase). A plain `s_mov_b32
+        # s_by, ttmp7` (as every other WMMA kernel still does) is only correct when grid.z
+        # is always 1 -- true everywhere except this kernel's split variant, which is why
+        # only this decode needs the mask/shift split.
         self._emit(f"s_mov_b32 s[{s.s_bx()}], ttmp9")
-        self._emit(f"s_mov_b32 s[{s.s_by()}], ttmp7")
+        if self.tunable.gemm_k_global_split:
+            self._emit(f"s_and_b32 s[{s.s_by()}], ttmp7, 0xffff")
+            self._emit(f"s_lshr_b32 s[{s.s_bz()}], ttmp7, 16")
+        else:
+            self._emit(f"s_mov_b32 s[{s.s_by()}], ttmp7")
         self._emit(f"s_wait_kmcnt 0x0")
+        if self.tunable.gemm_k_global_split:
+            self._emit(f"s_mul_i32 s[{s.s_gemm_k_wg_off()}], s[{s.s_bz()}], s[{s.s_gemm_k_per_wg()}]   ; this workgroup's K-slice base")
         self._emit_empty_line()
 
         m_int_div_rem_vs = macro_int_div_rem_vs_gfx1250_t(self.mc)
@@ -463,7 +491,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
 
         self._emit(f"s_lshl_b32 s[{s.s_block_m_off()}], s[{s.s_bx()}], {utility_log2(self.tunable.gemm_m_per_block)}   ; *gemm_m_per_block")
         self._emit(f"s_lshl_b32 s[{s.s_block_n_off()}], s[{s.s_by()}], {utility_log2(self.tunable.gemm_n_per_block)}   ; *gemm_n_per_block")
-        self._emit(f"s_mov_b32 s[{s.s_knum()}], s[{s.s_gemm_k()}]")
+        if self.tunable.gemm_k_global_split:
+            self._emit(f"s_mov_b32 s[{s.s_knum()}], s[{s.s_gemm_k_per_wg()}]   ; this workgroup only reduces its own K-slice")
+        else:
+            self._emit(f"s_mov_b32 s[{s.s_knum()}], s[{s.s_gemm_k()}]")
         # A's per-K-block (32 rows) global stride depends on a runtime tensor extent (K_out) --
         # unlike fwd's compile-time-constant +64 bytes. B has no equivalent constant stride
         # anymore (Phase 5c): its address is recomputed fresh every iteration (see
@@ -514,6 +545,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], {col_start_shift}, v[{v.v_tmp(1)}]      ; col_start = col_group*{self.tunable.gemm_k_per_block}")
         self._emit(f"v_add_u32 v[{v.v_tmp()}], v[{v.v_tmp(1)}], v[{v.v_tmp()}]")
         self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_block_m_off()}], v[{v.v_tmp()}]")
+        if self.tunable.gemm_k_global_split:
+            self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_gemm_k_wg_off()}], s[{s.s_a_m_total()}]   ; this workgroup's K-slice base, in A row units")
+            self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_tmp(2)}], v[{v.v_tmp()}]")
         self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.data_byte)}, v[{v.v_tmp()}]")
         self._emit(f"v_mov_b32 v[{v.v_addr_a_base(1)}], s[{s.s_p_in(1)}]")
         self._emit(f"v_add_co_u32 v[{v.v_addr_a_base()}], vcc_lo, s[{s.s_p_in()}], v[{v.v_tmp()}]")
@@ -605,7 +639,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_lshl_b32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], 2   ; tap byte offset")
         self._emit(f"s_add_u32 s[{s.s_p_out_tap()}], s[{s.s_p_out()}], s[{s.s_tmp(2)}]")
         self._emit(f"s_addc_u32 s[{s.s_p_out_tap(1)}], s[{s.s_p_out(1)}], 0")
-        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out.label))
+        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out.label, s.s_tmp()))
         self._emit(f"s_wait_storecnt 0x0")
         self._emit_empty_line()
 
@@ -635,9 +669,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         v = self.vgpr
         m_int_div_rem_vs = macro_int_div_rem_vs_gfx1250_t(self.mc)
         if s_k_block_off is not None:
-            self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], s[{s_k_block_off}], v[{v.v_row_local()}]   ; k_abs")
+            self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], s[{s_k_block_off}], v[{v.v_row_local()}]   ; k_abs (within this workgroup's K-slice)")
         else:
-            self._emit(f"v_mov_b32 v[{v.v_gtc_tmp(0)}], v[{v.v_row_local()}]   ; k_abs (k_block_off=0)")
+            self._emit(f"v_mov_b32 v[{v.v_gtc_tmp(0)}], v[{v.v_row_local()}]   ; k_abs (k_block_off=0, within this workgroup's K-slice)")
+        if self.tunable.gemm_k_global_split:
+            self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], s[{s.s_gemm_k_wg_off()}]   ; += this workgroup's K-slice base")
         self._emit(m_int_div_rem_vs(v.v_gtc_tmp(1), v.v_gtc_tmp(2), v.v_gtc_tmp(0), s.s_ho_wo(), v.v_tmp(), s.s_tmp()))
         self._emit(f"; v_gtc_tmp(1)=hw_idx (rem), v_gtc_tmp(2)=n_idx (quo)")
         self._emit(m_int_div_rem_vs(v.v_gtc_tmp(3), v.v_gtc_tmp(4), v.v_gtc_tmp(1), s.s_wo(), v.v_tmp(), s.s_tmp()))

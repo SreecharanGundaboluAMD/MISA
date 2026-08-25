@@ -1729,3 +1729,170 @@ checked `_async` (fwd) the same way. Confirmed via `.globl` inspection that `_db
 - `driver/igemm_gtc_base.h` -- `igemm_gtc_tunable_t`'s three new fields, their parsing in
   `igemm_gtc_tunable_from_config`, and the mirrored suffix block in
   `igemm_gtc_encode_kernel_name`
+
+## Phase 17 (2026-08-25): `gemm_k_global_split` for wrw -- fixes the 76x-3087x wrw slowdown
+
+`docs/gfx1250_vendor_benchmark_vs_miopen.md` found wrw catastrophically slow on real backbone
+shapes: small GEMM_M (K_out) and GEMM_N (C_in*Y*X) with huge GEMM_K (N*Ho*Wo) means several
+shapes launch just 1-2 workgroups total on a 256-CU part -- one workgroup serially eats
+1000+ main-loop iterations with nothing else to hide latency behind. The mature XDLOPS wrw
+path already solves this (`gemm_k_global_split`: split the reduction axis across grid.z,
+atomically accumulate partial sums); the WMMA path had zero occurrences of the mechanism.
+Ported it to `igemm_wrw_gtc_wmma_nhwc.py` -- fp16/bf16/fp32 (int8 wrw doesn't exist in this
+codebase at all).
+
+**Simpler than the XDLOPS mechanism, for two hardware-specific reasons found while building
+this**:
+1. `global_atomic_add_f32` assembles and runs correctly on gfx1250 in the exact SADDR form
+   (`global_atomic_add_f32 v_voffset, v_data, s[saddr:saddr+1]`) the epilogue already uses for
+   `global_store_dword` -- no CAS-loop fallback needed (some other archs' `buffer_atomic_add`
+   path has one, gated by an `atomic_add_using_cas` assembler switch; gfx1250 doesn't need it).
+2. The WMMA output buffer is always allocated fp32 regardless of the tunable's nominal
+   precision (`conv_driver.cpp`'s `dtype_alloc_byte = is_wmma ? 4 : data_byte`). So unlike
+   XDLOPS's fp16/bf16 path -- which needs a separate fp32 workspace buffer plus a
+   `tensor_cast_*` postlog kernel to fold splits back into a real fp16/bf16 tensor -- this
+   kernel atomic-adds fp32 straight into the real output for every precision. No workspace,
+   no postlog kernel, no separate reduction step at all: the atomic add *is* the reduction.
+
+**Split-count policy** (deliberately simple -- no runtime search over multiple split counts
+like XDLOPS's `gks_iterative`): pick the largest `splits` that evenly divides `num_k_blocks =
+gemm_k / gemm_k_per_block`, targeting `ceil(num_cu / (grid_x*grid_y))` workgroups. Requiring
+`splits` to divide `num_k_blocks` means every split gets an identical, exact multiple of
+`gemm_k_per_block` -- the WMMA main loop has no K-tail handling at all, so this preserves that
+invariant per split instead of inventing tail-handling. Lives in
+`driver/igemm_wrw_gtc_driver.h`'s WMMA `run()` branch, entirely host-side.
+
+### Correction to the Phase 12/13 ttmp workgroup-id finding: `blockIdx.z` is not a separate register
+
+Adding a 3rd grid dimension required knowing where gfx1250 delivers `blockIdx.z`. The earlier
+finding (this doc's "Workgroup ID delivery" section) only established x/y (`ttmp9`/`ttmp7`)
+since nothing before this phase ever launched a 3D grid. **`blockIdx.z` is not a separate ttmp
+register: `ttmp7`'s low 16 bits are `blockIdx.y` and its high 16 bits are `blockIdx.z`.**
+`ttmp9` remains a clean, unpacked `blockIdx.x`.
+
+Found by writing a HIP kernel that reads real `blockIdx.x/y/z` (compiler ground truth) plus six
+raw `ttmp4..ttmp9` registers via inline `asm volatile("s_mov_b32 %0, ttmpN\n" : "=s"(t))`, in
+the SAME kernel, launched with a real 3D grid (`dim3(2,3,4)`) via `hipLaunchKernelGGL` on real
+hardware. Direct correlation, no disassembly-reading required: `ttmp7`'s value was exactly
+`blockIdx.z * 65536 + blockIdx.y` for every dispatched workgroup (e.g. z=2,y=1 -> ttmp7 =
+0x20001). An initial guess that a *different* ttmp register (`ttmp6`, read alongside `ttmp7`
+during the same disassembly inspection that found `ttmp9`/`ttmp7`) held `blockIdx.z` directly
+was tested this same way and **disproven** -- its values didn't correlate with any dispatched
+grid coordinate at all (likely some other wave-launch state); always verify a register-mapping
+guess against compiler ground truth before shipping it, not just "it assembles and doesn't
+crash."
+
+**Every existing WMMA kernel's `s_mov_b32 s_by, ttmp7` was never wrong** -- it's just been
+implicitly relying on grid.z always being 1 (so the upper 16 bits are 0) for every kernel that
+existed before this phase. Only `igemm_wrw_gtc_wmma_nhwc_t`'s split variant now decodes it
+correctly: `s_and_b32 s_by, ttmp7, 0xffff` / `s_lshr_b32 s_bz, ttmp7, 16`. fwd/bwd are
+unmodified (they never launch a 3rd grid dimension) but this is a landmine for whoever adds one
+there next -- **grep for `s_mov_b32 s[{s.s_by()}], ttmp7` before doing so.**
+
+### A hardware correctness pitfall found via this port: atomic scope
+
+`global_atomic_add_f32` **without an explicit scope modifier silently drops updates across
+compute units** on this hardware/driver. Found the hard way: the 64x64 tile config (more
+workgroups resident per CU, smaller footprint) passed correctness immediately; the 128x128
+tile config (same math, same K-split, larger footprint -> more likely to schedule the two
+accumulating workgroups on *different* CUs) failed with wrong-but-plausible values -- not
+garbage, not a clean 2x/0x pattern, just wrong partial sums (including at least one sign flip
+against the reference), consistent with a lost update rather than an addressing bug.
+
+Ruled out by direct measurement, in order, before finding the real cause: the K-range
+split arithmetic itself (verified via a temporary debug buffer dumping each workgroup's
+decoded `bz`/`gemm_k_wg_off` back to the host -- exactly correct in every case, including the
+failing ones); a queue-depth/back-to-back-issue hazard on the atomic instruction (added a full
+`s_wait_storecnt 0x0` between every single atomic -- no change); the epilogue's `offset:`
+immediate specifically for atomics (replaced with explicit address adds -- no change). Adding
+`scope:SCOPE_SYS` to the atomic instruction fixed it immediately and reproducibly. Since gfx12
+introduced scope-qualified cache/memory instructions as part of its updated cache hierarchy
+(also seen on `global_prefetch_b8 ... scope:SCOPE_SE` in compiler-generated code during the
+Phase 12 ttmp probe), the likely explanation is that a bare atomic defaults to a narrower
+(CU/WGP-local) scope that only guarantees atomicity for lanes/waves sharing that scope, not
+across the full device -- gfx1250's atomic-add mnemonic needs the scope stated explicitly for
+cross-CU correctness; **this is the load-bearing detail, not a style choice** -- do not drop it
+if this code is ever refactored.
+
+### Verification
+
+Correctness (`valid:y`) confirmed on real hardware for: a single K-block (`splits` trivially
+1, isolating the atomic+zero-init machinery from real multi-workgroup summation), an exact
+2-K-block/2-way split on both tile shapes, group>1, and the vendor-benchmark doc's actual
+failing shapes at up to 300-way splits, for fp16/bf16/fp32. Non-split configs (all directions,
+all dtypes, all tile variants exercised earlier this session) re-verified unaffected -- the
+epilogue's `global_atomic_add_f32`/`scope:SCOPE_SYS` path and the `s_by`/`s_bz` ttmp7 split are
+both compile-time-gated on `tunable.gemm_k_global_split`, byte-identical generated code
+otherwise.
+
+A per-iteration correctness pitfall specific to benchmarking accumulator kernels, found and
+fixed during this work: `driver/igemm_wrw_gtc_driver.h`'s WMMA `run()` originally zeroed the
+output buffer *once*, before the warmup+repeat timing loop, rather than once per dispatch. Since
+atomics accumulate rather than overwrite, the 2nd+ timed iteration's adds landed on top of the
+1st iteration's already-correct result, corrupting the final readback despite every individual
+dispatch being correct in isolation. Fixed by moving the zero-init into the `prolog_kernel`
+callback `igemm_launch_kernels` already runs before every single dispatch (mirroring how the
+mature XDLOPS path's `wrw_prolog` does the same). Any future accumulator-style WMMA kernel
+needs the same per-iteration (not per-`run()`-call) zero-init.
+
+### Results
+
+Fixes the vendor-benchmark doc's headline wrw regression. Re-ran that doc's exact 10 failing
+bf16 shapes (batch=42) through the `_gsplit` config: worst case improved from 3087x slower than
+MIOpen to 29x slower; most shapes landed within 2-6x of MIOpen (previously 76x-1525x). See
+`docs/gfx1250_vendor_benchmark_vs_miopen.md`'s updated results table for the full per-shape
+breakdown -- same GPU-contention caveat as every other number in that doc applies here too.
+
+### Critical files (Phase 17)
+
+- `python/igemm/igemm_wrw_gtc_wmma_nhwc.py` -- `s_bz`/`s_gemm_k_per_wg`/`s_gemm_k_wg_off`
+  sgprs, the fixed `s_by`/`s_bz` ttmp7 decode, the K-slice offset folded into A's base address
+  and B's per-iteration gather, `s_knum` bound to the per-workgroup slice length
+- `python/operations/coalescing_store_wmma.py` -- `ctrl.gemm_k_global_split` gating
+  `global_atomic_add_f32 ... scope:SCOPE_SYS` vs `global_store_dword`
+- `driver/igemm_wrw_gtc_driver.h` -- split-count policy, grid.z, the `gemm_k_per_wg` karg
+  field, and the per-iteration zero-init prolog
+- `config/igemm_wrw_gtc_gfx1250_nhwc_{bf16,fp16,fp32}_gsplit.config` -- the new configs
+
+## Phase 18 (2026-08-25): split-count runtime search -- the single-heuristic policy left real perf on the table
+
+Phase 17 picked one split count per problem (`largest divisor of num_k_blocks <= ceil(num_cu /
+tile_count)`) and trusted it. Timing that heuristic's actual choice against nearby alternatives
+showed it was often well off the fastest option -- e.g. one shape's heuristic pick (splits=300)
+ran at 2.27ms while a smaller pick (splits=200) ran at 0.376ms for the *same problem*, a ~6x
+difference from split count alone. Too many splits means the fixed per-workgroup cost (kernel
+epilogue, atomic RMW round-trips to L2) starts dominating a shrinking slice of real work per
+workgroup; the single-heuristic target (aimed at "one workgroup per CU") doesn't account for
+that at all.
+
+Fix: mirror the mature XDLOPS path's `gks_iterative` in spirit, but bounded to 3 candidates
+instead of a full sweep, since the WMMA main loop's no-K-tail constraint already limits the
+useful candidate set to divisors of `num_k_blocks`. `driver/igemm_wrw_gtc_driver.h`'s WMMA
+`run()` now builds 3 candidate split counts -- `largest_divisor_leq(num_k_blocks, t)` for `t` in
+`{target, target/2, target*2}`, deduplicated -- actually launches and times each one (with the
+existing per-iteration zero-init prolog), and keeps whichever ran fastest. This roughly triples
+the wall-clock cost of a single `run()` call for `gemm_k_global_split` tunables (3 real
+dispatches instead of 1) -- acceptable for `driver_mode_normal`'s tuning/benchmarking use case,
+same tradeoff the XDLOPS path already accepts for its own gks search.
+
+`result.gks` now reports the *actually selected* split count (previously always 0), surfaced by
+`conv_driver.cpp`'s `_gkgs[N]` display convention -- useful for spot-checking that the search
+picked something sensible for a given shape.
+
+### Results
+
+Re-ran the same 10 vendor-benchmark wrw shapes with the search in place (see
+`docs/gfx1250_vendor_benchmark_vs_miopen.md`'s update for the full table). Several shapes
+improved 1.6x-2x over the single-heuristic result (e.g. `192,60,80,64,1x1`: 0.127ms -> 0.074ms;
+`64,60,80,256,1x1`: 0.148ms -> 0.087ms); none regressed outside normal run-to-run noise. Worst
+case vs MIOpen improved from ~23-29x to ~13x slower.
+
+Three candidates is a small bracket, not a real search -- it can still miss a better split count
+between/beyond the tried values. A wider or adaptive search (binary-search toward the minimum,
+or trying every divisor within some CU-count-relative band) is the natural next step if more
+of this gap needs closing, at the cost of more `run()` wall-clock time per tuning pass.
+
+### Critical files (Phase 18)
+
+- `driver/igemm_wrw_gtc_driver.h` -- `largest_divisor_leq`, the `gsplit_candidates` list, and
+  the per-candidate launch-and-keep-best loop in the WMMA `run()` branch

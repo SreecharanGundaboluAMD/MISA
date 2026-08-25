@@ -265,7 +265,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             # computed once from the now-correct y*x*c row stride, reset into v_addr_b fresh
             # every tap (then move_slice_window_b bumps v_addr_b across K-iterations within a tap).
             self.v_addr_b_base = sym_t('v_addr_b_base' , vseq(2, 2))
-            self.v_addr_out    = sym_t('v_addr_out'    , vseq(2, 2))    # scratch used by coalescing_store_wmma
+            self.v_addr_out    = sym_t('v_addr_out'    , vseq(1))    # scratch used by coalescing_store_wmma
             self.v_sst_os      = sym_t('v_sst_os'      , vseq(1))    # shared store offset (same for A/B region)
             self.v_sld_a_os    = sym_t('v_sld_a_os'    , vseq(1))
             self.v_sld_b_os    = sym_t('v_sld_b_os'    , vseq(1))    # transposed byte offset (see get_gemm_index_for_src_matrix_transposed)
@@ -1031,7 +1031,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         s = self.sgpr
         # s_out_c_total (=gemm_n*group) is grad_input's TOTAL row stride (NOT K_out, and not
         # just the per-group gemm_n either once group>1 -- see class docstring's Phase 7 note).
-        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_c_total.label, v.v_addr_out.label))
+        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_c_total.label, v.v_addr_out.label, s.s_tmp()))
         self._emit(f"s_wait_storecnt 0x0")
 
     def emit_kernel_body(self):
