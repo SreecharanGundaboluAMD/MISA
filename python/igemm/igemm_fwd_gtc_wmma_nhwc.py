@@ -183,6 +183,24 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # now (kept separate to isolate correctness of each mechanism).
         assert not (tunable.async_global_load and (self.row_repeat_a > 1 or self.row_repeat_b > 1)), \
             "row_repeat > 1 is not yet supported together with async_global_load"
+        # Phase 15 (main-loop interleaving): mutually exclusive with async_global_load (no
+        # staging buffer to interleave around) and, for this first pass, with row_repeat>1
+        # (kept separate to isolate correctness of each mechanism, same discipline as above).
+        # REQUIRES lds_double_buffer=1 -- confirmed on real hardware (multi-K-block battery
+        # case, nrms=0.035 vs 0.0082 threshold) that single-buffered interleaving races
+        # across waves: a wave that stores an early chunk of the NEXT tile can overwrite LDS
+        # a slower wave is still reading as part of the CURRENT tile's LATER substeps, since
+        # interleaving moves stores much earlier in program order than the non-interleaved
+        # path's "defer every store until every substep's read is done" discipline (the
+        # implicit cross-wave safety margin that discipline relies on). Double-buffering
+        # routes the interleaved stores to the OTHER physical LDS buffer, eliminating the
+        # overlap entirely regardless of how early any wave's stores happen.
+        assert not (tunable.main_loop_interleave and tunable.async_global_load), \
+            "main_loop_interleave is not supported together with async_global_load"
+        assert not (tunable.main_loop_interleave and (self.row_repeat_a > 1 or self.row_repeat_b > 1)), \
+            "main_loop_interleave is not yet supported together with row_repeat > 1"
+        assert not (tunable.main_loop_interleave and not tunable.lds_double_buffer), \
+            "main_loop_interleave requires lds_double_buffer=1 (single-buffered interleaving races across waves, confirmed on hardware)"
 
         ctrl_wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(tunable.gemm_m_per_block, tunable.gemm_n_per_block,
                 tunable.wmma_tile_m, tunable.wmma_tile_n, tunable.wmma_repeat_m, tunable.wmma_repeat_n,
@@ -1029,6 +1047,56 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 return outer.chunk_num_dwordx4
         return functor_t()
 
+    def global_load_chunk_a_functor(self):
+        ''' Phase 15: single-chunk primitive for the interleaved main loop -- issues ONE
+        chunk's global load (row 0 only; main_loop_interleave is asserted mutually exclusive
+        with row_repeat_a>1 in __init__). Reuses the exact same helper (_emit_gld_chunk_load)
+        and v_flag masking as global_load_a_functor's chunk-0 call, just parameterized by
+        chunk_idx instead of hardcoded to 0. '''
+        outer = self
+        class functor_t:
+            def __call__(self, chunk_idx):
+                v = outer.vgpr
+                with outer._deferred_context():
+                    outer._emit_gld_chunk_load(v.v_gld_a, v.v_addr_a, chunk_idx, v_flag=v.v_flag)
+                return outer._get_deferred()
+        return functor_t()
+
+    def global_load_chunk_b_functor(self):
+        ''' Phase 15: see global_load_chunk_a_functor's docstring -- B is untransposed too,
+        same treatment (no masking needed for B, mirrors global_load_b_functor's v_flag=None). '''
+        outer = self
+        class functor_t:
+            def __call__(self, chunk_idx):
+                v = outer.vgpr
+                with outer._deferred_context():
+                    outer._emit_gld_chunk_load(v.v_gld_b, v.v_addr_b, chunk_idx, v_flag=None)
+                return outer._get_deferred()
+        return functor_t()
+
+    def shared_store_chunk_a_functor(self):
+        ''' Phase 15: single-chunk primitive for the interleaved main loop -- stores ONE
+        already-loaded-and-waited chunk (reuses _emit_sst_chunk, the same helper
+        _emit_sst_remaining_chunks calls internally). '''
+        outer = self
+        class functor_t:
+            def __call__(self, chunk_idx):
+                v = outer.vgpr
+                with outer._deferred_context():
+                    outer._emit_sst_chunk(v.v_gld_a, v.v_sst_os, 0, chunk_idx)
+                return outer._get_deferred()
+        return functor_t()
+
+    def shared_store_chunk_b_functor(self):
+        outer = self
+        class functor_t:
+            def __call__(self, chunk_idx):
+                v = outer.vgpr
+                with outer._deferred_context():
+                    outer._emit_sst_chunk(v.v_gld_b, v.v_sst_os, outer.lds_a_size, chunk_idx)
+                return outer._get_deferred()
+        return functor_t()
+
     def _emit_ds_read_chunked(self, v_base_sym, v_os_sym, base_off, num_v):
         '''
         Reads `num_v` contiguous dwords from LDS starting at `base_off`, into
@@ -1130,6 +1198,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.lds_buffer_num   = self.lds_buffer_num
         ctrl.async_global_to_lds_a = self.tunable.async_global_load
         ctrl.async_global_to_lds_b = self.tunable.async_global_load
+        ctrl.interleave = self.tunable.main_loop_interleave
         # Phase 1 (k-sub-loop): both A and B are untransposed here (K contiguous within
         # an LDS row), so advancing inst_wmma.k K-elements is just inst_wmma.k*data_byte.
         ctrl.k_substep_stride_bytes_a    = self.wmma_mapping.ctrl.inst_wmma.k * self.data_byte
@@ -1142,6 +1211,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.shared_load_b_functor       = self.shared_load_b_functor()
         ctrl.move_slice_window_a_functor = self.move_slice_window_a_functor()
         ctrl.move_slice_window_b_functor = self.move_slice_window_b_functor()
+        if self.tunable.main_loop_interleave:
+            ctrl.global_load_chunk_a_functor  = self.global_load_chunk_a_functor()
+            ctrl.global_load_chunk_b_functor  = self.global_load_chunk_b_functor()
+            ctrl.shared_store_chunk_a_functor = self.shared_store_chunk_a_functor()
+            ctrl.shared_store_chunk_b_functor = self.shared_store_chunk_b_functor()
         ctrl.v_a       = sym_t(self.vgpr.v_a.label)
         ctrl.v_b       = sym_t(self.vgpr.v_b.label)
         ctrl.v_c       = sym_t(self.vgpr.v_c.label)

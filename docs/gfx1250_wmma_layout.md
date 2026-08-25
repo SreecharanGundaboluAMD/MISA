@@ -1586,3 +1586,101 @@ gfx1250 configs (12 base + fwd/fp16's 2 asymmetric shapes) regenerate identicall
 
 **Not yet done**: bwd/wrw asymmetric shapes at all (see previous section's findings), combining
 `row_repeat` with Phase 13's async-load path.
+
+## Phase 15 (2026-08-25): main-loop chunk/compute interleaving -- implemented, hardware-validated, correct but a real regression, KEPT per explicit user instruction
+
+Phase 2's own conclusion identified the actual fix needed for fwd's Phase 1 k-sub-loop
+regression: only chunk 0's global load ever overlaps with compute (issued before the barrier);
+chunks 1..num_k_chunks-1 (== num_k_substeps, by construction) were loaded+waited+stored
+sequentially, all AFTER every substep's compute already finished, so their global-load latency
+was never hidden behind anything. This phase implements that fix.
+
+### Design
+
+New `ctrl_wmma_main_loop_t.interleave` flag (default False). When set, each substep
+`ks in 1..num_k_substeps-1` issues chunk `ks`'s global load, THEN does that substep's
+(unrelated, already-in-LDS) shared_load+compute, THEN waits for and stores chunk `ks` --
+instead of batching all substeps' compute first and all remaining chunks' load+store after.
+Chunk `ks`'s load overlaps with the LDS-read+compute that happens between its issue and its
+wait, hiding at least some of its latency. Needed a new single-chunk functor interface
+(`global_load_chunk_a/b_functor`, `shared_store_chunk_a/b_functor` -- callable as
+`f(chunk_idx)`, reusing the existing `_emit_gld_chunk_load`/`_emit_sst_chunk` primitives
+directly) alongside the existing bulk `global_load_a/b_functor`/`shared_store_a/b_functor`
+(kept, unchanged, used by the non-interleaved path and the one-time prologue store). New
+tunable `main_loop_interleave` (default 0), asserted mutually exclusive with
+`async_global_load` (no staging buffer to interleave around) and `row_repeat_a/b > 1` (kept
+separate to isolate correctness, same discipline as every other new mechanism this session).
+
+### A real bug found on hardware, not by inspection
+
+First implementation (single-buffered LDS) passed every single-K-block hardware test
+(degenerate, stride+pad, multi-tap, group>1) but failed the multi-K-block case (`nrms=0.0355`
+vs `0.0082` threshold, `valid:n`) -- the only case exercising the STEADY-STATE loop body across
+2+ outer iterations. Root cause: interleaving moves stores much earlier in program order than
+the non-interleaved path's "defer every store until every substep's read is done" discipline --
+that discipline is what gave every OTHER wave in the workgroup enough of an implicit timing
+margin to finish reading the CURRENT tile before this wave starts overwriting the SAME
+(single-buffered) LDS region with the NEXT tile's data. With interleaving, a fast wave can store
+chunk 0 of the next tile immediately after substep 0's compute, potentially before a slower
+wave has finished reading substep 1 of the current tile from the SAME memory range --
+corrupting it. **Fix: `main_loop_interleave` now asserts `lds_double_buffer=1`** -- confirmed
+on hardware that adding double-buffering (routing interleaved stores to the physically
+different "other" buffer) fixes the multi-K-block case outright (`nrms=0.000165`, `valid:y`),
+eliminating the cross-wave race regardless of how early any wave's stores happen.
+
+**Validated on real hardware**, fwd/fp16/128x128x64 (k-sub-loop + double-buffer +
+interleave), full 6-case battery (degenerate, multi-K-block, stride+pad, multi-tap+dilation,
+group=2, group=4) against `naive_conv_fwd_nhwc` -- all `valid:y`. Byte-identical regression
+check: all existing configs (including `_k2x`/`_k2x_dbuf`, which share the same main-loop code
+path with `interleave` defaulting to False) regenerate identically.
+
+### Benchmark: a real, reproducible regression -- KEPT anyway
+
+Interleaved old/new methodology (learned from Phase 13's mistake): `IGEMM_WARMUP=5
+IGEMM_REPEAT=25`, alternating build+run order across 6 rounds, two different problem sizes.
+Compared against the `_k2x_dbuf` config (k-sub-loop + double-buffer, no interleaving -- the
+closest apples-to-apples baseline, isolating interleaving's own effect from double-buffering's
+already-known-neutral one):
+
+- Large (`n=8,c=2048,H=16,W=16,k=2048`): baseline 145.8-149.3 tflops (mean ~147.4) vs
+  interleaved 137.0-137.6 tflops (mean ~137.4) -- **~7% regression**, no overlap between the
+  two distributions across 6 measurements each.
+- Small (`n=4,c=512,H=16,W=16,k=512`): baseline 13.73-13.94 tflops vs interleaved 13.14-13.31
+  tflops -- **~4-5% regression**, same pattern.
+
+Root cause not conclusively diagnosed (candidates: the interleaved schedule's per-substep
+wait_loadcnt/wait_dscnt pairs may create more total synchronization points than the batched
+non-interleaved version even though each one is individually cheaper to satisfy; the small
+`num_k_substeps=2` case tested here may not carry enough "next chunk" work to amortize the
+new per-substep bookkeeping against; double-buffering's own XOR-toggle overhead may compound
+with the new interleaved control flow in a way it didn't with the simple batched version) --
+out of scope for this phase, which was implementation + honest measurement, not root-causing a
+second-order interaction between two already-landed mechanisms.
+
+**Net**: implementation is fully correct (passes every hardware battery) but is a measured
+regression, not the hoped-for fix for fwd's Phase 1 regression. **Per explicit user
+instruction, kept anyway** (same rationale as Phase 13's async-load regression): gfx1250 is
+pre-production hardware, so the relative cost of this schedule vs the batched one could change
+on future silicon revisions; a correct, validated implementation sitting behind a default-off
+tunable (`main_loop_interleave=0` for every existing config) costs nothing to keep. The
+`_interleave` config is a reference point for future re-benchmarking, not a recommended
+setting today.
+
+### Not yet done
+
+Testing at `num_k_substeps > 2` (e.g. `gemm_k_per_block=128`, if/when such a config exists) to
+see whether the regression narrows or widens with more chunks to interleave; extending to
+bf16/int8/fp32; extending to bwd's A (untransposed, same mechanism should port directly) and
+combining with bwd's already-ported `row_repeat_a` (currently mutually exclusive); root-causing
+why interleaving regresses rather than wins, if a future session wants to pursue it further.
+
+### Critical files
+
+- `python/operations/wmma_main_loop.py` -- `ctrl.interleave`, `emit_interleaved_substeps()`,
+  the new single-chunk functor fields
+- `python/igemm/igemm_fwd_gtc_wmma_nhwc.py` -- `global_load_chunk_a/b_functor`,
+  `shared_store_chunk_a/b_functor`, the `main_loop_interleave` asserts (mutual exclusion with
+  `async_global_load`/`row_repeat`, requires `lds_double_buffer`)
+- `python/igemm/igemm_base.py` -- new `main_loop_interleave` tunable (WMMA branch)
+- `config/igemm_fwd_gtc_gfx1250_nhwc_fp16_interleave.config` -- new config (k-sub-loop +
+  double-buffer + interleave combined)

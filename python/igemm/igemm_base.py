@@ -218,6 +218,14 @@ class igemm_gtc_tunable_parameter_t(object):
             # operands (fwd A/B, bwd A) use global_load_async_to_lds_b128 instead -- no VGPR
             # staging buffer, global memory -> LDS directly.
             self.async_global_load              = utility_dict_with_default_t(tunable_dict)('async_global_load', 0)
+            # Phase 15: optional, defaults to 0 (today's exact byte-identical main loop).
+            # When 1, interleaves each remaining k-sub-loop chunk's global load with the
+            # PREVIOUS chunk/substep's (unrelated, already-in-LDS) compute instead of loading
+            # + storing all remaining chunks sequentially after every substep's compute is
+            # done -- the actual fix for fwd's Phase 1 k-sub-loop regression, per Phase 2's
+            # own conclusion. Requires gemm_k_per_block > inst_wmma.k (k-sub-loop in use) and
+            # is mutually exclusive with async_global_load.
+            self.main_loop_interleave            = utility_dict_with_default_t(tunable_dict)('main_loop_interleave', 0)
         else:
             assert False
 

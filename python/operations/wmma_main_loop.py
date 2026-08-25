@@ -84,6 +84,27 @@ class ctrl_wmma_main_loop_t(object):
         self.k_substep_stride_bytes_a    = 0
         self.k_substep_stride_bytes_b    = 0
 
+        # Phase 15 (chunk/compute interleaving): the actual fix for fwd's Phase 1 k-sub-loop
+        # regression, per Phase 2's own conclusion. Phase 1 already amortizes the barrier/LDS
+        # round-trip over num_k_substeps v_wmma_* issues, but only substep 0's global load
+        # (issued before the barrier, see `global_load_a/b_functor`) ever overlaps with
+        # compute -- chunks 1..num_k_chunks-1 (== num_k_substeps, by construction: both count
+        # inst_wmma.k-wide slices of the same row) were previously loaded+waited+stored
+        # SEQUENTIALLY, all AFTER every substep's compute was already done, so their global-
+        # load latency was never hidden behind anything. When True (requires
+        # num_k_chunks==num_k_substeps > 1, i.e. Phase 1's k-sub-loop feature is in use, and
+        # is mutually exclusive with async_global_to_lds_a/b -- the async instruction has no
+        # small reused staging buffer to interleave around, see igemm_fwd_gtc_wmma_nhwc.py's
+        # global_load_a_functor docstring), each substep ks's compute is paired with chunk
+        # (ks+1)'s global-load issue instead: issue chunk ks+1's load, THEN do substep ks's
+        # (unrelated, already-in-LDS) shared_load+compute, THEN wait+store chunk ks+1 -- the
+        # compute gives the just-issued load real time to complete in the background before
+        # its wait is reached. Requires the new global_load_chunk_a/b_functor and
+        # shared_store_chunk_a/b_functor (single-chunk primitives, chunk_idx explicit)
+        # instead of the bulk global_load_a/b_functor/shared_store_a/b_functor used by the
+        # non-interleaved path. Default False = today's exact byte-identical behavior.
+        self.interleave                  = False
+
         # functor
         self.global_load_a_functor       = None
         self.global_load_b_functor       = None
@@ -93,6 +114,12 @@ class ctrl_wmma_main_loop_t(object):
         self.shared_load_b_functor       = None
         self.move_slice_window_a_functor = None
         self.move_slice_window_b_functor = None
+        # Phase 15 (interleaving): single-chunk primitives, only used when ctrl.interleave.
+        # Callable as f(chunk_idx) -- see docstring above.
+        self.global_load_chunk_a_functor  = None
+        self.global_load_chunk_b_functor  = None
+        self.shared_store_chunk_a_functor = None
+        self.shared_store_chunk_b_functor = None
 
         # symbol type
         self.v_a                         = None
@@ -121,6 +148,11 @@ class wmma_main_loop_t(mc_base_t):
         assert ctrl.lds_buffer_num in (1, 2), "wmma main loop supports single (1) or double (2) buffered LDS only"
         double_buffer = ctrl.lds_buffer_num == 2
         num_k_substeps = ctrl.unroll_k // inst_wmma.k
+        if ctrl.interleave:
+            assert num_k_substeps > 1, \
+                "interleave requires num_k_substeps>1 (Phase 1's k-sub-loop) -- nothing to interleave otherwise"
+            assert not (ctrl.async_global_to_lds_a or ctrl.async_global_to_lds_b), \
+                "interleave is not supported together with async_global_to_lds_a/b (no staging buffer to interleave around)"
 
         label_body     = f'L_{ctrl.label_prefix}_wmma_body'
         label_end      = f'L_{ctrl.label_prefix}_wmma_end'
@@ -133,6 +165,10 @@ class wmma_main_loop_t(mc_base_t):
         f_sld_b = ctrl.shared_load_b_functor
         f_move_slice_window_a = ctrl.move_slice_window_a_functor
         f_move_slice_window_b = ctrl.move_slice_window_b_functor
+        f_gld_chunk_a = ctrl.global_load_chunk_a_functor
+        f_gld_chunk_b = ctrl.global_load_chunk_b_functor
+        f_sst_chunk_a = ctrl.shared_store_chunk_a_functor
+        f_sst_chunk_b = ctrl.shared_store_chunk_b_functor
 
         v_a, v_b, v_c = ctrl.v_a, ctrl.v_b, ctrl.v_c
         v_sst_a_os, v_sld_a_os = ctrl.v_sst_a_os, ctrl.v_sld_a_os
@@ -166,6 +202,36 @@ class wmma_main_loop_t(mc_base_t):
                 self._emit(f_sld_b(v_b(), v_sld_b_os(), off_b))
                 self._emit(f"s_wait_dscnt 0x0")
                 emit_wmma_tile()
+
+        def emit_interleaved_substeps():
+            '''
+            Phase 15: replaces emit_extra_substeps() + the later bulk wait+store when
+            ctrl.interleave. Substep 0's compute (using v_a/v_b already read at the top of
+            the loop body) has already happened by the time this is called; chunk 0's global
+            load (issued via f_gld_a()/f_gld_b() before this, unchanged from the
+            non-interleaved path) is waited+stored here, THEN each remaining substep ks
+            (1..num_k_substeps-1) issues chunk ks's load BEFORE its own (unrelated,
+            already-in-LDS) shared_load+compute -- giving that load real time to complete in
+            the background -- and only waits+stores it after the compute. The final chunk
+            (num_k_substeps-1) still gets this same treatment; its wait+store simply lands
+            right before the loop's own trailing bookkeeping (buffer switch / branch), same
+            as the non-interleaved path's bulk store did.
+            '''
+            self._emit(f"s_wait_loadcnt 0x0   ; chunk 0's load")
+            self._emit(f_sst_chunk_a(0))
+            self._emit(f_sst_chunk_b(0))
+            for ks in range(1, num_k_substeps):
+                off_a = ks * ctrl.k_substep_stride_bytes_a
+                off_b = ks * ctrl.k_substep_stride_bytes_b
+                self._emit(f_gld_chunk_a(ks))
+                self._emit(f_gld_chunk_b(ks))
+                self._emit(f_sld_a(v_a(), v_sld_a_os(), off_a))
+                self._emit(f_sld_b(v_b(), v_sld_b_os(), off_b))
+                self._emit(f"s_wait_dscnt 0x0")
+                emit_wmma_tile()
+                self._emit(f"s_wait_loadcnt 0x0   ; chunk {ks}'s load")
+                self._emit(f_sst_chunk_a(ks))
+                self._emit(f_sst_chunk_b(ks))
 
         def emit_buffer_switch():
             # Phase 2 (double-buffering): toggle the store offset (v_sst_a_os and
@@ -240,32 +306,43 @@ class wmma_main_loop_t(mc_base_t):
 
         self._emit(f_move_slice_window_a())
         self._emit(f_move_slice_window_b())
-        if not async_a:
+        if ctrl.interleave:
+            # Phase 15: chunk 0 issued exactly as the non-interleaved path does; substep 0's
+            # compute happens next, then emit_interleaved_substeps() takes over chunk 0's
+            # wait+store AND every remaining chunk/substep, interleaved.
             self._emit(f_gld_a())
-        if not async_b:
             self._emit(f_gld_b())
-        self._emit_empty_line()
-
-        emit_wmma_tile()
-        emit_extra_substeps()
-        self._emit_empty_line()
-
-        # Phase 13: an async operand's NEXT-tile load-to-LDS is issued only now, after
-        # this tile's ds_reads (f_sld_a/f_sld_b above) are fully consumed -- the async
-        # load IS the LDS write, so (unlike the old design's chunk-0 early-issue trick)
-        # there is no safe-to-start-early sub-step to preserve; deferring ALL of it is
-        # what keeps the cross-wave LDS-write-visibility invariant from Phase 9 intact.
-        # An old-path operand keeps its usual s_wait_loadcnt + deferred store.
-        if any_old:
-            self._emit(f"s_wait_loadcnt 0x0")
+            self._emit_empty_line()
+            emit_wmma_tile()
+            emit_interleaved_substeps()
+            self._emit_empty_line()
+        else:
             if not async_a:
-                self._emit(f_sst_a())
+                self._emit(f_gld_a())
             if not async_b:
-                self._emit(f_sst_b())
-        if async_a:
-            self._emit(f_gld_a())
-        if async_b:
-            self._emit(f_gld_b())
+                self._emit(f_gld_b())
+            self._emit_empty_line()
+
+            emit_wmma_tile()
+            emit_extra_substeps()
+            self._emit_empty_line()
+
+            # Phase 13: an async operand's NEXT-tile load-to-LDS is issued only now, after
+            # this tile's ds_reads (f_sld_a/f_sld_b above) are fully consumed -- the async
+            # load IS the LDS write, so (unlike the old design's chunk-0 early-issue trick)
+            # there is no safe-to-start-early sub-step to preserve; deferring ALL of it is
+            # what keeps the cross-wave LDS-write-visibility invariant from Phase 9 intact.
+            # An old-path operand keeps its usual s_wait_loadcnt + deferred store.
+            if any_old:
+                self._emit(f"s_wait_loadcnt 0x0")
+                if not async_a:
+                    self._emit(f_sst_a())
+                if not async_b:
+                    self._emit(f_sst_b())
+            if async_a:
+                self._emit(f_gld_a())
+            if async_b:
+                self._emit(f_gld_b())
         if double_buffer:
             emit_buffer_switch()
         self._emit(f"s_branch {label_body}")
