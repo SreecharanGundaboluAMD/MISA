@@ -1559,3 +1559,30 @@ operands simultaneously. Scoping this out entirely rather than guessing at a par
 transposed B-addressing generalization above), any wrw asymmetric shape (needs the same
 transposed-operand generalization for both its operands), bf16/int8/fp32 at fwd's existing
 128x64/64x128 shapes, combining `row_repeat` with Phase 13's async-load path.
+
+### Phase 11 continued (again) (2026-08-25): bf16/int8/fp32 at fwd's 128x64/64x128 shapes -- mechanical port, all 6 combos hardware-validated
+
+Ported fwd's two landed asymmetric shapes (128x64, 64x128) to bf16/int8/fp32 -- purely
+config/table work, no kernel-file changes needed, since `row_repeat_a`/`row_repeat_b` were
+already precision-generic (built entirely on `self.data_byte`, matching Phase 8's fp32-port
+precedent). Added 6 new `ctrl_wmma_mapping_t` table entries (one per precision x shape) and 6
+new config files, mirroring the fp16 entries' `wave_repeat`/`waves` numbers exactly (only
+`gemm_k_per_block` and the resulting `tensor_a/b_thread_lengths[1]` differ per precision: 32 for
+bf16, 64 for int8, 4 for fp32 -- same per-precision K as their existing 128x128/64x64 entries).
+
+**One real process snag, not a kernel bug**: bf16's conv_driver.exe CLI mode string is
+`convbfp16`, not `convbf16` (`conv_driver.cpp` line ~684) -- the natural guess (matching the
+`bf16` precision string used everywhere else in this codebase) produces a silent-looking
+"Invalid Base Input Argument" with no further detail. Worth remembering for any future bf16
+hardware test on this driver.
+
+**All 6 combos (bf16/int8/fp32 x 128x64/64x128) hardware-validated** against
+`naive_conv_fwd_nhwc` (degenerate, stride+pad, group>1 -- a 3-case subset of the full battery,
+sufficient given the row_repeat mechanism itself was already proven correct via fwd/fp16's full
+6-case runs and this port only varies `data_byte`/`gemm_k_per_block`, already proven
+precision-generic by Phase 8's fp32 port and the earlier 64x64 bf16/int8/fp32 ports) -- all
+`valid:y`, no bugs found this time. Byte-identical regression check: all 14 pre-existing
+gfx1250 configs (12 base + fwd/fp16's 2 asymmetric shapes) regenerate identically.
+
+**Not yet done**: bwd/wrw asymmetric shapes at all (see previous section's findings), combining
+`row_repeat` with Phase 13's async-load path.

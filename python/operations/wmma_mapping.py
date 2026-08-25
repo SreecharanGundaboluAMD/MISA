@@ -250,6 +250,11 @@ ctrl_wmma_mapping_table = {
     'bf16': [
         ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x32_bf16),
         ctrl_wmma_mapping_t(64,  64,  16, 16, 2, 2, 4, v_wmma_f32_16x16x32_bf16),
+        # Asymmetric shapes (2026-08-25): mechanical port of fp16's 128x64/64x128 entries --
+        # the row_repeat mechanism operates purely on gemm_m/n_per_block vs block_size and is
+        # already precision-generic (uses self.data_byte throughout), same as the 64x64 port.
+        ctrl_wmma_mapping_t(128, 64,  16, 16, 2, 4, 4, v_wmma_f32_16x16x32_bf16),
+        ctrl_wmma_mapping_t(64,  128, 16, 16, 2, 4, 4, v_wmma_f32_16x16x32_bf16),
     ],
     # int8: K=64 (not 32), but num_v_a/num_v_b/num_v_c are still 8/8/8 (same as fp16/bf16 --
     # only elements/dword differs: 4 int8/dword vs 2 fp16/dword), so the same 128x128 macro
@@ -258,6 +263,9 @@ ctrl_wmma_mapping_table = {
     'int8': [
         ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_i32_16x16x64_iu8),
         ctrl_wmma_mapping_t(64,  64,  16, 16, 2, 2, 4, v_wmma_i32_16x16x64_iu8),
+        # Asymmetric shapes (2026-08-25): mechanical port, see fp16/bf16's entries above.
+        ctrl_wmma_mapping_t(128, 64,  16, 16, 2, 4, 4, v_wmma_i32_16x16x64_iu8),
+        ctrl_wmma_mapping_t(64,  128, 16, 16, 2, 4, 4, v_wmma_i32_16x16x64_iu8),
     ],
     # fp32: K=4 (much shorter than the others), num_v_a=num_v_b=2 (not 8 -- no packing at all,
     # 1 fp32/dword, unlike fp16's 2/dword or int8's 4/dword). D operand (num_v_c=8) carries
@@ -268,6 +276,9 @@ ctrl_wmma_mapping_table = {
     'fp32': [
         ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x4_f32),
         ctrl_wmma_mapping_t(64,  64,  16, 16, 2, 2, 4, v_wmma_f32_16x16x4_f32),
+        # Asymmetric shapes (2026-08-25): mechanical port, see fp16/bf16's entries above.
+        ctrl_wmma_mapping_t(128, 64,  16, 16, 2, 4, 4, v_wmma_f32_16x16x4_f32),
+        ctrl_wmma_mapping_t(64,  128, 16, 16, 2, 4, 4, v_wmma_f32_16x16x4_f32),
     ],
 }
 
