@@ -99,6 +99,25 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self.tunable = tunable
         self.data_byte = amdgpu_precision_data_byte(tunable.precision)
 
+        # Asymmetric tile shapes (2026-08-25): row_repeat_a generalizes A (grad_output,
+        # untransposed) the same way igemm_fwd_gtc_wmma_nhwc_t's row_repeat_a does -- thread
+        # tid owns global rows tid, tid+block_size, ..., row_repeat_a of them. B (weight) is
+        # TRANSPOSED here (see class docstring / get_gemm_index_for_src_matrix_transposed) --
+        # its per-thread row_local/col_group bit-sliced addressing is a fundamentally
+        # different mechanism from A's/fwd's simple "row=tid" mapping, so row_repeat_b (B
+        # needing multiple rows/thread) is NOT yet implemented; only shapes where
+        # gemm_n_per_block == block_size (row_repeat_b==1) are supported for now.
+        assert tunable.gemm_m_per_block % tunable.block_size == 0, \
+            f"gemm_m_per_block({tunable.gemm_m_per_block}) must be a multiple of block_size({tunable.block_size})"
+        assert tunable.gemm_n_per_block % tunable.block_size == 0, \
+            f"gemm_n_per_block({tunable.gemm_n_per_block}) must be a multiple of block_size({tunable.block_size})"
+        self.row_repeat_a = tunable.gemm_m_per_block // tunable.block_size
+        self.row_repeat_b = tunable.gemm_n_per_block // tunable.block_size
+        assert self.row_repeat_b == 1, \
+            "row_repeat_b > 1 (B needing multiple rows/thread) is not implemented for bwd's transposed B"
+        assert not (tunable.async_global_load and self.row_repeat_a > 1), \
+            "row_repeat_a > 1 is not yet supported together with async_global_load"
+
         ctrl_wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(tunable.gemm_m_per_block, tunable.gemm_n_per_block,
                 tunable.wmma_tile_m, tunable.wmma_tile_n, tunable.wmma_repeat_m, tunable.wmma_repeat_n,
                 tunable.block_size // tunable.wave_size, tunable.precision)
@@ -237,7 +256,10 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                 # B stays on the old technique), kept for parity/future-proofing.
                 self.v_sst_tmp = sym_t('v_sst_tmp'      , vseq(1))
             else:
-                self.v_addr_a  = sym_t('v_addr_a'       , vseq(2, 2))    # persistent global A address (64-bit)
+                # row_repeat_a copies, mirroring igemm_fwd_gtc_wmma_nhwc_t's v_addr_a -- see
+                # that file's __init__ docstring. row_repeat_a==1 for every existing config
+                # (byte-identical).
+                self.v_addr_a  = sym_t('v_addr_a'       , vseq(2 * outer.row_repeat_a, 2))    # persistent global A address(es) (64-bit each)
             self.v_addr_b      = sym_t('v_addr_b'      , vseq(2, 2))
             # Phase 5e: B's fixed per-thread base (before this tap's column offset is added) --
             # computed once from the now-correct y*x*c row stride, reset into v_addr_b fresh
@@ -257,7 +279,12 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             # tap re-derives ho_idx/wo_idx/flag from the SAME hi_idx/wi_idx). v_gtc_tmp is
             # scratch reused fresh every tap for the divide/flag/row_idx computation (needs
             # more registers than fwd's Phase 5d: 4 chained divisions here, not 2).
-            self.v_flag        = sym_t('v_flag'        , vseq(1))
+            # v_flag: row_repeat_a copies (must persist across the K-loop for every row this
+            # thread owns), mirroring igemm_fwd_gtc_wmma_nhwc_t's v_flag. v_n_idx/v_hi_idx/
+            # v_wi_idx stay SINGLE registers even for row_repeat_a>1 -- only row 0's
+            # decomposition is persisted; rows 1..row_repeat_a-1 recompute their own FRESH
+            # every tap inside _emit_tap_gather, reusing v_gtc_tmp's existing scratch slots.
+            self.v_flag        = sym_t('v_flag'        , vseq(outer.row_repeat_a))
             self.v_n_idx       = sym_t('v_n_idx'       , vseq(1))
             self.v_hi_idx      = sym_t('v_hi_idx'      , vseq(1))
             self.v_wi_idx      = sym_t('v_wi_idx'      , vseq(1))
@@ -524,63 +551,93 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         v_n_idx/v_hi_idx/v_wi_idx (this thread's GEMM_M decomposition, computed once in
         emit_kernel_prologue). See class docstring for the harder stride-gap divide this
         kernel needs (vs fwd's simpler bounds-only check).
+
+        A's computation is looped row_repeat_a times (once per row this thread owns -- see
+        __init__'s row_repeat_a docstring), mirroring igemm_fwd_gtc_wmma_nhwc_t's identical
+        row-loop structure. Row 0 uses the persistent v_hi_idx/v_wi_idx/v_n_idx exactly as
+        today. Rows 1..row_repeat_a-1 recompute (n_idx, hi_idx, wi_idx) FRESH from
+        v_tid+i*block_size, using v_gtc_tmp(0)/(1)/(2) as scratch (division scratch s_tmp(2),
+        free during this loop -- B's per-tap address computation after the loop is the only
+        other user, matching fwd's identical reasoning). The `pad_h - iy*dilation_h` /
+        `pad_w - ix*dilation_w` scalar values are recomputed fresh into s_tmp(0)/s_tmp(1) at
+        the TOP of every row's iteration (not hoisted once above the loop) -- row 0's own
+        numerator-division call uses s_tmp(0) as ITS scratch (see below), which would
+        otherwise silently corrupt the shared pad value before row 1 gets a chance to read
+        it (the exact bug igemm_fwd_gtc_wmma_nhwc_t's asymmetric-shape work found the hard
+        way, see docs/gfx1250_wmma_layout.md's Phase 11 section) -- recomputing fresh per row
+        sidesteps this entirely instead of hunting for a distinct scratch register.
+        row_repeat_a==1 for every existing config, so this loop runs once with i=0 and takes
+        the row-0 branch, byte-identical.
         '''
         s = self.sgpr
         v = self.vgpr
         m_int_div_rem_vs = macro_int_div_rem_vs_gfx1250_t(self.mc)
-        self._emit(f"; --- per-tap gather: numerator_h = hi_idx + pad_h - iy*dilation_h ---")
-        self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_iy()}], s[{s.s_dilation_h()}]")
-        self._emit(f"s_sub_i32 s[{s.s_tmp(0)}], s[{s.s_pad_h()}], s[{s.s_tmp(0)}]   ; pad_h - iy*dilation_h")
-        self._emit(f"s_mul_i32 s[{s.s_tmp(1)}], s[{s.s_ix()}], s[{s.s_dilation_w()}]")
-        self._emit(f"s_sub_i32 s[{s.s_tmp(1)}], s[{s.s_pad_w()}], s[{s.s_tmp(1)}]   ; pad_w - ix*dilation_w")
-        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(4)}], v[{v.v_hi_idx()}], s[{s.s_tmp(0)}]   ; numerator_h")
-        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(3)}], v[{v.v_wi_idx()}], s[{s.s_tmp(1)}]   ; numerator_w")
-        self._emit_empty_line()
 
-        self._emit(f"; ho_idx = numerator_h/stride_h (valid iff exact division & in bounds --")
-        self._emit(f"; a negative numerator wraps to a huge u32, which the bounds check below")
-        self._emit(f"; naturally rejects via quotient overflow, no separate sign check needed)")
-        self._emit(m_int_div_rem_vs(v.v_gtc_tmp(5), v.v_gtc_tmp(6), v.v_gtc_tmp(4), s.s_stride_h(), v.v_tmp(), s.s_tmp()))
-        self._emit(f"; v_gtc_tmp(5)=rem_h, v_gtc_tmp(6)=ho_idx")
-        self._emit(m_int_div_rem_vs(v.v_gtc_tmp(7), v.v_gtc_tmp(8), v.v_gtc_tmp(3), s.s_stride_w(), v.v_tmp(), s.s_tmp()))
-        self._emit(f"; v_gtc_tmp(7)=rem_w, v_gtc_tmp(8)=wo_idx")
-        self._emit_empty_line()
+        for i in range(self.row_repeat_a):
+            tag = '' if i == 0 else f'({i})'
+            self._emit(f"; --- per-tap gather (row{tag}): numerator_h = hi_idx + pad_h - iy*dilation_h ---")
+            self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_iy()}], s[{s.s_dilation_h()}]")
+            self._emit(f"s_sub_i32 s[{s.s_tmp(0)}], s[{s.s_pad_h()}], s[{s.s_tmp(0)}]   ; pad_h - iy*dilation_h")
+            self._emit(f"s_mul_i32 s[{s.s_tmp(1)}], s[{s.s_ix()}], s[{s.s_dilation_w()}]")
+            self._emit(f"s_sub_i32 s[{s.s_tmp(1)}], s[{s.s_pad_w()}], s[{s.s_tmp(1)}]   ; pad_w - ix*dilation_w")
 
-        self._emit(f"; v_flag = 1 iff both divisions are exact AND (ho_idx,wo_idx) in bounds")
-        self._emit(f"v_cmp_eq_u32 vcc_lo, 0, v[{v.v_gtc_tmp(5)}]")
-        self._emit(f"v_cndmask_b32 v[{v.v_flag()}], 0, 1, vcc_lo")
-        self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_ho()}], v[{v.v_gtc_tmp(6)}]")
-        self._emit(f"v_cndmask_b32 v[{v.v_flag()}], 0, v[{v.v_flag()}], vcc_lo")
-        self._emit(f"v_cmp_eq_u32 vcc_lo, 0, v[{v.v_gtc_tmp(7)}]")
-        self._emit(f"v_cndmask_b32 v[{v.v_flag()}], 0, v[{v.v_flag()}], vcc_lo")
-        self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_wo()}], v[{v.v_gtc_tmp(8)}]")
-        self._emit(f"v_cndmask_b32 v[{v.v_flag()}], 0, v[{v.v_flag()}], vcc_lo")
-        self._emit_empty_line()
-
-        self._emit(f"; row_idx = n_idx*(ho*wo) + ho_idx*wo + wo_idx (meaningless but harmless if")
-        self._emit(f"; v_flag==0 -- that lane's global_load_a is EXEC-masked off, see global_load_a_functor)")
-        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_ho_wo()}], v[{v.v_n_idx()}]")
-        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(2)}], s[{s.s_wo()}], v[{v.v_gtc_tmp(6)}]")
-        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(2)}]")
-        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(8)}]")
-        self._emit_empty_line()
-
-        if self.tunable.async_global_load:
-            self._emit(f"; v_off_a = row_idx * a_k_total * databyte (Phase 13: byte OFFSET only --")
-            self._emit(f"; s_p_in is passed separately as SADDR; a_k_total = gemm_k*group, see class docstring)")
-            self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_a_k_total()}], v[{v.v_gtc_tmp(0)}]")
-            self._emit(f"v_lshlrev_b32 v[{v.v_off_a()}], {utility_log2(self.data_byte)}, v[{v.v_gtc_tmp(0)}]")
+            if i == 0:
+                hi_src, wi_src, n_src = v.v_hi_idx(), v.v_wi_idx(), v.v_n_idx()
+            else:
+                self._emit(f"v_add_u32 v[{v.v_gtc_tmp(4)}], {i * self.tunable.block_size}, v[{v.v_tid()}]")
+                self._emit(f"v_add_u32 v[{v.v_gtc_tmp(4)}], s[{s.s_block_m_off()}], v[{v.v_gtc_tmp(4)}]   ; m_idx (row {i})")
+                self._emit(m_int_div_rem_vs(v.v_gtc_tmp(3), v.v_gtc_tmp(2), v.v_gtc_tmp(4), s.s_hi_wi(), v.v_tmp(), s.s_tmp(2)))
+                self._emit(m_int_div_rem_vs(v.v_gtc_tmp(1), v.v_gtc_tmp(0), v.v_gtc_tmp(3), s.s_wi(), v.v_tmp(), s.s_tmp(2)))
+                self._emit(f"; v_gtc_tmp(0)=hi_idx({i}), v_gtc_tmp(1)=wi_idx({i}), v_gtc_tmp(2)=n_idx({i})")
+                hi_src, wi_src, n_src = v.v_gtc_tmp(0), v.v_gtc_tmp(1), v.v_gtc_tmp(2)
+            self._emit(f"v_add_u32 v[{v.v_gtc_tmp(4)}], v[{hi_src}], s[{s.s_tmp(0)}]   ; numerator_h{tag}")
+            self._emit(f"v_add_u32 v[{v.v_gtc_tmp(3)}], v[{wi_src}], s[{s.s_tmp(1)}]   ; numerator_w{tag}")
             self._emit_empty_line()
-        else:
-            self._emit(f"; v_addr_a = p_in + row_idx * a_k_total * databyte (a_k_total = gemm_k*group --")
-            self._emit(f"; grad_output's pixel-to-pixel stride is its TOTAL K_out count, not the per-group gemm_k, see class docstring)")
-            self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_a_k_total()}], v[{v.v_gtc_tmp(0)}]")
-            self._emit(f"v_lshlrev_b32 v[{v.v_gtc_tmp(0)}], {utility_log2(self.data_byte)}, v[{v.v_gtc_tmp(0)}]")
-            self._emit(f"v_mov_b32 v[{v.v_addr_a(1)}], s[{s.s_p_in(1)}]   ; reset high half fresh -- this")
-            self._emit(f"                                                ; tap's address is NOT a continuation of the previous tap's")
-            self._emit(f"v_add_co_u32 v[{v.v_addr_a()}], vcc_lo, s[{s.s_p_in()}], v[{v.v_gtc_tmp(0)}]")
-            self._emit(f"v_add_co_ci_u32 v[{v.v_addr_a(1)}], vcc_lo, 0, v[{v.v_addr_a(1)}], vcc_lo")
+
+            self._emit(f"; ho_idx{tag} = numerator_h/stride_h (valid iff exact division & in bounds --")
+            self._emit(f"; a negative numerator wraps to a huge u32, which the bounds check below")
+            self._emit(f"; naturally rejects via quotient overflow, no separate sign check needed)")
+            self._emit(m_int_div_rem_vs(v.v_gtc_tmp(5), v.v_gtc_tmp(6), v.v_gtc_tmp(4), s.s_stride_h(), v.v_tmp(), s.s_tmp()))
+            self._emit(f"; v_gtc_tmp(5)=rem_h, v_gtc_tmp(6)=ho_idx{tag}")
+            self._emit(m_int_div_rem_vs(v.v_gtc_tmp(7), v.v_gtc_tmp(8), v.v_gtc_tmp(3), s.s_stride_w(), v.v_tmp(), s.s_tmp()))
+            self._emit(f"; v_gtc_tmp(7)=rem_w, v_gtc_tmp(8)=wo_idx{tag}")
             self._emit_empty_line()
+
+            self._emit(f"; v_flag{tag} = 1 iff both divisions are exact AND (ho_idx,wo_idx) in bounds")
+            self._emit(f"v_cmp_eq_u32 vcc_lo, 0, v[{v.v_gtc_tmp(5)}]")
+            self._emit(f"v_cndmask_b32 v[{v.v_flag(i)}], 0, 1, vcc_lo")
+            self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_ho()}], v[{v.v_gtc_tmp(6)}]")
+            self._emit(f"v_cndmask_b32 v[{v.v_flag(i)}], 0, v[{v.v_flag(i)}], vcc_lo")
+            self._emit(f"v_cmp_eq_u32 vcc_lo, 0, v[{v.v_gtc_tmp(7)}]")
+            self._emit(f"v_cndmask_b32 v[{v.v_flag(i)}], 0, v[{v.v_flag(i)}], vcc_lo")
+            self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_wo()}], v[{v.v_gtc_tmp(8)}]")
+            self._emit(f"v_cndmask_b32 v[{v.v_flag(i)}], 0, v[{v.v_flag(i)}], vcc_lo")
+            self._emit_empty_line()
+
+            self._emit(f"; row_idx{tag} = n_idx*(ho*wo) + ho_idx*wo + wo_idx (meaningless but harmless if")
+            self._emit(f"; v_flag==0 -- that lane's global_load_a is EXEC-masked off, see global_load_a_functor)")
+            self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_ho_wo()}], v[{n_src}]")
+            self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(2)}], s[{s.s_wo()}], v[{v.v_gtc_tmp(6)}]")
+            self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(2)}]")
+            self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(8)}]")
+            self._emit_empty_line()
+
+            if self.tunable.async_global_load:
+                self._emit(f"; v_off_a = row_idx * a_k_total * databyte (Phase 13: byte OFFSET only --")
+                self._emit(f"; s_p_in is passed separately as SADDR; a_k_total = gemm_k*group, see class docstring)")
+                self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_a_k_total()}], v[{v.v_gtc_tmp(0)}]")
+                self._emit(f"v_lshlrev_b32 v[{v.v_off_a()}], {utility_log2(self.data_byte)}, v[{v.v_gtc_tmp(0)}]")
+                self._emit_empty_line()
+            else:
+                self._emit(f"; v_addr_a{tag} = p_in + row_idx * a_k_total * databyte (a_k_total = gemm_k*group --")
+                self._emit(f"; grad_output's pixel-to-pixel stride is its TOTAL K_out count, not the per-group gemm_k, see class docstring)")
+                self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_a_k_total()}], v[{v.v_gtc_tmp(0)}]")
+                self._emit(f"v_lshlrev_b32 v[{v.v_gtc_tmp(0)}], {utility_log2(self.data_byte)}, v[{v.v_gtc_tmp(0)}]")
+                self._emit(f"v_mov_b32 v[{v.v_addr_a(i*2+1)}], s[{s.s_p_in(1)}]   ; reset high half fresh -- this")
+                self._emit(f"                                                ; tap's address is NOT a continuation of the previous tap's")
+                self._emit(f"v_add_co_u32 v[{v.v_addr_a(i*2)}], vcc_lo, s[{s.s_p_in()}], v[{v.v_gtc_tmp(0)}]")
+                self._emit(f"v_add_co_ci_u32 v[{v.v_addr_a(i*2+1)}], vcc_lo, 0, v[{v.v_addr_a(i*2+1)}], vcc_lo")
+                self._emit_empty_line()
 
         self._emit(f"; --- per-tap B address: v_addr_b = v_addr_b_base + (iy*x+ix)*gemm_n*{self.data_byte} bytes ---")
         self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_iy()}], s[{s.s_x()}]")
@@ -773,12 +830,22 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         return functor_t()
 
     def shared_store_a_functor(self):
+        ''' row_repeat_a > 1: row 0 uses the exact row_repeat_a==1 code path (unchanged);
+        rows 1..row_repeat_a-1 (no early-issue slot of their own -- see global_load_a_functor's
+        docstring) are fully deferred via _emit_sst_all_chunks (loads+stores every chunk,
+        including chunk 0 -- already exactly what that method does for B's num_k_chunks>1
+        case), storing into LDS shifted by i*block_size*bytes_per_row. '''
         outer = self
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
                     outer._emit_sst_remaining_chunks(v.v_gld_a, v.v_addr_a, v.v_sst_os, 0, v_flag=v.v_flag)
+                    for i in range(1, outer.row_repeat_a):
+                        row_addr = lambda idx=0, i=i: v.v_addr_a(i * 2 + idx)
+                        row_flag = lambda i=i: v.v_flag(i)
+                        row_off  = i * outer.tunable.block_size * outer.bytes_per_row
+                        outer._emit_sst_all_chunks(v.v_gld_a, row_addr, v.v_sst_os, row_off, v_flag=row_flag)
                 return outer._get_deferred()
             def get_issues(self):
                 return outer.chunk_num_dwordx4
@@ -890,6 +957,8 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         return functor_t()
 
     def move_slice_window_a_functor(self):
+        ''' row_repeat_a > 1: every row's v_addr_a pair advances independently by the same
+        per-K-substep stride, mirroring igemm_fwd_gtc_wmma_nhwc_t's identically-named method. '''
         outer = self
         class functor_t:
             def __call__(self):
@@ -898,8 +967,9 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                     if outer.tunable.async_global_load:
                         outer._emit(f"v_add_u32 v[{v.v_off_a()}], {outer.bytes_per_row}, v[{v.v_off_a()}]")
                     else:
-                        outer._emit(f"v_add_co_u32 v[{v.v_addr_a()}], vcc_lo, {outer.bytes_per_row}, v[{v.v_addr_a()}]")
-                        outer._emit(f"v_add_co_ci_u32 v[{v.v_addr_a(1)}], vcc_lo, 0, v[{v.v_addr_a(1)}], vcc_lo")
+                        for i in range(outer.row_repeat_a):
+                            outer._emit(f"v_add_co_u32 v[{v.v_addr_a(i*2)}], vcc_lo, {outer.bytes_per_row}, v[{v.v_addr_a(i*2)}]")
+                            outer._emit(f"v_add_co_ci_u32 v[{v.v_addr_a(i*2+1)}], vcc_lo, 0, v[{v.v_addr_a(i*2+1)}], vcc_lo")
                 return outer._get_deferred()
         return functor_t()
 

@@ -1498,3 +1498,64 @@ identically.
 
 **Not yet done**: bwd/wrw at 128x64 and 64x128, bf16/int8/fp32 at both asymmetric shapes,
 combining `row_repeat` with Phase 13's async-load path.
+
+### Phase 11 continued once more (2026-08-25): bwd/wrw asymmetric shapes investigated -- both found materially harder than the fwd port, no new config shipped
+
+User asked to close the remaining coverage gap: port the asymmetric shapes to bwd and wrw.
+Ported `row_repeat_a`'s A-side mechanism into `igemm_bwd_gtc_wmma_nhwc.py` (bwd's A/grad_output
+is untransposed, structurally close to fwd's A) -- same row-loop pattern, same
+fresh-per-row-recompute discipline, PLUS one more precaution the fwd port didn't need: bwd's
+per-tap gather computes a shared `pad_h - iy*dilation_h` / `pad_w - ix*dilation_w` scalar pair
+into `s_tmp(0)/s_tmp(1)` that's needed by EVERY row's numerator calculation -- but row 0's own
+division call also uses `s_tmp(0)` as its internal scratch (the same corruption class Phase 11's
+original A-side port found the hard way). Recomputing those two scalars fresh at the top of
+EVERY row's iteration (not hoisted once above the loop) sidesteps this without needing to hunt
+for a distinct scratch register.
+
+**Found two real, independent blockers before any hardware test was needed, both from static
+analysis of the generated code:**
+
+1. **VGPR ceiling**: bwd/fp16's existing 128x128 shape already sits at 256/256 VGPRs (fwd's
+   sits at 252) -- bwd's harder divide-based per-tap gather needs a bigger `v_gtc_tmp` scratch
+   pool (9 slots vs fwd's 5). `row_repeat_a`'s +3 registers (`v_flag` +1, `v_addr_a` +2) has
+   nowhere to land at fwd's exact 128x64 wave_repeat shape (accumulate_a/b/c = 32/32/128). A
+   smaller `wave_repeat_n=2` variant (128x32, accumulate_a/b/c = 32/16/64, freeing 80 VGPRs)
+   would numerically fit -- but revealed the second blocker below before it got that far.
+2. **B's row_local/col_group addressing assumes `block_size == gemm_n_per_block` EXACTLY, not
+   just `%==0`**: bwd's B (weight) is TRANSPOSED, addressed via `row_local = tid >>
+   col_group_bits`, `col_group = tid & (num_col_groups-1)` where `num_col_groups =
+   gemm_n_per_block // gemm_k_per_block`. This decomposition covers exactly
+   `num_col_groups * gemm_k_per_block == gemm_n_per_block` distinct (row_local, col_group)
+   pairs -- it silently assumes every thread's `row_local` lands in `[0, gemm_k_per_block)`,
+   which is only true when `block_size == gemm_n_per_block`. The 128x32 shape being considered
+   has `gemm_n_per_block(32) < block_size(64)` -- HALF the threads would compute
+   `row_local >= gemm_k_per_block`, an out-of-bounds row feeding directly into
+   `v_addr_b_base`'s pointer arithmetic (`row_local * wei_row_c`), corrupting memory outside
+   the intended weight tile. Caught by tracing the address formula by hand against the new
+   shape's actual thread count, **before** wasting a hardware test on a config that would have
+   produced silent wrong answers or a memory fault. This is a DIFFERENT generalization than
+   `row_repeat_b` (which handles `gemm_n_per_block > block_size`, i.e. needing MULTIPLE
+   rows/thread) -- here it's the opposite mismatch (`gemm_n_per_block < block_size`, i.e. some
+   threads owning ZERO valid B rows), and the transposed bit-sliced addressing scheme doesn't
+   degrade gracefully to that case the way the untransposed row-per-thread scheme does.
+
+**Decision**: kept the `row_repeat_a` mechanism port in `igemm_bwd_gtc_wmma_nhwc.py` (real,
+correct, reusable infrastructure -- byte-identical for `row_repeat_a==1`, confirmed against
+every existing bwd config, all precisions spot-checked). Did **not** ship a new bwd asymmetric
+config this pass -- neither the natural 128x64 shape (VGPR overflow) nor the smaller 128x32
+shape (B-addressing correctness bug) are viable without further work: either free ~3 VGPRs
+elsewhere in bwd's already-tight layout, or generalize B's row_local/col_group decomposition to
+handle `gemm_n_per_block != block_size` in both directions (an analogous but distinct mechanism
+to `row_repeat_a`/`row_repeat_b`, not yet designed).
+
+**wrw was not attempted at all**: per the class docstring, wrw's A (grad_output) AND B (input)
+are BOTH transposed (`get_gemm_index_for_src_matrix_transposed`), unlike bwd (A untransposed, B
+transposed) or fwd (both untransposed). wrw has no untransposed operand to build a
+straightforward `row_repeat_a`-style port on at all -- any asymmetric shape for wrw needs the
+SAME transposed-operand generalization bwd's B just exposed as unsolved, for BOTH of its
+operands simultaneously. Scoping this out entirely rather than guessing at a partial fix.
+
+**Not yet done**: a working bwd asymmetric shape (needs either a VGPR-savings redesign or the
+transposed B-addressing generalization above), any wrw asymmetric shape (needs the same
+transposed-operand generalization for both its operands), bf16/int8/fp32 at fwd's existing
+128x64/64x128 shapes, combining `row_repeat` with Phase 13's async-load path.
