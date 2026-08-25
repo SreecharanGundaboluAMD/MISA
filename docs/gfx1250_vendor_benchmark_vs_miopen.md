@@ -283,3 +283,44 @@ indistinguishable from the Phase 18 table above (within normal run-to-run noise)
 change (it's correctness-neutral and removes a real hazard) but it isn't the lever that matters
 here: the atomic RMW round-trip latency, not the surrounding address arithmetic, is almost
 certainly what dominates the atomic epilogue's cost.
+
+## Update (2026-08-25): split-count search pushed further — full-sweep characterization + ternary search
+
+Pushed on the split-count lever (`docs/gfx1250_wmma_layout.md`'s Phase 20) since it was the one
+shown to actually move the needle. Added a research-only `IGEMM_GSPLIT_SWEEP=<target>` env var
+and swept the **entire** perf-vs-split-count curve (every divisor of `num_k_blocks`, for all
+three distinct values across these 10 shapes) directly on hardware. Confirmed the curve is
+unimodal — but the true minimum's position relative to the naive `ceil(num_cu/tile_count)`
+target moves inconsistently between shapes (sometimes well above it, sometimes well below),
+which is exactly why Phase 18's fixed `{target, target/2, target×2}` bracket sometimes landed
+6x off. Replaced it with a ternary search over the full sorted divisor list — same underlying
+principle (unimodal ⇒ findable minimum), but it actually locates the minimum instead of
+guessing at its neighborhood, in O(log(divisor count)) real timed launches.
+
+| Shape (c,H,W,k,y×x) | Phase 18 (3-cand, ms) | Phase 20 (ternary, ms) | MIOpen (ms) | vs MIOpen |
+|---|---|---|---|---|
+| 128,120,160,128,3x3 | 2.362 | 1.995 | 0.414 | 4.8x slower |
+| 128,30,40,128,1x1 | 0.035 | 0.035 | 0.022 | 1.6x slower |
+| 128,30,40,128,3x3 | 0.408 | 0.413 | 0.067 | 6.2x slower |
+| 128,30,40,512,1x1 | 0.103 | 0.098 | 0.053 | 1.85x slower |
+| 192,60,80,64,1x1 | 0.074 | 0.065 | 0.0056 | 11.6x slower |
+| 256,30,40,128,1x1 | 0.084 | 0.085 | 0.028 | 3.0x slower |
+| 256,60,80,64,1x1 | 0.086 | 0.065 | 0.052 | 1.25x slower |
+| 512,30,40,128,1x1 | 0.103 | 0.096 | 0.050 | 1.9x slower |
+| 64,60,80,128,1x1 | 0.064 | 0.062 | 0.040 | 1.55x slower |
+| 64,60,80,256,1x1 | 0.087 | 0.067 | 0.052 | 1.3x slower |
+
+Two shapes improved a further ~23-24% over Phase 18 (`256,60,80,64,1x1` and `64,60,80,256,1x1`
+— both had target-vs-true-optimum mismatches the 3-candidate bracket couldn't bridge); the rest
+were flat to modestly better. **None regressed.** Worst case vs MIOpen: 13x → 11.6x. Six of ten
+shapes are now within 2x of MIOpen; the worst two (`128,30,40,128,3x3` at 6.2x and
+`192,60,80,64,1x1` at 11.6x) are the smallest-absolute-time shapes in the set, so also the most
+exposed to fixed per-dispatch overhead that no split-count choice can amortize away.
+
+This is very likely close to the ceiling for split-count tuning alone — the exhaustive sweep
+found points at most 1-2% better than the ternary search's picks. **Further gains from here
+need the epilogue itself**, specifically an LDS-reshuffle coalescing store for the non-atomic
+path (fwd/bwd/non-split wrw — the atomic path's fp32 atomic-add has no wide instruction to
+exploit, confirmed via the CDNA5 ISA doc in Phase 19). That work was deliberately deferred, not
+attempted in this session — see `docs/gfx1250_wmma_layout.md`'s Phase 19 "Critical files" note
+and this doc's own conclusion above for where to pick it back up.

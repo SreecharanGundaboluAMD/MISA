@@ -1933,3 +1933,86 @@ micro-optimization on the atomic path specifically.
 - `python/operations/coalescing_store_wmma.py` -- the `v_tmp1`/`v_tmp2` ping-pong
 - `python/igemm/igemm_{fwd,bwd,wrw}_gtc_wmma_nhwc.py` -- `v_addr_out` back to 2 registers,
   call sites pass both
+
+## Phase 20 (2026-08-25): ternary search over ALL divisors -- Phase 18's 3-candidate bracket characterized properly and replaced
+
+Pushed the split-count question further: rather than guessing at a better bracket, added a
+research-only `IGEMM_GSPLIT_SWEEP=<target>` env var to `driver/igemm_wrw_gtc_driver.h` (forces
+a single candidate, snapped to the nearest valid divisor of that target, bypassing whatever
+search logic is otherwise in place) and used it to sweep the **entire** perf-vs-split-count
+curve from an external shell loop, no rebuild needed between points.
+
+### The curve, measured on real hardware
+
+Swept every divisor of `num_k_blocks` for all three distinct values that occur across the 10
+vendor-benchmark shapes (25200, 6300, 1575 -- batch=42), `IGEMM_WARMUP=2 IGEMM_REPEAT=5` for
+speed (this is a shape-characterization pass, not a final measurement). All three curves are
+clearly **unimodal**: cost decreases monotonically from splits=1 (matches the original
+catastrophe -- 777ms at splits=1 for the worst shape) down to a single minimum, then increases
+again as splits keeps growing (fixed per-workgroup/per-atomic overhead starts dominating an
+ever-shrinking slice of real work). Sample points for the worst shape
+(`128,120,160,128,3x3`, `num_k_blocks=25200`, 128x128 tile):
+
+| splits | cost (ms) | | splits | cost (ms) | | splits | cost (ms) |
+|---|---|---|---|---|---|---|---|
+| 1 | 777.4 | | 300 | 2.94 | | 600 | **2.14** |
+| 10 | 71.5 | | 420 | 2.34 | | 630 | **2.06** (best) |
+| 100 | 7.51 | | 450 | 2.31 | | 700 | 2.11 |
+| 200 | 3.99 | | 504 | 2.33 | | 900 | 2.18 |
+| 252 | 3.30 | | 525 | 2.43 | | 1575 | 2.82 |
+
+The critical finding: **the minimum's location relative to `ceil(num_cu / tile_count)` (512
+here) is not consistent across shapes.** For this shape the true optimum (630) sits *above* the
+naive target; for `128,30,40,128,1x1` (`num_k_blocks=1575`, target also 512 since
+`grid_x*grid_y=1`) the true optimum was 225-315, well *below* the target. A fixed-offset
+bracket (Phase 18's `{target, target/2, target*2}`) structurally cannot reliably straddle a
+minimum that moves in different directions for different shapes -- it happened to land close
+sometimes and 6x off other times.
+
+### The fix: ternary search over the full sorted divisor list
+
+Since the curve is unimodal, a ternary search finds its minimum in O(log(divisor count)) real
+timed launches instead of guessing. `driver/igemm_wrw_gtc_driver.h`'s WMMA `run()` now:
+1. Enumerates every divisor of `num_k_blocks` (trial division up to sqrt, trivial cost --
+   divisor counts here ran 18-90, but this scales fine well beyond that).
+2. Ternary-searches the sorted list: at each step, times the two points at 1/3 and 2/3 of the
+   current window (`time_split(splits)` -- builds the karg for that split count and actually
+   launches+times it via `igemm_launch_kernels`, same per-iteration zero-init prolog as
+   before) and discards the third of the window on the losing side.
+3. Once the window shrinks to <=5 candidates, evaluates all of them directly and keeps the
+   true minimum -- real hardware timings are noisy, so trusting the last ternary comparison
+   alone risked landing one index off a locally-flat minimum.
+4. Caches every evaluated index (`std::vector<float> cache`, sentinel -1) so no split count is
+   ever timed twice across the narrowing loop and the final confirm.
+
+Degenerates correctly for non-split tunables: `divisors = {1}` when `gemm_k_global_split` is
+off, so the ternary loop's window is already `[0,0]` and the final confirm evaluates exactly
+one candidate (splits=1) -- same code path, no special-casing needed.
+
+### Results
+
+Re-ran all 10 vendor-benchmark shapes a fourth time (full warmup=5/repeat=20 fidelity, not the
+fast sweep settings above) -- see `docs/gfx1250_vendor_benchmark_vs_miopen.md`'s update for the
+complete table. Selected split counts landed within a few percent of the true minimum found by
+the earlier exhaustive sweep in every case checked. Two shapes improved ~23-24% further over
+Phase 18's 3-candidate result (`256,60,80,64,1x1`: 0.086ms -> 0.065ms; `64,60,80,256,1x1`:
+0.087ms -> 0.067ms) with the rest flat to modestly better; none regressed. Worst case vs MIOpen
+improved from ~13x (Phase 18) to ~11.6x.
+
+Cost: this now runs O(log(divisor count)) real dispatches per `run()` call for a
+`gemm_k_global_split` tunable instead of 3 -- roughly 15-20 for the divisor counts seen here,
+each `warmup+repeat` dispatches. Only matters for `driver_mode_normal`'s tuning/benchmarking
+use; a production deployment would run the search once per shape and cache the winning split
+count, same as any other autotuned kernel parameter.
+
+**Still not the theoretical ceiling** -- a full exhaustive sweep would occasionally find a
+point 1-2% better than the ternary search's answer (visible in the sample table above: 630 vs.
+the search's typical picks of 600-700), and the remaining gap to MIOpen beyond this is
+architectural (see Phase 19's conclusion: an LDS-reshuffle coalescing epilogue for the
+non-atomic store path is the next lever, not attempted in this phase -- deliberately deferred,
+see that doc's "revisit later" note).
+
+### Critical files (Phase 20)
+
+- `driver/igemm_wrw_gtc_driver.h` -- full divisor enumeration, `time_split` lambda, the
+  ternary search + cached final confirm, and the `IGEMM_GSPLIT_SWEEP` research override

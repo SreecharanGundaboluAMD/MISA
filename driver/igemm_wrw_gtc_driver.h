@@ -725,32 +725,36 @@ public:
 
             // gemm_k_global_split: split the reduction axis across grid.z, atomically
             // accumulating partial sums (see igemm_wrw_gtc_wmma_nhwc.py / docs/
-            // gfx1250_wmma_layout.md). `largest_divisor_leq` finds the largest divisor of
-            // num_k_blocks <= a target split count (so every split gets an identical, exact
-            // multiple of gemm_k_per_block -- the WMMA main loop has no K-tail handling).
-            // Rather than trusting one heuristic target, we bracket it with a small runtime
-            // search (mirroring the XDLOPS path's gks_iterative, just over a handful of
-            // candidates instead of a full sweep) and time each candidate for real, keeping
-            // whichever actually ran fastest.
+            // gfx1250_wmma_layout.md). A 3-candidate bracket around a heuristic target was
+            // tried first and left real perf on the table (see docs/gfx1250_wmma_layout.md's
+            // Phase 20): timing the FULL sweep of divisors of num_k_blocks (every split gets
+            // an identical, exact multiple of gemm_k_per_block -- the WMMA main loop has no
+            // K-tail handling, so only divisors are valid candidates at all) showed cost vs.
+            // split count is unimodal -- decreasing monotonically to a single minimum, then
+            // increasing -- but the minimum's LOCATION relative to the naive
+            // ceil(num_cu/tile_count) target isn't consistent (sometimes well above it,
+            // sometimes well below), so a fixed-offset bracket around that target
+            // structurally can't reliably find it. A ternary search over the sorted divisor
+            // list can, in O(log(divisor count)) real timed launches, exploiting that same
+            // unimodality.
             auto largest_divisor_leq = [](int num_k_blocks, int target) -> int {
                 for (int s = std::min(std::max(target, 1), num_k_blocks); s >= 1; s--) {
                     if (num_k_blocks % s == 0) return s;
                 }
                 return 1;
             };
-            std::vector<int> gsplit_candidates;
+            int num_k_blocks = gemm_k / tunable->gemm_k_per_block;
+            std::vector<int> divisors;
             if (tunable->gemm_k_global_split) {
-                int num_k_blocks = gemm_k / tunable->gemm_k_per_block;
-                int target_splits = static_cast<int>(utility_integer_divide_ceil(
-                    this->num_cu, static_cast<int>(grid_x * grid_y)));
-                std::vector<int> targets = {target_splits, target_splits / 2, target_splits * 2};
-                for (int t : targets) {
-                    int s = largest_divisor_leq(num_k_blocks, t);
-                    if (std::find(gsplit_candidates.begin(), gsplit_candidates.end(), s) == gsplit_candidates.end())
-                        gsplit_candidates.push_back(s);
+                for (int i = 1; static_cast<long long>(i) * i <= num_k_blocks; i++) {
+                    if (num_k_blocks % i == 0) {
+                        divisors.push_back(i);
+                        if (i != num_k_blocks / i) divisors.push_back(num_k_blocks / i);
+                    }
                 }
+                std::sort(divisors.begin(), divisors.end());
             } else {
-                gsplit_candidates.push_back(1);
+                divisors.push_back(1);
             }
 
             igemm_wrw_gtc_wmma_nhwc_karg_t karg;
@@ -815,10 +819,9 @@ public:
             }};
 
             std::string dump_dir = env_get_str("IGEMM_DUMPDIR_ALL", "");
-            int num_k_blocks = gemm_k / tunable->gemm_k_per_block;
-            float min_duration = FLT_MAX;
-            int selected_splits = 1;
-            for (int splits : gsplit_candidates) {
+            // Actually launches and times `splits` for real (karg.gemm_k_per_wg + grid.z),
+            // via the same per-iteration zero-init prolog every other launch path uses.
+            auto time_split = [&](int splits) -> float {
                 karg.gemm_k_per_wg = (num_k_blocks / splits) * tunable->gemm_k_per_block;
                 size_t grid_z = static_cast<size_t>(splits);
 
@@ -833,9 +836,41 @@ public:
                 float duration = igemm_launch_kernels(kernel_launchers, wrw_gsplit_prolog, noop, this->warmup, this->repeat);
                 if (dump_dir.size())
                     dump_shader_args(dump_dir, result.dumpheader, result.dumpdata, result.kernel_name);
-                if (duration < min_duration) {
-                    min_duration = duration;
-                    selected_splits = splits;
+                return duration;
+            };
+
+            float min_duration = FLT_MAX;
+            int selected_splits = 1;
+            // Research-only override for sweeping the perf-vs-split-count curve externally
+            // without rebuilding: IGEMM_GSPLIT_SWEEP=<target> forces a single candidate
+            // snapped to the nearest valid divisor of that target, bypassing the search.
+            int sweep_target = tunable->gemm_k_global_split ? env_get_int("IGEMM_GSPLIT_SWEEP", 0) : 0;
+            if (sweep_target > 0) {
+                selected_splits = largest_divisor_leq(num_k_blocks, sweep_target);
+                min_duration = time_split(selected_splits);
+            } else {
+                // Ternary search over the sorted divisor list, exploiting the measured
+                // unimodality (see comment above `divisors`). Caches each evaluated index so
+                // the narrowing loop and the final exhaustive confirm never re-launch the
+                // same split count twice. Degenerates to a single evaluation of divisors[0]
+                // (==1) when gemm_k_global_split is off, since `divisors` is just {1} then.
+                std::vector<float> cache(divisors.size(), -1.0f);
+                auto eval = [&](int idx) -> float {
+                    if (cache[idx] < 0.0f) cache[idx] = time_split(divisors[idx]);
+                    return cache[idx];
+                };
+                int lo = 0, hi = static_cast<int>(divisors.size()) - 1;
+                while (hi - lo > 4) {
+                    int m1 = lo + (hi - lo) / 3;
+                    int m2 = hi - (hi - lo) / 3;
+                    if (eval(m1) <= eval(m2)) hi = m2; else lo = m1;
+                }
+                // Final small window (<=5 candidates): confirm the true minimum directly
+                // rather than trusting the last ternary comparison, since real hardware
+                // timings are noisy and the curve can be locally flat near its minimum.
+                for (int idx = lo; idx <= hi; idx++) {
+                    float d = eval(idx);
+                    if (d < min_duration) { min_duration = d; selected_splits = divisors[idx]; }
                 }
             }
 
