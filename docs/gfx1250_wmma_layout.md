@@ -2561,3 +2561,131 @@ own qualitatively different risk profile.
   (kept in sync with the Python side, mirroring the existing `lds_double_buffer`/
   `async_global_load`/`main_loop_interleave` pattern)
 - `config/igemm_{fwd,bwd,wrw}_gtc_gfx1250_nhwc_fp16_k2x_f16acc{,_lp2}.config` -- new
+
+## Phase 25 (2026-08-26): GEMM_M boundary/tail handling for WMMA fwd -- closes most of the "not buildable" shape-coverage gap
+
+### Motivation
+
+Workgroup Clusters (the previous investigation, wrw's atomic contention) was dropped after
+a real microbenchmark showed no win at wrw's actual measured-optimal split count (630) --
+see the session history. Redirected to a different question: how does the older XDLOPS
+(MFMA) track achieve such broad shape/config coverage, and can WMMA close the gap?
+
+Research (a background agent, verified directly against source) found two distinct gaps:
+
+1. **WMMA has zero boundary/tail handling.** The WMMA-specific branch of fwd's
+   `tunable_is_valid()` (`driver/igemm_fwd_gtc_driver.h`) hard-rejects any shape where
+   `gemm_m`/`gemm_n`/`gemm_k` isn't an *exact* multiple of the tile's per-block size. XDLOPS's
+   nhwc path has no such rejection for M/N -- it computes a padded grid via
+   `utility_integer_divide_ceil` and EXEC-masks the tail block's out-of-range stores
+   (`coalescing_store.py`: `v_cmp_gt_u32` + `s_and_saveexec_b64` around each `global_store`).
+   This -- not a performance gap -- is why, per `docs/gfx1250_vendor_benchmark_vs_miopen.md`,
+   only 20 of 72 real (non-depthwise) conv shapes from a MIOpen trace were even buildable on
+   WMMA at all: the other 52 fail the exact-multiple requirement outright.
+2. **WMMA only has 4 macro-tile shapes (128x128/64x64/128x64/64x128) vs XDLOPS's 24** --
+   mostly because no one has authored the additional config sections/mapping-table entries
+   yet (XDLOPS's per-tile "variants" turned out to just be an nxe/gsplit/vector_store
+   cross-product, not different instruction shapes -- the 24 distinct (m,n,k) triples are the
+   real coverage difference). Deferred to a later, separate phase (additive, no overlap with
+   this one's files).
+
+Scoped to (1), fwd only, GEMM_M only, as a pilot -- prove the pattern end-to-end against real
+previously-unbuildable shapes before deciding whether to extend to GEMM_N, bwd, and wrw.
+
+### Design
+
+New tunable `wmma_m_tail` (default 0, every existing config unaffected -- fwd only for now,
+asserted incompatible with `gemm_k_global_split` since the atomic epilogue branch was never
+adapted). When set:
+
+1. **Driver validity relax** (`igemm_fwd_gtc_driver.h`): drops the `gemm_m % gemm_m_per_block
+   != 0` hard-reject; `gemm_n`/`gemm_k` still require an exact multiple (no B-operand or
+   K-loop tail handling exists yet). No grid-dispatch change needed at all -- both
+   `get_grid_size()` (the shared/generic path) and fwd's own direct-launch grid_x computation
+   already use `utility_integer_divide_ceil(gemm_m, gemm_m_per_block)`, so the padded grid was
+   already being dispatched; only the validity check was stopping it from ever being tried.
+2. **No new kernarg needed.** `s_gemm_m` -- the real, unpadded `n*ho*wo` -- was *already* being
+   loaded from the kernarg into an sgpr at kernel entry (piggybacking on an existing
+   `s_load_dwordx4` that also covers `s_p_out`/`s_gemm_n`), just never read anywhere
+   downstream. This phase is the first consumer.
+3. **A-operand load masking** (`igemm_fwd_gtc_wmma_nhwc.py`'s `_emit_tap_gather`): the
+   existing `v_flag` computation (today: masks conv spatial-padding OOB reads, `hi_idx`/
+   `wi_idx` outside `[0,hi)x[0,wi)`) gets one more `v_cndmask_b32` AND'd in -- this row's
+   absolute flattened index (`s_block_m_off + v_tid [+ i*block_size]`, recomputed fresh right
+   at the check rather than trusting an earlier register's survival across the division
+   macro) `< s_gemm_m`. Reuses the exact same masking plumbing every existing load path
+   already threads `v_flag` through (`_emit_gld_chunk_load`, `_emit_gld_async_all_chunks`) --
+   no new mechanism.
+4. **Epilogue store masking** (`coalescing_store_wmma.py`, non-atomic/LDS-reshuffle branch --
+   the one genuinely new piece of code): the gather loop's global-memory row value is copied
+   into a new scratch VGPR (`v_m_tail_row`, only allocated when `wmma_m_tail` is set) right
+   before it's folded into a byte address, then advanced by `row_step_per_pass` each pass.
+   Before each `global_store_*`: `v_cmpx_gt_u32 s[s_gemm_m], v[v_m_tail_row]` narrows EXEC to
+   lanes whose row is still in range, followed by `s_mov_b32 exec_lo, -1` to restore. This is
+   the *wave32* idiom already established elsewhere in this file
+   (`igemm_fwd_gtc_wmma_nhwc.py`'s `_emit_gld_chunk_load`: `v_cmpx_le_u32` + `exec_lo`
+   restore) -- not XDLOPS's 64-bit `s_and_saveexec_b64`/`s_or_b64` pattern, which doesn't
+   apply to a wave32-only kernel.
+
+### Bugs/gotchas found
+
+None in the masking logic itself -- it worked correctly on the first hardware run. One
+testing-workflow gotcha: `python3 igemm_codegen.py <config>` (without `-s`) clears `out/`
+before regenerating, so a previously-built `.hsaco` silently disappears the next time a
+*different* config is generated non-split -- cost a few minutes of `hipModuleLoad ... file
+not found` confusion before realizing the fix is just to regenerate the specific config
+being tested immediately before running it, not to assume yesterday's build is still there.
+
+### Verification
+
+**Byte-identical regression sweep**: 8 representative existing fwd configs (fp32/fp16/bf16/
+int8 bases, plus `_128x64`/`_ldspad`/`_k2x_lp2`/`_k2x_f16acc` variants) diffed against the
+pre-Phase-25 commit, ignoring only the version-banner line -- zero differences. Confirms
+`wmma_m_tail=0` (every existing config) is completely unaffected.
+
+**"Before" state confirmed**: the base (non-mtail) bf16 config, run against a real
+non-128/64-aligned shape (`n=1,c=64,H=10,W=10,k=128`, gemm_m=100), reports `not applicable`
+for both its tile sections -- exactly the "not buildable" gap the trace-shape analysis
+described.
+
+**Correctness, `_mtail` configs (bf16/fp16/fp32, 128x128 tile)**, all `valid:y` against the
+CPU reference:
+
+| Shape | gemm_m | Notes |
+|---|---|---|
+| n=1,c=64,H=10,W=10,k=128,1x1 | 100 | the original "not buildable" repro |
+| n=1,c=64,H=1,W=1,k=128,1x1 | 1 | extreme tail, 127/128 rows masked off |
+| n=1,c=64,H=1,W=127,k=128,1x1 | 127 | one short of exact multiple |
+| n=1,c=64,H=1,W=129,k=128,1x1 | 129 | spills into a 2nd (mostly-masked) tail block |
+| n=1,c=64,H=1,W=256,k=128,1x1 | 256 | exact multiple -- masking-is-a-no-op check |
+| n=5,c=64,H=5,W=6,k=128,1x1 | 150 | tail cut lands mid-batch (multi-`n` decomposition) |
+| n=2,c=128,H=5,W=5,k=256,g=2,1x1 | 50 | group>1 combined with tail |
+| n=2,c=64,H=9,W=9,k=128,3x3,pad=1 | 162 | general conv path (nxe/hi-wi masking + M-tail together), bf16 and fp16 both tested |
+
+### Net result
+
+The single biggest, most concrete lever for WMMA shape coverage found this session: fwd's
+GEMM_M exact-multiple requirement -- the reason most real trace shapes were outright
+unbuildable, not just slow -- is gone, using entirely reused masking plumbing plus one small
+new epilogue guard. GEMM_N tail (B-operand masking, genuinely new mechanism), GEMM_K tail
+(main-loop zero-padding, the most invasive of the three), and extending this pattern to
+bwd/wrw (each with their own GEMM_M/N semantics) are explicitly deferred -- revisit once this
+pilot's results inform whether the added complexity is worth it for those directions too.
+The separate tile-shape/config-count expansion (XDLOPS's 24 vs WMMA's 4 macro-tiles) remains
+untouched -- independent files, no overlap, can proceed separately.
+
+### Critical files (Phase 25)
+
+- `driver/igemm_gtc_base.h` -- `wmma_m_tail` tunable field + config parsing (not folded into
+  the kernel name -- purely a codegen/validity behavior change, mirrors
+  `local_prefetch_num`/`atomic_scope`'s precedent, not `wmma_acc_f16`'s)
+- `driver/igemm_fwd_gtc_driver.h` -- `tunable_is_valid()`'s relaxed gemm_m check
+- `python/igemm/igemm_base.py` -- reads `wmma_m_tail` (fwd-only, asserted mutually exclusive
+  with `gemm_k_global_split`)
+- `python/igemm/igemm_fwd_gtc_wmma_nhwc.py` -- `v_flag`'s new M-tail AND-in
+  (`_emit_tap_gather`), conditional `v_m_tail_row` scratch VGPR, wires `s_gemm_m`/
+  `v_m_tail_row` into the `coalescing_store()` call
+- `python/operations/coalescing_store_wmma.py` -- the new epilogue EXEC-mask guard
+  (non-atomic branch only), `ctrl.wmma_m_tail` field
+- `config/igemm_fwd_gtc_gfx1250_nhwc_{bf16,fp16,fp32}_mtail.config` -- new, one 128x128
+  section each with `wmma_m_tail=1`

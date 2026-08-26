@@ -165,6 +165,14 @@ typedef struct {
     // able to coexist as a distinct, separately-named kernel alongside the f32-accumulate
     // build of the same tile shape.
     int wmma_acc_f16;
+    // Phase 25: when set, relaxes fwd's WMMA-only gemm_m%gemm_m_per_block==0 validity
+    // requirement (tunable_is_valid()) and turns on the kernel's GEMM_M tail-masking codegen
+    // (v_flag OOB check on the A-operand load, EXEC-masked store in the epilogue). Purely a
+    // codegen/validity behavior change like local_prefetch_num/atomic_scope -- doesn't change
+    // buffer layout -- so NOT folded into the kernel name; by convention (see epilogue_lds_pad's
+    // config-file precedent) an _mtail config must not combine both a plain and an _mtail
+    // section of the SAME tile shape in one file, since they'd otherwise collide on name.
+    int wmma_m_tail;
 } igemm_gtc_tunable_t;
 
 static inline std::string get_igemm_gtc_fma_type(std::string arch_string, const config_section_t &sec){
@@ -229,6 +237,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.async_global_load        = sec.count("async_global_load") > 0 ? sec.at("async_global_load").get_int() : 0;
                 tunable.main_loop_interleave     = sec.count("main_loop_interleave") > 0 ? sec.at("main_loop_interleave").get_int() : 0;
                 tunable.wmma_acc_f16             = sec.count("wmma_acc_f16") > 0 ? sec.at("wmma_acc_f16").get_int() : 0;
+                tunable.wmma_m_tail               = sec.count("wmma_m_tail") > 0 ? sec.at("wmma_m_tail").get_int() : 0;
             }
             else{
                 tunable.wave_tile_m              = sec.at("wave_tile_m").get_int();

@@ -449,7 +449,11 @@ public:
             int gemm_m = n * ho * wo;
             int gemm_n = k / group;
             int gemm_k = c / group;
-            if(gemm_m % gemm_m_per_block != 0 || gemm_n % gemm_n_per_block != 0 || gemm_k % gemm_k_per_block != 0)
+            // Phase 25: wmma_m_tail relaxes the gemm_m exact-multiple requirement -- the
+            // kernel's v_flag/epilogue masking (see igemm_fwd_gtc_wmma_nhwc.py) handles the
+            // partial tail block correctly. gemm_n/gemm_k still require an exact multiple
+            // (no B-operand or K-loop tail handling exists yet).
+            if((!tunable->wmma_m_tail && gemm_m % gemm_m_per_block != 0) || gemm_n % gemm_n_per_block != 0 || gemm_k % gemm_k_per_block != 0)
                 return false;
             return true;
         }

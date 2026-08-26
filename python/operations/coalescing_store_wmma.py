@@ -97,6 +97,17 @@ class ctrl_coalescing_store_wmma_t(object):
         # instead of 4). See docs/gfx1250_wmma_layout.md's Phase 24.
         self.wmma_acc_f16 = 0
 
+        # Phase 25 (GEMM_M tail): non-atomic path only (see igemm_base.py's mutual-exclusion
+        # assert with gemm_k_global_split -- the atomic epilogue was never adapted for this).
+        # 0 (default) = today's unconditional store, every existing config unaffected. 1 =
+        # EXEC-mask each pass's global store off for lanes whose absolute row (block_m_off +
+        # this lane's tile-local row) is >= the real (unpadded) GEMM_M -- the tail block's
+        # out-of-range rows. Mirrors XDLOPS's coalescing_store.py v_cmp_gt_u32/saveexec guard,
+        # but using this file's existing v_cmpx/exec_lo idiom (see igemm_fwd_gtc_wmma_nhwc.py's
+        # _emit_gld_chunk_load) since WMMA is wave32-only -- no 64-bit saveexec needed, a plain
+        # exec_lo restore suffices. See docs/gfx1250_wmma_layout.md's Phase 25.
+        self.wmma_m_tail = 0
+
 
 class igemm_coalescing_store_wmma_t(mc_base_t):
     def __init__(self, mc, ctrl):
@@ -104,7 +115,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         assert type(ctrl) is ctrl_coalescing_store_wmma_t
         self.ctrl = ctrl
 
-    def __call__(self, v_c, v_gemm_im, v_gemm_in, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1, v_tid=None, v_gather=None, s_block_m_off=None, s_block_n_off=None):
+    def __call__(self, v_c, v_gemm_im, v_gemm_in, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1, v_tid=None, v_gather=None, s_block_m_off=None, s_block_n_off=None, s_gemm_m=None, v_tmp3=None):
         '''
         v_gemm_im/v_gemm_in: this thread's base (row, col) within the macro tile, from
             igemm_wmma_mapping_t.get_gemm_index_for_dst_matrix (row/col of wave_repeat
@@ -116,6 +127,9 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         v_tid/v_gather: only needed for the non-atomic (LDS-reshuffle) path -- v_tid is the
             kernel's persistent flat thread id, v_gather is a vector_write_out-wide scratch
             VGPR range (unused by the atomic path).
+        s_gemm_m/v_tmp3: only needed when ctrl.wmma_m_tail is set (non-atomic path only) --
+            s_gemm_m is the real (unpadded) GEMM_M scalar, v_tmp3 is 1 scratch VGPR used to
+            track each pass's absolute row for the EXEC-mask guard.
 
         ctrl.gemm_k_global_split selects between two structurally different epilogues:
 
@@ -143,6 +157,9 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         cxm = ctrl.cxm
         inst_wmma = cxm.inst_wmma
         assert cxm.wave_tile_m == 16 and cxm.wave_tile_n == 16
+        if ctrl.wmma_m_tail:
+            assert not ctrl.gemm_k_global_split, "wmma_m_tail's masking is only implemented for the non-atomic epilogue branch"
+            assert s_gemm_m is not None and v_tmp3 is not None
 
         with self._deferred_context():
             if ctrl.gemm_k_global_split:
@@ -306,6 +323,11 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                     self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {elem_byte_shift}, v[{v_tmp1}]   ; LDS byte address (invariant across passes)")
                 self._emit(f"v_add_u32 v[{v_gather}], s[{s_block_n_off}], v[{v_gather}]   ; + block_n_off -> global col")
                 self._emit(f"v_add_u32 v[{v_tmp2}], s[{s_block_m_off}], v[{v_tmp2}]   ; + block_m_off -> global row")
+                if ctrl.wmma_m_tail:
+                    # Phase 25: this lane's absolute row for pass 0, preserved across passes --
+                    # v_tmp2 itself gets folded into a byte address on the next line, so it can't
+                    # double as the running row counter the way it does in the unmasked case.
+                    self._emit(f"v_mov_b32 v[{v_tmp3}], v[{v_tmp2}]   ; wmma_m_tail: absolute row, pass 0")
                 self._emit(f"v_mul_lo_u32 v[{v_tmp2}], s[{s_gemm_m_stride}], v[{v_tmp2}]")
                 self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_gather}], v[{v_tmp2}]")
                 self._emit(f"v_lshlrev_b32 v[{v_tmp2}], {elem_byte_shift}, v[{v_tmp2}]   ; global memory byte address for pass 0")
@@ -318,8 +340,19 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                     # unpadded f32 case (elem_bytes=4).
                     self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * row_step_per_pass * padded_stride * elem_bytes}")
                     self._emit(f"s_wait_dscnt 0x0")
+                    if ctrl.wmma_m_tail:
+                        # Phase 25: EXEC-mask off lanes whose absolute row for this pass is in
+                        # the tail block's out-of-range tail (>= real gemm_m). Wave32-only idiom
+                        # (v_cmpx narrows EXEC directly, exec_lo restore afterward) -- mirrors
+                        # _emit_gld_chunk_load's existing v_flag masking in
+                        # igemm_fwd_gtc_wmma_nhwc.py, not XDLOPS's 64-bit saveexec/or pattern.
+                        self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
                     self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
+                    if ctrl.wmma_m_tail:
+                        self._emit(f"s_mov_b32 exec_lo, -1")
                     if it != num_passes - 1:
                         self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_tmp2}], s[{s_tmp1}]   ; advance to pass {it + 1}")
+                        if ctrl.wmma_m_tail:
+                            self._emit(f"v_add_u32 v[{v_tmp3}], {row_step_per_pass}, v[{v_tmp3}]   ; wmma_m_tail: advance absolute row")
                 self._emit_empty_line()
         return self._get_deferred()

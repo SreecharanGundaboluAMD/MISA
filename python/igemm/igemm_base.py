@@ -515,6 +515,18 @@ class igemm_gtc_tunable_parameter_t(object):
                 # so this combination is unsupported, not just unimplemented -- block it.
                 assert not self.gemm_k_global_split, \
                     "wmma_acc_f16 and gemm_k_global_split are mutually exclusive -- the atomic epilogue branch was never adapted to read a packed f16 accumulator, see docs/gfx1250_wmma_layout.md's Phase 24"
+            # Phase 25 (GEMM_M tail): optional, defaults to 0 (today's exact-gemm_m-multiple-
+            # only requirement, every existing config unaffected). When 1, the driver's
+            # tunable_is_valid() allows gemm_m % gemm_m_per_block != 0, and this kernel emits
+            # extra masking: the A-operand v_flag computation also checks the lane's absolute
+            # flattened row index against the real (unpadded) GEMM_M, and the epilogue
+            # EXEC-masks stores whose absolute row index is out of range. fwd only for now --
+            # bwd/wrw have their own GEMM_M semantics and haven't been reviewed for this yet.
+            self.wmma_m_tail = utility_dict_with_default_t(tunable_dict)('wmma_m_tail', 0)
+            if self.wmma_m_tail:
+                assert self.direction == 'fwd', "wmma_m_tail is only implemented for fwd so far, see docs/gfx1250_wmma_layout.md's Phase 25"
+                assert not self.gemm_k_global_split, \
+                    "wmma_m_tail and gemm_k_global_split are mutually exclusive for now -- the atomic epilogue branch has no M-tail masking, see docs/gfx1250_wmma_layout.md's Phase 25"
             wmma_mapping_key = self.precision + '_f16acc' if self.wmma_acc_f16 else self.precision
             wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(self.gemm_m_per_block, self.gemm_n_per_block, self.wmma_tile_m, self.wmma_tile_n,
                     self.wmma_repeat_m, self.wmma_repeat_n, self.block_size // self.wave_size, wmma_mapping_key)

@@ -223,6 +223,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_coalescing_store_wmma.atomic_cascade = tunable.atomic_cascade
         ctrl_coalescing_store_wmma.epilogue_lds_pad = tunable.epilogue_lds_pad
         ctrl_coalescing_store_wmma.wmma_acc_f16 = tunable.wmma_acc_f16
+        ctrl_coalescing_store_wmma.wmma_m_tail = tunable.wmma_m_tail
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
 
         # int8 added: the only two byte-width-dependent literals (the A/B global-address
@@ -372,6 +373,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 # is added) -- computed once from the *y*x*c* row stride, reused every tap.
                 self.v_addr_b_base = sym_t('v_addr_b_base' , vseq(2 * outer.row_repeat_b, 2))
             self.v_addr_out    = sym_t('v_addr_out'    , vseq(2))    # scratch used by coalescing_store_wmma (ping-pong pair)
+            if outer.tunable.wmma_m_tail:
+                # Phase 25: extra scratch for coalescing_store_wmma's per-pass absolute-row
+                # EXEC-mask guard -- only allocated when wmma_m_tail is set (every existing
+                # config is byte-identical, this register simply doesn't exist otherwise).
+                self.v_m_tail_row = sym_t('v_m_tail_row' , vseq(1))
             self.v_sst_os      = sym_t('v_sst_os'      , vseq(1))    # shared store offset (same for A/B region)
             self.v_sld_a_os    = sym_t('v_sld_a_os'    , vseq(1))
             self.v_sld_b_os    = sym_t('v_sld_b_os'    , vseq(1))
@@ -774,6 +780,23 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_wi()}], v[{v.v_gtc_tmp(1)}]")
             self._emit(f"v_cndmask_b32 v[{v.v_flag(i)}], 0, v[{v.v_flag(i)}], vcc_lo")
             self._emit_empty_line()
+
+            if self.tunable.wmma_m_tail:
+                # Phase 25: v_flag also gates on this row's absolute GEMM_M index (the same
+                # kind of OOB condition as hi/wi above, just against the tail block's real
+                # gemm_m instead of the input tensor's spatial extent). v_gtc_tmp(4) is free
+                # here for i==0 (unused until this point in that branch) and is recomputed
+                # fresh rather than reused from i>0's pre-division value at line ~754, to
+                # avoid depending on whether the division macro above preserves its dividend.
+                self._emit(f"; wmma_m_tail: v_flag{tag} &= (this row's absolute GEMM_M index < real gemm_m)")
+                if i == 0:
+                    self._emit(f"v_add_u32 v[{v.v_gtc_tmp(4)}], s[{s.s_block_m_off()}], v[{v.v_tid()}]")
+                else:
+                    self._emit(f"v_add_u32 v[{v.v_gtc_tmp(4)}], {i * self.tunable.block_size}, v[{v.v_tid()}]")
+                    self._emit(f"v_add_u32 v[{v.v_gtc_tmp(4)}], s[{s.s_block_m_off()}], v[{v.v_gtc_tmp(4)}]")
+                self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_gemm_m()}], v[{v.v_gtc_tmp(4)}]")
+                self._emit(f"v_cndmask_b32 v[{v.v_flag(i)}], 0, v[{v.v_flag(i)}], vcc_lo")
+                self._emit_empty_line()
 
             self._emit(f"; row_idx = n_idx*(hi*wi) + hi_idx*wi + wi_idx (meaningless but harmless if")
             self._emit(f"; v_flag==0 -- that lane's global_load_a is EXEC-masked off, see global_load_a_functor)")
@@ -1269,7 +1292,8 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         s = self.sgpr
         # s_out_k_total (=gemm_n*group) is the output tensor's TOTAL row stride (see class
         # docstring's group>1 note) -- s_gemm_n alone (per-group) is only correct for group=1.
-        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_k_total.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off()))
+        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_k_total.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off(),
+                    s.s_gemm_m.label if self.tunable.wmma_m_tail else None, v.v_m_tail_row() if self.tunable.wmma_m_tail else None))
         self._emit(f"s_wait_storecnt 0x0")
 
     def emit_kernel_body(self):
