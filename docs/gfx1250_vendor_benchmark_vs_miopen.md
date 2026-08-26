@@ -346,3 +346,55 @@ given how little of their total time the epilogue represents. Further gains on t
 would need to target the main loop itself (LDS bank conflicts, register double-buffering,
 graduated waitcnt — all flagged but not attempted in the original code review this session)
 rather than the epilogue.
+
+## Update (2026-08-26): register-level prefetch (`docs/gfx1250_wmma_layout.md`'s Phase 22), and a cross-architecture comparison vs. gfx950
+
+Implemented the deferred main-loop item from above: `local_prefetch_num=2`, intra-K-substep
+VGPR-level prefetch for `v_a`/`v_b` (ported from the dotx/mfma paths, adapted for WMMA — see
+Phase 22 for the full design and the VGPR-budget audit). Measured effect, fp32 128x128
+(the only precision with VGPR headroom to fit it today): fwd gets a real, reproducible win
+(+1.7% to +9.4% depending on shape), bwd regresses on one shape (-8.6%, not yet root-caused)
+and is flat on another, wrw (non-split) is flat both shapes tested (expected — it's
+occupancy-bound, not main-loop-latency-bound, same reason the epilogue work above didn't
+move it either). **Decision: enabled for fwd, held for bwd pending the regression's root
+cause, not used for wrw.** This only applies to fp32 — fp16/bf16/int8's 128x128 tile has no
+VGPR headroom to fit it (confirmed via the audit: `+64` VGPRs needed, `252/256` already used).
+
+### Cross-architecture comparison: MISA/gfx1250 vs. MIOpen/gfx950
+
+Since `local_prefetch_num=2` only applies to fp32 and this comparison's shape set is
+exclusively bf16 (same 20 buildable shapes as the MIOpen/gfx1250 comparison above, unchanged
+by that decision), this is really a separate question: **how does MISA's gfx1250 WMMA
+backend compare against MIOpen running on the older gfx950 (MI350X) architecture**, not a
+re-run of the same-arch comparison above. Found the counterpart trace file at
+`~/rocm-libraries/tracelens_shapes_gfx950.json` (same 112 total / 86 conv / 20-buildable
+shape set as the gfx1250 trace referenced above — confirmed by re-running the exact same
+shape-triage filter from this doc's own methodology and getting an identical 20-shape list).
+
+For wrw, used MISA's *current* best option (the `_gsplit` K-split config from Phase 17,
+built after the original MIOpen/gfx1250 comparison above) rather than the plain config that
+comparison used — an apples-to-apples "MISA's fastest option today" comparison, not a replay
+of an since-fixed regression. fwd/bwd use the same combined bf16 config as before (both tile
+shapes searched, fastest reported). `IGEMM_WARMUP=5 IGEMM_REPEAT=20`, same methodology as
+the original comparison.
+
+| Direction | Shapes | MISA/gfx1250 vs. MIOpen/gfx950 |
+|---|---|---|
+| fwd | 5 | 0.99x-1.31x (avg 1.19x) — one shape (`c=128,H=120,W=160,k=128,3x3`) is a dead heat |
+| bwd | 5 | 0.91x-1.24x (avg 1.08x) — one shape (`c=256,H=60,W=80,k=64,1x1`) is actually **faster** than MIOpen/gfx950 |
+| wrw (`_gsplit`) | 10 | 1.09x-4.89x (avg 2.01x) |
+
+**A dramatically different picture than the MIOpen/gfx1250 comparison above** (which showed
+1.4x-3.2x for fwd/bwd and 100x-1665x for wrw) — expected, since that comparison pit MISA's
+young gfx1250 kernels against MIOpen's own mature gfx1250 solvers, while this one compares
+against MIOpen running on an *older* architecture (gfx950/MI350X). fwd and bwd are
+essentially at parity with MIOpen-on-a-different-generation-GPU; wrw, even with the K-split
+fix, still trails by 1-5x — the `_gsplit` fix solved the catastrophic 100x-1665x-class
+failure (too few workgroups) but the resulting kernel's per-workgroup efficiency (one atomic
+add per output element, see Phase 19/21) still isn't fully competitive. Worth noting: this
+isn't a claim that gfx1250 silicon is faster than gfx950 silicon, or vice versa — it's a
+statement about how mature each *software stack* is on its respective hardware today.
+
+Same GPU-contention caveat as the rest of this doc applies; a couple of spot-reruns showed
+tight variance (fwd 3x3: 0.361/0.362ms; wrw-gsplit 3x3: 2.02/2.16ms, ~7% spread) but this
+was not re-benchmarked on an exclusively-held GPU.
