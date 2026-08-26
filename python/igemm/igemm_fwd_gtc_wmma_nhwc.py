@@ -202,9 +202,15 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         assert not (tunable.main_loop_interleave and not tunable.lds_double_buffer), \
             "main_loop_interleave requires lds_double_buffer=1 (single-buffered interleaving races across waves, confirmed on hardware)"
 
-        # Phase 24: 'fp16_f16acc' is a separate table key (not a field), see wmma_mapping.py --
-        # picks v_wmma_f16_16x16x32_f16 (num_v_c=4) instead of v_wmma_f32_16x16x32_f16 (num_v_c=8).
-        wmma_mapping_key = tunable.precision + '_f16acc' if tunable.wmma_acc_f16 else tunable.precision
+        # Phase 24/27: 'fp16_f16acc'/'bf16_bf16acc' are separate table keys (not fields), see
+        # wmma_mapping.py -- pick the num_v_c=4 narrow-accumulate instruction instead of the
+        # num_v_c=8 f32-accumulate one.
+        if tunable.wmma_acc_f16:
+            wmma_mapping_key = tunable.precision + '_f16acc'
+        elif tunable.wmma_acc_bf16:
+            wmma_mapping_key = tunable.precision + '_bf16acc'
+        else:
+            wmma_mapping_key = tunable.precision
         ctrl_wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(tunable.gemm_m_per_block, tunable.gemm_n_per_block,
                 tunable.wmma_tile_m, tunable.wmma_tile_n, tunable.wmma_repeat_m, tunable.wmma_repeat_n,
                 tunable.block_size // tunable.wave_size, wmma_mapping_key)
@@ -222,7 +228,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_coalescing_store_wmma.atomic_scope = tunable.atomic_scope
         ctrl_coalescing_store_wmma.atomic_cascade = tunable.atomic_cascade
         ctrl_coalescing_store_wmma.epilogue_lds_pad = tunable.epilogue_lds_pad
-        ctrl_coalescing_store_wmma.wmma_acc_f16 = tunable.wmma_acc_f16
+        # Phase 27: coalescing_store_wmma.py's ctrl field is named wmma_acc_f16 but its actual
+        # behavior is precision-agnostic ("is the accumulator 2-byte-packed"), proven by
+        # bf16-accumulate needing zero changes there -- both tunables funnel into this one
+        # ctrl field rather than adding a second, identical branch.
+        ctrl_coalescing_store_wmma.wmma_acc_f16 = tunable.wmma_acc_f16 or tunable.wmma_acc_bf16
         ctrl_coalescing_store_wmma.wmma_m_tail = tunable.wmma_m_tail
         ctrl_coalescing_store_wmma.wmma_n_tail = tunable.wmma_n_tail
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
@@ -462,7 +472,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         epilogue_pad = 4 if self.tunable.epilogue_lds_pad else 0
         # Phase 24: f16acc's epilogue stages genuinely 2-byte-per-element LDS data (see
         # coalescing_store_wmma.py's scatter), half the f32 case's footprint.
-        epilogue_elem_bytes = 2 if self.tunable.wmma_acc_f16 else 4
+        epilogue_elem_bytes = 2 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16) else 4
         epilogue_lds_bytes = self.tunable.gemm_m_per_block * (self.tunable.gemm_n_per_block + epilogue_pad) * epilogue_elem_bytes
         # Phase 23: the 128x128 tile is already exactly at the 64KB/workgroup hardware limit
         # with ZERO headroom (Phase 21) -- padding pushes it over (128*132*4 = 67584 > 65536).
@@ -622,7 +632,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # Phase 24: shift must follow the D-operand's real width (4 bytes normally, 2 under
         # wmma_acc_f16) -- see the identical bug found and fixed in wrw's per-tap output
         # offset (igemm_wrw_gtc_wmma_nhwc.py's emit_kernel_tap_loop).
-        out_elem_byte_shift = 1 if self.tunable.wmma_acc_f16 else 2
+        out_elem_byte_shift = 1 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16) else 2
         self._emit(f"; output: group offset = group_idx * gemm_n elements (D-operand is fp32/int32 (4B) normally, fp16 (2B) under wmma_acc_f16)")
         self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group_idx()}], s[{s.s_gemm_n()}]")
         self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {out_elem_byte_shift}")

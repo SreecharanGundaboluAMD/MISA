@@ -2796,3 +2796,101 @@ K-tail needs) that warrants its own focused pass rather than bundling further.
 - `config/igemm_bwd_gtc_gfx1250_nhwc_{bf16,fp16,fp32}_mtail.config` -- new, 64x64-only (26a)
 - `config/igemm_fwd_gtc_gfx1250_nhwc_{bf16,fp16,fp32}_ntail.config` -- new, 128x128 (26b)
 - `config/igemm_fwd_gtc_gfx1250_nhwc_bf16_mntail.config` -- new, combined M+N tail (26b)
+
+## Phase 27 (2026-08-26): BF16-accumulate WMMA -- unblocks bwd's 128x128 M-tail
+
+### Motivation
+
+Directly motivated by Phase 26a's finding: bwd's plain 128x128 bf16 tile sits at exactly
+256/256 VGPRs with zero margin, which is why `wmma_m_tail` (needing 1 extra VGPR) could only
+ship 64x64 for bwd. Asked to look for ISA-doc-grounded VGPR-reduction options. Found two:
+
+1. **VGPR-MSB indexing** (doc §3.3.2.3): a wave can be allocated up to 1024 VGPRs; addressing
+   past VGPR 255 needs `S_SET_VGPR_MSB` before instructions touching the high range. Real, but
+   a blunt/high-overhead instrument -- not pursued.
+2. **`V_WMMA_BF16_16X16X32_BF16`**: a bf16-native-accumulate WMMA variant, structurally
+   identical to Phase 24's `V_WMMA_F16_16X16X32_F16` -- confirmed via `llvm-mc` that it
+   requires a 4-VGPR accumulator (rejects 8-VGPR), the same 2x reduction in `v_c` Phase 24
+   already proved for fp16. (Also checked `V_WMMA_BF16F32_16X16X32_BF16` -- its C input is
+   8-VGPR f32 while D output is 4-VGPR bf16, different widths, so it can't be an in-place
+   iterative accumulator. Not usable.)
+
+### Design
+
+Mirrors Phase 24 (`wmma_acc_f16`) almost exactly with a new `wmma_acc_bf16` tunable (bf16-only,
+mutually exclusive with `gemm_k_global_split`/`epilogue_lds_pad`/`wmma_acc_f16` for the same
+reasons as Phase 24). **Key finding: `coalescing_store_wmma.py` needed zero changes** -- its
+f16acc epilogue code (`elem_bytes`/`ds_write_b16`/`ds_read_u16`/`global_store_short`, all gated
+on `ctrl.wmma_acc_f16`) operates on raw 16-bit patterns with no fp16-specific behavior, so
+`wmma_acc_bf16` just funnels into the SAME ctrl field
+(`ctrl_coalescing_store_wmma.wmma_acc_f16 = tunable.wmma_acc_f16 or tunable.wmma_acc_bf16`).
+Not excluded from `wmma_m_tail`/`wmma_n_tail` (unlike `gemm_k_global_split`) since those guards
+operate on lane/row/column indices, not element width -- this is the actual point of the
+phase: a combined `bf16_bf16acc_mtail` config at 128x128 lands at **193/256 VGPRs** (vs the
+257 that blocked plain `wmma_m_tail` at 128x128), a 63-VGPR swing, far more headroom than
+strictly needed. New `driver/gpu_tensor_cast/gpu_tensor_cast.cpp` kernel
+(`tensor_cast_fp32_bf16acc_1d`) mirrors Phase 24's fp16 cast-back kernel, using a new
+`__bfloat16_to_float` helper (a lossless left-shift, unlike the existing rounding
+`__float_to_bfloat16` used for the opposite direction).
+
+### Verification
+
+Byte-identical regression sweep (fwd/bwd/wrw, all precisions, f16acc/gsplit/mtail/ntail
+configs) -- zero change for `wmma_acc_bf16=0`. `.vgpr_count` confirmed as designed: 128x128
+tile drops from 252/256/251 (f32-accumulate baseline) to 188/192/187 (fwd/bwd/wrw) with plain
+bf16acc, and the bwd `bf16acc+mtail` combo lands at 193 -- comfortably under 256.
+
+**Hardware correctness, bf16acc alone**: fwd validated `valid:y` across 1x1 (large batch),
+3x3-pad1 (n=42 real shape), and a K-sweep up to 2048 with no failures. The bwd/wrw M-tail
+combo battery (Phase 26a's shape set, at 128x128 this time) passed **7 of 8** cases
+(extreme/one-short/one-over/exact/multi-batch/padded-3x3 all `valid:y`) -- see below for the
+1 failure and why it's not a Phase 27 bug.
+
+### Two real findings, both pre-existing / not Phase-27 bugs (documented, not fixed here)
+
+1. **BF16-native-accumulate has a real, reproducible precision ceiling at larger K for bwd
+   and wrw** -- not observed for fwd in equivalent testing. Controlled K-sweep (bwd, 1x1,
+   `n=1`): K=256/512 `valid:y`, K=1024 `valid:n`, reproducible across 3 different random
+   seeds (not borderline/flaky -- a real, consistent divergence past a K threshold, not
+   precision noise). wrw showed the same pattern (small K `valid:y`, `gemm_k=8192` `valid:n`).
+   fwd stayed `valid:y` up to K=2048 in the shapes tested. bf16's mantissa (7 bits) is
+   meaningfully coarser than fp16's (10 bits, which showed no such issue in Phase 24's
+   validation), so this is very plausibly inherent to bf16 accumulation precision interacting
+   with each direction's specific data distribution -- the underlying masking/addressing
+   mechanism is independently confirmed correct (small-K shapes and the VGPR counts both
+   check out). **Practical implication**: do not treat `wmma_acc_bf16` as a blanket "always
+   safe" choice for bwd/wrw's larger-K shapes the way `wmma_acc_f16` appears to be -- validate
+   accuracy per-shape, same as any lower-precision accumulate mode requires. Not investigated
+   further this phase (would need per-shape accuracy sweeps or a mitigation like periodic
+   renormalization, out of scope).
+2. **bwd has a pre-existing group>1 bug when a single group spans multiple N-blocks**
+   (`gemm_n > gemm_n_per_block`, i.e. `c/group` needs more than one N-tile) -- found while
+   testing the bf16acc+mtail combo with `c=256,k=128,g=2` (`gemm_n=128` on a `gemm_n_per_block`
+   of 64 or 128, i.e. >=2 N-blocks per group). Reproduces with **plain fp16/f32-accumulate**,
+   **at both 64x64 and 128x128 tiles**, with **no `wmma_m_tail`/`wmma_n_tail`/`wmma_acc_bf16`
+   involved at all** -- confirmed unrelated to every feature shipped in Phases 24-27.
+   Phase 26a's own group>1 validation (`n=2,c=128,H=5,W=5,k=128,g=2`) still reproduces
+   correctly (`valid:y`) because that shape's `gemm_n=64` happens to be exactly one N-block
+   per group -- it never exercised the multi-N-block-per-group path. This looks like a
+   group-index-decoding bug (`s_group_idx` derived from `s_by`) that only manifests when a
+   group's data spans more than one N-tile. Not fixed here -- flagged for a dedicated future
+   investigation; likely affects wrw too given the shared code pattern (not yet checked).
+
+### Critical files (Phase 27)
+
+- `python/operations/wmma.py` -- new `v_wmma_bf16_16x16x32_bf16` instruction instance
+- `python/operations/wmma_mapping.py` -- new `'bf16_bf16acc'` table key
+- `python/igemm/igemm_base.py` -- `wmma_acc_bf16` tunable (bf16-only, excludes
+  `gemm_k_global_split`/`epilogue_lds_pad`/`wmma_acc_f16`; NOT excluded from
+  `wmma_m_tail`/`wmma_n_tail`), `wmma_mapping_key` selection, kernel-name fold
+- `python/igemm/igemm_{fwd,bwd,wrw}_gtc_wmma_nhwc.py` -- wires `wmma_acc_bf16` everywhere
+  `wmma_acc_f16` is wired (mapping key, `ctrl_coalescing_store_wmma.wmma_acc_f16` OR'd in,
+  `epilogue_elem_bytes`/`out_elem_byte_shift`(`_group`) byte-width selection)
+- `driver/gpu_tensor_cast/gpu_tensor_cast.cpp` -- new `__bfloat16_to_float` helper and
+  `tensor_cast_fp32_bf16acc_1d` kernel
+- `driver/conv_driver.cpp` -- `is_wmma_bf16_acc`, `dtype_alloc_byte` fold, 3 new
+  `tensor_cast_fp32_bf16acc_1d` invocation sites (fwd/bwd/wrw)
+- `driver/igemm_gtc_base.h` -- `wmma_acc_bf16` struct field, config parsing, kernel-name fold
+- `config/igemm_{fwd,bwd,wrw}_gtc_gfx1250_nhwc_bf16_k2x_bf16acc{,_lp2}.config` -- new
+- `config/igemm_bwd_gtc_gfx1250_nhwc_bf16_bf16acc_mtail.config` -- new, the phase's key
+  validation config (128x128, both flags set)

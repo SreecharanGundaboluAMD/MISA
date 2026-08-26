@@ -78,13 +78,19 @@ v_wmma_f32_16x16x32_f16   = inst_wmma_t(16, 16, 32,  AMDGPU_PRECISION_FP16,  Non
 # each VGPR packing 2 output rows (bits [15:0]/[31:16] of the same lane/column, per the
 # CDNA5 ISA doc's 16-bit C/D-matrix table). Verified via llvm-mc -show-encoding: assembles
 # with a 4-VGPR (v[d:d+3]) accumulator, and REJECTS an 8-VGPR accumulator ("invalid operand
-# for instruction") -- num_v_c=4 is assembler-enforced, not assumed. bf16/int8 have no
-# equivalent halved-accumulate variant on this ISA (bf16's only narrower option,
-# v_wmma_bf16_16x16x32_bf16, accumulates natively in bf16 -- a real precision tradeoff, not
-# implemented here; int8 has no narrower-than-i32 accumulate at all) -- see
-# docs/gfx1250_wmma_layout.md's Phase 24.
+# for instruction") -- num_v_c=4 is assembler-enforced, not assumed. int8 has no
+# narrower-than-i32 accumulate option at all on this ISA. bf16 DOES have an equivalent
+# (v_wmma_bf16_16x16x32_bf16, below) -- see docs/gfx1250_wmma_layout.md's Phase 24/27.
 v_wmma_f16_16x16x32_f16   = inst_wmma_t(16, 16, 32,  AMDGPU_PRECISION_FP16,  None,  8,   8,   4,  name='v_wmma_f16_16x16x32_f16')
 v_wmma_f32_16x16x32_bf16  = inst_wmma_t(16, 16, 32,  AMDGPU_PRECISION_BF16,  None,  8,   8,   8,  name='v_wmma_f32_16x16x32_bf16')
+# Phase 27: BF16-accumulate variant -- num_v_c=4 (half of the f32-accumulate entry above),
+# mirroring v_wmma_f16_16x16x32_f16 exactly (same packed-2-rows-per-VGPR layout). Verified
+# via llvm-mc -show-encoding: assembles with a 4-VGPR (v[d:d+3]) accumulator, REJECTS an
+# 8-VGPR accumulator. Also checked v_wmma_bf16f32_16x16x32_bf16 (C=f32 8-VGPR in, D=bf16
+# 4-VGPR out, per llvm-mc) -- different widths for its C and D operands, so it can't be used
+# as an in-place iterative accumulator across main-loop K-iterations; not wired up. See
+# docs/gfx1250_wmma_layout.md's Phase 27.
+v_wmma_bf16_16x16x32_bf16 = inst_wmma_t(16, 16, 32,  AMDGPU_PRECISION_BF16,  None,  8,   8,   4,  name='v_wmma_bf16_16x16x32_bf16')
 # neg_lo:[1,1,0] selects SIGNED interpretation of A and B (the base encoding with no modifier
 # defaults to unsigned, confirmed via llvm-mc -- see docs/gfx1250_wmma_layout.md). The original
 # fwd-only round-trip probe used small UNSIGNED (0..8) test values, so this never mattered

@@ -268,6 +268,14 @@ ctrl_wmma_mapping_table = {
         ctrl_wmma_mapping_t(128, 64,  16, 16, 2, 4, 4, v_wmma_f32_16x16x32_bf16),
         ctrl_wmma_mapping_t(64,  128, 16, 16, 2, 4, 4, v_wmma_f32_16x16x32_bf16),
     ],
+    # Phase 27 (BF16-accumulate WMMA): mirrors 'fp16_f16acc' above exactly -- same tile shapes
+    # as 'bf16', just v_wmma_bf16_16x16x32_bf16 instead of v_wmma_f32_16x16x32_bf16.
+    'bf16_bf16acc': [
+        ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_bf16_16x16x32_bf16),
+        ctrl_wmma_mapping_t(64,  64,  16, 16, 2, 2, 4, v_wmma_bf16_16x16x32_bf16),
+        ctrl_wmma_mapping_t(128, 64,  16, 16, 2, 4, 4, v_wmma_bf16_16x16x32_bf16),
+        ctrl_wmma_mapping_t(64,  128, 16, 16, 2, 4, 4, v_wmma_bf16_16x16x32_bf16),
+    ],
     # int8: K=64 (not 32), but num_v_a/num_v_b/num_v_c are still 8/8/8 (same as fp16/bf16 --
     # only elements/dword differs: 4 int8/dword vs 2 fp16/dword), so the same 128x128 macro
     # tile / 4x4 wave_repeat shape carries over unchanged. Verified via hardware round-trip

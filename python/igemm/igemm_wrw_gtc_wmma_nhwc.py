@@ -158,7 +158,12 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # picks v_wmma_f16_16x16x32_f16 (num_v_c=4) instead of v_wmma_f32_16x16x32_f16 (num_v_c=8).
         # Mutually exclusive with gemm_k_global_split (asserted in igemm_base.py) since the
         # atomic epilogue branch below was never adapted for a packed accumulator.
-        wmma_mapping_key = tunable.precision + '_f16acc' if tunable.wmma_acc_f16 else tunable.precision
+        if tunable.wmma_acc_f16:
+            wmma_mapping_key = tunable.precision + '_f16acc'
+        elif tunable.wmma_acc_bf16:
+            wmma_mapping_key = tunable.precision + '_bf16acc'
+        else:
+            wmma_mapping_key = tunable.precision
         ctrl_wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(tunable.gemm_m_per_block, tunable.gemm_n_per_block,
                 tunable.wmma_tile_m, tunable.wmma_tile_n, tunable.wmma_repeat_m, tunable.wmma_repeat_n,
                 tunable.block_size // tunable.wave_size, wmma_mapping_key)
@@ -177,7 +182,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_coalescing_store_wmma.atomic_scope = tunable.atomic_scope
         ctrl_coalescing_store_wmma.atomic_cascade = tunable.atomic_cascade
         ctrl_coalescing_store_wmma.epilogue_lds_pad = tunable.epilogue_lds_pad
-        ctrl_coalescing_store_wmma.wmma_acc_f16 = tunable.wmma_acc_f16
+        # Phase 27: see igemm_fwd_gtc_wmma_nhwc.py's identical comment -- the ctrl field's
+        # actual behavior is precision-agnostic (2-byte-packed accumulator), so both tunables
+        # funnel into it.
+        ctrl_coalescing_store_wmma.wmma_acc_f16 = tunable.wmma_acc_f16 or tunable.wmma_acc_bf16
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
 
         # A-region (grad_output) and B-region (input): both natural [GEMM_K rows][M or N
@@ -362,7 +370,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         epilogue_pad = 4 if self.tunable.epilogue_lds_pad else 0
         # Phase 24: f16acc's epilogue stages genuinely 2-byte-per-element LDS data (see
         # coalescing_store_wmma.py's scatter), half the f32 case's footprint.
-        epilogue_elem_bytes = 2 if self.tunable.wmma_acc_f16 else 4
+        epilogue_elem_bytes = 2 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16) else 4
         epilogue_lds_bytes = 0 if self.tunable.gemm_k_global_split else \
             self.tunable.gemm_m_per_block * (self.tunable.gemm_n_per_block + epilogue_pad) * epilogue_elem_bytes
         # Phase 23: the 128x128 tile is already exactly at the 64KB/workgroup hardware limit
@@ -547,7 +555,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # per-tap offset automatically inherits this block-constant group shift. ----
         # Phase 24: shift must follow the D-operand's real width (4 bytes normally, 2 under
         # wmma_acc_f16) -- same bug class as emit_kernel_tap_loop's per-tap offset above.
-        out_elem_byte_shift_group = 1 if self.tunable.wmma_acc_f16 else 2
+        out_elem_byte_shift_group = 1 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16) else 2
         self._emit(f"; output (grad_weight): group offset = group_idx * gemm_m * wei_row_c elements")
         self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group_idx()}], s[{s.s_gemm_m()}]")
         self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_wei_row_c()}]")
@@ -666,7 +674,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # is the only place outside coalescing_store_wmma.py that independently computes a
         # byte address into the WMMA-native output buffer. f16acc halves that buffer's
         # element width to 2 bytes, so this must shift by 1, not 2, in that case.
-        out_elem_byte_shift = 1 if self.tunable.wmma_acc_f16 else 2
+        out_elem_byte_shift = 1 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16) else 2
         self._emit(f"; s_p_out_tap = p_out + (iy*x+ix)*gemm_n*{1 << out_elem_byte_shift} bytes (WMMA D-operand is")
         self._emit(f"; fp32/int32 (4B) normally, or fp16 (2B) under wmma_acc_f16 -- see coalescing_store_wmma.py)")
         self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_iy()}], s[{s.s_x()}]")

@@ -515,6 +515,24 @@ class igemm_gtc_tunable_parameter_t(object):
                 # so this combination is unsupported, not just unimplemented -- block it.
                 assert not self.gemm_k_global_split, \
                     "wmma_acc_f16 and gemm_k_global_split are mutually exclusive -- the atomic epilogue branch was never adapted to read a packed f16 accumulator, see docs/gfx1250_wmma_layout.md's Phase 24"
+            # Phase 27 (BF16-accumulate WMMA): mirrors wmma_acc_f16 exactly, using
+            # v_wmma_bf16_16x16x32_bf16 instead of v_wmma_f16_16x16x32_f16. A separate flag
+            # (not a shared "wmma_acc_narrow" concept) since each is precision-gated to its
+            # own dtype and independently mutually exclusive with gemm_k_global_split/
+            # epilogue_lds_pad for the identical reasons -- but see below, NOT excluded from
+            # wmma_m_tail/wmma_n_tail: those EXEC-mask guards operate on lane/row/column
+            # indices, not element width, so they compose with a 2-byte-packed accumulator
+            # with no changes needed (this is the actual motivation for this phase -- see
+            # docs/gfx1250_wmma_layout.md's Phase 27).
+            self.wmma_acc_bf16 = utility_dict_with_default_t(tunable_dict)('wmma_acc_bf16', 0)
+            if self.wmma_acc_bf16:
+                assert self.precision == 'bf16', \
+                    f"wmma_acc_bf16=1 is only implemented for bf16 (got precision={self.precision})"
+                assert not self.epilogue_lds_pad, \
+                    "wmma_acc_bf16 and epilogue_lds_pad are mutually exclusive for now -- see wmma_acc_f16's identical Phase 23/24 reasoning"
+                assert not self.gemm_k_global_split, \
+                    "wmma_acc_bf16 and gemm_k_global_split are mutually exclusive -- the atomic epilogue branch was never adapted to read a packed accumulator, see wmma_acc_f16's identical Phase 24 reasoning"
+                assert not self.wmma_acc_f16, "wmma_acc_bf16 and wmma_acc_f16 are mutually exclusive (different precisions)"
             # Phase 25 (GEMM_M tail): optional, defaults to 0 (today's exact-gemm_m-multiple-
             # only requirement, every existing config unaffected). When 1, the driver's
             # tunable_is_valid() allows gemm_m % gemm_m_per_block != 0, and this kernel emits
@@ -547,7 +565,12 @@ class igemm_gtc_tunable_parameter_t(object):
                     "wmma_n_tail and async_global_load are mutually exclusive for now -- global_load_async_to_lds_b128's masking was only ever validated for the A operand, see docs/gfx1250_wmma_layout.md's Phase 13/26b"
                 assert self.gemm_n_per_block // self.block_size == 1, \
                     "wmma_n_tail requires row_repeat_b == 1 -- rows 1+ have no flag of their own, see docs/gfx1250_wmma_layout.md's Phase 26b"
-            wmma_mapping_key = self.precision + '_f16acc' if self.wmma_acc_f16 else self.precision
+            if self.wmma_acc_f16:
+                wmma_mapping_key = self.precision + '_f16acc'
+            elif self.wmma_acc_bf16:
+                wmma_mapping_key = self.precision + '_bf16acc'
+            else:
+                wmma_mapping_key = self.precision
             wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(self.gemm_m_per_block, self.gemm_n_per_block, self.wmma_tile_m, self.wmma_tile_n,
                     self.wmma_repeat_m, self.wmma_repeat_n, self.block_size // self.wave_size, wmma_mapping_key)
             self.num_vgpr_accumulate_c          = wmma_mapping.total_acc_c()
@@ -1044,6 +1067,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_interleave"
         if tunable.wmma_acc_f16:
             kernel_name += "_f16acc"
+        if tunable.wmma_acc_bf16:
+            kernel_name += "_bf16acc"
 
     if tunable.tensor_a_pass_through:
         kernel_name += "_pta"

@@ -165,6 +165,9 @@ typedef struct {
     // able to coexist as a distinct, separately-named kernel alongside the f32-accumulate
     // build of the same tile shape.
     int wmma_acc_f16;
+    // Phase 27: bf16 analog of wmma_acc_f16 above -- same reasoning (folded into kernel name,
+    // driver buffer-allocation impact), just gated to precision=='bf16' instead of 'fp16'.
+    int wmma_acc_bf16;
     // Phase 25: when set, relaxes fwd's WMMA-only gemm_m%gemm_m_per_block==0 validity
     // requirement (tunable_is_valid()) and turns on the kernel's GEMM_M tail-masking codegen
     // (v_flag OOB check on the A-operand load, EXEC-masked store in the epilogue). Purely a
@@ -242,6 +245,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.async_global_load        = sec.count("async_global_load") > 0 ? sec.at("async_global_load").get_int() : 0;
                 tunable.main_loop_interleave     = sec.count("main_loop_interleave") > 0 ? sec.at("main_loop_interleave").get_int() : 0;
                 tunable.wmma_acc_f16             = sec.count("wmma_acc_f16") > 0 ? sec.at("wmma_acc_f16").get_int() : 0;
+                tunable.wmma_acc_bf16             = sec.count("wmma_acc_bf16") > 0 ? sec.at("wmma_acc_bf16").get_int() : 0;
                 tunable.wmma_m_tail               = sec.count("wmma_m_tail") > 0 ? sec.at("wmma_m_tail").get_int() : 0;
                 tunable.wmma_n_tail               = sec.count("wmma_n_tail") > 0 ? sec.at("wmma_n_tail").get_int() : 0;
             }
@@ -445,6 +449,8 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += std::string("_interleave");
         if(tunable->wmma_acc_f16)
             kernel_name += std::string("_f16acc");
+        if(tunable->wmma_acc_bf16)
+            kernel_name += std::string("_bf16acc");
     }
     if(tensor_a_pass_through)
         kernel_name += std::string("_pta");

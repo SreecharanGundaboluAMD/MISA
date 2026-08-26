@@ -667,6 +667,9 @@ int main(int argc, char **argv) {
     // special-casing needed for them (they were already correctly sized by data_byte, or
     // harmlessly over-allocated to fp32 by is_wmma's dtype_alloc_byte).
     bool is_wmma_f16_acc = is_wmma && tunables[0].wmma_acc_f16 != 0;
+    // Phase 27: bf16 analog of is_wmma_f16_acc above -- same 2-byte-native-role-buffer
+    // situation, just gated to wmma_acc_bf16.
+    bool is_wmma_bf16_acc = is_wmma && tunables[0].wmma_acc_bf16 != 0;
 
     hipModule_t module;
 #ifndef IGEMM_SPLIT_KERNEL
@@ -769,7 +772,7 @@ int main(int argc, char **argv) {
     // -- e.g. a pure fp32 build defines none of them, and previously (a Phase 24 regression,
     // caught by this branch's own byte-identical-assembly regression sweep) those lambdas
     // failed to compile with "use of undeclared identifier 'dtype_alloc_byte'".
-    size_t dtype_alloc_byte = is_wmma_f16_acc ? data_byte : (is_wmma ? sizeof(float) : data_byte);
+    size_t dtype_alloc_byte = (is_wmma_f16_acc || is_wmma_bf16_acc) ? data_byte : (is_wmma ? sizeof(float) : data_byte);
 #if defined(USE_HALF) || defined(USE_INT8) || defined(USE_BF16) || defined(USE_INT4)
     host_input_dtype  = malloc(n * c * hi * wi * dtype_alloc_byte);
     host_weight_dtype = malloc(k * c * y * x * dtype_alloc_byte);
@@ -1008,6 +1011,21 @@ int main(int argc, char **argv) {
                                    hipMemcpyDeviceToHost));
                     is_valid = valid_vector<float>(host_output, static_cast<float*>(device_output_to_host),
                                             static_cast<size_t>(n) * k * ho * wo, nrms);
+                }else if(is_wmma_bf16_acc){
+                    // Phase 27: bf16 analog of the is_wmma_f16_acc branch above.
+                    hipFunction_t bf16acc_cast_func;
+                    HIP_CALL(hipModuleGetFunction(&bf16acc_cast_func, module_tensor_cast, "tensor_cast_fp32_bf16acc_1d"));
+                    tensor_cast_karg_t karg_bf16acc_cast;
+                    karg_bf16acc_cast.output = device_output;
+                    karg_bf16acc_cast.input = device_output_dtype;
+                    karg_bf16acc_cast.total_length = n * k * ho * wo;
+                    const size_t thread_length_bf16acc_cast = (static_cast<size_t>(n) * k * ho * wo + 8 * 256) / (8 * 256) * (8 * 256) / 8;
+                    igemm_launch_kernel_single(bf16acc_cast_func, &karg_bf16acc_cast, sizeof(karg_bf16acc_cast), {thread_length_bf16acc_cast, 1, 1}, {256, 1, 1});
+                    HIP_CALL(hipMemcpy(device_output_to_host, device_output,
+                                   static_cast<size_t>(n) * k * ho * wo * sizeof(float),
+                                   hipMemcpyDeviceToHost));
+                    is_valid = valid_vector<float>(host_output, static_cast<float*>(device_output_to_host),
+                                            static_cast<size_t>(n) * k * ho * wo, nrms);
                 }else if(is_wmma){
                     // WMMA always accumulates/stores D at full width (fp32, or int32 for
                     // int8) regardless of tunable->precision -- see comment near is_wmma.
@@ -1166,6 +1184,21 @@ int main(int argc, char **argv) {
                     karg_f16acc_cast.total_length = n * c * hi * wi;
                     const size_t thread_length_f16acc_cast = (static_cast<size_t>(n) * c * hi * wi + 8 * 256) / (8 * 256) * (8 * 256) / 8;
                     igemm_launch_kernel_single(f16acc_cast_func, &karg_f16acc_cast, sizeof(karg_f16acc_cast), {thread_length_f16acc_cast, 1, 1}, {256, 1, 1});
+                    HIP_CALL(hipMemcpy(device_input_to_host, device_input,
+                                    static_cast<size_t>(n) * c * hi * wi * sizeof(float),
+                                    hipMemcpyDeviceToHost));
+                    is_valid = valid_vector<float>(host_input, static_cast<float*>(device_input_to_host),
+                                                static_cast<size_t>(n) * c * hi * wi, nrms);
+                } else if(is_wmma_bf16_acc){
+                    // Phase 27: bf16 analog of the is_wmma_f16_acc branch above.
+                    hipFunction_t bf16acc_cast_func;
+                    HIP_CALL(hipModuleGetFunction(&bf16acc_cast_func, module_tensor_cast, "tensor_cast_fp32_bf16acc_1d"));
+                    tensor_cast_karg_t karg_bf16acc_cast;
+                    karg_bf16acc_cast.output = device_input;
+                    karg_bf16acc_cast.input = device_input_dtype;
+                    karg_bf16acc_cast.total_length = n * c * hi * wi;
+                    const size_t thread_length_bf16acc_cast = (static_cast<size_t>(n) * c * hi * wi + 8 * 256) / (8 * 256) * (8 * 256) / 8;
+                    igemm_launch_kernel_single(bf16acc_cast_func, &karg_bf16acc_cast, sizeof(karg_bf16acc_cast), {thread_length_bf16acc_cast, 1, 1}, {256, 1, 1});
                     HIP_CALL(hipMemcpy(device_input_to_host, device_input,
                                     static_cast<size_t>(n) * c * hi * wi * sizeof(float),
                                     hipMemcpyDeviceToHost));
@@ -1346,6 +1379,21 @@ int main(int argc, char **argv) {
                     karg_f16acc_cast.total_length = ngroups * (k / ngroups) * (c / ngroups) * y * x;
                     const size_t thread_length_f16acc_cast = (static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x + 8 * 256) / (8 * 256) * (8 * 256) / 8;
                     igemm_launch_kernel_single(f16acc_cast_func, &karg_f16acc_cast, sizeof(karg_f16acc_cast), {thread_length_f16acc_cast, 1, 1}, {256, 1, 1});
+                    HIP_CALL(hipMemcpy(device_weight_to_host, device_weight,
+                                   static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x * sizeof(float),
+                                   hipMemcpyDeviceToHost));
+                    is_valid = valid_vector<float>(host_weight, static_cast<float*>(device_weight_to_host),
+                                        static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x, nrms);
+                }else if(is_wmma_bf16_acc){
+                    // Phase 27: bf16 analog of the is_wmma_f16_acc branch above.
+                    hipFunction_t bf16acc_cast_func;
+                    HIP_CALL(hipModuleGetFunction(&bf16acc_cast_func, module_tensor_cast, "tensor_cast_fp32_bf16acc_1d"));
+                    tensor_cast_karg_t karg_bf16acc_cast;
+                    karg_bf16acc_cast.output = device_weight;
+                    karg_bf16acc_cast.input = device_weight_dtype;
+                    karg_bf16acc_cast.total_length = ngroups * (k / ngroups) * (c / ngroups) * y * x;
+                    const size_t thread_length_bf16acc_cast = (static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x + 8 * 256) / (8 * 256) * (8 * 256) / 8;
+                    igemm_launch_kernel_single(bf16acc_cast_func, &karg_bf16acc_cast, sizeof(karg_bf16acc_cast), {thread_length_bf16acc_cast, 1, 1}, {256, 1, 1});
                     HIP_CALL(hipMemcpy(device_weight_to_host, device_weight,
                                    static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x * sizeof(float),
                                    hipMemcpyDeviceToHost));

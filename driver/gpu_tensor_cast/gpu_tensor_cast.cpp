@@ -10,6 +10,18 @@ typedef union _cvt_bf16_fp32
     float f32;
 } _cvt_bf16_fp32_t;
 
+// Phase 27: opposite direction of __float_to_bfloat16 below -- bf16 is just the upper 16 bits
+// of an fp32 value (truncated on the way in, per __float_to_bfloat16's rounding), so widening
+// back to fp32 is an exact, lossless left-shift into the high half with a zero low half. No
+// rounding needed (unlike the narrowing direction).
+inline __device__ __host__ float __bfloat16_to_float(ushort src_val)
+{
+    _cvt_bf16_fp32_t target_val;
+    target_val.ushortvec[0] = 0;
+    target_val.ushortvec[1] = src_val;
+    return target_val.f32;
+}
+
 inline __device__ __host__ ushort __float_to_bfloat16(float src_val)
 {
     _cvt_bf16_fp32_t target_val;
@@ -188,6 +200,61 @@ void tensor_cast_fp32_fp16acc_1d(float* output, half* input, int total_length)
             int index = min(i + tid, total_length - 1);
             in_data = input[index];
             out_data = __half2float(in_data);
+            *(output + index) = out_data;
+        }
+    }
+}
+
+// Phase 27 (gfx1250 WMMA BF16-accumulate): bf16 analog of tensor_cast_fp32_fp16acc_1d above --
+// same structure, ushort (raw bf16 bit pattern) input instead of half, __bfloat16_to_float
+// instead of __half2float. See docs/gfx1250_wmma_layout.md's Phase 27.
+extern "C"
+__global__ __launch_bounds__(256,2)
+void tensor_cast_fp32_bf16acc_1d(float* output, ushort* input, int total_length)
+{
+    constexpr auto unroll_length = 8;
+    ushort vec_in_data[unroll_length];
+    float vec_out_data[unroll_length];
+    ushort *tmp_in;
+    float *tmp_out;
+
+    unsigned int tid = threadIdx.x;
+    unsigned int bid = blockIdx.x;
+    unsigned int block_size = blockDim.x;
+
+    int offset = bid * unroll_length * 256;
+    int block_end = offset + unroll_length * 256;
+
+    if(block_end <= total_length)
+    {
+        tmp_in = input + offset + tid;
+        #pragma unroll
+        for(int i = 0; i < unroll_length; i++){
+            vec_in_data[i] = *(tmp_in);
+            tmp_in += 1 * 256;
+        }
+
+        #pragma unroll
+        for(int i = 0; i < unroll_length; i++){
+            vec_out_data[i] = __bfloat16_to_float(vec_in_data[i]);
+        }
+
+        tmp_out = output + offset + tid * 1;
+        #pragma unroll
+        for(int i = 0; i < unroll_length; i++){
+            *(tmp_out) = vec_out_data[i];
+            tmp_out += 1 * 256;
+        }
+    }
+    else
+    {
+        ushort in_data;
+        float out_data;
+        for(int i = offset; i < total_length; i += 256)
+        {
+            int index = min(i + tid, total_length - 1);
+            in_data = input[index];
+            out_data = __bfloat16_to_float(in_data);
             *(output + index) = out_data;
         }
     }
