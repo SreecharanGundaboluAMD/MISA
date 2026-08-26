@@ -2231,20 +2231,61 @@ tile shape, which is exactly the class of address-math derivation this branch ha
 subtly wrong before (Phase 21's two bugs). Deferred rather than guessed at without the
 ability to validate on real hardware in this pass.
 
-### Verification (this phase only -- GPU deferred)
+### Verification
 
-GPU was busy with another workload this session, so only compile-only checks ran (codegen
-+ `clang++ -x assembler` -> `.hsaco`, no kernel launch): fp32 128x128 `_k2x_lp2` for
-fwd/bwd/wrw assembles cleanly, `.vgpr_count` matches the predicted +16 exactly, and the
-emitted schedule was inspected directly in the `.inc` (the `ds_read`/`v_wmma_*`/
-`s_wait_dscnt` sequence matches the intended 2-slot pipelining exactly: substep 0's data
-already in hand, substep 1's load issued and waited before substep 0 computes, cycling
-slots 0/1 thereafter, no dangling prefetch after the final substep). **Actual on-GPU
-correctness (`-V 1`) and the full regression sweep/benchmark are NOT done yet** -- deferred
-until the GPU is free, per explicit instruction this session. Don't treat "assembles
-cleanly with the right VGPR count" as "correct" -- it only rules out the classes of bugs
-that show up as reject-at-assemble-time or gross register-arithmetic mistakes, not
-addressing/data correctness.
+Compile-only checks first (codegen + `clang++ -x assembler` -> `.hsaco`, no kernel launch):
+fp32 128x128 `_k2x_lp2` for fwd/bwd/wrw assembles cleanly, `.vgpr_count` matches the
+predicted +16 exactly, and the emitted schedule was inspected directly in the `.inc` (the
+`ds_read`/`v_wmma_*`/`s_wait_dscnt` sequence matches the intended 2-slot pipelining exactly:
+substep 0's data already in hand, substep 1's load issued and waited before substep 0
+computes, cycling slots 0/1 thereafter, no dangling prefetch after the final substep).
+
+**Regression sweep, real hardware**: rather than re-running every existing config by hand,
+generated 11 representative existing configs (fwd/bwd/wrw, fp16/fp32, covering
+`_k2x`/`_dbuf`/`_interleave`/`_async`/the atomic `_gsplit` path) at the pre-Phase-22 commit
+(`ca2876b`, via a scratch clone) and at current HEAD, and diffed the generated `.s` output
+directly -- **byte-identical** (modulo a version-hash comment banner) across all 11,
+proving zero behavior change for every config that doesn't set `local_prefetch_num` (i.e.
+every config that existed before this phase). Stronger than a hardware spot-check: it rules
+out the change entirely at the instruction level, not just "still passes this one test".
+
+**New-mechanism correctness, real hardware**: `conv_driver.exe`, all 3 new
+`fp32_k2x_lp2` configs (fwd/bwd/wrw), 12 shape/direction combinations total (1x1 at two
+different tile-aligned sizes, 3x3 stride1/pad1, stride2/pad1, 5x5 dilation=2) -- **12/12
+`valid:y`** against `naive_conv_{fwd,bwd,wrw}_nhwc`. (Group>1 shapes report "not
+applicable" for this config regardless of `local_prefetch_num` -- a pre-existing limitation
+of the base fp32 128x128 tunable's tensor_a/b_cluster_lengths, unrelated to this phase.)
+
+### Results
+
+fp32 128x128, `_k2x` (prefetch=1) vs `_k2x_lp2` (prefetch=2), same shapes, `-V 0 -t 1 -w 1`,
+each figure the median of 3 back-to-back runs (all tight, <0.5% run-to-run variance):
+
+| Shape | Direction | Before (tflops) | After (tflops) | Change |
+|---|---|---|---|---|
+| n=8,c=k=2048,H=W=32,1x1 (K-loop-bound) | fwd | 191.0 | 209.0 | **+9.4%** |
+| 128,120,160,128,3x3 (n=42) | fwd | 195.2 | 198.4 | +1.7% |
+| n=8,c=k=2048,H=W=32,1x1 (K-loop-bound) | bwd | 141.3 | 141.4 | flat (noise) |
+| 128,120,160,128,3x3 (n=42) | bwd | 163.7 | 149.7 | **-8.6%** |
+| n=8,c=k=2048,H=W=32,1x1 (K-loop-bound) | wrw (non-split) | 38.5 | 38.6 | flat (noise) |
+| 128,30,40,128,1x1 (n=42) | wrw (non-split) | 0.141 | 0.141 | flat (noise) |
+
+**Honest read, mixed picture -- same shape of result as Phase 9's original k2x rollout**:
+fwd gets a real, reproducible win (largest on the K-loop-bound shape, where hiding the
+LDS-read behind WMMA issue has the most substep iterations to pay off across). bwd
+*regresses* on the 3x3 shape specifically, reproducibly (~8.6%, tight across 3 reruns) --
+not yet root-caused; bwd's B operand uses the transposed read-and-pack `shared_load_b_functor`
+(scratch-heavy, multiple `ds_read`+shift-pack per element, see Phase 8/9's docstrings) which
+may simply have a different latency/occupancy profile under the 2-slot scheme than the
+untransposed A path fwd uses for both operands -- a real candidate for follow-up, not
+guessed at further here. wrw (non-split) is flat both shapes, expected: non-split wrw's
+bottleneck is occupancy (too few workgroups), which this change doesn't touch -- the same
+reason Phase 21's epilogue vectorization also showed near-zero for wrw.
+
+**Net recommendation**: ship for fwd (clear win, no downside seen), hold on bwd until the
+3x3 regression is understood (the K-loop-bound shape is neutral for bwd, so this isn't a
+uniform loss -- shape-dependent, same as k2x itself was). Not worth enabling wrw at all
+given zero measured effect either way.
 
 ### Critical files (Phase 22)
 
