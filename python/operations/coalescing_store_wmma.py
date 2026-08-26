@@ -62,6 +62,30 @@ class ctrl_coalescing_store_wmma_t(object):
         # LDS-reshuffle phase for the derivation.
         self.vector_write_out = 4
 
+        # Phase 23 (ISA-driven epilogue tuning): atomic path only. Default 'SCOPE_SYS' =
+        # today's exact behavior. 'SCOPE_DEV' resolves within the device's L2 instead of
+        # forcing a full system-level flush/invalidate -- sufficient since gemm_k_global_split's
+        # contending workgroups are always on the same device. See docs/gfx1250_wmma_layout.md.
+        self.atomic_scope = 'SCOPE_SYS'
+        # atomic path only. 0 (default) = regular atomic. 1 = TH[2] cascading/deferred-scope
+        # atomic. The `th:TH_ATOMIC_CASCADE_RT` ENCODING was confirmed correct via an
+        # `llvm-mc -show-encoding` round-trip probe (Phase 23) -- but using it CONFIRMED HANGS
+        # ON REAL HARDWARE: this kernel's `s_wait_storecnt 0x0` before `s_endpgm` never
+        # completes, because the doc states a cascading atomic's full scope/completion is only
+        # realized at "a subsequent release... of a matching or higher scope", which this
+        # kernel never issues. Hard-blocked in igemm_base.py's tunable read (`assert not
+        # self.atomic_cascade`) until a companion release mechanism is designed and added --
+        # do not wire this up without that. See docs/gfx1250_wmma_layout.md's Phase 23.
+        self.atomic_cascade = 0
+        # the confirmed `th:` identifier to emit when atomic_cascade=1 -- a string, not a raw
+        # number (llvm-mc requires a symbolic th value, rejects numeric immediates).
+        self.atomic_th = 'TH_ATOMIC_CASCADE_RT'
+        # non-atomic path only. 0 (default) = today's unpadded tile-linear LDS layout. 1 =
+        # pad the row stride by one element to break a bank-conflict periodicity (macro_tile_n
+        # is always a multiple of 64, so the unpadded layout puts every row of a given column
+        # in the same LDS bank -- see docs/gfx1250_wmma_layout.md).
+        self.epilogue_lds_pad = 0
+
 
 class igemm_coalescing_store_wmma_t(mc_base_t):
     def __init__(self, mc, ctrl):
@@ -129,12 +153,15 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                             c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
                             col_off = i_rn * cxm.wave_tile_n * 4
                             offset_str = f" offset:{col_off}" if col_off != 0 else ""
-                            # scope:SCOPE_SYS is load-bearing, not decoration: a bare
-                            # global_atomic_add_f32 defaults to a narrower (CU/WGP-local)
-                            # cache scope on gfx1250, which silently drops updates when the
-                            # two accumulating workgroups land on different compute units --
-                            # confirmed on hardware. See docs/gfx1250_wmma_layout.md.
-                            self._emit(f"global_atomic_add_f32 v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str} scope:SCOPE_SYS")
+                            # scope:SCOPE_SYS (or SCOPE_DEV, Phase 23) is load-bearing, not
+                            # decoration: a bare global_atomic_add_f32 defaults to a narrower
+                            # (CU/WGP-local) cache scope on gfx1250, which silently drops
+                            # updates when the two accumulating workgroups land on different
+                            # compute units -- confirmed on hardware. See
+                            # docs/gfx1250_wmma_layout.md. th:{th} (Phase 23, optional) marks
+                            # a cascading/deferred-scope atomic -- see ctrl.atomic_cascade.
+                            th_str = f" th:{ctrl.atomic_th}" if ctrl.atomic_cascade else ""
+                            self._emit(f"global_atomic_add_f32 v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str} scope:{ctrl.atomic_scope}{th_str}")
                         cur, nxt = nxt, cur
                 self._emit_empty_line()
             else:
@@ -152,6 +179,22 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                 assert elems_per_pass % macro_tile_n == 0, f"elems_per_pass:{elems_per_pass} not divisible by macro_tile_n:{macro_tile_n}"
                 row_step_per_pass = elems_per_pass // macro_tile_n
                 log2_n = utility_log2(macro_tile_n)
+                # Phase 23: pad the LDS row stride by one dwordx4 (4 elements) to break a
+                # bank-conflict periodicity -- macro_tile_n is always a multiple of 64 (LDS
+                # bank count), so the unpadded tile-linear address puts every row of a given
+                # column in the same bank (a guaranteed 2-way conflict on every scatter
+                # ds_write_b32, since WMMA's per-lane row differs by exactly 8 between the
+                # two 16-lane halves, and (row+8)*macro_tile_n === row*macro_tile_n (mod 64)
+                # -- both halves collide into the same 16 banks). Padding by 4 elements
+                # (not 1) is deliberate: it still fully separates the two halves into
+                # disjoint 16-bank ranges (offset by 4*8=32, per the same math), while
+                # keeping every row's start byte-address a multiple of 16 -- required for
+                # ds_read_b128/global_store_dwordx4 (vwo=4) to stay naturally aligned. A
+                # 1-element pad would break bank periodicity too but misalign every row
+                # whose index isn't a multiple of 4, corrupting vwo=4 reads. See
+                # docs/gfx1250_wmma_layout.md's Phase 23 for the full derivation.
+                pad = 4 if ctrl.epilogue_lds_pad else 0
+                padded_stride = macro_tile_n + pad
                 ds_read_inst = {1: "ds_read_b32", 2: "ds_read_b64", 4: "ds_read_b128"}[vwo]
                 gst_inst = {1: "global_store_dword", 2: "global_store_dwordx2", 4: "global_store_dwordx4"}[vwo]
                 v_gather_range = f"{v_gather}:{v_gather}+{vwo - 1}" if vwo > 1 else v_gather
@@ -179,12 +222,15 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                     row_off = i_rm * cxm.wave_tile_m
                     self._emit(f"v_add_u32 v[{v_tmp1}], {row_off}, v[{v_gemm_im}]" if row_off != 0 else f"v_mov_b32 v[{v_tmp1}], v[{v_gemm_im}]")
                     self._emit(f"v_and_b32 v[{v_tmp1}], {macro_tile_m - 1}, v[{v_tmp1}]   ; tile-local row")
-                    self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {log2_n}, v[{v_tmp1}]   ; row << log2(macro_tile_n)")
+                    if pad:
+                        self._emit(f"v_mul_lo_u32 v[{v_tmp1}], {padded_stride}, v[{v_tmp1}]   ; row * padded_stride")
+                    else:
+                        self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {log2_n}, v[{v_tmp1}]   ; row << log2(macro_tile_n)")
                     self._emit(f"v_add_u32 v[{v_tmp1}], v[{v_tmp2}], v[{v_tmp1}]   ; + col -> tile-linear index, row {row_off}")
                     self._emit(f"v_lshlrev_b32 v[{v_tmp1}], 2, v[{v_tmp1}]   ; byte address")
                     for j in range(inst_wmma.num_v_c):
                         if j != 0:
-                            self._emit(f"v_add_u32 v[{v_tmp1}], {macro_tile_n * 4}, v[{v_tmp1}]   ; advance to row {row_off + j}")
+                            self._emit(f"v_add_u32 v[{v_tmp1}], {padded_stride * 4}, v[{v_tmp1}]   ; advance to row {row_off + j}")
                         for i_rn in range(cxm.wave_repeat_n):
                             c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
                             col_off = i_rn * cxm.wave_tile_n * 4
@@ -206,17 +252,31 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                 # precomputed per-pass stride. ----
                 self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {utility_log2(vwo)}, v[{v_tid}]   ; tid*{vwo}, tile-linear index for pass 0")
                 self._emit(f"v_and_b32 v[{v_gather}], {macro_tile_n - 1}, v[{v_tmp1}]   ; col0 (tile-local)")
-                self._emit(f"v_add_u32 v[{v_gather}], s[{s_block_n_off}], v[{v_gather}]   ; + block_n_off -> global col")
                 self._emit(f"v_lshrrev_b32 v[{v_tmp2}], {log2_n}, v[{v_tmp1}]   ; row0 (tile-local)")
+                # Phase 23: compute the LDS byte address (padded or not) from row0/col0 while
+                # they're still tile-local -- must happen BEFORE the block-offset adds below
+                # overwrite v_gather/v_tmp2 with global col/row. v_tmp1's original tid*vwo
+                # value is dead after this (unpadded case reuses it directly; padded case
+                # recomputes from row0*padded_stride+col0, since padding breaks the direct
+                # shift relationship between the packed index and the LDS offset).
+                if pad:
+                    self._emit(f"v_mul_lo_u32 v[{v_tmp1}], {padded_stride}, v[{v_tmp2}]   ; row0 * padded_stride")
+                    self._emit(f"v_add_u32 v[{v_tmp1}], v[{v_gather}], v[{v_tmp1}]   ; + col0 -> padded tile-linear index")
+                    self._emit(f"v_lshlrev_b32 v[{v_tmp1}], 2, v[{v_tmp1}]   ; padded LDS byte address (invariant across passes)")
+                else:
+                    self._emit(f"v_lshlrev_b32 v[{v_tmp1}], 2, v[{v_tmp1}]   ; LDS byte address (invariant across passes)")
+                self._emit(f"v_add_u32 v[{v_gather}], s[{s_block_n_off}], v[{v_gather}]   ; + block_n_off -> global col")
                 self._emit(f"v_add_u32 v[{v_tmp2}], s[{s_block_m_off}], v[{v_tmp2}]   ; + block_m_off -> global row")
                 self._emit(f"v_mul_lo_u32 v[{v_tmp2}], s[{s_gemm_m_stride}], v[{v_tmp2}]")
                 self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_gather}], v[{v_tmp2}]")
                 self._emit(f"v_lshlrev_b32 v[{v_tmp2}], 2, v[{v_tmp2}]   ; global memory byte address for pass 0")
-                self._emit(f"v_lshlrev_b32 v[{v_tmp1}], 2, v[{v_tmp1}]   ; LDS byte address (invariant across passes)")
                 self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], {utility_log2(row_step_per_pass) + 2}   ; per-pass memory stride")
                 self._emit_empty_line()
                 for it in range(num_passes):
-                    self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * elems_per_pass * 4}")
+                    # row_step_per_pass*padded_stride*4 == elems_per_pass*4 when pad=0 (since
+                    # elems_per_pass is a multiple of macro_tile_n by construction) -- one
+                    # formula, byte-identical to the old literal in the unpadded case.
+                    self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * row_step_per_pass * padded_stride * 4}")
                     self._emit(f"s_wait_dscnt 0x0")
                     self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
                     if it != num_passes - 1:

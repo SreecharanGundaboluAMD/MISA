@@ -132,6 +132,9 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_coalescing_store_wmma.cxm = ctrl_wmma_mapping
         ctrl_coalescing_store_wmma.block_size = tunable.block_size
         ctrl_coalescing_store_wmma.precision = tunable.precision
+        ctrl_coalescing_store_wmma.atomic_scope = tunable.atomic_scope
+        ctrl_coalescing_store_wmma.atomic_cascade = tunable.atomic_cascade
+        ctrl_coalescing_store_wmma.epilogue_lds_pad = tunable.epilogue_lds_pad
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
 
         # gemm_k_per_block*data_byte happens to equal 64 bytes for fp16/bf16/int8 (32*2, 32*2,
@@ -329,7 +332,16 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         # see igemm_fwd_gtc_wmma_nhwc_t's identically-named field for the rationale: the
         # LDS-reshuffle epilogue needs the whole output tile's worth of LDS, which can exceed
         # what the main loop alone reserved.
-        epilogue_lds_bytes = self.tunable.gemm_m_per_block * self.tunable.gemm_n_per_block * 4
+        # Phase 23: epilogue_lds_pad adds 4 padding elements per row to break a bank-conflict
+        # periodicity (see coalescing_store_wmma.py) -- reflect that in the LDS size too.
+        epilogue_pad = 4 if self.tunable.epilogue_lds_pad else 0
+        epilogue_lds_bytes = self.tunable.gemm_m_per_block * (self.tunable.gemm_n_per_block + epilogue_pad) * 4
+        # Phase 23: the 128x128 tile is already exactly at the 64KB/workgroup hardware limit
+        # with ZERO headroom (Phase 21) -- padding pushes it over (128*132*4 = 67584 > 65536).
+        # Fail loudly at codegen time, not silently at kernel-load time on real hardware.
+        assert epilogue_lds_bytes <= 65536, \
+            f"epilogue LDS ({epilogue_lds_bytes} bytes) exceeds the 64KB/workgroup hardware limit -- " \
+            f"epilogue_lds_pad is not usable for this tile shape ({self.tunable.gemm_m_per_block}x{self.tunable.gemm_n_per_block})"
         kernel_code_dict = {
             'enable_sgpr_kernarg_segment_ptr'  :   1,
             'enable_sgpr_workgroup_id_x'       :   1,

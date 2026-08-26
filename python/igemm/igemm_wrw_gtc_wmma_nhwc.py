@@ -169,6 +169,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_coalescing_store_wmma.block_size = tunable.block_size
         ctrl_coalescing_store_wmma.precision = tunable.precision
         ctrl_coalescing_store_wmma.gemm_k_global_split = tunable.gemm_k_global_split
+        ctrl_coalescing_store_wmma.atomic_scope = tunable.atomic_scope
+        ctrl_coalescing_store_wmma.atomic_cascade = tunable.atomic_cascade
+        ctrl_coalescing_store_wmma.epilogue_lds_pad = tunable.epilogue_lds_pad
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
 
         # A-region (grad_output) and B-region (input): both natural [GEMM_K rows][M or N
@@ -348,8 +351,17 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # see igemm_fwd_gtc_wmma_nhwc_t's identically-named field for the rationale. Only
         # the non-atomic (non-split) epilogue uses the LDS reshuffle -- the gemm_k_global_split
         # atomic path never touches LDS in the epilogue, so it doesn't need the boost.
+        # Phase 23: epilogue_lds_pad adds 4 padding elements per row to break a bank-conflict
+        # periodicity (see coalescing_store_wmma.py) -- reflect that in the LDS size too.
+        epilogue_pad = 4 if self.tunable.epilogue_lds_pad else 0
         epilogue_lds_bytes = 0 if self.tunable.gemm_k_global_split else \
-            self.tunable.gemm_m_per_block * self.tunable.gemm_n_per_block * 4
+            self.tunable.gemm_m_per_block * (self.tunable.gemm_n_per_block + epilogue_pad) * 4
+        # Phase 23: the 128x128 tile is already exactly at the 64KB/workgroup hardware limit
+        # with ZERO headroom (Phase 21) -- padding pushes it over (128*132*4 = 67584 > 65536).
+        # Fail loudly at codegen time, not silently at kernel-load time on real hardware.
+        assert epilogue_lds_bytes <= 65536, \
+            f"epilogue LDS ({epilogue_lds_bytes} bytes) exceeds the 64KB/workgroup hardware limit -- " \
+            f"epilogue_lds_pad is not usable for this tile shape ({self.tunable.gemm_m_per_block}x{self.tunable.gemm_n_per_block})"
         kernel_code_dict = {
             'enable_sgpr_kernarg_segment_ptr'  :   1,
             'enable_sgpr_workgroup_id_x'       :   1,

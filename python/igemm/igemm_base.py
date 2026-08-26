@@ -230,6 +230,32 @@ class igemm_gtc_tunable_parameter_t(object):
             # in the num_vgpr_accumulate_a/b section -- this __init__ has a later, shared
             # `self.local_prefetch_num = 1` default (for every fma_type) that runs AFTER
             # this point and would otherwise clobber a value read here.
+            # Phase 23 (ISA-driven epilogue tuning): all three default to today's exact
+            # byte-identical behavior, every existing config unaffected. See
+            # coalescing_store_wmma.py and docs/gfx1250_wmma_layout.md's Phase 23 for the
+            # ISA citations behind each.
+            # atomic_scope: SCOPE_SYS (default) or SCOPE_DEV for the wrw gemm_k_global_split
+            # atomic-add epilogue -- SYS forces a full system-level flush/invalidate; DEV
+            # resolves within the device's L2, sufficient since K-split workgroups are always
+            # on the same device.
+            self.atomic_scope                   = utility_dict_with_default_t(tunable_dict)('atomic_scope', 'SCOPE_SYS')
+            # atomic_cascade: 0 (default, regular atomic) or 1 (TH[2] cascading/deferred-scope
+            # atomic). CONFIRMED HANGS ON REAL HARDWARE (Phase 23): the kernel's existing
+            # `s_wait_storecnt 0x0` before `s_endpgm` never completes, because a cascading
+            # atomic's completion signal is deferred to a later release/fence of matching-or-
+            # higher scope -- which this kernel never issues. Encoding was verified correct via
+            # an llvm-mc probe, but the *semantic* prerequisite (a companion release) isn't
+            # implemented. Hard-blocked until that's added -- do not remove this assert without
+            # implementing the release mechanism first. See docs/gfx1250_wmma_layout.md.
+            self.atomic_cascade                 = utility_dict_with_default_t(tunable_dict)('atomic_cascade', 0)
+            assert not self.atomic_cascade, \
+                "atomic_cascade=1 hangs on real hardware (s_wait_storecnt never completes without a companion release) -- not usable yet, see docs/gfx1250_wmma_layout.md's Phase 23"
+            # epilogue_lds_pad: 0 (default, unpadded) or 1 (pad the non-atomic LDS-reshuffle
+            # epilogue's row stride by one element to break a bank-conflict periodicity --
+            # macro_tile_n is always a multiple of 64, so the unpadded tile-linear address
+            # puts every row of a given column in the same LDS bank). Only affects the
+            # non-atomic (fwd/bwd/non-split-wrw) epilogue branch.
+            self.epilogue_lds_pad                = utility_dict_with_default_t(tunable_dict)('epilogue_lds_pad', 0)
         else:
             assert False
 

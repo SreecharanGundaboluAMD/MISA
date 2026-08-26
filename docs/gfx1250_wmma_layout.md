@@ -2299,3 +2299,113 @@ given zero measured effect either way.
   through `emit_kernel_fma_main_loop()`
 - `config/igemm_{fwd,bwd,wrw}_gtc_gfx1250_nhwc_fp32_k2x_lp2.config` -- new, the only
   configs confirmed to fit the VGPR budget today
+
+## Phase 23 (2026-08-26): ISA-driven epilogue tuning -- atomic scope/cascade, LDS bank-conflict pad
+
+Follow-on from a three-agent ISA research pass (VGPR pressure, atomic/reduction
+instructions, LDS/scheduling behavior) over the CDNA5/gfx1250 ISA doc. Three flag-gated
+features, all default-off (byte-identical to before when unset).
+
+**1. `atomic_scope` (`SCOPE_SYS` -> `SCOPE_DEV`) for the wrw `gemm_k_global_split` atomic
+epilogue.** Per the ISA doc's SCOPE table (Table 13), SYS forces a full system-level
+flush/invalidate; DEV resolves within the device's L2, sufficient since K-split's
+contending workgroups are always on the same device. **Validated correct** on real
+hardware (3 shapes: 3x3 stride1/pad1, 1x1, stride2/pad1, all `valid:y`). **Benchmark: no
+measurable difference** -- tested a light-contention shape (3x3, ~2ms) and a heavy one
+(huge-K 1x1, ~0.15ms), both showed SCOPE_DEV within run-to-run noise of SCOPE_SYS (a couple
+of runs even showed it marginally slower). Likely explanation: the atomic unit's own
+per-address serialization (confirmed real, per the ISA doc's L2 atomic-unit description) is
+the actual bottleneck for these shapes, not the scope-driven cache flush cost -- SCOPE_DEV
+saves work that wasn't the binding constraint. Left as an available, correctness-clean
+opt-in rather than a default; may matter more on a genuinely idle GPU (this session's
+usual contention caveat) or a shape with even heavier cross-workgroup contention.
+
+**2. `atomic_cascade` (TH[2] cascading/deferred-scope atomic) -- IMPLEMENTED, ENCODING
+VERIFIED, THEN FOUND TO HANG ON REAL HARDWARE, HARD-BLOCKED.** The ISA doc's RMW-atomic
+TH-field table describes a cascading atomic as ideal for exactly this histogram-style
+accumulation pattern. The instruction encoding was verified correct via an
+`llvm-mc -show-encoding` round-trip probe -- `th:TH_ATOMIC_CASCADE_RT` produces a distinct,
+expected bit pattern, confirmed via a batch of candidate identifier names (LLVM requires a
+symbolic `th:` value, not a raw number -- `th:4` fails with "expected an identifier").
+Wiring it into the actual wrw `_gsplit_cascade` config **hung real hardware** -- the
+`conv_driver.exe` process had to be killed via a 2-minute timeout. Root cause, traced from
+the generated `.inc`: the kernel's existing `s_wait_storecnt 0x0` immediately before
+`s_endpgm` never completes for a cascading atomic, because per the ISA doc's own wording,
+"the full specified scope of the op is not realized until a subsequent release
+.../fence/atomic-operation... of a matching or higher scope occurs" -- this kernel never
+issues that subsequent release, so the store-completion signal the wave is waiting on
+simply never arrives. **This is now hard-blocked** with an `assert not
+self.atomic_cascade` in `igemm_base.py`'s tunable read (not just left at a default-off
+value) specifically so a future attempt to enable it fails loudly at codegen time instead
+of silently hanging a GPU again. Fixing this properly would need a companion release
+instruction added at the right point (after the K-split accumulation is truly complete,
+before whatever reads the final result) -- not attempted this phase; a real follow-up, not
+abandoned entirely.
+
+**3. `epilogue_lds_pad` -- LDS bank-conflict padding for the non-atomic (fwd/bwd/non-split
+wrw) epilogue's reshuffle.** LDS is 64 banks x 4 bytes, flat-mapped (`bank = byte_addr/4
+mod 64`, ISA doc §11.1/11.2). Since `macro_tile_n` is always a multiple of 64, the unpadded
+tile-linear address `(row*macro_tile_n+col)*4` collapses to `bank = col mod 64` for every
+row -- and since WMMA's per-lane row differs by exactly 8 between the two 16-lane halves
+(`v_gemm_im = ((lane>>4)&1)*8`), `(row+8)*macro_tile_n ≡ row*macro_tile_n (mod 64)`,
+meaning **both halves collide into the same 16 banks on every single scatter
+`ds_write_b32`** -- a real, deterministic, previously-unnoticed 2-way conflict.
+
+Fix: pad the row stride by 4 elements (`padded_stride = macro_tile_n + 4`), not 1 -- a
+1-element pad breaks the bank periodicity too, but was ruled out because it also breaks
+16-byte alignment for `ds_read_b128`/`global_store_dwordx4` (`vwo=4`) on rows whose index
+isn't a multiple of 4, which would misalign (and likely corrupt) those reads. A 4-element
+pad both fully separates the two lane-halves into disjoint 16-bank ranges (offset by
+`4*8=32`, still within one 64-bank space) AND keeps every row's byte offset a multiple of
+16 (`(macro_tile_n+4)*4 = macro_tile_n*4 + 16`, and `macro_tile_n*4` is already a multiple
+of 64). This is a real rewrite, not a 1-line change -- the unpadded design deliberately
+exploited `macro_tile_n` being a power of 2 for shift-based addressing in both scatter and
+gather; padding breaks that, so the scatter's row-shift became a row-multiply, and the
+gather had to be restructured to compute the LDS address (row0*padded_stride+col0) and the
+global memory address (unaffected by LDS layout) from the same tile-local (row0, col0)
+BEFORE either gets overwritten by the global block-offset math -- both share `v_tmp1`/
+`v_tmp2`/`v_gather`'s single register each, no new VGPR allocation needed.
+
+**Hard LDS-budget wall found immediately**: the 128x128 tile is already exactly at the
+64KB/workgroup limit with zero headroom (Phase 21) -- padding pushes it to 67584 bytes,
+over budget. Caught by a new codegen-time assert (`epilogue_lds_bytes <= 65536`) in each
+kernel file's `get_kernel_code()`, verified to fire correctly on a deliberately-bad test
+config before shipping anything. **`epilogue_lds_pad` is therefore only usable on the
+64x64 tile** (17408 bytes, comfortable) and the asymmetric 128x64/64x128 shapes (34816/
+33792 bytes, also fine) -- not 128x128. Shipped configs reflect this: the 128x128 section
+stays unpadded, only the 64x64 section sets the flag.
+
+**Validated correct** on real hardware for fwd/bwd/non-split-wrw, both the padded 64x64
+section and the (deliberately unpadded) 128x128 section in the same config file, across
+1x1/3x3/dilated shapes -- all `valid:y`. **Benchmark: no measurable difference** on the
+shapes tested (a small single-tile-block case and a slightly larger one), timings matched
+baseline within noise (one comparison showed a ~1.6% tflops difference, within normal
+run-to-run variance). Given the epilogue is already a small fraction of total kernel time
+for compute-bound shapes (the same conclusion Phase 21's epilogue vectorization reached),
+and 2-way bank conflicts add real but modest latency (roughly doubling ~32-128 individual
+`ds_write_b32`/`ds_read_b128` instructions' issue time, not the whole kernel's), a
+sub-noise-floor result here is plausible rather than surprising -- consistent with this
+branch's repeated finding that fwd/bwd's bottleneck is the main loop, not the epilogue.
+
+**Overall assessment**: the encoding-and-correctness work is real and now available
+(`atomic_scope`, `epilogue_lds_pad`), but neither showed a measured win on the shapes
+tested here, and `atomic_cascade` is a confirmed hardware hang, hard-blocked pending a
+proper release-mechanism design. Worth remeasuring on an uncontended GPU before writing
+either off completely, given this session's persistent contention caveat -- but don't
+expect a large effect based on what's been measured so far.
+
+### Critical files (Phase 23)
+
+- `python/operations/coalescing_store_wmma.py` -- `ctrl.atomic_scope`/`atomic_cascade`/
+  `atomic_th` (atomic branch), padded scatter/gather addressing gated on
+  `ctrl.epilogue_lds_pad` (non-atomic branch)
+- `python/igemm/igemm_base.py` -- reads the three new tunable keys; hard `assert not
+  self.atomic_cascade` (see above -- do not remove without implementing the release fix)
+- `python/igemm/igemm_{fwd,bwd,wrw}_gtc_wmma_nhwc.py` -- wires the three fields into
+  `ctrl_coalescing_store_wmma_t`; `get_kernel_code()`'s epilogue LDS-size formula accounts
+  for the pad and asserts it fits the 64KB limit
+- `config/igemm_wrw_gtc_gfx1250_nhwc_bf16_gsplit_scopedev.config` -- `atomic_scope` only
+  (the cascade and scopedev+cascade config variants were removed after confirming the hang
+  -- do not recreate them without the release-mechanism fix)
+- `config/igemm_{fwd,bwd,wrw}_gtc_gfx1250_nhwc_bf16_ldspad.config` -- `epilogue_lds_pad`,
+  64x64 section only (128x128 section deliberately left unpadded, see LDS-budget note)
