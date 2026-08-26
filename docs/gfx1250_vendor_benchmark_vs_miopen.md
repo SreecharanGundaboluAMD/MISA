@@ -398,3 +398,43 @@ statement about how mature each *software stack* is on its respective hardware t
 Same GPU-contention caveat as the rest of this doc applies; a couple of spot-reruns showed
 tight variance (fwd 3x3: 0.361/0.362ms; wrw-gsplit 3x3: 2.02/2.16ms, ~7% spread) but this
 was not re-benchmarked on an exclusively-held GPU.
+
+## Update (2026-08-26): re-checked against a real MIOpen/gfx1250 trace with solver names
+
+The `tracelens_shapes_gfx1250.json` file this doc originally cited no longer exists on disk.
+Found what's almost certainly its replacement/successor:
+`~/rocm-libraries/tracelense_gfx1250_b01_2.json` — same 112-entry structure, same host
+architecture (`GPU Model: 1 x AMD Radeon Graphics`, `gfx1250`, host `heliosr-1b114-b01-2`,
+matching this doc's "b01_2"-style naming), and critically, each entry's `row[2]` records the
+actual MIOpen solver name (e.g. `156/ConvHipImplicitGemmGroupWrwXdlops`), not just a time —
+letting this comparison show *what MIOpen chose*, not only *how fast*.
+
+**No new runs were done for this update** (per instruction) — MISA's side reuses the bf16
+numbers already measured earlier in this session for the MIOpen/gfx950 comparison above
+(fwd/bwd: plain combined config; wrw: the `_gsplit` config), matched against this trace
+file's numbers for the same 20 shapes, read directly (not re-run).
+
+| Direction | Shapes | MISA/gfx1250 vs. MIOpen/gfx1250 | MIOpen solver(s) chosen |
+|---|---|---|---|
+| fwd | 5 | 0.81x-1.10x (avg 0.98x) — MISA is *faster* on 2/5 | `ConvHipImplicitGemmGroupFwdXdlops`, `ConvHipConv` |
+| bwd | 5 | 1.02x-1.84x (avg 1.25x) | `ConvHipConv`, `ConvHipImplicitGemmGroupBwdXdlops` |
+| wrw (`_gsplit`) | 10 | 1.23x-11.41x (avg 3.5x, one outlier) | `ConvHipImplicitGemmGroupWrwXdlops` (all 10) |
+
+**This is the real, same-architecture comparison the top of this doc originally attempted**
+(before its source trace went missing) — and it tells a much better story than that
+original attempt's stale numbers (1.4x-3.2x fwd/bwd, 100x-1665x wrw): fwd is now
+essentially at parity with MIOpen's own gfx1250 solvers (occasionally faster), bwd trails by
+a modest ~1.25x on average, and wrw — with the `_gsplit` K-split fix — trails by ~3.5x
+average instead of the original 2-3 orders of magnitude. One wrw shape
+(`c=192,H=60,W=80,k=64,1x1`) is a 11.4x outlier: MIOpen's solver reports an unusually fast
+0.0056ms there relative to every structurally similar shape in the set (0.03-0.05ms range),
+which looks more like a measurement/solver-selection quirk specific to that one shape than a
+real, general 11x gap — worth a closer look before trusting it, not something to generalize
+from.
+
+**Caveat, stated plainly**: this is not a controlled, same-session A/B — MISA's numbers came
+from this session's earlier gfx950-comparison run, MIOpen's from a trace recorded on a
+different run (possibly a different day, different GPU contention state, different MIOpen
+version). Directionally consistent with everything else measured this session (fwd wins,
+wrw still behind but no longer catastrophically), but treat the exact multiples as
+approximate, same as every other number in this doc.
