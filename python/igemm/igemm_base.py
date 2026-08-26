@@ -218,6 +218,23 @@ class igemm_gtc_tunable_parameter_t(object):
             # operands (fwd A/B, bwd A) use global_load_async_to_lds_b128 instead -- no VGPR
             # staging buffer, global memory -> LDS directly.
             self.async_global_load              = utility_dict_with_default_t(tunable_dict)('async_global_load', 0)
+            # Phase 28: TDM (Tensor Data Mover)-based global-to-LDS load for the A operand --
+            # optional, defaults to 0 (today's exact byte-identical behavior). When 1, uses
+            # tensor_load_to_lds (the dedicated TDM hardware unit) instead of
+            # global_load_async_to_lds_b128. fwd-only, 1x1-conv-only (nxe==0), and mutually
+            # exclusive with async_global_load/main_loop_interleave for this first pilot --
+            # row_repeat_a>1 and local_prefetch_num>1 exclusions are asserted in
+            # igemm_fwd_gtc_wmma_nhwc.py's __init__ (mirroring async_global_load's identical
+            # row_repeat_a assert there). See docs/gfx1250_wmma_layout.md's Phase 28.
+            self.tdm_global_load                = utility_dict_with_default_t(tunable_dict)('tdm_global_load', 0)
+            if self.tdm_global_load:
+                # NOTE: self.direction/self.nxe aren't set yet at this point in __init__ (this
+                # fma_type-specific branch runs before them) -- read the raw dict instead.
+                assert tunable_dict['direction'] == 'fwd', "tdm_global_load is only implemented for fwd so far, see docs/gfx1250_wmma_layout.md's Phase 28"
+                assert tunable_dict['nxe'] == 0, "tdm_global_load is only implemented for 1x1/unit-stride convs (nxe=0) so far, see docs/gfx1250_wmma_layout.md's Phase 28"
+                assert not self.async_global_load, "tdm_global_load and async_global_load are mutually exclusive -- they're two different load mechanisms for the same operand"
+                assert not utility_dict_with_default_t(tunable_dict)('main_loop_interleave', 0), \
+                    "tdm_global_load and main_loop_interleave are mutually exclusive for now, see docs/gfx1250_wmma_layout.md's Phase 28"
             # Phase 15: optional, defaults to 0 (today's exact byte-identical main loop).
             # When 1, interleaves each remaining k-sub-loop chunk's global load with the
             # PREVIOUS chunk/substep's (unrelated, already-in-LDS) compute instead of loading
@@ -1063,6 +1080,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_dbuf"
         if tunable.async_global_load:
             kernel_name += "_async"
+        if tunable.tdm_global_load:
+            kernel_name += "_tdm"
         if tunable.main_loop_interleave:
             kernel_name += "_interleave"
         if tunable.wmma_acc_f16:

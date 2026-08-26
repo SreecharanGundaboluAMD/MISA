@@ -2894,3 +2894,115 @@ combo battery (Phase 26a's shape set, at 128x128 this time) passed **7 of 8** ca
 - `config/igemm_{fwd,bwd,wrw}_gtc_gfx1250_nhwc_bf16_k2x_bf16acc{,_lp2}.config` -- new
 - `config/igemm_bwd_gtc_gfx1250_nhwc_bf16_bf16acc_mtail.config` -- new, the phase's key
   validation config (128x128, both flags set)
+
+## Phase 28 (2026-08-26): TDM-based global-to-LDS load pilot (fwd, 1x1 conv, A operand only)
+
+### Motivation
+
+Researching FlyDSL and hipconv (two other AMD ROCm GPU-kernel projects on this machine,
+see `docs/gfx1250_external_research_findings.md` for the full writeup) turned up TDM
+(Tensor Data Mover) -- a dedicated gfx1250 DMA unit (`TENSOR_LOAD_TO_LDS`/
+`TENSOR_STORE_FROM_LDS`, ISA doc §10.11) that MISA had never used, despite the ISA doc
+having documented it all along. Both other projects use it heavily in production. Verified
+independently on real hardware before touching any real kernel: `tensor_load_to_lds`/
+`tensor_store_from_lds` both work; hardware OOB behavior confirmed exactly as documented
+(load zero-fills out-of-bounds rows, store silently drops out-of-bounds writes); confirmed
+through MISA's actual pipeline (`-x assembler`, `hipModuleLoad`+`hipExtModuleLaunchKernel`,
+not just HIP C++); descriptor bit-packing cross-checked against the ISA doc, FlyDSL's
+`CopyAtom.cpp`, AND hipconv's `bunnies_mi400.hpp` -- three independent sources agree.
+
+This is a big enough capability (hardware OOB could replace Phases 25/26's EXEC-mask
+guards AND finally solve GEMM_K tail, which has no existing plan) that it needed a
+narrowly-scoped first pilot inside a real kernel before deciding how far to take it.
+
+### Scope
+
+fwd only, A-operand load only, 1x1-conv-only (`nxe=0`), new opt-in `tdm_global_load`
+tunable -- mirrors `async_global_load`'s (Phase 13) exact scoping and mutual-exclusion
+discipline (excludes `async_global_load`, `main_loop_interleave`, `row_repeat_a>1`,
+`local_prefetch_num>1`). Deliberately does NOT attempt M/K-tail via TDM's OOB fields yet,
+NOT the B operand, NOT bwd/wrw, NOT TDM store for the epilogue -- narrowest possible slice
+to prove the mechanism inside one real main loop first.
+
+### Design
+
+`coalescing_store_wmma.py` needed no changes (this pilot is load-only). The key insight
+integrating into `wmma_main_loop.py`: **TDM shares async's exact control-flow shape** --
+"data lands directly in LDS via the load instruction itself, no separate store step" --
+differing only in which counter to wait on (`s_wait_tensorcnt` vs `s_wait_asynccnt`). So
+`wmma_main_loop.py`'s existing `async_a`/`async_b`/`any_async`/`any_old` logic was
+generalized to `a_style_async = async_a or tdm_a` (and `_b`), with `any_tdm` tracked
+separately just for the wait-instruction choice -- every other branch (`f_sst_a`
+skip-if-async-style, `f_gld_a` re-issue timing) needed zero new logic.
+
+New per-kernel pieces (`igemm_fwd_gtc_wmma_nhwc.py`):
+- `_emit_tdm_descriptor_setup_a()`: builds the A-operand's group0 (4 SGPRs)/group1
+  (8 SGPRs) descriptor ONCE in the prologue. `tile_dim0`/`tile_dim1` (gemm_k_per_block/
+  gemm_m_per_block) are compile-time constants, baked in as immediates; `tensor_dim0`/
+  `tensor_dim1`/stride (gemm_k/gemm_m/in_c_total) are runtime SGPR values built via
+  `s_lshl_b32`/`s_lshr_b32`/`s_or_b32` bit-packing, verified against the same probe that
+  confirmed TDM on real hardware.
+- `global_load_a_functor()`: new `tdm_global_load` branch emits one
+  `tensor_load_to_lds s[g0:g0+3], s[g1:g1+7]` instead of the chunked
+  `global_load_dwordx4`/`global_load_async_to_lds_b128` sequence.
+- `move_slice_window_a_functor()`: new branch advances the descriptor's `global_addr`
+  (group0 s2/s3, a genuine 64-bit scalar address) by `bytes_per_row` per main-loop
+  iteration via `s_add_u32`/`s_addc_u32` -- s3's top 2 bits hold the constant `type=2`
+  field (set once, never re-touched); safe to `addc` directly into it since `global_addr`
+  is only 57 bits (25 meaningful bits in s3), nowhere near the type field for any real
+  address.
+- SGPR allocation for the 12-SGPR descriptor needed explicit alignment
+  (`sseq(4, 4)`/`sseq(8, 4)`) -- the assembler rejected the default unaligned allocation
+  ("invalid register alignment") on the first attempt; both TDM operand groups need
+  4-SGPR alignment for the multi-register addressing mode.
+
+**Known, deliberate inefficiency**: every wave in the workgroup issues an identical,
+redundant TDM load (TDM ignores EXEC and isn't per-lane, so this doesn't affect
+correctness, just wastes DMA bandwidth 4x for a 128x128/4-wave tile). Confirmed by
+hipconv's research to be a real, measured cost (single-issuer-wave design measured at
+-3% to -7% improvement) -- explains why this pilot's first hardware timing came back ~20%
+slower than the existing `_async` config on the same shape. Not fixed in this phase
+(correctness-first, per the plan); see `docs/gfx1250_external_research_findings.md` for
+the concrete follow-up techniques (single-issuer-wave, deeper `s_wait_tensorcnt(N>0)`
+pipelining, not draining LDS reads before the next TDM issue).
+
+### Verification
+
+Byte-identical regression sweep (fwd fp32/fp16/bf16/int8 bases, `_async`/`_interleave`,
+Phase 25/26 tail configs, Phase 27 bf16acc config) -- zero change for `tdm_global_load=0`,
+including through the `wmma_main_loop.py` control-flow generalization. Hardware
+correctness: bf16 across an exact-multiple large shape (n=8,c=k=2048,H=W=32,
+`valid:y`, and the SAME shape's existing `_async` config for a timing sanity check),
+medium-K, group>1, and a multi-K-block shape (32 main-loop iterations, confirming the
+descriptor advance is correct across many iterations, not just one) -- all `valid:y`.
+fp16 and fp32 spot-checked on a multi-K-block shape each, both `valid:y`.
+
+### Net result
+
+TDM is now proven correct inside a real MISA kernel's main loop, through the project's
+actual hand-assembly pipeline, for the narrowest useful case. The path is now open to:
+(a) fix the redundant-issue inefficiency (single-issuer-wave, per hipconv's measured
+technique) to get this pilot to a real performance comparison against `_async`, (b) extend
+to the B operand and multi-tap convs, (c) use `tensor_dim0 < tile_dim0` for GEMM_K tail
+(hipconv's depthwise kernel does exactly this for its channel dimension, in production) --
+the single biggest capability unlock, since GEMM_K tail has no other plan today, (d) use a
+3D descriptor's `tensor_dim2=0/1` trick for GEMM_M boundary handling as a hardware
+alternative to Phases 25/26's EXEC-mask guards, (e) TDM store for the epilogue. None of
+these attempted yet -- decide next steps after this pilot's findings are reviewed.
+
+### Critical files (Phase 28)
+
+- `driver/igemm_gtc_base.h` -- `tdm_global_load` struct field, config parsing,
+  kernel-name fold (`_tdm` suffix)
+- `python/igemm/igemm_base.py` -- `tdm_global_load` tunable (fwd-only, `nxe==0`-only,
+  excludes `async_global_load`/`main_loop_interleave`), kernel-name fold
+- `python/igemm/igemm_fwd_gtc_wmma_nhwc.py` -- `row_repeat_a`/`local_prefetch_num`
+  exclusion asserts, `s_tdm_g0`/`s_tdm_g1` SGPR allocation, `_emit_tdm_descriptor_setup_a`,
+  `global_load_a_functor`/`move_slice_window_a_functor` TDM branches,
+  `ctrl.tdm_global_to_lds_a` wiring
+- `python/operations/wmma_main_loop.py` -- `tdm_global_to_lds_a`/`_b` ctrl fields,
+  `a_style_async`/`b_style_async`/`any_tdm` generalization of the async control flow,
+  `s_wait_tensorcnt` emission
+- `config/igemm_fwd_gtc_gfx1250_nhwc_{bf16,fp16,fp32}_tdm.config` -- new
+- `docs/gfx1250_external_research_findings.md` -- new, the full FlyDSL/hipconv research
+  writeup this phase is based on

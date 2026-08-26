@@ -75,6 +75,14 @@ class ctrl_wmma_main_loop_t(object):
         # barrier. Default False for both = today's exact byte-identical behavior.
         self.async_global_to_lds_a       = False
         self.async_global_to_lds_b       = False
+        # Phase 28: TDM (Tensor Data Mover)-based load -- shares async's "data lands
+        # directly in LDS, no separate store step" control-flow shape (both flags feed the
+        # same a_style_async/b_style_async checks below), but waits on a DIFFERENT counter
+        # (TENSORcnt via s_wait_tensorcnt, not ASYNCcnt via s_wait_asynccnt), so it's tracked
+        # as its own pair of flags rather than folded into async_global_to_lds_a/b. Default
+        # False = today's exact byte-identical behavior.
+        self.tdm_global_to_lds_a         = False
+        self.tdm_global_to_lds_b         = False
 
         # Phase 1 (k-sub-loop): byte offset between consecutive inst_wmma.k-wide K-slices
         # within one already-in-LDS tile, one value per operand since transposed vs
@@ -303,8 +311,17 @@ class wmma_main_loop_t(mc_base_t):
 
         async_a = ctrl.async_global_to_lds_a
         async_b = ctrl.async_global_to_lds_b
+        tdm_a = ctrl.tdm_global_to_lds_a
+        tdm_b = ctrl.tdm_global_to_lds_b
+        # Phase 28: TDM shares async's "data lands directly in LDS, no separate store step"
+        # control-flow shape -- a_style_async/b_style_async gate every "is this operand
+        # already in LDS" check below, identically for async and TDM. Only the actual WAIT
+        # instruction differs (s_wait_asynccnt vs s_wait_tensorcnt, see label_body below).
+        a_style_async = async_a or tdm_a
+        b_style_async = async_b or tdm_b
         any_async = async_a or async_b
-        any_old   = (not async_a) or (not async_b)
+        any_tdm   = tdm_a or tdm_b
+        any_old   = (not a_style_async) or (not b_style_async)
 
         # Phase 13: an operand on the async path already issued its first tile's data
         # straight into LDS (global_load_async_to_lds_b128, no VGPR staging, no separate
@@ -314,9 +331,9 @@ class wmma_main_loop_t(mc_base_t):
         # usual s_wait_loadcnt + deferred store, same as always.
         if any_old:
             self._emit(f"s_wait_loadcnt 0x0")
-            if not async_a:
+            if not a_style_async:
                 self._emit(f_sst_a())
-            if not async_b:
+            if not b_style_async:
                 self._emit(f_sst_b())
             self._emit_empty_line()
 
@@ -340,6 +357,8 @@ class wmma_main_loop_t(mc_base_t):
         # (e.g. bwd: A async, B still on the old technique).
         if any_async:
             self._emit(f"s_wait_asynccnt 0x0")
+        if any_tdm:
+            self._emit(f"s_wait_tensorcnt 0x0")
         if any_old:
             self._emit(f"s_wait_dscnt 0x0")
         self._emit(f"s_barrier_signal -1")
@@ -369,9 +388,9 @@ class wmma_main_loop_t(mc_base_t):
             emit_interleaved_substeps()
             self._emit_empty_line()
         else:
-            if not async_a:
+            if not a_style_async:
                 self._emit(f_gld_a())
-            if not async_b:
+            if not b_style_async:
                 self._emit(f_gld_b())
             self._emit_empty_line()
 
@@ -390,13 +409,13 @@ class wmma_main_loop_t(mc_base_t):
             # An old-path operand keeps its usual s_wait_loadcnt + deferred store.
             if any_old:
                 self._emit(f"s_wait_loadcnt 0x0")
-                if not async_a:
+                if not a_style_async:
                     self._emit(f_sst_a())
-                if not async_b:
+                if not b_style_async:
                     self._emit(f_sst_b())
-            if async_a:
+            if a_style_async:
                 self._emit(f_gld_a())
-            if async_b:
+            if b_style_async:
                 self._emit(f_gld_b())
         if double_buffer:
             emit_buffer_switch()

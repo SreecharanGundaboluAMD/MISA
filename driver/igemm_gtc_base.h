@@ -156,6 +156,12 @@ typedef struct {
     // hipModuleGetFunction looks up the wrong (un-suffixed) name and fails to find it.
     int lds_double_buffer;
     int async_global_load;
+    // Phase 28: TDM (Tensor Data Mover)-based global-to-LDS load for the A operand --
+    // gfx1250-only, an alternative to async_global_load's global_load_async_to_lds_b128
+    // path using the dedicated TENSOR_LOAD_TO_LDS hardware unit instead. Folded into the
+    // kernel name (matches async_global_load's treatment) since it's the same category of
+    // load-mechanism flag, even though it doesn't change buffer layout.
+    int tdm_global_load;
     int main_loop_interleave;
     // Phase 24: also folded into the kernel name (unlike local_prefetch_num/atomic_scope/
     // atomic_cascade/epilogue_lds_pad, which are purely internal-codegen choices that don't
@@ -243,6 +249,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.wave_tile_k              = 0;
                 tunable.lds_double_buffer        = sec.count("lds_double_buffer") > 0 ? sec.at("lds_double_buffer").get_int() : 0;
                 tunable.async_global_load        = sec.count("async_global_load") > 0 ? sec.at("async_global_load").get_int() : 0;
+                tunable.tdm_global_load          = sec.count("tdm_global_load") > 0 ? sec.at("tdm_global_load").get_int() : 0;
                 tunable.main_loop_interleave     = sec.count("main_loop_interleave") > 0 ? sec.at("main_loop_interleave").get_int() : 0;
                 tunable.wmma_acc_f16             = sec.count("wmma_acc_f16") > 0 ? sec.at("wmma_acc_f16").get_int() : 0;
                 tunable.wmma_acc_bf16             = sec.count("wmma_acc_bf16") > 0 ? sec.at("wmma_acc_bf16").get_int() : 0;
@@ -445,6 +452,8 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += std::string("_dbuf");
         if(tunable->async_global_load)
             kernel_name += std::string("_async");
+        if(tunable->tdm_global_load)
+            kernel_name += std::string("_tdm");
         if(tunable->main_loop_interleave)
             kernel_name += std::string("_interleave");
         if(tunable->wmma_acc_f16)
