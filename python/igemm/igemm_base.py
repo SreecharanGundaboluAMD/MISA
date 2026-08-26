@@ -240,16 +240,61 @@ class igemm_gtc_tunable_parameter_t(object):
             # on the same device.
             self.atomic_scope                   = utility_dict_with_default_t(tunable_dict)('atomic_scope', 'SCOPE_SYS')
             # atomic_cascade: 0 (default, regular atomic) or 1 (TH[2] cascading/deferred-scope
-            # atomic). CONFIRMED HANGS ON REAL HARDWARE (Phase 23): the kernel's existing
-            # `s_wait_storecnt 0x0` before `s_endpgm` never completes, because a cascading
-            # atomic's completion signal is deferred to a later release/fence of matching-or-
-            # higher scope -- which this kernel never issues. Encoding was verified correct via
-            # an llvm-mc probe, but the *semantic* prerequisite (a companion release) isn't
-            # implemented. Hard-blocked until that's added -- do not remove this assert without
-            # implementing the release mechanism first. See docs/gfx1250_wmma_layout.md.
+            # atomic). CONFIRMED HANGS ON REAL HARDWARE (Phase 23) -- DO NOT ENABLE without
+            # completing the TODO below.
+            #
+            # TODO (atomic_cascade resumption checklist):
+            # 1. ROOT CAUSE: a cascading atomic defers its full-scope completion signal to
+            #    "a subsequent release/fence/atomic-operation of a matching or higher scope"
+            #    (CDNA5 ISA doc §4.1 Table 12). The existing `s_wait_storecnt 0x0` at kernel
+            #    end (wrw_gtc_wmma_nhwc.py's emit_kernel_fma_end) waits for that signal, which
+            #    never arrives because no such release is ever issued -- GPU hangs indefinitely.
+            #
+            # 2. FIX REQUIRED BEFORE ENABLING: add a release (one of the following, each
+            #    chosen from ISA doc §4.1 "VMEM Policies for Writeback and Invalidate Ops"):
+            #    (a) Simplest: emit a matching `global_store_b32` (or zero-sized FLAT with
+            #        `cpol:SCOPE_DEV`) with TH_STORE_WB (write-back) at the same scope level
+            #        as atomic_scope, after the last atomic but before the existing storecnt wait.
+            #        This is a "release" in the ISA's sense -- completes the deferred scope.
+            #    (b) Alternative: replace the existing `s_wait_storecnt 0x0` with an explicit
+            #        `buffer_gl2_wb` (writeback to L2) + `s_wait_storecnt`, which forces the
+            #        same scope-promotion the release above would provide.
+            #    (c) Check whether `s_wait_storecnt` alone is sufficient after removing the
+            #        TH_ATOMIC_CASCADE_RT bit -- the hang is specifically from the deferred-scope
+            #        semantic, so removing that bit would revert to a normal atomic.
+            #
+            # 3. VERIFY ENCODING (already done, no re-work needed): llvm-mc -show-encoding
+            #    confirmed `th:TH_ATOMIC_CASCADE_RT` on `global_atomic_add_f32` produces the
+            #    correct bit pattern -- this part is correct and need not be re-probed.
+            #
+            # 4. TEST SEQUENCE after implementing the release:
+            #    (a) Add a single `global_atomic_add_f32 ... th:TH_ATOMIC_CASCADE_RT` with
+            #        a companion release to a minimal HIP probe (not the full igemm kernel)
+            #        and confirm it completes without a hang -- isolate the fix before wiring
+            #        into the full codegen.
+            #    (b) Wire into coalescing_store_wmma.py's atomic branch; re-enable this assert
+            #        (change `assert not` to `assert in (0, 1)`), create the gsplit_cascade
+            #        config variant (was deleted in Phase 23 -- recreate from
+            #        igemm_wrw_gtc_gfx1250_nhwc_bf16_gsplit.config + atomic_cascade = 1).
+            #    (c) Full correctness battery: conv_driver.exe -V 1 for wrw gsplit across all
+            #        shape battery shapes. Then benchmark vs baseline, comparing both the
+            #        cascade-only and cascade+SCOPE_DEV combinations.
+            #
+            # 5. EXPECTED BENEFIT (if it works): the ISA doc describes the cascade pattern
+            #    as purpose-built for "histogram (non-returning) type atomic ops" -- exactly
+            #    wrw's K-split accumulation pattern. The expected benefit is reduced per-atomic
+            #    L2-coherence overhead: instead of each non-returning atomic-add fully committing
+            #    at the requested scope before the next begins, the hardware can batch/pipeline
+            #    the scope promotion until the eventual release. May help most for the
+            #    small-K-dimension wrw shapes with many K-split workgroups contending on
+            #    the same output elements (e.g. the shapes measured as 2-5x slower than
+            #    MIOpen's wrw solver in the Phase 23 gfx1250 trace comparison).
+            #
+            # See docs/gfx1250_wmma_layout.md's Phase 23 for the full hang diagnosis and the
+            # llvm-mc probe transcript.
             self.atomic_cascade                 = utility_dict_with_default_t(tunable_dict)('atomic_cascade', 0)
             assert not self.atomic_cascade, \
-                "atomic_cascade=1 hangs on real hardware (s_wait_storecnt never completes without a companion release) -- not usable yet, see docs/gfx1250_wmma_layout.md's Phase 23"
+                "atomic_cascade=1 hangs on real hardware (s_wait_storecnt never completes without a companion release) -- not usable yet; see TODO in igemm_base.py and docs/gfx1250_wmma_layout.md Phase 23"
             # epilogue_lds_pad: 0 (default, unpadded) or 1 (pad the non-atomic LDS-reshuffle
             # epilogue's row stride by one element to break a bank-conflict periodicity --
             # macro_tile_n is always a multiple of 64, so the unpadded tile-linear address
