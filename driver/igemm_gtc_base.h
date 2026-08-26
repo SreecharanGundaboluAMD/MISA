@@ -173,6 +173,11 @@ typedef struct {
     // config-file precedent) an _mtail config must not combine both a plain and an _mtail
     // section of the SAME tile shape in one file, since they'd otherwise collide on name.
     int wmma_m_tail;
+    // Phase 26b: analogous to wmma_m_tail but for GEMM_N (fwd only so far) -- relaxes
+    // gemm_n%gemm_n_per_block==0 and turns on B-operand load masking + a second epilogue
+    // EXEC-mask guard. Independent flag (not folded into wmma_m_tail) so M-only, N-only, and
+    // M+N configs can all exist. Same not-folded-into-kernel-name rationale as wmma_m_tail.
+    int wmma_n_tail;
 } igemm_gtc_tunable_t;
 
 static inline std::string get_igemm_gtc_fma_type(std::string arch_string, const config_section_t &sec){
@@ -238,6 +243,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.main_loop_interleave     = sec.count("main_loop_interleave") > 0 ? sec.at("main_loop_interleave").get_int() : 0;
                 tunable.wmma_acc_f16             = sec.count("wmma_acc_f16") > 0 ? sec.at("wmma_acc_f16").get_int() : 0;
                 tunable.wmma_m_tail               = sec.count("wmma_m_tail") > 0 ? sec.at("wmma_m_tail").get_int() : 0;
+                tunable.wmma_n_tail               = sec.count("wmma_n_tail") > 0 ? sec.at("wmma_n_tail").get_int() : 0;
             }
             else{
                 tunable.wave_tile_m              = sec.at("wave_tile_m").get_int();

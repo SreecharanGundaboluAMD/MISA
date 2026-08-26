@@ -108,6 +108,13 @@ class ctrl_coalescing_store_wmma_t(object):
         # exec_lo restore suffices. See docs/gfx1250_wmma_layout.md's Phase 25.
         self.wmma_m_tail = 0
 
+        # Phase 26b (GEMM_N tail): analogous to wmma_m_tail but for the column. 0 (default) =
+        # unaffected. 1 = a second EXEC-mask guard, chained right after the M-tail one (wave32
+        # v_cmpx intersects with the already-narrowed EXEC -- no extra VGPR needed here, since
+        # `v_gather` already holds this lane's global column for every pass, per its own
+        # comment below). Independent of wmma_m_tail -- either, both, or neither may be set.
+        self.wmma_n_tail = 0
+
 
 class igemm_coalescing_store_wmma_t(mc_base_t):
     def __init__(self, mc, ctrl):
@@ -115,7 +122,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         assert type(ctrl) is ctrl_coalescing_store_wmma_t
         self.ctrl = ctrl
 
-    def __call__(self, v_c, v_gemm_im, v_gemm_in, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1, v_tid=None, v_gather=None, s_block_m_off=None, s_block_n_off=None, s_gemm_m=None, v_tmp3=None):
+    def __call__(self, v_c, v_gemm_im, v_gemm_in, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1, v_tid=None, v_gather=None, s_block_m_off=None, s_block_n_off=None, s_gemm_m=None, v_tmp3=None, s_gemm_n=None, v_tmp4=None):
         '''
         v_gemm_im/v_gemm_in: this thread's base (row, col) within the macro tile, from
             igemm_wmma_mapping_t.get_gemm_index_for_dst_matrix (row/col of wave_repeat
@@ -130,6 +137,10 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         s_gemm_m/v_tmp3: only needed when ctrl.wmma_m_tail is set (non-atomic path only) --
             s_gemm_m is the real (unpadded) GEMM_M scalar, v_tmp3 is 1 scratch VGPR used to
             track each pass's absolute row for the EXEC-mask guard.
+        s_gemm_n/v_tmp4: only needed when ctrl.wmma_n_tail is set (non-atomic path only) --
+            s_gemm_n is the real (unpadded) GEMM_N scalar, v_tmp4 is 1 scratch VGPR holding
+            this lane's column-in-range flag (`v_gather` itself gets reused as the gather's
+            LDS-read destination, so its column value doesn't survive to pass 0's guard).
 
         ctrl.gemm_k_global_split selects between two structurally different epilogues:
 
@@ -160,6 +171,9 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         if ctrl.wmma_m_tail:
             assert not ctrl.gemm_k_global_split, "wmma_m_tail's masking is only implemented for the non-atomic epilogue branch"
             assert s_gemm_m is not None and v_tmp3 is not None
+        if ctrl.wmma_n_tail:
+            assert not ctrl.gemm_k_global_split, "wmma_n_tail's masking is only implemented for the non-atomic epilogue branch"
+            assert s_gemm_n is not None and v_tmp4 is not None
 
         with self._deferred_context():
             if ctrl.gemm_k_global_split:
@@ -323,6 +337,15 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                     self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {elem_byte_shift}, v[{v_tmp1}]   ; LDS byte address (invariant across passes)")
                 self._emit(f"v_add_u32 v[{v_gather}], s[{s_block_n_off}], v[{v_gather}]   ; + block_n_off -> global col")
                 self._emit(f"v_add_u32 v[{v_tmp2}], s[{s_block_m_off}], v[{v_tmp2}]   ; + block_m_off -> global row")
+                if ctrl.wmma_n_tail:
+                    # Phase 26b: this lane's column-in-range flag, captured NOW -- v_gather
+                    # itself is about to be reused as the gather's LDS-read destination
+                    # register (v_gather_range aliases v_gather, see below), so its "global
+                    # column" value would otherwise be gone before pass 0's guard needs it.
+                    # Pass-invariant (column never changes across passes), so this is computed
+                    # once here, not per-pass.
+                    self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s_gemm_n}], v[{v_gather}]")
+                    self._emit(f"v_cndmask_b32 v[{v_tmp4}], 0, 1, vcc_lo   ; wmma_n_tail: col < real gemm_n")
                 if ctrl.wmma_m_tail:
                     # Phase 25: this lane's absolute row for pass 0, preserved across passes --
                     # v_tmp2 itself gets folded into a byte address on the next line, so it can't
@@ -347,8 +370,16 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                         # _emit_gld_chunk_load's existing v_flag masking in
                         # igemm_fwd_gtc_wmma_nhwc.py, not XDLOPS's 64-bit saveexec/or pattern.
                         self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
+                    if ctrl.wmma_n_tail:
+                        # Phase 26b: chained right after the M-tail guard (if any) -- wave32
+                        # v_cmpx intersects with the current EXEC rather than overwriting it,
+                        # so this further narrows to lanes that are ALSO column-in-range.
+                        # v_tmp4 holds the pass-invariant column flag computed once above (see
+                        # the flag idiom used by _emit_gld_chunk_load elsewhere in this
+                        # codebase: v_cmpx_le_u32 1, v[flag]).
+                        self._emit(f"v_cmpx_le_u32 1, v[{v_tmp4}]   ; wmma_n_tail: col < real gemm_n")
                     self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
-                    if ctrl.wmma_m_tail:
+                    if ctrl.wmma_m_tail or ctrl.wmma_n_tail:
                         self._emit(f"s_mov_b32 exec_lo, -1")
                     if it != num_passes - 1:
                         self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_tmp2}], s[{s_tmp1}]   ; advance to pass {it + 1}")

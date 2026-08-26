@@ -451,9 +451,21 @@ public:
             int gemm_k = c / group;
             // Phase 25: wmma_m_tail relaxes the gemm_m exact-multiple requirement -- the
             // kernel's v_flag/epilogue masking (see igemm_fwd_gtc_wmma_nhwc.py) handles the
-            // partial tail block correctly. gemm_n/gemm_k still require an exact multiple
-            // (no B-operand or K-loop tail handling exists yet).
-            if((!tunable->wmma_m_tail && gemm_m % gemm_m_per_block != 0) || gemm_n % gemm_n_per_block != 0 || gemm_k % gemm_k_per_block != 0)
+            // partial tail block correctly. Phase 26b: wmma_n_tail does the same for gemm_n
+            // (B-operand load masking + a second epilogue guard) -- BUT the epilogue's
+            // non-atomic store is vectorized 4 elements (fp32-accumulator dwords) at a time
+            // (coalescing_store_wmma.py's vector_write_out=4, not currently a config knob),
+            // and the EXEC-mask guard only checks the group's FIRST column -- a group whose
+            // 4 columns straddle a non-multiple-of-4 gemm_n would silently write the
+            // out-of-range tail columns too (confirmed on real hardware: valid:n for
+            // gemm_n%4 != 0, valid:y otherwise). So wmma_n_tail additionally requires the
+            // real (unpadded) gemm_n itself to be a multiple of 4 -- not just relaxed to
+            // "any" non-exact-multiple-of-gemm_n_per_block value. gemm_k still requires an
+            // exact multiple of gemm_k_per_block (no K-loop tail handling exists yet).
+            if((!tunable->wmma_m_tail && gemm_m % gemm_m_per_block != 0) ||
+               (!tunable->wmma_n_tail && gemm_n % gemm_n_per_block != 0) ||
+               (tunable->wmma_n_tail && gemm_n % 4 != 0) ||
+               gemm_k % gemm_k_per_block != 0)
                 return false;
             return true;
         }

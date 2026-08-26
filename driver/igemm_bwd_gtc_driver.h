@@ -524,7 +524,10 @@ public:
             int gemm_m = n * hi * wi;
             int gemm_n = c / group;
             int gemm_k = k / group;
-            if(gemm_m % gemm_m_per_block != 0 || gemm_n % gemm_n_per_block != 0 || gemm_k % gemm_k_per_block != 0)
+            // Phase 26a: wmma_m_tail relaxes the gemm_m exact-multiple requirement, mirroring
+            // fwd's identical relax in igemm_fwd_gtc_driver.h (Phase 25) -- see that file's
+            // comment for the rationale. gemm_n/gemm_k still require an exact multiple.
+            if((!tunable->wmma_m_tail && gemm_m % gemm_m_per_block != 0) || gemm_n % gemm_n_per_block != 0 || gemm_k % gemm_k_per_block != 0)
                 return false;
             return true;
         }

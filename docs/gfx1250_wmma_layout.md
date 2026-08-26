@@ -2689,3 +2689,110 @@ untouched -- independent files, no overlap, can proceed separately.
   (non-atomic branch only), `ctrl.wmma_m_tail` field
 - `config/igemm_fwd_gtc_gfx1250_nhwc_{bf16,fp16,fp32}_mtail.config` -- new, one 128x128
   section each with `wmma_m_tail=1`
+
+## Phase 26 (2026-08-26): GEMM_M tail for bwd + GEMM_N tail for fwd
+
+### Context
+
+Direct continuation of Phase 25. A research pass ranked the remaining boundary-handling
+gaps by reuse/difficulty: M-tail for bwd (near-mechanical port of Phase 25), N-tail for fwd
+(one new persistent flag + a composable epilogue guard), M-tail for wrw (harder --
+`gemm_k_global_split` is wrw's primary path, not an excluded edge case), N-tail for bwd/wrw
+(transposed-operand nuances), and GEMM_K tail for any direction (genuinely new main-loop
+mechanism, ~200+ line estimate). Scoped this phase to the first two -- both direct extensions
+of Phase 25's exact pattern with no new masking *mechanism*.
+
+### Phase 26a: bwd M-tail
+
+Near-identical port of Phase 25: relaxed `driver/igemm_bwd_gtc_driver.h`'s WMMA
+`tunable_is_valid()` (same `gemm_m % gemm_m_per_block` relax, gated on `wmma_m_tail`), added
+a 5th `v_cndmask_b32` AND-in to bwd's existing 4-condition `v_flag` (which already checks two
+exact-division remainders plus `ho_idx`/`wo_idx` bounds -- see Phase 11), and wired the same
+`v_m_tail_row`/epilogue-guard plumbing Phase 25 built.
+
+**Real constraint found, exactly as flagged in the plan**: bwd's 128x128 tile was already at
+**256/256 VGPRs** before this phase (zero margin). Adding `v_m_tail_row` (1 more persistent
+VGPR) pushed it to **257** -- the assembler rejected it outright ("register index is out of
+range"), not a silent miscompile. Shipped **64x64-only** for bwd's `_mtail` configs (177
+VGPRs, comfortable margin), documented in the config file header rather than silently
+dropping 128x128 or trying to shave a register elsewhere.
+
+**Verification**: byte-identical regression sweep (bwd fp32/fp16/bf16/int8 bases) confirmed
+zero change for `wmma_m_tail=0`. Hardware battery (bf16/fp16/fp32, 64x64 tile) covering
+gemm_m=1/63/65/100/128/150 (multi-batch), group>1, and padded 3x3 conv -- all `valid:y`.
+
+### Phase 26b: fwd N-tail
+
+B-operand's per-lane column (`block_n_off + tid`) was already computed transiently in the
+prologue but never persisted; added a new persistent `v_flag_b` (kernel-lifetime constant,
+computed once -- unlike A's per-tap `v_flag`, B's column never changes across taps/K-
+iterations) and threaded it into every B-load call site (`global_load_b_functor`,
+`shared_store_b_functor`'s remaining-chunks path, and the `main_loop_interleave` chunk-load
+path). Scoped out (asserted mutually exclusive) with `async_global_load` -- B's async load
+path (`_emit_gld_async_all_chunks`) was only ever validated for A's masking, per its own
+Phase 13 docstring -- and with `row_repeat_b > 1` (no per-row flag exists for rows 1+, same
+scope narrowing the codebase already applies to B in general).
+
+**Design correction found during implementation** (the research's estimate was wrong on this
+point, caught by re-deriving from the actual code rather than trusting the summary): the
+epilogue's `v_gather` register does **not** survive across gather passes the way the research
+assumed -- it gets overwritten by the very first `ds_read` (its register range is reused as
+the LDS-read destination). A second scratch VGPR (`v_n_tail_col`) is needed after all, to
+capture the column-in-range flag *before* the first pass's read clobbers `v_gather`. Net: 1
+extra VGPR for N-tail's epilogue guard, not 0 as originally estimated -- still fits every
+128x128 config tested (fp32/fp16/bf16 all land at 253-255/256 VGPRs, no exclusions needed,
+unlike bwd's M-tail).
+
+**Real correctness bug found via hardware validation, fixed before shipping**: the epilogue's
+non-atomic store is vectorized 4 elements at a time (`vector_write_out=4`, a hardcoded
+constant -- not a config knob anywhere in this codebase), and the EXEC-mask guard only checks
+a group's *first* column. For `gemm_n` values that are exact multiples of 4 (e.g. 100, 200,
+256), every group's 4 columns are either fully in-range or fully out-of-range, so the guard
+is correct. For non-multiples of 4 (99, 101, 126, 127, 129, 1 -- all tested), a boundary
+group straddles the real `gemm_n`, and the guard's single first-column check let the *entire*
+group's store through, writing 1-3 out-of-range columns of garbage. This surfaced as
+`valid:n` (wrong answer) for those shapes, and as an outright process abort
+(`Assertion 'is_valid' failed`, core dump) once `IGEMM_ASSERT_WHEN_INVALID=1` was set -- not
+a subtle numerical drift, a clean and immediately obvious failure once tested against the
+right shapes. **Fixed** by additionally requiring the real (unpadded) `gemm_n` to be a
+multiple of 4 in `tunable_is_valid()` whenever `wmma_n_tail` is set -- a documented,
+driver-enforced restriction, not a silent limitation. (Properly handling non-multiple-of-4
+tails would need per-element masking within a vectorized store group -- a similar order of
+complexity to GEMM_K tail's partial-chunk problem, explicitly not attempted here.)
+
+**Verification**: byte-identical regression sweep (fwd fp32/fp16/bf16/int8 bases plus
+`_async`/`_interleave`/`_k2x_f16acc`, bwd bases, wrw base + `_gsplit`) confirmed zero change
+for `wmma_n_tail=0`. Hardware battery (bf16, 128x128 tile) covering gemm_n=1/4/99/100/101/
+124/126/132/200(group>1)/256(exact), confirming the exact multiple-of-4 boundary the fix
+predicts (4/100/124/132/200/256 all `valid:y`; 1/99/101/126 correctly rejected as
+"not applicable" post-fix, `valid:n`/abort pre-fix). fp16/fp32 spot-checked with a padded 3x3
+shape. A combined `_mntail` config (both flags set) validated on two shapes -- confirms the
+two EXEC-mask guards (`v_cmpx_gt_u32` for M chained with `v_cmpx_le_u32` for N) compose
+correctly via wave32's EXEC-intersecting `v_cmpx` semantics, no interaction bugs.
+
+### Net result
+
+Fwd now has full M+N tail coverage (K still exact-multiple-only); bwd has M-tail (64x64
+only, due to VGPR budget). wrw M-tail, N-tail for bwd/wrw, and GEMM_K tail for any direction
+remain deferred -- each has its own complication (wrw's `gemm_k_global_split`-as-primary-path
+interaction, transposed-operand addressing, or the fundamentally new main-loop mechanism
+K-tail needs) that warrants its own focused pass rather than bundling further.
+
+### Critical files (Phase 26)
+
+- `driver/igemm_bwd_gtc_driver.h` -- bwd's `tunable_is_valid()` gemm_m relax (26a)
+- `driver/igemm_gtc_base.h` -- new `wmma_n_tail` tunable field + config parsing (26b)
+- `driver/igemm_fwd_gtc_driver.h` -- gemm_n relax AND the multiple-of-4 restriction when
+  `wmma_n_tail` is set (26b)
+- `python/igemm/igemm_base.py` -- `wmma_m_tail` extended to allow `direction in ('fwd',
+  'bwd')`; new `wmma_n_tail` read/assert block (fwd-only, excludes `async_global_load` and
+  `row_repeat_b > 1`)
+- `python/igemm/igemm_bwd_gtc_wmma_nhwc.py` -- 5th `v_flag` condition, conditional
+  `v_m_tail_row`, `coalescing_store()` wiring (26a)
+- `python/igemm/igemm_fwd_gtc_wmma_nhwc.py` -- new persistent `v_flag_b`/`v_n_tail_col`
+  VGPRs, B-load call sites threaded with the new flag, `coalescing_store()` wiring (26b)
+- `python/operations/coalescing_store_wmma.py` -- new `ctrl.wmma_n_tail` field, `s_gemm_n`/
+  `v_tmp4` params, the chained `v_cmpx_le_u32` guard and its pass-invariant flag capture (26b)
+- `config/igemm_bwd_gtc_gfx1250_nhwc_{bf16,fp16,fp32}_mtail.config` -- new, 64x64-only (26a)
+- `config/igemm_fwd_gtc_gfx1250_nhwc_{bf16,fp16,fp32}_ntail.config` -- new, 128x128 (26b)
+- `config/igemm_fwd_gtc_gfx1250_nhwc_bf16_mntail.config` -- new, combined M+N tail (26b)

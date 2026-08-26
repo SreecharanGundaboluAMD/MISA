@@ -224,6 +224,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_coalescing_store_wmma.epilogue_lds_pad = tunable.epilogue_lds_pad
         ctrl_coalescing_store_wmma.wmma_acc_f16 = tunable.wmma_acc_f16
         ctrl_coalescing_store_wmma.wmma_m_tail = tunable.wmma_m_tail
+        ctrl_coalescing_store_wmma.wmma_n_tail = tunable.wmma_n_tail
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
 
         # int8 added: the only two byte-width-dependent literals (the A/B global-address
@@ -378,6 +379,10 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 # EXEC-mask guard -- only allocated when wmma_m_tail is set (every existing
                 # config is byte-identical, this register simply doesn't exist otherwise).
                 self.v_m_tail_row = sym_t('v_m_tail_row' , vseq(1))
+            if outer.tunable.wmma_n_tail:
+                # Phase 26b: extra scratch for coalescing_store_wmma's pass-invariant
+                # column-in-range flag -- only allocated when wmma_n_tail is set.
+                self.v_n_tail_col = sym_t('v_n_tail_col' , vseq(1))
             self.v_sst_os      = sym_t('v_sst_os'      , vseq(1))    # shared store offset (same for A/B region)
             self.v_sld_a_os    = sym_t('v_sld_a_os'    , vseq(1))
             self.v_sld_b_os    = sym_t('v_sld_b_os'    , vseq(1))
@@ -399,6 +404,12 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             # (no extra persistent VGPRs) -- see that function's docstring. This keeps the
             # asymmetric shape's VGPR cost to +3 total (v_flag +1, v_addr_a +2) instead of +6.
             self.v_flag        = sym_t('v_flag'        , vseq(outer.row_repeat_a))
+            if outer.tunable.wmma_n_tail:
+                # Phase 26b: B's column (block_n_off + tid) is a kernel-lifetime constant
+                # (unlike A's per-tap v_flag) -- computed once in emit_kernel_prologue, not
+                # per-tap. Only allocated when wmma_n_tail is set (every existing config byte-
+                # identical).
+                self.v_flag_b  = sym_t('v_flag_b'      , vseq(1))
             self.v_n_idx       = sym_t('v_n_idx'       , vseq(1))
             self.v_ho_idx      = sym_t('v_ho_idx'      , vseq(1))
             self.v_wo_idx      = sym_t('v_wo_idx'      , vseq(1))
@@ -697,6 +708,14 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 else:
                     self._emit(f"v_add_u32 v[{v.v_tmp(1)}], {i * self.tunable.block_size}, v[{v.v_tid()}]")
                     self._emit(f"v_add_u32 v[{v.v_tmp(1)}], s[{s.s_block_n_off()}], v[{v.v_tmp(1)}]")
+                if i == 0 and self.tunable.wmma_n_tail:
+                    # Phase 26b: v_flag_b = 1 iff this lane's absolute column < real gemm_n --
+                    # a kernel-lifetime constant, computed once here (only row 0; row_repeat_b
+                    # > 1 has no masking support at all today, matching the pre-existing scope
+                    # narrowing this loop's own docstring already describes for B).
+                    self._emit(f"; wmma_n_tail: v_flag_b = 1 iff this lane's absolute column < real gemm_n")
+                    self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_gemm_n()}], v[{v.v_tmp(1)}]")
+                    self._emit(f"v_cndmask_b32 v[{v.v_flag_b()}], 0, 1, vcc_lo")
                 self._emit(f"v_mul_lo_u32 v[{v.v_tmp(1)}], s[{s.s_wei_k_stride()}], v[{v.v_tmp(1)}]")
                 self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], {utility_log2(self.data_byte)}, v[{v.v_tmp(1)}]")
                 self._emit(f"v_mov_b32 v[{v.v_addr_b_base(i*2+1)}], s[{s.s_p_wei(1)}]")
@@ -1050,7 +1069,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                     if outer.tunable.async_global_load:
                         outer._emit_gld_async_all_chunks(v.v_off_b, v.v_sst_os, outer.lds_a_size, outer.sgpr.s_p_wei, v_flag=None)
                     else:
-                        outer._emit_gld_chunk_load(v.v_gld_b, v.v_addr_b, 0, v_flag=None)
+                        outer._emit_gld_chunk_load(v.v_gld_b, v.v_addr_b, 0, v_flag=(v.v_flag_b if outer.tunable.wmma_n_tail else None))
                 return outer._get_deferred()
             def get_issues(self):
                 return outer.chunk_num_dwordx4
@@ -1089,10 +1108,12 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    outer._emit_sst_remaining_chunks(v.v_gld_b, v.v_addr_b, v.v_sst_os, outer.lds_a_size, v_flag=None)
+                    outer._emit_sst_remaining_chunks(v.v_gld_b, v.v_addr_b, v.v_sst_os, outer.lds_a_size, v_flag=(v.v_flag_b if outer.tunable.wmma_n_tail else None))
                     for i in range(1, outer.row_repeat_b):
                         row_addr = lambda idx=0, i=i: v.v_addr_b(i * 2 + idx)
                         row_off  = outer.lds_a_size + i * outer.tunable.block_size * outer.bytes_per_row
+                        # rows 1..row_repeat_b-1 have no flag of their own (row_repeat_b==1 is
+                        # asserted in __init__ whenever wmma_n_tail is set -- see there).
                         outer._emit_sst_all_chunks_row(v.v_gld_b, row_addr, v.v_sst_os, row_off, v_flag=None)
                 return outer._get_deferred()
             def get_issues(self):
@@ -1122,7 +1143,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self, chunk_idx):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    outer._emit_gld_chunk_load(v.v_gld_b, v.v_addr_b, chunk_idx, v_flag=None)
+                    outer._emit_gld_chunk_load(v.v_gld_b, v.v_addr_b, chunk_idx, v_flag=(v.v_flag_b if outer.tunable.wmma_n_tail else None))
                 return outer._get_deferred()
         return functor_t()
 
@@ -1293,7 +1314,8 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # s_out_k_total (=gemm_n*group) is the output tensor's TOTAL row stride (see class
         # docstring's group>1 note) -- s_gemm_n alone (per-group) is only correct for group=1.
         self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_k_total.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off(),
-                    s.s_gemm_m.label if self.tunable.wmma_m_tail else None, v.v_m_tail_row() if self.tunable.wmma_m_tail else None))
+                    s.s_gemm_m.label if self.tunable.wmma_m_tail else None, v.v_m_tail_row() if self.tunable.wmma_m_tail else None,
+                    s.s_gemm_n.label if self.tunable.wmma_n_tail else None, v.v_n_tail_col() if self.tunable.wmma_n_tail else None))
         self._emit(f"s_wait_storecnt 0x0")
 
     def emit_kernel_body(self):
