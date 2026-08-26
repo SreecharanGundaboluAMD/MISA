@@ -486,8 +486,38 @@ class igemm_gtc_tunable_parameter_t(object):
             self.local_prefetch_num = utility_dict_with_default_t(tunable_dict)('local_prefetch_num', 1)
             if self.local_prefetch_num == 2:
                 assert self.main_loop_interleave == 0, "local_prefetch_num=2 and main_loop_interleave are mutually exclusive for now"
+            # Phase 24 (F16-accumulate WMMA): optional, defaults to 0 (today's f32-accumulate,
+            # every existing config unaffected). When 1, selects the WMMA variant that
+            # accumulates directly in fp16 (num_v_c=4, half the VGPRs of f32-accumulate's
+            # num_v_c=8) -- fp16 only; bf16/int8 have no equivalent on this ISA (see
+            # wmma.py's v_wmma_f16_16x16x32_f16 comment). Only affects the non-atomic
+            # epilogue branch (coalescing_store_wmma.py) -- there is no packed-fp16
+            # atomic-add on this ISA, so gemm_k_global_split stays f32-accumulate regardless.
+            self.wmma_acc_f16 = utility_dict_with_default_t(tunable_dict)('wmma_acc_f16', 0)
+            if self.wmma_acc_f16:
+                assert self.precision == 'fp16', \
+                    f"wmma_acc_f16=1 is only implemented for fp16 (got precision={self.precision}) -- " \
+                    f"bf16/int8 have no equivalent halved-accumulate WMMA variant, see docs/gfx1250_wmma_layout.md's Phase 24"
+                # epilogue_lds_pad's pad amount (4 elements) was derived for 4-byte-wide
+                # accumulator elements specifically (breaks bank conflicts while preserving
+                # 16-byte alignment for ds_read_b128/global_store_dwordx4). f16acc's LDS
+                # elements are 2 bytes wide -- the SAME pad constant would misalign the
+                # narrower ds_read_b64/global_store_dwordx2 the gather uses, and a correct
+                # 2-byte-element pad amount hasn't been derived. Mutually exclusive for now.
+                assert not self.epilogue_lds_pad, \
+                    "wmma_acc_f16 and epilogue_lds_pad are mutually exclusive for now -- the Phase 23 pad constant was derived for 4-byte elements, not f16acc's 2-byte elements, see docs/gfx1250_wmma_layout.md's Phase 24"
+                # The WMMA instruction (and its num_v_c/accumulator width) is selected ONCE
+                # per kernel, shared by both epilogue branches -- there is no way for the
+                # atomic (gemm_k_global_split) branch to keep reading f32-width VGPRs while
+                # the non-atomic branch reads packed f16 ones from the SAME v_c allocation.
+                # coalescing_store_wmma.py's atomic branch was never adapted for a packed
+                # accumulator (it has no packed atomic-add to target anyway, per Phase 19),
+                # so this combination is unsupported, not just unimplemented -- block it.
+                assert not self.gemm_k_global_split, \
+                    "wmma_acc_f16 and gemm_k_global_split are mutually exclusive -- the atomic epilogue branch was never adapted to read a packed f16 accumulator, see docs/gfx1250_wmma_layout.md's Phase 24"
+            wmma_mapping_key = self.precision + '_f16acc' if self.wmma_acc_f16 else self.precision
             wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(self.gemm_m_per_block, self.gemm_n_per_block, self.wmma_tile_m, self.wmma_tile_n,
-                    self.wmma_repeat_m, self.wmma_repeat_n, self.block_size // self.wave_size, self.precision)
+                    self.wmma_repeat_m, self.wmma_repeat_n, self.block_size // self.wave_size, wmma_mapping_key)
             self.num_vgpr_accumulate_c          = wmma_mapping.total_acc_c()
             self.num_vgpr_accumulate_a          = self.wmma_repeat_m * wmma_mapping.inst_wmma.num_v_a * self.local_prefetch_num
             self.num_vgpr_accumulate_b          = self.wmma_repeat_n * wmma_mapping.inst_wmma.num_v_b * self.local_prefetch_num
@@ -980,6 +1010,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_async"
         if tunable.main_loop_interleave:
             kernel_name += "_interleave"
+        if tunable.wmma_acc_f16:
+            kernel_name += "_f16acc"
 
     if tunable.tensor_a_pass_through:
         kernel_name += "_pta"

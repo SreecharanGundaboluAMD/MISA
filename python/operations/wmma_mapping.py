@@ -247,6 +247,18 @@ ctrl_wmma_mapping_table = {
         # this mirror was materially simpler to implement than the 128x64 entry's A-side work.
         ctrl_wmma_mapping_t(64,  128, 16, 16, 2, 4, 4, v_wmma_f32_16x16x32_f16),
     ],
+    # Phase 24 (F16-accumulate WMMA): separate table key (not a field on ctrl_wmma_mapping_t)
+    # so the existing f32-accumulate 'fp16' entries stay byte-identical -- the caller
+    # (igemm_base.py) picks this key instead of 'fp16' when tunable.wmma_acc_f16=1. Same
+    # tile shapes as 'fp16' above (accumulate width doesn't affect tiling), just
+    # v_wmma_f16_16x16x32_f16 instead of v_wmma_f32_16x16x32_f16 -- total_acc_c() naturally
+    # halves (num_v_c=4 instead of 8) with no other change needed.
+    'fp16_f16acc': [
+        ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f16_16x16x32_f16),
+        ctrl_wmma_mapping_t(64,  64,  16, 16, 2, 2, 4, v_wmma_f16_16x16x32_f16),
+        ctrl_wmma_mapping_t(128, 64,  16, 16, 2, 4, 4, v_wmma_f16_16x16x32_f16),
+        ctrl_wmma_mapping_t(64,  128, 16, 16, 2, 4, 4, v_wmma_f16_16x16x32_f16),
+    ],
     'bf16': [
         ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x32_bf16),
         ctrl_wmma_mapping_t(64,  64,  16, 16, 2, 2, 4, v_wmma_f32_16x16x32_bf16),

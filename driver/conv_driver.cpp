@@ -660,6 +660,13 @@ int main(int argc, char **argv) {
     // test (output for fwd, input for bwd, weight for wrw) must instead be sized/read/
     // compared at 4 bytes/element, or a real WMMA kernel would silently overrun it.
     bool is_wmma = tunables.size() > 0 && tunables[0].fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA;
+    // Phase 24: wmma_acc_f16 (fp16 only) makes the WMMA kernel's D operand genuinely 2
+    // bytes/element instead of the usual 4 -- the "native role" buffer (output for fwd,
+    // input for bwd, weight for wrw) needs its OWN width, separate from is_wmma's blanket
+    // fp32 override below. The other two buffers stay ordinary fp16 either way, so no
+    // special-casing needed for them (they were already correctly sized by data_byte, or
+    // harmlessly over-allocated to fp32 by is_wmma's dtype_alloc_byte).
+    bool is_wmma_f16_acc = is_wmma && tunables[0].wmma_acc_f16 != 0;
 
     hipModule_t module;
 #ifndef IGEMM_SPLIT_KERNEL
@@ -750,11 +757,20 @@ int main(int argc, char **argv) {
     void *device_input_dtype;
     void *device_weight_dtype;
     void *device_output_dtype;
-#if defined(USE_HALF) || defined(USE_INT8) || defined(USE_BF16) || defined(USE_INT4)
     // over-allocate to fp32 width for WMMA (see is_wmma comment above) -- harmless for the
     // roles that stay native-precision, since only the actually-used prefix of each buffer
     // is ever read/written.
-    size_t dtype_alloc_byte = is_wmma ? sizeof(float) : data_byte;
+    // Phase 24: when wmma_acc_f16 is active, the "native role" buffer is genuinely 2
+    // bytes/element (not 4) -- and since the OTHER two buffers are ordinary fp16 anyway
+    // (data_byte==sizeof(half) for fp16 tests), sizing ALL THREE at data_byte is correct
+    // for every one of them, not just an accepted over-allocation like the plain is_wmma
+    // case below. Declared unconditionally (not inside the #if below) since fwd_pre/bwd_pre/
+    // wrw_pre further down reference it regardless of which USE_* macro (if any) is defined
+    // -- e.g. a pure fp32 build defines none of them, and previously (a Phase 24 regression,
+    // caught by this branch's own byte-identical-assembly regression sweep) those lambdas
+    // failed to compile with "use of undeclared identifier 'dtype_alloc_byte'".
+    size_t dtype_alloc_byte = is_wmma_f16_acc ? data_byte : (is_wmma ? sizeof(float) : data_byte);
+#if defined(USE_HALF) || defined(USE_INT8) || defined(USE_BF16) || defined(USE_INT4)
     host_input_dtype  = malloc(n * c * hi * wi * dtype_alloc_byte);
     host_weight_dtype = malloc(k * c * y * x * dtype_alloc_byte);
     host_output_dtype = malloc(n * k * ho * wo * dtype_alloc_byte);
@@ -959,7 +975,7 @@ int main(int argc, char **argv) {
         auto fwd_pre = [&](){
             if (need_verify)
                 HIP_CALL(hipMemset(driver_data_type == driverFloat ? device_output : device_output_dtype,
-                    0, static_cast<size_t>(n) * k * ho * wo * (is_wmma ? sizeof(float) : data_byte)));
+                    0, static_cast<size_t>(n) * k * ho * wo * dtype_alloc_byte));
         };
 
         auto fwd_post = [&](){
@@ -969,6 +985,26 @@ int main(int argc, char **argv) {
                 if(driver_data_type == driverFloat){
                     HIP_CALL(hipMemcpy(device_output_to_host, device_output,
                                    static_cast<size_t>(n) * k * ho * wo * data_byte,
+                                   hipMemcpyDeviceToHost));
+                    is_valid = valid_vector<float>(host_output, static_cast<float*>(device_output_to_host),
+                                            static_cast<size_t>(n) * k * ho * wo, nrms);
+                }else if(is_wmma_f16_acc){
+                    // Phase 24: device_output_dtype holds the WMMA kernel's genuinely
+                    // 2-byte/element (packed-then-unpacked, see coalescing_store_wmma.py)
+                    // fp16 output -- expand it to fp32 via the new tensor_cast kernel
+                    // (reusing device_output, free by this point -- its data was already
+                    // copied out to host_output for the reference comparison above) so the
+                    // existing valid_vector<float> comparison logic runs unchanged.
+                    hipFunction_t f16acc_cast_func;
+                    HIP_CALL(hipModuleGetFunction(&f16acc_cast_func, module_tensor_cast, "tensor_cast_fp32_fp16acc_1d"));
+                    tensor_cast_karg_t karg_f16acc_cast;
+                    karg_f16acc_cast.output = device_output;
+                    karg_f16acc_cast.input = device_output_dtype;
+                    karg_f16acc_cast.total_length = n * k * ho * wo;
+                    const size_t thread_length_f16acc_cast = (static_cast<size_t>(n) * k * ho * wo + 8 * 256) / (8 * 256) * (8 * 256) / 8;
+                    igemm_launch_kernel_single(f16acc_cast_func, &karg_f16acc_cast, sizeof(karg_f16acc_cast), {thread_length_f16acc_cast, 1, 1}, {256, 1, 1});
+                    HIP_CALL(hipMemcpy(device_output_to_host, device_output,
+                                   static_cast<size_t>(n) * k * ho * wo * sizeof(float),
                                    hipMemcpyDeviceToHost));
                     is_valid = valid_vector<float>(host_output, static_cast<float*>(device_output_to_host),
                                             static_cast<size_t>(n) * k * ho * wo, nrms);
@@ -1107,7 +1143,7 @@ int main(int argc, char **argv) {
         auto bwd_pre = [&](){
             if (need_verify)
                 HIP_CALL(hipMemset(driver_data_type == driverFloat ? device_input : device_input_dtype,
-                    0x7f, static_cast<size_t>(n) * c * hi * wi * (is_wmma ? sizeof(float) : data_byte))); // 0x7f7f7f7f ~= 7.41e+28, a very large number
+                    0x7f, static_cast<size_t>(n) * c * hi * wi * dtype_alloc_byte)); // 0x7f7f7f7f ~= 7.41e+28, a very large number
         };
 
         auto bwd_post = [&](){
@@ -1117,6 +1153,21 @@ int main(int argc, char **argv) {
                 if(driver_data_type == driverFloat){
                     HIP_CALL(hipMemcpy(device_input_to_host, device_input,
                                     static_cast<size_t>(n) * c * hi * wi * data_byte,
+                                    hipMemcpyDeviceToHost));
+                    is_valid = valid_vector<float>(host_input, static_cast<float*>(device_input_to_host),
+                                                static_cast<size_t>(n) * c * hi * wi, nrms);
+                } else if(is_wmma_f16_acc){
+                    // Phase 24: see the equivalent fwd comment near is_wmma_f16_acc.
+                    hipFunction_t f16acc_cast_func;
+                    HIP_CALL(hipModuleGetFunction(&f16acc_cast_func, module_tensor_cast, "tensor_cast_fp32_fp16acc_1d"));
+                    tensor_cast_karg_t karg_f16acc_cast;
+                    karg_f16acc_cast.output = device_input;
+                    karg_f16acc_cast.input = device_input_dtype;
+                    karg_f16acc_cast.total_length = n * c * hi * wi;
+                    const size_t thread_length_f16acc_cast = (static_cast<size_t>(n) * c * hi * wi + 8 * 256) / (8 * 256) * (8 * 256) / 8;
+                    igemm_launch_kernel_single(f16acc_cast_func, &karg_f16acc_cast, sizeof(karg_f16acc_cast), {thread_length_f16acc_cast, 1, 1}, {256, 1, 1});
+                    HIP_CALL(hipMemcpy(device_input_to_host, device_input,
+                                    static_cast<size_t>(n) * c * hi * wi * sizeof(float),
                                     hipMemcpyDeviceToHost));
                     is_valid = valid_vector<float>(host_input, static_cast<float*>(device_input_to_host),
                                                 static_cast<size_t>(n) * c * hi * wi, nrms);
@@ -1272,7 +1323,7 @@ int main(int argc, char **argv) {
         auto wrw_pre = [&](){
             if (need_verify)
                 HIP_CALL(hipMemset(driver_data_type == driverFloat ? device_weight : device_weight_dtype,
-                    0, static_cast<size_t>(k) * c * y * x * (is_wmma ? sizeof(float) : data_byte)));
+                    0, static_cast<size_t>(k) * c * y * x * dtype_alloc_byte));
         };
 
         auto wrw_post = [&](){
@@ -1285,6 +1336,21 @@ int main(int argc, char **argv) {
                                    hipMemcpyDeviceToHost));
                     is_valid = valid_vector<float>(host_weight, static_cast<float*>(device_weight_to_host),
                                     static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x, nrms);
+                }else if(is_wmma_f16_acc){
+                    // Phase 24: see the equivalent fwd comment near is_wmma_f16_acc.
+                    hipFunction_t f16acc_cast_func;
+                    HIP_CALL(hipModuleGetFunction(&f16acc_cast_func, module_tensor_cast, "tensor_cast_fp32_fp16acc_1d"));
+                    tensor_cast_karg_t karg_f16acc_cast;
+                    karg_f16acc_cast.output = device_weight;
+                    karg_f16acc_cast.input = device_weight_dtype;
+                    karg_f16acc_cast.total_length = ngroups * (k / ngroups) * (c / ngroups) * y * x;
+                    const size_t thread_length_f16acc_cast = (static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x + 8 * 256) / (8 * 256) * (8 * 256) / 8;
+                    igemm_launch_kernel_single(f16acc_cast_func, &karg_f16acc_cast, sizeof(karg_f16acc_cast), {thread_length_f16acc_cast, 1, 1}, {256, 1, 1});
+                    HIP_CALL(hipMemcpy(device_weight_to_host, device_weight,
+                                   static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x * sizeof(float),
+                                   hipMemcpyDeviceToHost));
+                    is_valid = valid_vector<float>(host_weight, static_cast<float*>(device_weight_to_host),
+                                        static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x, nrms);
                 }else if(is_wmma){
                     // WMMA always writes grad_weight at full width (fp32, or int32 for int8) --
                     // see the equivalent fwd/bwd comment near is_wmma.

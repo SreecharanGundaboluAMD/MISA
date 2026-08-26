@@ -86,6 +86,17 @@ class ctrl_coalescing_store_wmma_t(object):
         # in the same LDS bank -- see docs/gfx1250_wmma_layout.md).
         self.epilogue_lds_pad = 0
 
+        # Phase 24 (F16-accumulate WMMA): non-atomic path only (there is no packed-fp16
+        # atomic-add on this ISA -- the gemm_k_global_split path always stays f32-accumulate
+        # regardless of this flag). 0 (default) = v_c holds one fp32 element/VGPR, today's
+        # exact behavior. 1 = v_c holds TWO packed fp16 elements/VGPR (rows 2j and 2j+1 of
+        # the same column in bits [15:0]/[31:16], per the CDNA5 ISA doc's 16-bit C/D-matrix
+        # table) -- the scatter must split each VGPR into two separate LDS writes at their
+        # real row addresses (one row apart), and every element-width-dependent byte
+        # shift/instruction-selection in the gather halves accordingly (2 bytes/element
+        # instead of 4). See docs/gfx1250_wmma_layout.md's Phase 24.
+        self.wmma_acc_f16 = 0
+
 
 class igemm_coalescing_store_wmma_t(mc_base_t):
     def __init__(self, mc, ctrl):
@@ -195,9 +206,26 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                 # docs/gfx1250_wmma_layout.md's Phase 23 for the full derivation.
                 pad = 4 if ctrl.epilogue_lds_pad else 0
                 padded_stride = macro_tile_n + pad
-                ds_read_inst = {1: "ds_read_b32", 2: "ds_read_b64", 4: "ds_read_b128"}[vwo]
-                gst_inst = {1: "global_store_dword", 2: "global_store_dwordx2", 4: "global_store_dwordx4"}[vwo]
-                v_gather_range = f"{v_gather}:{v_gather}+{vwo - 1}" if vwo > 1 else v_gather
+                # Phase 24: the scatter unpacks f16acc's packed accumulator into genuinely
+                # 2-byte-per-element LDS storage (see the scatter loop below) -- so from the
+                # gather's point of view, LDS (and the final global memory tensor) just holds
+                # narrower elements, same tile-linear layout otherwise. vwo counts LOGICAL
+                # elements regardless of width; only the instruction/byte-shift selection
+                # needs to know the width.
+                elem_bytes = 2 if ctrl.wmma_acc_f16 else 4
+                elem_byte_shift = 1 if ctrl.wmma_acc_f16 else 2
+                if ctrl.wmma_acc_f16:
+                    ds_read_inst = {1: "ds_read_u16", 2: "ds_read_b32", 4: "ds_read_b64"}[vwo]
+                    gst_inst = {1: "global_store_short", 2: "global_store_dword", 4: "global_store_dwordx2"}[vwo]
+                else:
+                    ds_read_inst = {1: "ds_read_b32", 2: "ds_read_b64", 4: "ds_read_b128"}[vwo]
+                    gst_inst = {1: "global_store_dword", 2: "global_store_dwordx2", 4: "global_store_dwordx4"}[vwo]
+                # register range width = dwords needed to hold vwo elements at elem_bytes
+                # each (vwo*4 for f32 -- always vwo dwords/VGPRs; vwo*2 for f16acc -- half as
+                # many VGPRs, floored at 1 since ds_read_u16/global_store_short both address
+                # one full VGPR regardless of the 16-bit payload being smaller than a dword).
+                v_gather_num_regs = max(1, (vwo * elem_bytes) // 4)
+                v_gather_range = f"{v_gather}:{v_gather}+{v_gather_num_regs - 1}" if v_gather_num_regs > 1 else v_gather
 
                 self._emit(f"; wmma LDS-reshuffle coalescing store, tile {macro_tile_m}x{macro_tile_n}, "
                            f"vector_write_out={vwo}, {num_passes} passes")
@@ -227,15 +255,26 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                     else:
                         self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {log2_n}, v[{v_tmp1}]   ; row << log2(macro_tile_n)")
                     self._emit(f"v_add_u32 v[{v_tmp1}], v[{v_tmp2}], v[{v_tmp1}]   ; + col -> tile-linear index, row {row_off}")
-                    self._emit(f"v_lshlrev_b32 v[{v_tmp1}], 2, v[{v_tmp1}]   ; byte address")
+                    self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {elem_byte_shift}, v[{v_tmp1}]   ; byte address")
+                    # Phase 24: for f16acc, VGPR j packs TWO logical rows (2j lo-half, 2j+1
+                    # hi-half, per the ISA doc's 16-bit C/D-matrix table) -- v_tmp1 tracks the
+                    # LO row's address, stepping 2 rows (not 1) per j; the HI row's write
+                    # reuses the SAME v_tmp1 base with one extra row's stride folded into its
+                    # offset immediate (no extra address-compute instruction needed).
+                    row_step = 2 if ctrl.wmma_acc_f16 else 1
                     for j in range(inst_wmma.num_v_c):
                         if j != 0:
-                            self._emit(f"v_add_u32 v[{v_tmp1}], {padded_stride * 4}, v[{v_tmp1}]   ; advance to row {row_off + j}")
+                            self._emit(f"v_add_u32 v[{v_tmp1}], {padded_stride * elem_bytes * row_step}, v[{v_tmp1}]   ; advance to row {row_off + j * row_step}")
                         for i_rn in range(cxm.wave_repeat_n):
                             c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
-                            col_off = i_rn * cxm.wave_tile_n * 4
+                            col_off = i_rn * cxm.wave_tile_n * elem_bytes
                             offset_str = f" offset:{col_off}" if col_off != 0 else ""
-                            self._emit(f"ds_write_b32 v[{v_tmp1}], v[{v_c}+{c_index}]{offset_str}")
+                            if ctrl.wmma_acc_f16:
+                                hi_off = col_off + padded_stride * elem_bytes
+                                self._emit(f"ds_write_b16 v[{v_tmp1}], v[{v_c}+{c_index}]{offset_str}   ; row {row_off + j*2} (lo 16 bits)")
+                                self._emit(f"ds_write_b16_d16_hi v[{v_tmp1}], v[{v_c}+{c_index}] offset:{hi_off}   ; row {row_off + j*2 + 1} (hi 16 bits)")
+                            else:
+                                self._emit(f"ds_write_b32 v[{v_tmp1}], v[{v_c}+{c_index}]{offset_str}")
                 self._emit_empty_line()
 
                 # ---- barrier: all scatter writes must be visible to every lane before any gather read ----
@@ -262,21 +301,22 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                 if pad:
                     self._emit(f"v_mul_lo_u32 v[{v_tmp1}], {padded_stride}, v[{v_tmp2}]   ; row0 * padded_stride")
                     self._emit(f"v_add_u32 v[{v_tmp1}], v[{v_gather}], v[{v_tmp1}]   ; + col0 -> padded tile-linear index")
-                    self._emit(f"v_lshlrev_b32 v[{v_tmp1}], 2, v[{v_tmp1}]   ; padded LDS byte address (invariant across passes)")
+                    self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {elem_byte_shift}, v[{v_tmp1}]   ; padded LDS byte address (invariant across passes)")
                 else:
-                    self._emit(f"v_lshlrev_b32 v[{v_tmp1}], 2, v[{v_tmp1}]   ; LDS byte address (invariant across passes)")
+                    self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {elem_byte_shift}, v[{v_tmp1}]   ; LDS byte address (invariant across passes)")
                 self._emit(f"v_add_u32 v[{v_gather}], s[{s_block_n_off}], v[{v_gather}]   ; + block_n_off -> global col")
                 self._emit(f"v_add_u32 v[{v_tmp2}], s[{s_block_m_off}], v[{v_tmp2}]   ; + block_m_off -> global row")
                 self._emit(f"v_mul_lo_u32 v[{v_tmp2}], s[{s_gemm_m_stride}], v[{v_tmp2}]")
                 self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_gather}], v[{v_tmp2}]")
-                self._emit(f"v_lshlrev_b32 v[{v_tmp2}], 2, v[{v_tmp2}]   ; global memory byte address for pass 0")
-                self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], {utility_log2(row_step_per_pass) + 2}   ; per-pass memory stride")
+                self._emit(f"v_lshlrev_b32 v[{v_tmp2}], {elem_byte_shift}, v[{v_tmp2}]   ; global memory byte address for pass 0")
+                self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], {utility_log2(row_step_per_pass) + elem_byte_shift}   ; per-pass memory stride")
                 self._emit_empty_line()
                 for it in range(num_passes):
-                    # row_step_per_pass*padded_stride*4 == elems_per_pass*4 when pad=0 (since
-                    # elems_per_pass is a multiple of macro_tile_n by construction) -- one
-                    # formula, byte-identical to the old literal in the unpadded case.
-                    self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * row_step_per_pass * padded_stride * 4}")
+                    # row_step_per_pass*padded_stride*elem_bytes == elems_per_pass*elem_bytes
+                    # when pad=0 (since elems_per_pass is a multiple of macro_tile_n by
+                    # construction) -- one formula, byte-identical to the old literal in the
+                    # unpadded f32 case (elem_bytes=4).
+                    self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * row_step_per_pass * padded_stride * elem_bytes}")
                     self._emit(f"s_wait_dscnt 0x0")
                     self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
                     if it != num_passes - 1:

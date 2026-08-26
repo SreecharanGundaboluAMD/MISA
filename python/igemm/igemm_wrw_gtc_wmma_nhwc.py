@@ -154,9 +154,14 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self.tunable = tunable
         self.data_byte = amdgpu_precision_data_byte(tunable.precision)
 
+        # Phase 24: 'fp16_f16acc' is a separate table key (not a field), see wmma_mapping.py --
+        # picks v_wmma_f16_16x16x32_f16 (num_v_c=4) instead of v_wmma_f32_16x16x32_f16 (num_v_c=8).
+        # Mutually exclusive with gemm_k_global_split (asserted in igemm_base.py) since the
+        # atomic epilogue branch below was never adapted for a packed accumulator.
+        wmma_mapping_key = tunable.precision + '_f16acc' if tunable.wmma_acc_f16 else tunable.precision
         ctrl_wmma_mapping = get_ctrl_wmma_mapping_from_wave_tile(tunable.gemm_m_per_block, tunable.gemm_n_per_block,
                 tunable.wmma_tile_m, tunable.wmma_tile_n, tunable.wmma_repeat_m, tunable.wmma_repeat_n,
-                tunable.block_size // tunable.wave_size, tunable.precision)
+                tunable.block_size // tunable.wave_size, wmma_mapping_key)
         # gemm_k_per_block must be a multiple of the wired-up instruction's K (32 for
         # fp16/bf16, 64 for int8, 4 for fp32) -- Phase 1's k-sub-loop (wmma_main_loop.py)
         # issues gemm_k_per_block // inst_wmma.k v_wmma_* calls per LDS round-trip.
@@ -172,6 +177,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_coalescing_store_wmma.atomic_scope = tunable.atomic_scope
         ctrl_coalescing_store_wmma.atomic_cascade = tunable.atomic_cascade
         ctrl_coalescing_store_wmma.epilogue_lds_pad = tunable.epilogue_lds_pad
+        ctrl_coalescing_store_wmma.wmma_acc_f16 = tunable.wmma_acc_f16
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
 
         # A-region (grad_output) and B-region (input): both natural [GEMM_K rows][M or N
@@ -354,8 +360,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # Phase 23: epilogue_lds_pad adds 4 padding elements per row to break a bank-conflict
         # periodicity (see coalescing_store_wmma.py) -- reflect that in the LDS size too.
         epilogue_pad = 4 if self.tunable.epilogue_lds_pad else 0
+        # Phase 24: f16acc's epilogue stages genuinely 2-byte-per-element LDS data (see
+        # coalescing_store_wmma.py's scatter), half the f32 case's footprint.
+        epilogue_elem_bytes = 2 if self.tunable.wmma_acc_f16 else 4
         epilogue_lds_bytes = 0 if self.tunable.gemm_k_global_split else \
-            self.tunable.gemm_m_per_block * (self.tunable.gemm_n_per_block + epilogue_pad) * 4
+            self.tunable.gemm_m_per_block * (self.tunable.gemm_n_per_block + epilogue_pad) * epilogue_elem_bytes
         # Phase 23: the 128x128 tile is already exactly at the 64KB/workgroup hardware limit
         # with ZERO headroom (Phase 21) -- padding pushes it over (128*132*4 = 67584 > 65536).
         # Fail loudly at codegen time, not silently at kernel-load time on real hardware.
@@ -536,10 +545,13 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # s_wei_row_c, just computed. Added directly to s_p_out (not s_p_out_tap, which is
         # recomputed fresh every tap FROM s_p_out -- see emit_kernel_tap_loop), so every tap's
         # per-tap offset automatically inherits this block-constant group shift. ----
+        # Phase 24: shift must follow the D-operand's real width (4 bytes normally, 2 under
+        # wmma_acc_f16) -- same bug class as emit_kernel_tap_loop's per-tap offset above.
+        out_elem_byte_shift_group = 1 if self.tunable.wmma_acc_f16 else 2
         self._emit(f"; output (grad_weight): group offset = group_idx * gemm_m * wei_row_c elements")
         self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group_idx()}], s[{s.s_gemm_m()}]")
         self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_wei_row_c()}]")
-        self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], 2   ; D-operand always 4 bytes")
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {out_elem_byte_shift_group}   ; D-operand is fp32/int32 (4B) normally, fp16 (2B) under wmma_acc_f16")
         self._emit(f"s_add_u32 s[{s.s_p_out()}], s[{s.s_p_out()}], s[{s.s_tmp(0)}]")
         self._emit(f"s_addc_u32 s[{s.s_p_out(1)}], s[{s.s_p_out(1)}], 0")
         self._emit_empty_line()
@@ -648,12 +660,19 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # wei_row_c (y*x*c) instead of plain c, and the tap's column-block offset is folded
         # into a fresh per-tap base pointer (s_p_out_tap) rather than perturbing per-thread
         # column indices, so coalescing_store_wmma.py itself needs no changes ----
-        self._emit(f"; s_p_out_tap = p_out + (iy*x+ix)*gemm_n*4 bytes (WMMA D-operand is always")
-        self._emit(f"; fp32/int32, 4 bytes, regardless of tunable->precision -- see coalescing_store_wmma.py)")
+        # Phase 24 bug found via hardware validation (wrw f16acc gave valid:n while fwd/bwd
+        # passed): this shift was hardcoded to 2 (WMMA D-operand assumed always fp32/int32,
+        # 4 bytes) -- true for every direction EXCEPT wrw's own per-tap output offset, which
+        # is the only place outside coalescing_store_wmma.py that independently computes a
+        # byte address into the WMMA-native output buffer. f16acc halves that buffer's
+        # element width to 2 bytes, so this must shift by 1, not 2, in that case.
+        out_elem_byte_shift = 1 if self.tunable.wmma_acc_f16 else 2
+        self._emit(f"; s_p_out_tap = p_out + (iy*x+ix)*gemm_n*{1 << out_elem_byte_shift} bytes (WMMA D-operand is")
+        self._emit(f"; fp32/int32 (4B) normally, or fp16 (2B) under wmma_acc_f16 -- see coalescing_store_wmma.py)")
         self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_iy()}], s[{s.s_x()}]")
         self._emit(f"s_add_i32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], s[{s.s_ix()}]   ; tap linear index")
         self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], s[{s.s_gemm_n()}]")
-        self._emit(f"s_lshl_b32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], 2   ; tap byte offset")
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], {out_elem_byte_shift}   ; tap byte offset")
         self._emit(f"s_add_u32 s[{s.s_p_out_tap()}], s[{s.s_p_out()}], s[{s.s_tmp(2)}]")
         self._emit(f"s_addc_u32 s[{s.s_p_out_tap(1)}], s[{s.s_p_out(1)}], 0")
         self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off()))

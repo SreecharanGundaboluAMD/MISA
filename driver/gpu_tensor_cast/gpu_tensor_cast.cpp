@@ -134,3 +134,61 @@ void tensor_cast_bf16_fp32_1d(ushort* output, float* input, int total_length)
         }
     }
 }
+
+// Phase 24 (gfx1250 WMMA F16-accumulate): opposite direction from the two kernels above --
+// expands the WMMA kernel's packed-fp16-accumulator native output buffer (2 bytes/element)
+// back up to fp32, so the driver's existing fp32 comparison/validation logic
+// (conv_driver.cpp's valid_vector<float>(...)) runs completely unchanged. See
+// docs/gfx1250_wmma_layout.md's Phase 24 -- this is the ONLY new code the driver needs for
+// wmma_acc_f16 output-buffer handling; the comparison call sites themselves are untouched.
+extern "C"
+__global__ __launch_bounds__(256,2)
+void tensor_cast_fp32_fp16acc_1d(float* output, half* input, int total_length)
+{
+    constexpr auto unroll_length = 8;
+    half vec_in_data[unroll_length];
+    float vec_out_data[unroll_length];
+    half *tmp_in;
+    float *tmp_out;
+
+    unsigned int tid = threadIdx.x;
+    unsigned int bid = blockIdx.x;
+    unsigned int block_size = blockDim.x;
+
+    int offset = bid * unroll_length * 256;
+    int block_end = offset + unroll_length * 256;
+
+    if(block_end <= total_length)
+    {
+        tmp_in = input + offset + tid;
+        #pragma unroll
+        for(int i = 0; i < unroll_length; i++){
+            vec_in_data[i] = *(tmp_in);
+            tmp_in += 1 * 256;
+        }
+
+        #pragma unroll
+        for(int i = 0; i < unroll_length; i++){
+            vec_out_data[i] = __half2float(vec_in_data[i]);
+        }
+
+        tmp_out = output + offset + tid * 1;
+        #pragma unroll
+        for(int i = 0; i < unroll_length; i++){
+            *(tmp_out) = vec_out_data[i];
+            tmp_out += 1 * 256;
+        }
+    }
+    else
+    {
+        half in_data;
+        float out_data;
+        for(int i = offset; i < total_length; i += 256)
+        {
+            int index = min(i + tid, total_length - 1);
+            in_data = input[index];
+            out_data = __half2float(in_data);
+            *(output + index) = out_data;
+        }
+    }
+}

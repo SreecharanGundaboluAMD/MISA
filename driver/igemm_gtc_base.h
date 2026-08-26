@@ -157,6 +157,14 @@ typedef struct {
     int lds_double_buffer;
     int async_global_load;
     int main_loop_interleave;
+    // Phase 24: also folded into the kernel name (unlike local_prefetch_num/atomic_scope/
+    // atomic_cascade/epilogue_lds_pad, which are purely internal-codegen choices that don't
+    // change anything the driver needs to know) -- wmma_acc_f16 changes the WMMA kernel's
+    // native-width output-role buffer from fp32 to fp16, which the driver's buffer allocation/
+    // comparison logic (conv_driver.cpp's is_wmma handling) must match, and which must be
+    // able to coexist as a distinct, separately-named kernel alongside the f32-accumulate
+    // build of the same tile shape.
+    int wmma_acc_f16;
 } igemm_gtc_tunable_t;
 
 static inline std::string get_igemm_gtc_fma_type(std::string arch_string, const config_section_t &sec){
@@ -220,6 +228,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.lds_double_buffer        = sec.count("lds_double_buffer") > 0 ? sec.at("lds_double_buffer").get_int() : 0;
                 tunable.async_global_load        = sec.count("async_global_load") > 0 ? sec.at("async_global_load").get_int() : 0;
                 tunable.main_loop_interleave     = sec.count("main_loop_interleave") > 0 ? sec.at("main_loop_interleave").get_int() : 0;
+                tunable.wmma_acc_f16             = sec.count("wmma_acc_f16") > 0 ? sec.at("wmma_acc_f16").get_int() : 0;
             }
             else{
                 tunable.wave_tile_m              = sec.at("wave_tile_m").get_int();
@@ -419,6 +428,8 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += std::string("_async");
         if(tunable->main_loop_interleave)
             kernel_name += std::string("_interleave");
+        if(tunable->wmma_acc_f16)
+            kernel_name += std::string("_f16acc");
     }
     if(tensor_a_pass_through)
         kernel_name += std::string("_pta");

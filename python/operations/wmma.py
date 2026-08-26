@@ -74,6 +74,16 @@ class inst_wmma_t(object):
 # docs/gfx1250_wmma_layout.md for the lane/vgpr -> (row,col,k) formula, verified end-to-end
 # on real hardware for the fp16 entry below).
 v_wmma_f32_16x16x32_f16   = inst_wmma_t(16, 16, 32,  AMDGPU_PRECISION_FP16,  None,  8,   8,   8,  name='v_wmma_f32_16x16x32_f16')
+# Phase 24: F16-accumulate variant -- num_v_c=4 (half of the f32-accumulate entry above),
+# each VGPR packing 2 output rows (bits [15:0]/[31:16] of the same lane/column, per the
+# CDNA5 ISA doc's 16-bit C/D-matrix table). Verified via llvm-mc -show-encoding: assembles
+# with a 4-VGPR (v[d:d+3]) accumulator, and REJECTS an 8-VGPR accumulator ("invalid operand
+# for instruction") -- num_v_c=4 is assembler-enforced, not assumed. bf16/int8 have no
+# equivalent halved-accumulate variant on this ISA (bf16's only narrower option,
+# v_wmma_bf16_16x16x32_bf16, accumulates natively in bf16 -- a real precision tradeoff, not
+# implemented here; int8 has no narrower-than-i32 accumulate at all) -- see
+# docs/gfx1250_wmma_layout.md's Phase 24.
+v_wmma_f16_16x16x32_f16   = inst_wmma_t(16, 16, 32,  AMDGPU_PRECISION_FP16,  None,  8,   8,   4,  name='v_wmma_f16_16x16x32_f16')
 v_wmma_f32_16x16x32_bf16  = inst_wmma_t(16, 16, 32,  AMDGPU_PRECISION_BF16,  None,  8,   8,   8,  name='v_wmma_f32_16x16x32_bf16')
 # neg_lo:[1,1,0] selects SIGNED interpretation of A and B (the base encoding with no modifier
 # defaults to unsigned, confirmed via llvm-mc -- see docs/gfx1250_wmma_layout.md). The original

@@ -2409,3 +2409,155 @@ expect a large effect based on what's been measured so far.
   -- do not recreate them without the release-mechanism fix)
 - `config/igemm_{fwd,bwd,wrw}_gtc_gfx1250_nhwc_bf16_ldspad.config` -- `epilogue_lds_pad`,
   64x64 section only (128x128 section deliberately left unpadded, see LDS-budget note)
+
+## Phase 24 (2026-08-26): F16-accumulate WMMA -- unlocks local_prefetch_num=2 for fp16
+
+The highest-leverage item from Phase 22's VGPR audit and the follow-on ISA research: gfx1250
+has a 16-bit-accumulate WMMA mode using half the VGPRs of today's fp32-accumulate mode.
+`local_prefetch_num=2` (Phase 22) needs +64 VGPRs on a 128x128 tile; fp16/bf16/int8 had zero
+headroom (252/256 already used). Halving the accumulator's 128 VGPRs to 64 makes exactly
+enough room: 188 (post-halving) + 64 (lp2) = 252 -- landing at the *exact same* ceiling the
+fp32 case already proved workable, confirmed via the actual generated `.vgpr_count` (not
+just the arithmetic).
+
+**Scope, precisely** (confirmed via the CDNA5 ISA doc's WMMA instruction table, not
+assumed): **fp16 only**. `V_WMMA_F16_16X16X32_F16` exists and accumulates in fp16 (each
+VGPR packs 2 output rows in bits [15:0]/[31:16], same lane, per the doc's 16-bit C/D-matrix
+table). **bf16 has no equivalent** -- its only narrower option,
+`V_WMMA_BF16_16X16X32_BF16`, accumulates *natively in bf16* (7-bit mantissa, not fp16's
+10-bit) across every k-substep, a real unquantified precision risk for wrw's large-K sums
+-- deferred, not implemented. **int8 has no narrower-than-i32 accumulate variant on this
+ISA at all** -- permanently out of scope for this technique, confirmed via a full
+opcode-table grep, not just "not found yet".
+
+### Design
+
+New `v_wmma_f16_16x16x32_f16` instruction instance (`wmma.py`, `num_v_c=4` vs the f32
+variant's 8) -- mnemonic and operand widths verified via an `llvm-mc -show-encoding`
+round-trip probe (assembles with a 4-VGPR accumulator, REJECTS an 8-VGPR one). New
+`'fp16_f16acc'` table key in `wmma_mapping.py` (not a field -- keeps the existing `'fp16'`
+f32-accumulate entries byte-identical), selected via a new `wmma_acc_f16` tunable (default
+0). `total_acc_c()` and `wmma_main_loop.py`'s `emit_wmma_tile()` already derive everything
+from `inst_wmma.num_v_c` -- both auto-shrink correctly with zero code change.
+
+**Epilogue rewrite** (`coalescing_store_wmma.py`, non-atomic branch only -- the atomic
+`gemm_k_global_split` path has no packed-fp16 atomic-add on this ISA, per Phase 19, and is
+asserted mutually exclusive with `wmma_acc_f16`): each VGPR now packs 2 logical output rows
+(2j lo-half, 2j+1 hi-half). Scatter uses `ds_write_b16`/`ds_write_b16_d16_hi` (both verified
+via llvm-mc; the `_d16_hi` variant writes the upper 16 bits directly, no extra shift
+instruction needed) at two addresses one row apart -- the second folded into the first's
+existing offset immediate, no new address-compute instruction. Gather/global-store width
+halves throughout (`ds_read_u16/b32/b64` and `global_store_short/dword/dwordx2` instead of
+the b32/b64/b128 and dword/dwordx2/dwordx4 f32 forms) -- verified `global_store_short`'s
+exact assembly form via llvm-mc too (canonicalizes to `global_store_b16`). Mutually
+exclusive with `epilogue_lds_pad` for now (Phase 23's 4-element pad constant was derived
+for 4-byte elements; a correct 2-byte-element pad hasn't been derived).
+
+**Driver integration** (`conv_driver.cpp`): reused the existing `tensor_cast` kernel
+mechanism instead of touching the 6 hardcoded fp32 comparison call sites -- added one new
+HIP kernel, `tensor_cast_fp32_fp16acc_1d` (`gpu_tensor_cast.cpp`, mirrors the existing
+fp16/bf16-to-fp32 kernels' exact style, opposite direction), invoked once per validation to
+expand the half-width native buffer back to fp32 before the existing `valid_vector<float>`
+logic runs untouched. `wmma_acc_f16` also had to be added to the C++ tunable struct AND
+folded into both Python's and C++'s kernel-name encoding (`_f16acc` suffix) -- unlike
+Phase 22/23's flags (`local_prefetch_num`/`atomic_scope`/`atomic_cascade`/
+`epilogue_lds_pad`), this one changes the output buffer width the driver must allocate and
+which native-width kernel the driver must locate by name, so it can't stay a purely
+internal codegen choice.
+
+### Three real bugs found via hardware validation (all fixed)
+
+1. **wrw's per-tap output offset hardcoded a 4-byte D-operand shift.** wrw's tap loop
+   recomputes `s_p_out_tap` fresh every tap (`emit_kernel_tap_loop`) via an independent
+   `s_lshl_b32 ..., 2` -- the ONLY place outside `coalescing_store_wmma.py` that computes a
+   byte address into the WMMA-native output buffer. `valid:y` for fwd/bwd, `valid:n` for
+   wrw immediately flagged this. Fixed: shift is now `1` under `wmma_acc_f16`, `2`
+   otherwise.
+2. **fwd's and bwd's group>1 output-offset computation had the identical bug** (`group_idx
+   * gemm_n`, hardcoded `<<2`) -- found by grepping for the same "D-operand always 4 bytes"
+   comment pattern after finding bug #1, not independently triggered by any test in this
+   phase's battery (group>1 wasn't tested for f16acc). Fixed proactively, same pattern.
+3. **wrw's group>1 output-offset had the same bug too** (`group_idx * gemm_m * wei_row_c`,
+   hardcoded `<<2`) -- found by the same grep sweep. Fixed proactively.
+   All four sites now compute `out_elem_byte_shift = 1 if wmma_acc_f16 else 2` locally and
+   use it instead of a bare literal. **Lesson, consistent with this branch's whole history**:
+   any code that independently re-derives a "byte width" constant instead of referencing a
+   single shared source of truth needs an explicit search-and-audit pass whenever that
+   constant becomes conditional -- `coalescing_store_wmma.py`'s own width handling was
+   updated carefully, but three OTHER call sites silently baked in the same stale assumption
+   and were found only by grepping for the giveaway comment text, not by the type system or
+   any test that happened to exercise them.
+4. **A driver regression introduced by an overly broad find-and-replace**: reusing
+   `dtype_alloc_byte` at 3 call sites broke pure-fp32 builds ("use of undeclared identifier"),
+   because that variable was declared inside `#if defined(USE_HALF) || ...` -- a block that
+   defines nothing for fp32-only configs. Caught by this branch's own byte-identical-assembly
+   regression sweep (which builds a plain fp32 config as one of its representative cases),
+   not by any f16acc-specific test. Fixed by hoisting the declaration outside the `#if`.
+
+### Verification
+
+Compile-only: `.vgpr_count` confirmed exactly as predicted for all 6 new configs (fwd/bwd/
+wrw x f16acc-alone/f16acc+lp2, 128x128 tile) -- 188/252 (fwd), 192/256 (bwd, exactly at the
+hard ceiling with zero margin), 187/251 (wrw). Real hardware: 12/12 `valid:y` across a
+1x1/3x3-stride1/stride2-pad1/dilated-5x5 shape battery for fwd/bwd, and a battery for wrw
+after fixing bug #1. Regression sweep: 8 representative existing configs (spanning fwd/bwd/
+wrw, fp16/fp32/bf16, k2x, gsplit+scopedev, ldspad) byte-identical to the pre-Phase-24
+commit -- caught bug #4 in the process.
+
+### Results
+
+fp16 128x128, f32acc (baseline) vs f16acc-alone vs f16acc+lp2, `-V 0 -t 1 -w 1`, each figure
+reproducible across 2-3 reruns (tight variance):
+
+| Shape | Direction | f32acc (ms) | f16acc alone (ms) | f16acc+lp2 (ms) |
+|---|---|---|---|---|
+| n=8,c=k=2048,H=W=32,1x1 (K-loop-bound) | fwd | 0.155 | 0.155 | 0.154 |
+| 128,120,160,128,3x3 (n=42) | fwd | 0.559 | **0.531 (-5.0%)** | 0.578 (+3.4%) |
+| n=8,c=k=2048,H=W=32,1x1 (K-loop-bound) | bwd | 0.184 | 0.187 | 0.186 |
+| 128,120,160,128,3x3 (n=42) | bwd | 0.683 | **0.577 (-15.5%)** | 0.726 (+6.3%) |
+| n=8,c=k=2048,H=W=32,1x1 (K-loop-bound) | wrw (non-split) | 0.813 | 0.813 | 0.811 |
+| n=8,c=256,H=W=32,k=128,1x1 | wrw (non-split) | 0.860 | 0.880 (+2.3%) | 0.881 (+2.4%) |
+
+**Honest read, a genuinely different picture than Phase 22's fp32 result**: F16-accumulate
+*alone* is a real, reproducible win for fwd/bwd's 3x3 shape (-5% to -15.5%) -- likely just
+the halved `v_c` footprint improving occupancy directly, independent of any pipelining.
+**Adding `local_prefetch_num=2` on top makes it WORSE, not better** -- both fwd and bwd's
+3x3 shape regress relative to f16acc-alone (and bwd's regresses even past the f32acc
+baseline). This is the opposite of Phase 22's fp32 result (where lp2 alone helped fwd) and
+means the VGPR-fits-so-it-must-help intuition doesn't hold here -- the K-loop-bound shape
+(where Phase 22's fp32 lp2 win was clearest) is flat for f16acc in every combination,
+suggesting fp16's LDS-read latency profile or the interaction between the halved
+accumulator and the doubled `v_a`/`v_b` doesn't hide latency the same way fp32's did. wrw
+(non-split) is flat-to-slightly-worse everywhere, consistent with every prior finding this
+session that non-split wrw is occupancy/main-loop-bound, not accumulator- or
+epilogue-bound.
+
+**Net recommendation**: ship `wmma_acc_f16` alone for fwd/bwd (real win, no downside seen);
+do NOT combine with `local_prefetch_num=2` for fp16 -- despite fitting the VGPR budget
+exactly, it measures as a net regression versus f16acc alone in every shape tested. Not
+worth enabling for wrw at all (flat-to-worse, matches the established occupancy-bound
+diagnosis). bf16's native-bf16-accumulate variant remains a real, unexplored follow-up
+question (does its lower per-substep precision actually matter for real shapes?) --
+deliberately not investigated this phase, given int8's flat "no option exists" and bf16's
+own qualitatively different risk profile.
+
+### Critical files (Phase 24)
+
+- `python/operations/wmma.py` -- new `v_wmma_f16_16x16x32_f16` instruction instance
+- `python/operations/wmma_mapping.py` -- new `'fp16_f16acc'` table key
+- `python/igemm/igemm_base.py` -- reads `wmma_acc_f16` (fp16-only, asserted mutually
+  exclusive with `gemm_k_global_split` and `epilogue_lds_pad`), selects the mapping table
+  key, folds `_f16acc` into the kernel name
+- `python/operations/coalescing_store_wmma.py` -- non-atomic branch's hi/lo 16-bit
+  extraction, doubled per-row addressing, 2-byte instruction selection
+- `python/igemm/igemm_{fwd,bwd,wrw}_gtc_wmma_nhwc.py` -- wires `wmma_acc_f16` through;
+  fixes to the 3 independent D-operand-width bugs (wrw's per-tap offset, fwd/bwd's group>1
+  offset, wrw's group>1 offset); `get_kernel_code()`'s epilogue LDS size accounts for the
+  halved element width
+- `driver/conv_driver.cpp` -- `is_wmma_f16_acc`, unconditional `dtype_alloc_byte` (fixing
+  the pure-fp32 regression), the 3 new `tensor_cast_fp32_fp16acc_1d` invocation sites
+- `driver/gpu_tensor_cast/gpu_tensor_cast.cpp` -- new `tensor_cast_fp32_fp16acc_1d` kernel
+- `driver/igemm_gtc_base.h` -- `wmma_acc_f16` struct field, config parsing, kernel-name fold
+  (kept in sync with the Python side, mirroring the existing `lds_double_buffer`/
+  `async_global_load`/`main_loop_interleave` pattern)
+- `config/igemm_{fwd,bwd,wrw}_gtc_gfx1250_nhwc_fp16_k2x_f16acc{,_lp2}.config` -- new
