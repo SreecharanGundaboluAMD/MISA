@@ -3253,3 +3253,67 @@ kernel-name fold; `python/operations/wmma_main_loop.py` -- `ctrl.wmma_setprio`,
 `ctrl.wmma_setprio` wiring; `driver/igemm_gtc_base.h` -- struct field, config parsing,
 kernel-name fold; `config/igemm_{fwd,bwd}_gtc_gfx1250_nhwc_bf16_setprio.config`,
 `config/igemm_wrw_gtc_gfx1250_nhwc_bf16_gsplit_setprio.config` -- new.
+
+## Phase 33 (2026-08-27): wrw split-K heuristic cross-check
+
+Second of three Tier 1 items from `docs/gfx1250_perf_parity_action_plan.md`. Cross-checks
+MISA's existing ternary search over split counts (Phase 20) against CK's closed-form
+split-K occupancy formula (`num_cu * max_occupancy_per_CU / grid_size`) by feeding it as
+one more candidate into the search's own divisor list.
+
+**Discovery**: MISA already had this exact formula shape --
+`driver/igemm_wrw_gtc_driver.h`'s `compute_gemmk_global_splits(grid_size,
+potential_occupancy)` (`num_cu * potential_occupancy / grid_size`), inherited from the
+older XDLOPS/DLOPS track, which calls it with a hardcoded `potential_occupancy=3`. The
+WMMA path's own `run()` never called it at all. Rather than writing new formula logic,
+this phase wires the EXISTING function into the WMMA path with a REAL occupancy value:
+`hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(kernel_func, block_size, 0)` --
+querying the actual compiled kernel's occupancy (VGPR/LDS-limited), not a guessed
+constant. This is a legitimate implementation of CK's formula using MISA's own
+pre-existing infrastructure, not new math.
+
+**Design**: right after `kernel_func`/`block_size` become available in the WMMA `run()`
+method (gated behind `tunable->gemm_k_global_split`, so non-split builds are completely
+untouched), compute the heuristic split count, snap it to the nearest valid divisor of
+`num_k_blocks` via the existing `largest_divisor_leq` helper (the same snapping the
+`IGEMM_GSPLIT_SWEEP` override already uses), and insert it into the `divisors` vector
+(de-duplicated, re-sorted) BEFORE the ternary search's cache/eval loop runs. **Strictly
+additive and non-regressive by construction**: the ternary search still evaluates every
+candidate it always would, plus this one; its own min-of-all-evaluated logic already
+handles a bad candidate correctly (never selects it) at the cost of one extra real timed
+launch per search.
+
+**No regression sweep needed**: this change is entirely host-side C++ search logic
+(`driver/igemm_wrw_gtc_driver.h`) -- it does not touch Python codegen, so the compiled
+kernel binaries for every config, gsplit or not, are byte-identical to before. Confirmed
+by inspection (the new code only runs inside the WMMA `run()` method's dispatch path,
+never `igemm_codegen.py`'s kernel-generation path) and by the non-gsplit sanity check
+below (matches the pre-Phase-17 gsplit catastrophe numbers exactly, confirming that path
+is untouched).
+
+**Hardware validation**: `valid:y` across wrw's exact-multiple large shape, a 3x3
+multi-tap shape, group>1, and the benchmark doc's worst-case outlier
+(`c=192,H=60,W=80,k=64,1x1`) -- correctness fully intact. Non-gsplit wrw config spot-
+checked separately: 17.6ms for `c=64,k=128` (matches the original pre-gsplit-fix
+catastrophe from `docs/gfx1250_vendor_benchmark_vs_miopen.md` almost exactly), confirming
+the new code path genuinely never executes when `gemm_k_global_split=0`.
+
+**Timing**: same severe contention as Phase 32 (see that phase's writeup). Measured
+"does the search land in the known-fast split range (~0.065ms) or the known-slow range
+(~0.148ms)" as a success-rate proxy, since raw means are unreliable under this session's
+bimodal noise: pre-phase driver landed in the fast range 3/8 runs; with the heuristic
+candidate wired in, 4/8 runs. A modest, directionally consistent improvement, but not a
+statistically strong result at this sample size under this much external noise --
+consistent with Phase 32's own honest assessment, needs re-measurement on an idle GPU.
+Unlike Phase 32, though, this change carries no performance-regression risk even if the
+improvement doesn't hold up: it can only ever add a candidate, never remove one.
+
+**Net result**: shipped. Zero regression risk (host-only, additive-only), one legitimate,
+real occupancy query replacing a previously-unused hardcoded constant from a different
+code path. Performance verdict: modest positive signal, unconfirmed under current
+contention, safe either way.
+
+**Critical files (Phase 33)**: `driver/igemm_wrw_gtc_driver.h` -- new heuristic-candidate
+block in the WMMA `run()` method, reusing the existing `compute_gemmk_global_splits`/
+`largest_divisor_leq` helpers with a real `hipModuleOccupancyMaxActiveBlocksPerMultiprocessor`
+query.

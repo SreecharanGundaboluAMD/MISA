@@ -792,6 +792,27 @@ public:
 
             size_t block_size = get_block_size(tunable);
 
+            // Phase 33: cross-check the ternary search against MISA's existing (originally
+            // XDLOPS-only) closed-form occupancy heuristic, compute_gemmk_global_splits --
+            // fed a REAL hipModuleOccupancyMaxActiveBlocksPerMultiprocessor value instead of
+            // that path's hardcoded potential_occupancy=3. This is exactly CK's own split-K
+            // formula shape (num_cu * max_occupancy_per_CU / grid_size), see
+            // docs/gfx1250_perf_parity_action_plan.md's Tier 1 item 3. Added as one MORE
+            // candidate into the divisor list the ternary search below already evaluates --
+            // strictly non-regressive: worst case is one extra real timed launch; if the
+            // heuristic's candidate turns out worse, the search's own min-of-all-evaluated
+            // logic simply never selects it.
+            if (tunable->gemm_k_global_split) {
+                int potential_occupancy = 1;
+                HIP_CALL(hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(&potential_occupancy, kernel_func, static_cast<int>(block_size), 0));
+                int heuristic_splits = compute_gemmk_global_splits(static_cast<int>(grid_x * grid_y), potential_occupancy);
+                int heuristic_candidate = largest_divisor_leq(num_k_blocks, heuristic_splits);
+                if (std::find(divisors.begin(), divisors.end(), heuristic_candidate) == divisors.end()) {
+                    divisors.push_back(heuristic_candidate);
+                    std::sort(divisors.begin(), divisors.end());
+                }
+            }
+
             result_t result;
             result.kernel_name = kernel_name;
             memset(&result.dumpheader, 0, sizeof(result.dumpheader));
