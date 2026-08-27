@@ -4268,3 +4268,66 @@ tile each); `config/igemm_bwd_gtc_gfx1250_nhwc_{fp16,bf16,fp32,int8}_all.config`
 global-load/move-slice-window wiring), `python/igemm/igemm_base.py` (direction-gate
 widening + mutual-exclusion assert), `driver/igemm_bwd_gtc_driver.h`
 (`tunable_is_valid()` K-relax + `unit_conv` runtime check).
+
+## Phase 43 (2026-08-27): wrw 64x64 tile widened to its addressing-mechanism K ceiling
+
+Attempted the backlog's literal ask ("widen wrw's tile-shape space: pair the small 64x64
+M/N tile with a larger `gemm_k_per_block` -- 96/128/256, mirroring CK's small-tile/
+large-`KPerBlock` pattern"). **Found a hard structural blocker before writing any config**:
+wrw's A and B operand addressing (`igemm_wrw_gtc_wmma_nhwc.py`'s `emit_kernel_prologue`)
+both derive their per-thread row/column split from
+`num_col_groups = gemm_m_per_block // gemm_k_per_block` (both operands share this
+identical formula -- wrw's tiles are always square, and both A and B are "transposed"
+with GEMM_K as the spatial axis). This requires `gemm_m_per_block >= gemm_k_per_block`
+(and a power-of-2 quotient, for the `utility_log2`-based bit-slicing) -- for a 64-wide
+tile, `gemm_k_per_block` values of 96/128/256 all violate this (`64 // 128 == 0`,
+breaking `col_group_bits = utility_log2(0)` and the entire per-thread addressing scheme).
+The existing 128x128 tile's `_k2x`/`_k4x` configs (K=64/128) work only because they sit
+at or below `gemm_m_per_block=128` -- they are not evidence this mechanism generalizes
+past `gemm_k_per_block == gemm_m_per_block`.
+
+**What this means**: CK's specific pairing (64x64 tile + K=96-256) is not reachable via a
+config-only change with wrw's current addressing mechanism -- it would need a genuine
+redesign (e.g. a thread owning a fractional/multi-chunk row, or restructuring which axis
+each lane indexes), matching Tier 3 effort, not the "config file only" effort the backlog
+item's original wording implied. This is now corrected in
+`docs/gfx1250_optimization_backlog.md`.
+
+**What WAS implemented**: the actual ceiling this tile shape's current mechanism
+supports, `gemm_k_per_block = gemm_m_per_block = 64` (`num_col_groups = 1`), for
+bf16/fp16/fp32 -- new `_64x64_kmax` configs, folded into the master config union. This is
+2x the existing 64x64 base (K=32 for bf16/fp16, or 16x the base K=4 for fp32) -- a real,
+if smaller-than-hoped, widening.
+
+### Verification (CPU-only -- no GPU execution this session, see caveat below)
+
+**LDS/VGPR budget derived by hand, then confirmed exactly by the actual build output**
+(no guessing left unverified): bf16/fp16 K=64 -> `lds_a=lds_b=64*64*2=8192B`, sum 16384B,
+single-buffered (no `lds_double_buffer`) -> 16KB total, matching the compiled kernel's
+reported `group_segment_fixed_size: 16384` exactly. fp32 K=64 -> `lds_a=lds_b=64*64*4=
+16384B`, sum 32768B -> matches the compiled `group_segment_fixed_size: 32768` exactly.
+VGPR counts (171 bf16/fp16, 111 fp32) are well within the 256 limit -- unchanged from the
+base 64x64x32 config's own VGPR count (K depth doesn't affect accumulator VGPR count,
+only LDS).
+
+**Codegen + assembly** (`python3 igemm_codegen.py` -> full `llvm-mc`/`clang` assembler
+pipeline, CPU-only, no `hipModuleLoad`/kernel launch): all three precisions (bf16/fp16/
+fp32) assemble cleanly to a working `conv_driver.exe` binary, individually and folded
+into the master config union (`script/build_gfx1250_master_configs.py --write`).
+
+**Zero regression**: git-worktree before/after diff of all three master config files'
+generated `.s` output -- every existing kernel byte-identical; the only diff is the one
+new `bt64x64x64` kernel symbol appended.
+
+**Explicit caveat, not glossed over**: this was implemented under an explicit
+no-GPU-execution constraint (another benchmark was running on the shared GPU) --
+correctness has NOT been hardware-validated (no `conv_driver.exe` run, no comparison
+against `naive_conv_wrw_nhwc`). The LDS/VGPR-budget and zero-regression checks above are
+real and meaningful (they rule out a whole class of build-time and collision failures),
+but they do not substitute for the hardware correctness battery every other phase in
+this doc has required before being called "done." Do not treat this as validated until
+that battery runs.
+
+**Critical files**: `config/igemm_wrw_gtc_gfx1250_nhwc_{bf16,fp16,fp32}_64x64_kmax.config`
+(new), `config/igemm_wrw_gtc_gfx1250_nhwc_{bf16,fp16,fp32}_all.config` (regenerated,
+additive-only).

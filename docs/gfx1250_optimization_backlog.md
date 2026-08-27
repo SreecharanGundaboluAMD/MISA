@@ -89,12 +89,32 @@ section for the record).
 
 ## Tier 2 — medium effort (real codegen work, well-grounded)
 
-- [ ] **Widen wrw's tile-shape space**: CK pairs small M/N tiles (64x64) with much
-      larger `KPerBlock` (96/128/256, vs. MISA's 32/64) so small-output-channel wrw
-      problems get fewer, cheaper main-loop iterations. FlyDSL/rocKE separately support
-      tile_m as low as 16/32/48/96. Needs new VGPR/LDS-budget derivation per tile size,
-      not a flag flip. Partially done via the existing `_k4x` (128x128x128) config —
-      the smaller-tile-larger-K direction (64x64 with K=96/128/256) is still open.
+- [x] ~~**Widen wrw's tile-shape space to 64x64 with K=96/128/256**~~ — **attempted
+      2026-08-27, corrected: not reachable as originally worded.** wrw's A/B addressing
+      (`igemm_wrw_gtc_wmma_nhwc.py`) derives its per-thread split from
+      `num_col_groups = gemm_m_per_block // gemm_k_per_block`, which requires
+      `gemm_m_per_block >= gemm_k_per_block` — for a 64-wide tile, K=96/128/256 all break
+      this (`64 // 128 == 0`, `utility_log2(0)` is undefined). The existing 128x128
+      `_k2x`/`_k4x` configs only work because they sit at or below 128; they're not
+      evidence this generalizes past `gemm_k_per_block == gemm_m_per_block`. Reaching
+      CK's actual 96-256 range would need a genuine addressing redesign — Tier 3 effort,
+      not a config-only change. See `docs/gfx1250_wmma_layout.md` Phase 43 for the full
+      trail. **What was actually implemented**: the real ceiling this tile's mechanism
+      supports, `gemm_k_per_block=64` (`num_col_groups=1`), for bf16/fp16/fp32 — new
+      `_64x64_kmax` configs, folded into the master config union. LDS/VGPR budgets
+      derived by hand and confirmed exactly against the compiled kernel's reported
+      metadata; codegen+assembly clean (CPU-only); zero regression (git-worktree diff,
+      every existing kernel byte-identical, only the one new kernel symbol appended).
+      **Not hardware-validated** — implemented under an explicit no-GPU-execution
+      constraint (a benchmark was running on the shared GPU); correctness is unconfirmed
+      until the hardware battery every other phase in this doc has required actually
+      runs. Do not treat as "done" in the sense every other closed item here is.
+- [ ] **wrw addressing redesign to support `gemm_k_per_block > gemm_m_per_block`** —
+      found while attempting the tile-widening above. The real blocker to CK's stated
+      64x64-tile/large-K pairing (Tier 3 effort): `num_col_groups` would need to
+      support values <1 (multiple threads cooperating on one K-row, or a lane owning
+      more than one row) — a different per-thread addressing scheme for both A and B,
+      not a config change. Not attempted.
 - [x] **Extend TDM to bwd** (both operands, 1x1/unit-stride) — done 2026-08-27, Phase 42
       (`docs/gfx1250_wmma_layout.md`). Zero regression (45 configs byte-identical),
       hardware-validated correct across all 4 precisions, group>1, large-K, and a full
