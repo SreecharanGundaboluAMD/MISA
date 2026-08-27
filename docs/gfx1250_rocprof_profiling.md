@@ -167,6 +167,84 @@ this as `SCHED_MODE` "bit 4" — the ISA doc specifies bit[2]; fixed in that fil
    strengthen the "overhead scales with split count" diagnosis with direct counter
    evidence rather than inference from timing alone.
 
+## Finding 3: real occupancy is tile-shape-bound, identical across fwd/bwd/wrw and across tail mechanisms — this weakens (doesn't kill) the `disable_xdl_arb_stall` case
+
+Measured directly via `hipModuleOccupancyMaxActiveBlocksPerMultiprocessor` (new tool:
+`script/gfx1250_occupancy_check.cpp`), not inferred from `SQ_WAVES`, which only gives a
+cumulative dispatch-lifetime total, not a per-CU concurrency figure. Queried against every
+built master-config `.hsaco`, both tile shapes, all three directions, and every
+tail/split-K variant available:
+
+| Kernel class | block_size | vgpr_count | LDS/block | active_blocks/CU | waves/CU | max waves/CU | occupancy |
+|---|---|---|---|---|---|---|---|
+| 64x64 tile (fwd base, bwd base, bwd mtail_ntail_ktail, wrw gsplit base) | 64 | 172 | 16 KB | 10 | 20 | 64 | **31.2%** |
+| 128x128 tile (fwd base/mtail_ntail_ktail/tdm/tdm_mtail_ntail, bwd base, wrw gsplit base/mtail_ntail_gkgs, wrw 128x128x128 k4x) | 128 | 252 | 64 KB | 4 | 16 | 64 | **25.0%** |
+
+Two things this directly establishes:
+1. **Occupancy is a pure function of tile shape** (which fixes VGPR count and LDS
+   footprint) — completely flat across direction, tail-mechanism (base/mtail/ntail/ktail/
+   tdm/combined), and split-K enablement. None of these control-flow variants change the
+   compiled kernel's resource footprint enough to move the needle.
+2. **wrw's `gemm_k_global_split` workgroups are NOT uniquely low-occupancy relative to
+   fwd/bwd** — they sit at the exact same 25%/31.2% as every other kernel using the same
+   tile shape. This is worth stating plainly because it revises (not invalidates) the
+   `disable_xdl_arb_stall` reasoning in the "ISA-doc cross-reference" section above: that
+   recommendation was motivated by an inference that wrw's small split-K workgroups are
+   plausibly low-occupancy-per-SIMD ("exactly the regime the ISA doc says this bit
+   helps"). The measured reality is 16-20 resident waves per CU (4-10 blocks x 2-4 waves),
+   which is far from the ISA doc's stated ideal case of "a single wave running on a SIMD"
+   for either tile shape, in any direction. The A/B test (Tier 2 item 5, still worth
+   running — see `docs/gfx1250_optimization_backlog.md`) should be read as an empirical
+   check of a weaker, direction-agnostic hypothesis ("does reducing arbitration stalls
+   help at ~25-31% occupancy in general") rather than a wrw-specific fix for a uniquely
+   bad occupancy problem, since no such asymmetry actually exists.
+3. Neither tile shape is anywhere near LDS-capacity-bound at the observed concurrency:
+   `sharedMemPerMultiprocessor` on this device is 320 KB; 10 blocks x 16 KB = 160 KB and
+   4 blocks x 64 KB = 256 KB, both under budget, with the 128x128 case close enough (256
+   of 320 KB, one more block would need 320 KB exactly) that LDS rounding/reservation
+   overhead plausibly caps it at 4 rather than 5 — not conclusively isolated from a
+   VGPR-driven cap (252 vgprs/thread is also a substantial fraction of typical
+   register-file capacity), but LDS is the more likely binding constraint for the
+   128x128 tile specifically given how close to the budget boundary it sits.
+
+## Finding 4: extended to bwd and fwd's tail paths (mtail/ntail/ktail/tdm) — same qualitative story, but this run was measured under confirmed heavy GPU contention
+
+Extended the Finding 1/2 methodology (isolated single-tile-shape scratch configs, same
+`--pmc` counter set, via `/opt/rocm-10.1.0a20260820/bin/rocprofv3`) to the paths that
+Finding 2's "Recommendations" item 3 flagged as unmeasured: bwd-base, bwd's combined
+M+N+K-tail kernel, and fwd's `mtail_ntail_ktail`/`tdm`/`tdm_mtail_ntail` kernels. Same
+shape family as Finding 2 (`c=64,H=60,W=80,k=128,1x1`, `n=42`) for the base/tdm cases;
+`c=90or100,H=60,W=80,k=90or92,1x1` (chosen to actually activate the tail masks — `k`
+kept a multiple of 4 per the `classify_gfx1250_coverage.py` `gemm_n%4==0` constraint
+already documented in `docs/gfx1250_wmma_coverage_gap_analysis.md`) for the tail cases:
+
+| Kernel | SQ busy % | WMMA busy % | SQ_CYCLES (sum, 7 dispatches) |
+|---|---|---|---|
+| bwd base | 93.5% | 0.61% | 1,852,691,450 |
+| bwd mtail_ntail_ktail | 93.9% | 0.83% | 2,037,931,712 |
+| fwd mtail_ntail_ktail | 93.9% | 0.92% | 1,843,725,310 |
+| fwd tdm | 93.9% | 0.64% | 1,776,072,790 |
+| fwd tdm_mtail_ntail | 93.8% | 0.91% | 1,854,993,114 |
+
+**Important caveat, confirmed directly**: `rocm-smi --showuse` at measurement time
+reported **GPU use: 100%** from other processes sharing this box (a multi-tenant
+research machine — several unrelated `claude` sessions and other users' workloads were
+active). This is the exact "GPU under contention" caveat already flagged in "Not yet
+done" below, now directly confirmed rather than just suspected. The absolute WMMA-busy%
+values above are **3-8x lower** than Finding 2's fwd-base figure (5.15%) measured earlier
+in the session on the same rough shape family — almost certainly a contention artifact
+(competing workloads inflate `SQ_CYCLES`' wall-clock-cycle count without adding to *this*
+dispatch's own `SQ_INST_CYCLES_VALU_WMMA`), not a real regression in the tail paths.
+**Do not compare these absolute percentages against Finding 1/2's numbers directly.**
+
+What still survives, because it's a within-run (same-contention-level) relative
+comparison rather than an absolute one: SQ busy consistently 93-94% (same
+"genuinely active, not idle" story as base kernels), WMMA busy consistently well under
+1% for every tail/TDM variant just as for the base kernels — no tail mechanism stands
+out as qualitatively different in kind from the base path's overhead profile. Re-running
+this specific comparison on an idle GPU to get absolute numbers comparable to Finding 1/2
+remains open (see "Not yet done").
+
 ## Not yet done
 
 - No LDS-bank-conflict-specific counters collected (there are dedicated ones on this GPU,
@@ -174,10 +252,6 @@ this as `SCHED_MODE` "bit 4" — the ISA doc specifies bit[2]; fixed in that fil
 - No `rocprof-compute` (the roofline/comprehensive successor to Omniperf, confirmed
   present at `/home/sgundabo/rocm-10.1/bin/rocprof-compute`) run yet — would give a more
   complete automated roofline/occupancy report per kernel instead of hand-picked counters.
-- No occupancy-vs-theoretical-max computation (`SQ_WAVES` vs. `max_waves_per_simd`,
-  both queryable) — would directly confirm or refute the "low occupancy per SIMD" premise
-  behind the `disable_xdl_arb_stall` recommendation above, rather than leaving it as a
-  plausible inference.
 - GPU was under contention throughout this session (see
   `docs/gfx1250_vendor_benchmark_vs_miopen.md`'s repeated notes on this) — the *ratios*
   reported here (WMMA-busy-fraction etc.) should be far less contention-sensitive than
