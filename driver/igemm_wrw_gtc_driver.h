@@ -282,10 +282,35 @@ public:
             // non-multiple-of-4 tail would silently write past the real gemm_n. The atomic
             // epilogue (gemm_k_global_split) issues one scalar atomic per element (no 4-wide
             // grouping), so this restriction does not apply there.
+            // Phase 45: tdm_global_load relaxes the gemm_k (wmma_gemm_k = n*ho*wo) exact-
+            // multiple requirement the same way fwd's Phase 39/bwd's Phase 42 do -- TDM's
+            // hardware OOB zero-fills the tail row on both A and B. Also mirrors those same
+            // phases' runtime-shape check: tdm_global_load's "1x1/unit-stride only"
+            // restriction was previously enforced only at CONFIG level (igemm_base.py
+            // asserts nxe==0 for the tunable itself), never against the actual
+            // runtime-requested shape.
+            //
+            // That relaxation is NOT extended to gemm_k_global_split: this driver's
+            // karg.gemm_k_per_wg (this workgroup's own K-slice length) is computed as
+            // (num_k_blocks / splits) * gemm_k_per_block -- i.e. gemm_k rounded UP to the
+            // next multiple of gemm_k_per_block before being divided among shards. wrw's
+            // wmma_k_tail mechanism (a separate, explicit kernarg + on-device flag) is what
+            // normally clamps the LAST shard back down to the true gemm_k under split-K --
+            // TDM asserts mutual exclusivity with wmma_k_tail (see igemm_wrw_gtc_wmma_nhwc.py's
+            // __init__), so it has no such clamp. Confirmed on real hardware: a non-exact
+            // gemm_k with tdm_global_load + gemm_k_global_split silently reads past the true
+            // gemm_k (TDM's own tensor_dim1 gets set to the ROUNDED-UP per-shard length, not
+            // the true remainder) -- valid:n. Exact-multiple gemm_k under split-K has no such
+            // rounding (num_k_blocks divides evenly), so it stays valid:y and is left enabled.
+            bool unit_conv = (x==1)&&(y==1)&&(stride_h==1)&&(stride_w==1)&&(dilation_h==1)&&(dilation_w==1)&&(pad_h==0)&&(pad_w==0);
+            if(tunable->tdm_global_load && !unit_conv)
+                return false;
+            if(tunable->tdm_global_load && tunable->gemm_k_global_split && wmma_gemm_k % tunable->gemm_k_per_block != 0)
+                return false;
             if((!tunable->wmma_m_tail && wmma_gemm_m % tunable->gemm_m_per_block != 0) ||
                (!tunable->wmma_n_tail && wmma_gemm_n % tunable->gemm_n_per_block != 0) ||
                (tunable->wmma_n_tail && !tunable->gemm_k_global_split && wmma_gemm_n % 4 != 0) ||
-               (!tunable->wmma_k_tail && wmma_gemm_k % tunable->gemm_k_per_block != 0))
+               (!tunable->tdm_global_load && !tunable->wmma_k_tail && wmma_gemm_k % tunable->gemm_k_per_block != 0))
                 return false;
             return true;
         }

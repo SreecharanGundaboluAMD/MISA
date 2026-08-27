@@ -236,7 +236,12 @@ class igemm_gtc_tunable_parameter_t(object):
                 # weight (B) is read in the SAME physical layout fwd's B reads, just with
                 # tensor_dim0/tensor_dim1's roles swapped (bwd's GEMM_K is weight's ROW axis,
                 # not its contiguous axis) -- see docs/gfx1250_wmma_layout.md's Phase 42.
-                assert tunable_dict['direction'] in ('fwd', 'bwd'), "tdm_global_load is only implemented for fwd/bwd so far, see docs/gfx1250_wmma_layout.md's Phase 28/42"
+                # Phase 45: wrw added -- GEMM_K (spatial n*ho*wo) is the ROW axis for BOTH
+                # operands here (grad_output and input are both NHWC, channel-contiguous
+                # per pixel), unlike bwd where only B needed axis-swapping. Base case only
+                # (no M/N-tail combined with TDM yet) -- see igemm_wrw_gtc_wmma_nhwc.py's
+                # __init__ assert and docs/gfx1250_wmma_layout.md's Phase 45.
+                assert tunable_dict['direction'] in ('fwd', 'bwd', 'wrw'), "tdm_global_load is only implemented for fwd/bwd/wrw so far, see docs/gfx1250_wmma_layout.md's Phase 28/42/45"
                 assert tunable_dict['nxe'] == 0, "tdm_global_load is only implemented for 1x1/unit-stride convs (nxe=0) so far, see docs/gfx1250_wmma_layout.md's Phase 28"
                 assert not self.async_global_load, "tdm_global_load and async_global_load are mutually exclusive -- they're two different load mechanisms for the same operand"
                 assert not utility_dict_with_default_t(tunable_dict)('main_loop_interleave', 0), \

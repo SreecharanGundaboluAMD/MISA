@@ -24,6 +24,22 @@ The output file will result in `out` directory. result in a assembly file `*.s` 
 ```
 currently this executable will run all the kernel configs one by one, the same as you used for kernel generation stage.
 
+**IMPORTANT — the mode string selects verification precision, not just "conv":** the
+positional mode argument (`conv` above) determines what dtype the driver generates/casts
+test data as and compares results against — `conv`=fp32, `convfp16`=fp16,
+`convbfp16`=bf16, `convint8`=int8, `convint4`=int4 (same convention as MIOpenDriver).
+**If you run a non-fp32 (fp16/bf16/int8/int4) kernel with the plain `conv` mode, it will
+silently generate/compare fp32 data against a kernel that expects packed lower-precision
+data — every result comes back `pred:-nan`/`valid:n`, with no error, indistinguishable
+from a genuine kernel or hardware bug.** This has already cost an entire multi-hour
+debugging session (see `docs/gfx1250_wmma_layout.md`'s Phase 45 note) chasing a phantom
+regression across the whole GPU/toolchain stack when the actual issue was just the wrong
+mode string. Always match the mode string to the tunable's `precision`:
+```
+./conv_driver.exe  convfp16  -n 128 -c 1024 -H 17 -W 17 -k 1024  -y 1 -x 1 -p 0 -q 0 -u 1 -v 1 -l 1 -j 1 -F 2 -V 1
+./conv_driver.exe  convbfp16 -n 128 -c 1024 -H 17 -W 17 -k 1024  -y 1 -x 1 -p 0 -q 0 -u 1 -v 1 -l 1 -j 1 -F 2 -V 1
+```
+
 some environment variables may affect the behavior and printout of `conv_driver.exe`
 * `IGEMM_HSACO` : indicate the path of code object to use. default use the generated one in currentl directory.
 * `IGEMM_SCLK_MHZ` : current GPU sclk MHZ. used to calculate efficiency.

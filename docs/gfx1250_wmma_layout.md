@@ -4396,3 +4396,82 @@ remains **unexplained** -- something else dominates the deep-K cost, not yet ide
 **Critical files**: `python/igemm/igemm_fwd_gtc_wmma_nhwc.py`,
 `python/igemm/igemm_bwd_gtc_wmma_nhwc.py` (`move_slice_window_a/b_functor`, both TDM
 branches).
+
+## Phase 45 (2026-08-27): TDM extended to wrw, both operands, split-K aware
+
+Closes the remaining open TDM-extension item: wrw was the only direction without a
+tensor_load_to_lds path. Structurally different from fwd/bwd's ports: wrw's GEMM_K
+(n*ho*wo, spatial) is the ROW axis for **both** operands (grad_output and input), not
+just one -- fwd/bwd each only needed the axis-swapped descriptor for a single operand
+(fwd's B, bwd's B). Both of wrw's descriptors mirror the *shape* of bwd's B descriptor
+(Phase 42): `tensor_dim0` = the contiguous channel axis (K_out for A, C_in for B),
+`tensor_dim1` = GEMM_K (spatial, row axis), `tensor_dim0_stride` = the tensor's own
+per-pixel total channel count (`a_m_total`/`b_n_total`, already-established non-TDM
+quantities). The 1x1/unit-stride restriction (asserted via `nxe==0`) is what makes B's
+normally-gathered address collapse to the same simple linear-in-K form A's already has
+(`_emit_tap_gather`'s (n,ho,wo)->(hi,wi) remap becomes the identity when hi=ho, wi=wo,
+and critically `hi_wi == ho_wo` too with no padding/stride reduction).
+
+Also carries Phase 44's rebuild-skip guard from day one (no separate unconditional-rebuild
+step ever existed for wrw) and Phase 29/42's wave0-only TDM issue gating.
+
+**New files**: `config/igemm_wrw_gtc_gfx1250_nhwc_{fp16,bf16,fp32}_tdm.config`, each with
+a plain 128x128 section and a `gemm_k_global_split` (split-K) section.
+
+**Driver-side fix, found via hardware validation, not anticipated in the design**:
+`driver/igemm_wrw_gtc_driver.h`'s `tunable_is_valid()` initially relaxed the
+exact-gemm_k-multiple requirement for `tdm_global_load` unconditionally (mirroring fwd's
+Phase 39 / bwd's Phase 42 pattern verbatim). That relaxation does NOT hold once
+`gemm_k_global_split` is also set: this driver computes each workgroup's own K-slice
+length as `karg.gemm_k_per_wg = (num_k_blocks / splits) * gemm_k_per_block` -- i.e. gemm_k
+is rounded UP to the next multiple of gemm_k_per_block before being divided among
+shards. wrw's `wmma_k_tail` mechanism is what normally clamps the last shard back down to
+the true (possibly non-exact) gemm_k under split-K, via a dedicated kernarg + on-device
+flag -- TDM asserts mutual exclusivity with `wmma_k_tail` (see
+`igemm_wrw_gtc_wmma_nhwc.py`'s `__init__`), so it has no such clamp. Confirmed on real
+hardware: `tdm_global_load` + `gemm_k_global_split` + a non-exact-multiple gemm_k silently
+computed `pred:-nan` values (TDM's own `tensor_dim1` gets set to the rounded-up per-shard
+length, reading past the true gemm_k). Fixed by requiring gemm_k to be an exact multiple
+of gemm_k_per_block whenever TDM is combined with split-K specifically (non-split TDM
+keeps the full relaxation, matching fwd/bwd).
+
+**Hardware validation** (`conv_driver.exe`, all 3 precisions, against the CPU reference):
+- Non-split, K-tail battery (gemm_k = 1, 31, 32, 33, 63, 65, 100): **7/7 `valid:y`**,
+  fp16 and bf16.
+- Split-K (`gemm_k_global_split`), exact-multiple gemm_k (32, and large-K 8-shard):
+  **`valid:y`**, fp16/fp32.
+- Split-K, non-exact-multiple gemm_k (1, 31, 33, 63, 65, 100): correctly rejected as
+  "not applicable" post-fix (previously silent `pred:-nan` pre-fix) -- confirmed for
+  fp16 and bf16.
+- Large-K (8 main-loop iterations, non-split and split): `valid:y`, fp16.
+- `group=2`: `valid:y`, fp16.
+- Full master-config search (`igemm_wrw_gtc_gfx1250_nhwc_fp16_all.config`, 19 candidates
+  including both new TDM sections): every candidate `valid:y`.
+
+**Zero regression**: git-worktree diff of the pre-Phase-45 commit vs. this tree for
+`igemm_wrw_gtc_gfx1250_nhwc_fp16.config` (the plain, non-TDM config) -- generated `.inc`
+and `.hsaco` files byte-identical; only `conv_driver.exe` differs (the deliberate
+driver-side split-K fix above). Master-config regeneration is purely additive (new TDM
+sections appended; the pre-existing `igemm_wrw_gtc_gfx1250_nhwc_bf16_gsplit_stagger.config`
+exclusion preserved via the same temporarily-move-it-out workaround used in prior phases).
+
+**A documentation note on how this phase actually went**: the hardware-validation pass
+for this phase was preceded by several hours of investigation into what looked like a
+total, environment-wide regression (every WMMA kernel, every direction, returning
+`pred:-nan` -- including kernels unrelated to this phase, and even the project's very
+first fp16 WMMA commit from months earlier, re-tested via `git worktree`). That
+investigation (compiler crashes in an unrelated code path, a live hardware error in
+`dmesg`, a machine reboot, and a dozen self-built minimal repros that each turned out to
+have their own bugs) ultimately traced to a single, embarrassingly simple root cause:
+`conv_driver.exe` selects verification precision via its **mode string**
+(`conv`=fp32, `convfp16`=fp16, `convbfp16`=bf16, `convint8`=int8), and every fp16/bf16/int8
+invocation that night had used the plain `conv` mode -- silently defaulting to fp32
+comparison logic against a packed-precision kernel. No code, driver, firmware, or
+hardware defect existed. Recorded here so the same multi-hour detour doesn't happen
+again: **always pass the mode string matching the tunable's precision.**
+
+**Critical files**: `python/igemm/igemm_wrw_gtc_wmma_nhwc.py` (new
+`_emit_tdm_descriptor_setup_a/b`, TDM branches in `global_load_a/b_functor` and
+`move_slice_window_a/b_functor`, `_emit_wave0_only`), `python/igemm/igemm_base.py`
+(widened the `tdm_global_load` direction assert to include `wrw`),
+`driver/igemm_wrw_gtc_driver.h` (`tunable_is_valid()`'s TDM+split-K exact-multiple fix).

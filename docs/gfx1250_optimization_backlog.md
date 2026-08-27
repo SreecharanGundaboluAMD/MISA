@@ -148,27 +148,20 @@ section for the record).
       hypothesis and profiling pass (e.g. rocprof instruction-mix/cycle breakdown on the
       TDM vs non-TDM K=1024 dispatches specifically, mirroring Finding 5's methodology)
       -- not yet attempted.
-- [ ] **Extend TDM to wrw and/or multi-tap (y/x>1) convolutions** — assessed 2026-08-27,
-      **not attempted**. TDM support is now fwd+bwd, still 1x1/unit-stride-only.
-      Structural analysis: wrw's GEMM_K (spatial, `n*ho*wo`) is the ROW axis for **BOTH**
-      A and B (`num_col_groups = gemm_m_per_block // gemm_k_per_block` used identically
-      for both operands, per Phase 43's investigation) -- unlike bwd, where only B needed
-      the "swapped" TDM axis treatment (A's GEMM_K was already the natural contiguous
-      axis). A TDM port for wrw would need the axis-swapped descriptor design (validated
-      for bwd's B in Phase 42) applied to *both* operands, PLUS correctly handle
-      split-K's per-shard K-slice offset interacting with the descriptor's `global_addr`
-      and `tensor_dim1` -- a genuinely new interaction bwd never had to solve (bwd has no
-      split-K at all). Phase 42's bwd port had a strong safety net every step of the way:
-      each new formula could be cross-checked against bwd's own already-validated
-      non-TDM stride/offset math before ever touching hardware. wrw's split-K
-      per-shard-offset interaction has no equivalently strong existing reference to
-      cross-check against, meaning more of the design would be genuinely novel and
-      untested rather than a structural port. Combined with zero hardware validation
-      ability this session, this was assessed as too high-risk to attempt blind --
-      deferred in full (not even a partial/untested implementation) until GPU access
-      returns. Multi-tap (any direction) is a separate, larger question (TDM's
-      per-tap-gather-free assumption would need re-examining entirely) and wasn't
-      assessed further this pass.
+- [x] **Extend TDM to wrw, both operands, split-K aware** — done 2026-08-27 (Phase 45),
+      hardware-validated. TDM support is now fwd+bwd+wrw, still 1x1/unit-stride-only.
+      Both wrw operands needed the axis-swapped descriptor (GEMM_K is the row axis for
+      BOTH A and B in wrw, unlike bwd where only B needed it). Split-K's per-shard offset
+      interaction turned up one real, driver-side gap: `gemm_k_global_split`'s
+      `karg.gemm_k_per_wg` computation rounds gemm_k UP to the next multiple of
+      `gemm_k_per_block`, which TDM (no `wmma_k_tail` clamp, asserted mutually exclusive)
+      has no way to correct for -- fixed by requiring an exact-multiple gemm_k whenever
+      TDM is combined with split-K specifically (non-split TDM still gets the full
+      K-tail-via-hardware-OOB relaxation). See `docs/gfx1250_wmma_layout.md`'s Phase 45
+      for full validation battery and the (unrelated to this item, but discovered during
+      it) `conv_driver.exe` mode-string gotcha. Multi-tap (any direction) remains
+      unaddressed -- TDM's per-tap-gather-free assumption would need re-examining
+      entirely and wasn't assessed this pass.
 - [x] **Fix `script/classify_gfx1250_coverage.py`'s `gemm_n % 4 == 0` blind spot** — done
       2026-08-27 (CPU-only, no GPU execution needed — pure static analysis script).
       Added `gap_n_mod4_fwd`/`gap_n_mod4_bwd` categories, gated on `'N' in needs and

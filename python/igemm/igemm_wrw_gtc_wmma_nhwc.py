@@ -221,6 +221,19 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self.chunk_num_dwords  = inst_wmma_k_bytes // 4
         self.num_k_chunks      = self.num_dwordx4 // self.chunk_num_dwordx4
 
+        # Phase 45 (TDM global load, wrw): both A and B are "128-wide tiles" sharing the
+        # same num_col_groups formula (GEMM_K is the row axis for BOTH operands here,
+        # unlike bwd where only B needed axis-swapping) -- base case only (no M/N-tail
+        # combined with TDM yet, mirroring fwd's original Phase 28 scope before Phase 37
+        # extended it).
+        assert not (tunable.tdm_global_load and (tunable.wmma_m_tail or tunable.wmma_n_tail or tunable.wmma_k_tail)), \
+            "tdm_global_load is not yet combined with wmma_m_tail/n_tail/k_tail for wrw -- TDM's own hardware OOB replaces wmma_k_tail; M/N-tail-via-TDM is a separate, not-yet-attempted extension"
+        assert not (tunable.tdm_global_load and tunable.local_prefetch_num > 1), \
+            "tdm_global_load is not yet supported together with local_prefetch_num > 1"
+        assert not (tunable.tdm_global_load and tunable.async_global_load), \
+            "tdm_global_load and async_global_load are mutually exclusive -- two different load mechanisms for the same operand"
+        self._tdm_label_counter = 0
+
         self.sgpr = self.kernel_sgpr_t(mc, self)
         self.vgpr = self.kernel_vgpr_t(mc, self)
 
@@ -289,6 +302,26 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 # last shard" is a simple s_bz == s_gemm_k_num_splits-1 compare.
                 self.s_gemm_k_tail       = sym_t('s_gemm_k_tail'       , sseq(1))
                 self.s_gemm_k_num_splits = sym_t('s_gemm_k_num_splits' , sseq(1))
+            if outer.tunable.tdm_global_load:
+                # Phase 45: TDM descriptors for A (grad_output) and B (input) -- both
+                # operands are "128-wide tiles" here (GEMM_K is the row axis for BOTH),
+                # see _emit_tdm_descriptor_setup_a/b.
+                self.s_tdm_g0  = sym_t('s_tdm_g0'      , sseq(4, 4))
+                self.s_tdm_g1  = sym_t('s_tdm_g1'      , sseq(8, 4))
+                self.s_tdm_g0_b = sym_t('s_tdm_g0_b'   , sseq(4, 4))
+                self.s_tdm_g1_b = sym_t('s_tdm_g1_b'   , sseq(8, 4))
+                self.s_wave_id = sym_t('s_wave_id'     , sseq(1))
+                # Remaining valid K (this shard's own spatial reduction range) --
+                # initialized from s_knum (already the correct per-shard length,
+                # including split-K, since tdm_global_load asserts not wmma_k_tail so
+                # s_knum needs no separate tail-extension logic here).
+                self.s_tdm_k_remain = sym_t('s_tdm_k_remain', sseq(1))
+                # B's per-K-block global stride (mirrors s_a_k_stride, using b_n_total
+                # instead of a_m_total) -- needed for TDM's per-iteration global_addr
+                # advance (move_slice_window_b), since B's per-K-block byte stride isn't
+                # otherwise computed anywhere (the non-TDM path re-derives B's address
+                # from scratch every iteration via the stride/pad gather instead).
+                self.s_b_k_stride = sym_t('s_b_k_stride', sseq(1))
             self.s_tmp         = sym_t('s_tmp'         , sseq(4))
             self.s_end         = sym_t('s_end'         , sseq())
 
@@ -509,6 +542,118 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 self.tunable.gemm_n_per_block * self.data_byte, self.data_byte, 'n'))
         self._emit_empty_line()
 
+    def _emit_tdm_descriptor_setup_a(self):
+        '''
+        Phase 45: TDM descriptor for A (grad_output). GEMM_K (n*ho*wo, spatial) is the
+        ROW axis here (not the contiguous axis, unlike fwd's A/bwd's A) -- each row is a
+        single spatial reduction position, GEMM_M (K_out) is the contiguous axis within
+        that row (grad_output is NHWC, K_out innermost). This is the SAME axis-swap
+        bwd's B needed (Phase 42), just applied to wrw's A: tensor_dim0=gemm_m (K_out,
+        contiguous), tensor_dim1=gemm_k (spatial, row axis), tensor_dim0_stride=a_m_total
+        (this project's already-established, non-TDM-validated per-pixel row stride --
+        see s_a_k_stride's own derivation, which uses the identical a_m_total base).
+
+        Only correct for the 1x1/unit-stride/no-pad/no-dilation case (asserted via
+        nxe==0 at the tunable level) -- for y=x=1 with stride=1/pad=0/dilation=1, B's
+        per-tap gather (`_emit_b_gather`, decomposing the absolute K-index into
+        (n,ho,wo) then remapping through the stride/pad formula to (hi,wi)) collapses to
+        an IDENTITY (hi=ho, wi=wo, and critically `hi_wi == ho_wo` too since input and
+        output spatial extents are equal with no padding/stride reduction) -- so the
+        recomposed `row_idx` used for B's address is provably equal to the same flat K
+        index that was decomposed, meaning B's address is ALSO a simple linear function
+        of the K index for this restricted case, exactly like every other TDM operand
+        this project has ported. A's own tap-independence (grad_output has no Y,X extent
+        at all) makes this even more direct for A.
+        '''
+        s = self.sgpr
+        data_size_code = utility_log2(self.data_byte)
+        tile_dim0 = self.tunable.gemm_m_per_block
+        tile_dim1 = self.tunable.gemm_k_per_block
+        assert tile_dim0 < 65536 and tile_dim1 < 65536, "TDM tile_dim0/1 are 16-bit fields"
+
+        self._emit(f"; --- Phase 45: TDM descriptor for A operand (grad_output) ---")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g0(0)}], 1   ; group0: pred=1 (valid tensor)")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g0(1)}], 0   ; group0: lds_addr (A's LDS region starts at byte 0)")
+        self._emit(f"; group0: global_addr = p_in + (block_m_off + gemm_k_wg_off*a_m_total) * data_byte")
+        if self.tunable.gemm_k_global_split:
+            self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_gemm_k_wg_off()}], s[{s.s_a_m_total()}]")
+            self._emit(f"s_add_u32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_block_m_off()}]")
+        else:
+            self._emit(f"s_mov_b32 s[{s.s_tmp(0)}], s[{s.s_block_m_off()}]")
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {data_size_code}")
+        self._emit(f"s_add_u32 s[{s.s_tdm_g0(2)}], s[{s.s_p_in()}], s[{s.s_tmp(0)}]")
+        self._emit(f"s_addc_u32 s[{s.s_tmp(1)}], s[{s.s_p_in(1)}], 0")
+        self._emit(f"s_or_b32 s[{s.s_tdm_g0(3)}], s[{s.s_tmp(1)}], 0x80000000   ; | type=2 (image) in bits[31:30]")
+        self._emit_empty_line()
+
+        self._emit(f"; group1: data_size={data_size_code}, workgroup_mask=0 (not clustered)")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1(0)}], {data_size_code << 16}")
+        self._emit(f"s_lshl_b32 s[{s.s_tdm_g1(1)}], s[{s.s_gemm_m()}], 16   ; tensor_dim0 (gemm_m) lo16 -> [31:16]")
+        self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_gemm_m()}], 16   ; tensor_dim0 hi16")
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim1 (this shard's remaining K) lo16")
+        self._emit(f"s_or_b32 s[{s.s_tdm_g1(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
+        self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim1 hi16")
+        self._emit(f"s_or_b32 s[{s.s_tdm_g1(3)}], s[{s.s_tmp(0)}], {tile_dim0 << 16}   ; | tile_dim0 (compile-time)")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1(4)}], {tile_dim1}   ; tile_dim1 (compile-time), tile_dim2 unused")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1(5)}], s[{s.s_a_m_total()}]   ; tensor_dim0_stride lo32 (elements)")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1(6)}], 0   ; tensor_dim0_stride hi16 (assume < 2^32 elements)")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1(7)}], 0   ; tensor_dim1_stride unused (2D tensor)")
+        self._emit_empty_line()
+
+    def _emit_tdm_descriptor_setup_b(self):
+        '''
+        Phase 45: TDM descriptor for B (input). Structurally identical to A's -- input is
+        also NHWC (C_in innermost, contiguous), GEMM_K (spatial) is the row axis, GEMM_N
+        (C_in) is the contiguous axis. tensor_dim0=gemm_n, tensor_dim1=gemm_k,
+        tensor_dim0_stride=b_n_total. See _emit_tdm_descriptor_setup_a's docstring for
+        why the 1x1/unit-stride restriction makes B's normally-gathered address a simple
+        linear function of the K index here too.
+        '''
+        s = self.sgpr
+        data_size_code = utility_log2(self.data_byte)
+        tile_dim0 = self.tunable.gemm_n_per_block
+        tile_dim1 = self.tunable.gemm_k_per_block
+        assert tile_dim0 < 65536 and tile_dim1 < 65536, "TDM tile_dim0/1 are 16-bit fields"
+
+        self._emit(f"; --- Phase 45: TDM descriptor for B operand (input) ---")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g0_b(0)}], 1   ; group0: pred=1 (valid tensor)")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g0_b(1)}], {self.lds_a_size}   ; group0: lds_addr (B's LDS region starts after A's)")
+        self._emit(f"; group0: global_addr = p_wei + (block_n_off + gemm_k_wg_off*b_n_total) * data_byte")
+        if self.tunable.gemm_k_global_split:
+            self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_gemm_k_wg_off()}], s[{s.s_b_n_total()}]")
+            self._emit(f"s_add_u32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_block_n_off()}]")
+        else:
+            self._emit(f"s_mov_b32 s[{s.s_tmp(0)}], s[{s.s_block_n_off()}]")
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {data_size_code}")
+        self._emit(f"s_add_u32 s[{s.s_tdm_g0_b(2)}], s[{s.s_p_wei()}], s[{s.s_tmp(0)}]")
+        self._emit(f"s_addc_u32 s[{s.s_tmp(1)}], s[{s.s_p_wei(1)}], 0")
+        self._emit(f"s_or_b32 s[{s.s_tdm_g0_b(3)}], s[{s.s_tmp(1)}], 0x80000000   ; | type=2 (image) in bits[31:30]")
+        self._emit_empty_line()
+
+        self._emit(f"; group1: data_size={data_size_code}, workgroup_mask=0 (not clustered)")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1_b(0)}], {data_size_code << 16}")
+        self._emit(f"s_lshl_b32 s[{s.s_tdm_g1_b(1)}], s[{s.s_gemm_n()}], 16   ; tensor_dim0 (gemm_n) lo16 -> [31:16]")
+        self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_gemm_n()}], 16   ; tensor_dim0 hi16")
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim1 (this shard's remaining K) lo16")
+        self._emit(f"s_or_b32 s[{s.s_tdm_g1_b(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
+        self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim1 hi16")
+        self._emit(f"s_or_b32 s[{s.s_tdm_g1_b(3)}], s[{s.s_tmp(0)}], {tile_dim0 << 16}   ; | tile_dim0 (compile-time)")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1_b(4)}], {tile_dim1}   ; tile_dim1 (compile-time), tile_dim2 unused")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1_b(5)}], s[{s.s_b_n_total()}]   ; tensor_dim0_stride lo32 (elements)")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1_b(6)}], 0   ; tensor_dim0_stride hi16 (assume < 2^32 elements)")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1_b(7)}], 0   ; tensor_dim1_stride unused (2D tensor)")
+        self._emit_empty_line()
+
+    def _emit_wave0_only(self, body_fn):
+        ''' Phase 45: direct port of igemm_fwd_gtc_wmma_nhwc_t's identical Phase 29 helper. '''
+        s = self.sgpr
+        self._tdm_label_counter += 1
+        label = f"L_{self.name()}_wave0_only_{self._tdm_label_counter}"
+        self._emit(f"s_cmp_eq_u32 s[{s.s_wave_id()}], 0")
+        self._emit(f"s_cbranch_scc0 {label}")
+        body_fn()
+        self._emit_front(f"{label}:")
+
     def emit_kernel_prologue(self):
         s = self.sgpr
         v = self.vgpr
@@ -535,6 +680,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"s_load_dword s[{s.s_gemm_k_tail()}], s[{s.s_ka()}:{s.s_ka(1)}], 92")
             self._emit(f"s_load_dword s[{s.s_gemm_k_num_splits()}], s[{s.s_ka()}:{s.s_ka(1)}], 96")
         self._emit(f"v_mov_b32 v[{v.v_tid()}], v0")
+        if self.tunable.tdm_global_load:
+            # Phase 45: mirrors fwd/bwd's identical Phase 29/42 computation -- this wave's
+            # index within the workgroup, derived while EXEC is still fully enabled.
+            self._emit(f"v_readfirstlane_b32 s[{s.s_wave_id()}], v[{v.v_tid()}]   ; Phase 29/42/45: lane 0's flat tid = this wave's base")
+            self._emit(f"s_lshr_b32 s[{s.s_wave_id()}], s[{s.s_wave_id()}], 5   ; wave index within workgroup")
         # gfx1250 delivers workgroup id via ttmp9/ttmp7 -- see docs/gfx1250_wmma_layout.md.
         # ttmp9 is a clean, unpacked blockIdx.x. ttmp7 PACKS blockIdx.y (low 16 bits) and
         # blockIdx.z (high 16 bits) -- confirmed by an inline-asm probe comparing raw ttmp
@@ -626,6 +776,15 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # its real physical [K][M_total] storage is the TOTAL K_out count, same reasoning as
         # the per-pixel row stride above.
         self._emit(f"s_lshl_b32 s[{s.s_a_k_stride()}], s[{s.s_a_m_total()}], {utility_log2(self.data_byte * self.tunable.gemm_k_per_block)}   ; a_m_total * databyte * {self.tunable.gemm_k_per_block}")
+        if self.tunable.tdm_global_load:
+            # Phase 45: B's per-K-block global stride (mirrors s_a_k_stride's derivation,
+            # using b_n_total instead of a_m_total) -- only needed for TDM's B descriptor
+            # advance, since the non-TDM path never has a constant B stride (its address
+            # is re-gathered from scratch every iteration instead).
+            self._emit(f"s_lshl_b32 s[{s.s_b_k_stride()}], s[{s.s_b_n_total()}], {utility_log2(self.data_byte * self.tunable.gemm_k_per_block)}   ; b_n_total * databyte * {self.tunable.gemm_k_per_block}")
+            self._emit(f"s_mov_b32 s[{s.s_tdm_k_remain()}], s[{s.s_knum()}]   ; Phase 45: this shard's own remaining K (s_knum already reflects split-K)")
+            self._emit_tdm_descriptor_setup_a()
+            self._emit_tdm_descriptor_setup_b()
         self._emit(f"s_mul_i32 s[{s.s_hi_wi()}], s[{s.s_hi()}], s[{s.s_wi()}]")
         # grad_weight's per-K_out-row element count is y*x*c (not just c as in the 1x1 case) --
         # reused for the epilogue's row stride (Phase 5f). B (input) itself has no y/x
@@ -762,18 +921,27 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"v_mov_b32 v[{v.v_c(i)}], 0")
         self._emit_empty_line()
 
-        # ---- reset A's address to its tap-independent base (move_slice_window_a bumped it
-        # across the PREVIOUS tap's K-loop) ----
-        self._emit(f"v_mov_b32 v[{v.v_addr_a()}], v[{v.v_addr_a_base()}]")
-        self._emit(f"v_mov_b32 v[{v.v_addr_a(1)}], v[{v.v_addr_a_base(1)}]")
-        self._emit_empty_line()
+        if not self.tunable.tdm_global_load:
+            # ---- reset A's address to its tap-independent base (move_slice_window_a
+            # bumped it across the PREVIOUS tap's K-loop) ----
+            self._emit(f"v_mov_b32 v[{v.v_addr_a()}], v[{v.v_addr_a_base()}]")
+            self._emit(f"v_mov_b32 v[{v.v_addr_a(1)}], v[{v.v_addr_a_base(1)}]")
+            self._emit_empty_line()
 
-        # ---- B's initial (k_block_off=0) gather for this tap's first global load -- reads
-        # the CURRENT s_iy/s_ix live, so no special-casing needed here ----
-        self._emit_b_gather(None)
-        if self.tunable.wmma_k_tail:
-            self._emit_a_kflag(None)
-        self._emit_empty_line()
+            # ---- B's initial (k_block_off=0) gather for this tap's first global load --
+            # reads the CURRENT s_iy/s_ix live, so no special-casing needed here ----
+            # Phase 45: skipped entirely under TDM -- for 1x1 (TDM's only supported case,
+            # nxe==0), there is exactly one tap (y=x=1), and _emit_b_gather's whole
+            # purpose (the 2-division (n,ho,wo) decomposition + stride/pad remap) is
+            # provably a no-op identity for that case (see
+            # _emit_tdm_descriptor_setup_a's docstring) -- global_load_b_functor's TDM
+            # branch never references its output (v_addr_b/v_flag) at all. Skipping it
+            # avoids paying for two integer-division macro calls per kernel launch for
+            # nothing, mirroring bwd's identical Phase 42 optimization.
+            self._emit_b_gather(None)
+            if self.tunable.wmma_k_tail:
+                self._emit_a_kflag(None)
+            self._emit_empty_line()
 
         # ---- issue the first global loads for this tap (main loop expects this precondition) ----
         self._emit(self.global_load_a_functor()())
@@ -988,8 +1156,14 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
+                s = outer.sgpr
                 with outer._deferred_context():
-                    if outer.num_k_chunks == 1:
+                    if outer.tunable.tdm_global_load:
+                        # Phase 45: mirrors fwd/bwd's identical TDM branch -- one TDM
+                        # instruction moves the whole gemm_k_per_block x gemm_m_per_block
+                        # tile straight into LDS, wave-0-only issue.
+                        outer._emit_wave0_only(lambda: outer._emit(f"tensor_load_to_lds s[{s.s_tdm_g0()}:{s.s_tdm_g0(3)}], s[{s.s_tdm_g1()}:{s.s_tdm_g1(7)}]"))
+                    elif outer.num_k_chunks == 1:
                         outer._emit_gld_chunk_load(v.v_gld_a, v.v_addr_a, 0, v_flag=outer._a_flag_symbol())
                 return outer._get_deferred()
             def get_issues(self):
@@ -1010,8 +1184,12 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
+                s = outer.sgpr
                 with outer._deferred_context():
-                    if outer.num_k_chunks == 1:
+                    if outer.tunable.tdm_global_load:
+                        # Phase 45: mirrors global_load_a_functor's TDM branch above.
+                        outer._emit_wave0_only(lambda: outer._emit(f"tensor_load_to_lds s[{s.s_tdm_g0_b()}:{s.s_tdm_g0_b(3)}], s[{s.s_tdm_g1_b()}:{s.s_tdm_g1_b(7)}]"))
+                    elif outer.num_k_chunks == 1:
                         outer._emit_gld_chunk_load(v.v_gld_b, v.v_addr_b, 0, v_flag=v.v_flag)
                 return outer._get_deferred()
             def get_issues(self):
@@ -1160,11 +1338,30 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 v = outer.vgpr
                 s = outer.sgpr
                 with outer._deferred_context():
-                    outer._emit(f"v_add_co_u32 v[{v.v_addr_a()}], vcc_lo, s[{s.s_a_k_stride()}], v[{v.v_addr_a()}]")
-                    outer._emit(f"v_add_co_ci_u32 v[{v.v_addr_a(1)}], vcc_lo, 0, v[{v.v_addr_a(1)}], vcc_lo")
-                    if outer.tunable.wmma_k_tail:
-                        outer._emit(f"s_sub_i32 s[{s.s_tmp(1)}], s[{s.s_knum()}], s[{s.s_kitr()}]   ; k_block_off")
-                        outer._emit_a_kflag(s.s_tmp(1))
+                    if outer.tunable.tdm_global_load:
+                        # Phase 45: advance by s_a_k_stride (one K-tile's worth of ROWS --
+                        # GEMM_K is the row axis for A here, same reasoning as bwd's B in
+                        # Phase 42). K-tail-via-hardware-OOB rebuild mirrors Phase 44's
+                        # skip-unless-genuinely-partial guard from the very start (no
+                        # separate unconditional-rebuild step, since Phase 44 already
+                        # validated this pattern for fwd/bwd).
+                        outer._emit(f"s_add_u32 s[{s.s_tdm_g0(2)}], s[{s.s_tdm_g0(2)}], s[{s.s_a_k_stride()}]")
+                        outer._emit(f"s_addc_u32 s[{s.s_tdm_g0(3)}], s[{s.s_tdm_g0(3)}], 0")
+                        skip_label = f"L_{outer.name()}_tdm_a_skip_rebuild"
+                        outer._emit(f"s_cmp_lt_i32 s[{s.s_tdm_k_remain()}], {outer.tunable.gemm_k_per_block}   ; Phase 44/45: is the tile now being prepared genuinely partial?")
+                        outer._emit(f"s_cbranch_scc0 {skip_label}   ; not partial -- skip the rebuild, tensor_dim1 stays >= tile_dim1")
+                        outer._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_gemm_m()}], 16   ; tensor_dim0 (gemm_m) hi16 -- unchanged, re-derived fresh")
+                        outer._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim1 (remaining K) lo16")
+                        outer._emit(f"s_or_b32 s[{s.s_tdm_g1(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
+                        outer._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim1 (remaining K) hi16")
+                        outer._emit(f"s_or_b32 s[{s.s_tdm_g1(3)}], s[{s.s_tmp(0)}], {outer.tunable.gemm_m_per_block << 16}   ; | tile_dim0 (compile-time)")
+                        outer._emit_front(f"{skip_label}:")
+                    else:
+                        outer._emit(f"v_add_co_u32 v[{v.v_addr_a()}], vcc_lo, s[{s.s_a_k_stride()}], v[{v.v_addr_a()}]")
+                        outer._emit(f"v_add_co_ci_u32 v[{v.v_addr_a(1)}], vcc_lo, 0, v[{v.v_addr_a(1)}], vcc_lo")
+                        if outer.tunable.wmma_k_tail:
+                            outer._emit(f"s_sub_i32 s[{s.s_tmp(1)}], s[{s.s_knum()}], s[{s.s_kitr()}]   ; k_block_off")
+                            outer._emit_a_kflag(s.s_tmp(1))
                 return outer._get_deferred()
         return functor_t()
 
@@ -1177,14 +1374,32 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         and _emit_b_gather. k_block_off = s_knum - s_kitr, evaluated here (i.e. AFTER
         wmma_main_loop.py's per-iteration s_kitr -= unroll_k), correctly gives the K already
         consumed = the offset of the block about to be loaded.
+
+        Phase 45 (tdm_global_load): this whole non-TDM gather-recompute is bypassed --
+        TDM's B descriptor uses a genuine constant per-K-block stride (s_b_k_stride,
+        mirroring A's s_a_k_stride) instead, since the 1x1/unit-stride restriction makes
+        B's gather a provable identity (see _emit_tdm_descriptor_setup_a's docstring).
         '''
         outer = self
         class functor_t:
             def __call__(self):
                 s = outer.sgpr
                 with outer._deferred_context():
-                    outer._emit(f"s_sub_i32 s[{s.s_tmp()}], s[{s.s_knum()}], s[{s.s_kitr()}]   ; k_block_off")
-                    outer._emit_b_gather(s.s_tmp())
+                    if outer.tunable.tdm_global_load:
+                        outer._emit(f"s_add_u32 s[{s.s_tdm_g0_b(2)}], s[{s.s_tdm_g0_b(2)}], s[{s.s_b_k_stride()}]")
+                        outer._emit(f"s_addc_u32 s[{s.s_tdm_g0_b(3)}], s[{s.s_tdm_g0_b(3)}], 0")
+                        skip_label = f"L_{outer.name()}_tdm_b_skip_rebuild"
+                        outer._emit(f"s_cmp_lt_i32 s[{s.s_tdm_k_remain()}], {outer.tunable.gemm_k_per_block}   ; Phase 44/45: is the tile now being prepared genuinely partial?")
+                        outer._emit(f"s_cbranch_scc0 {skip_label}   ; not partial -- skip the rebuild, tensor_dim1 stays >= tile_dim1")
+                        outer._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_gemm_n()}], 16   ; tensor_dim0 (gemm_n) hi16 -- unchanged, re-derived fresh")
+                        outer._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim1 (remaining K) lo16")
+                        outer._emit(f"s_or_b32 s[{s.s_tdm_g1_b(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
+                        outer._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim1 (remaining K) hi16")
+                        outer._emit(f"s_or_b32 s[{s.s_tdm_g1_b(3)}], s[{s.s_tmp(0)}], {outer.tunable.gemm_n_per_block << 16}   ; | tile_dim0 (compile-time)")
+                        outer._emit_front(f"{skip_label}:")
+                    else:
+                        outer._emit(f"s_sub_i32 s[{s.s_tmp()}], s[{s.s_knum()}], s[{s.s_kitr()}]   ; k_block_off")
+                        outer._emit_b_gather(s.s_tmp())
                 return outer._get_deferred()
         return functor_t()
 
@@ -1198,6 +1413,8 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.lds_buffer_num   = self.lds_buffer_num
         ctrl.local_prefetch_num = self.tunable.local_prefetch_num
         ctrl.wmma_setprio = self.tunable.wmma_setprio
+        ctrl.tdm_global_to_lds_a = self.tunable.tdm_global_load
+        ctrl.tdm_global_to_lds_b = self.tunable.tdm_global_load
         # Phase 1 (k-sub-loop): both A (grad_output) and B (input) are TRANSPOSED here
         # ([K rows][M or N cols] in LDS), so advancing inst_wmma.k K-elements means
         # advancing inst_wmma.k whole K-rows, i.e. inst_wmma.k * row_pitch, matching each
@@ -1222,6 +1439,8 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.v_sld_b_os = sym_t(self.vgpr.v_sld_b_os.label)
         ctrl.s_kitr    = sym_t(self.sgpr.s_kitr.label)
         ctrl.s_knum    = sym_t(self.sgpr.s_knum.label)
+        if self.tunable.tdm_global_load:
+            ctrl.s_tdm_k_remain = sym_t(self.sgpr.s_tdm_k_remain.label)
 
         # first global load for this tap already issued by emit_kernel_tap_loop(), which is
         # also the sole caller of this method and also emits the per-tap epilogue store
