@@ -126,19 +126,62 @@ section for the record).
       tensor_dim rebuild's fixed cost outweighs the one-time gather savings once K is
       deep enough. Added to the master config search (not a blanket replacement) so the
       driver picks whichever is actually faster per shape.
-- [ ] **Skip the per-iteration TDM tensor_dim rebuild when not needed** — found while
-      measuring Phase 42's bwd timing trade-off above: the rebuild (K-tail-via-hardware-OOB)
-      runs unconditionally every K-loop iteration in BOTH fwd's original TDM and bwd's new
-      port, even for shapes where gemm_k is an exact multiple and no tail-masking is ever
-      needed. This is very likely the direct cause of the large-K slowdown. Skipping it for
-      all but the last iteration (or the exact-multiple case entirely) would likely close
-      most of that gap — needs either a compile-time-provable exact-multiple fast path or a
-      cheap runtime branch; not yet attempted for either fwd or bwd.
-- [ ] **Extend TDM to wrw and/or multi-tap (y/x>1) convolutions** — TDM support is now
-      fwd+bwd, still 1x1/unit-stride-only. wrw's split-K/atomic-accumulate structure is a
-      bigger design departure than bwd turned out to be (bwd's operands were direct
-      structural matches for the existing descriptor abstraction once worked through);
-      multi-tap would need TDM's per-tap gather-free assumption re-examined entirely.
+- [ ] **Skip the per-iteration TDM tensor_dim rebuild when not needed** — design refined
+      2026-08-27, **implementation deliberately deferred (see below), not attempted**.
+      `wmma_main_loop.py`'s loop structure (`label_body`/`label_body_last`) means
+      `move_slice_window_a/b_functor` (the rebuild's call site) only ever runs to prepare
+      the *next* tile, and is skipped entirely once the *current* tile is already the
+      last one (`s_kitr <= 0` branches straight to `label_body_last`, which computes WMMA
+      on the already-loaded final tile and never calls `move_slice_window` again). So the
+      rebuild's job on any given call is "does the tile I'm about to prepare turn out to
+      be a genuinely partial one" — true for at most ONE call per K-loop (whichever one
+      prepares the actual tail tile), false for every other call. Concrete design: guard
+      the existing 4-instruction rebuild with
+      `s_cmp_lt_i32 s[tdm_k_remain], {tile_dim0}` / `s_cbranch_scc0 {skip_label}` — when
+      NOT less-than (this upcoming tile is fully valid), skip the rebuild entirely and
+      leave `tensor_dim0`/`tensor_dim1` holding `tile_dim0` (already true from either the
+      prologue's initial setup or the previous "no rebuild needed" pass, since nothing
+      overwrites it in that branch). This is logically sound as a *consequence* of
+      Phase 31's own hardware-confirmed OOB semantics (`lane_index < tensor_dim`,
+      relative to this call's `global_addr`) — setting `tensor_dim0 = tile_dim0` exactly
+      makes that comparison true for every lane in a full tile by construction, so no
+      zero-fill triggers either way. **This is NOT the same configuration Phase 31 tested
+      and found broken** (Phase 31 found a *never-updated, always-`gemm_k`* tensor_dim0
+      reads real OOB memory on the tail -- this design instead uses the per-iteration
+      compile-time `tile_dim0` constant for every non-tail call, and only the genuine
+      tail call gets the full runtime rebuild), so it is a materially different, untested
+      hardware configuration, not a repeat of an already-answered question.
+      **Deliberately not implemented this pass**: this is a real edit to the
+      already-hardware-validated `move_slice_window_a/b` functors in BOTH
+      `igemm_fwd_gtc_wmma_nhwc.py` (Phases 28-31/37, multiple precisions) and
+      `igemm_bwd_gtc_wmma_nhwc.py` (Phase 42, just landed) -- a regression here would
+      silently affect every existing TDM config in both directions. Implemented under an
+      explicit no-GPU-execution constraint this session (shared GPU running another
+      benchmark); a subtle correctness gap in this reasoning could only be caught by the
+      same kind of direct hardware OOB probe Phase 31 itself used, which isn't possible
+      right now. Left as a fully-specified, ready-to-implement design rather than
+      guessed-and-shipped code.
+- [ ] **Extend TDM to wrw and/or multi-tap (y/x>1) convolutions** — assessed 2026-08-27,
+      **not attempted**. TDM support is now fwd+bwd, still 1x1/unit-stride-only.
+      Structural analysis: wrw's GEMM_K (spatial, `n*ho*wo`) is the ROW axis for **BOTH**
+      A and B (`num_col_groups = gemm_m_per_block // gemm_k_per_block` used identically
+      for both operands, per Phase 43's investigation) -- unlike bwd, where only B needed
+      the "swapped" TDM axis treatment (A's GEMM_K was already the natural contiguous
+      axis). A TDM port for wrw would need the axis-swapped descriptor design (validated
+      for bwd's B in Phase 42) applied to *both* operands, PLUS correctly handle
+      split-K's per-shard K-slice offset interacting with the descriptor's `global_addr`
+      and `tensor_dim1` -- a genuinely new interaction bwd never had to solve (bwd has no
+      split-K at all). Phase 42's bwd port had a strong safety net every step of the way:
+      each new formula could be cross-checked against bwd's own already-validated
+      non-TDM stride/offset math before ever touching hardware. wrw's split-K
+      per-shard-offset interaction has no equivalently strong existing reference to
+      cross-check against, meaning more of the design would be genuinely novel and
+      untested rather than a structural port. Combined with zero hardware validation
+      ability this session, this was assessed as too high-risk to attempt blind --
+      deferred in full (not even a partial/untested implementation) until GPU access
+      returns. Multi-tap (any direction) is a separate, larger question (TDM's
+      per-tap-gather-free assumption would need re-examining entirely) and wasn't
+      assessed further this pass.
 - [x] **Fix `script/classify_gfx1250_coverage.py`'s `gemm_n % 4 == 0` blind spot** — done
       2026-08-27 (CPU-only, no GPU execution needed — pure static analysis script).
       Added `gap_n_mod4_fwd`/`gap_n_mod4_bwd` categories, gated on `'N' in needs and
