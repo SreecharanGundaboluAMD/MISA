@@ -119,6 +119,11 @@ class ctrl_wmma_main_loop_t(object):
         # non-interleaved path. Default False = today's exact byte-identical behavior.
         self.interleave                  = False
 
+        # Phase 32: brackets emit_wmma_tile()'s WMMA-issue burst with s_setprio 1 (before)
+        # / s_setprio 0 (after) -- see igemm_base.py's wmma_setprio docstring for the
+        # rationale/citation. Default False = today's exact byte-identical behavior.
+        self.wmma_setprio                = False
+
         # functor
         self.global_load_a_functor       = None
         self.global_load_b_functor       = None
@@ -212,6 +217,15 @@ class wmma_main_loop_t(mc_base_t):
 
         def emit_wmma_tile(slot=0):
             self._emit(f"; wmma compute, {wmma_m.wave_repeat_m}x{wmma_m.wave_repeat_n} instruction issues")
+            if ctrl.wmma_setprio:
+                # Phase 32: raise this wave's issue priority for the duration of the WMMA
+                # burst (CK's v1 WMMA pipeline and hipconv's direct/kernel.hpp both do this
+                # around exactly this kind of back-to-back WMMA-issue region) -- lets the
+                # burst issue without yielding to other waves mid-burst, at the cost of
+                # blocking their co-execution opportunity for that window. See the ISA
+                # doc's own caveat (5.7.2.1) about when this helps vs. hurts, cited in
+                # igemm_base.py's wmma_setprio docstring.
+                self._emit(f"s_setprio 1")
             a_slot_off = slot * num_v_a_total
             b_slot_off = slot * num_v_b_total
             for i_rm in range(wmma_m.wave_repeat_m):
@@ -224,6 +238,8 @@ class wmma_main_loop_t(mc_base_t):
                         v_a((a_index, a_index + inst_wmma.num_v_a - 1)),
                         v_b((b_index, b_index + inst_wmma.num_v_b - 1)),
                         v_c((c_index, c_index + inst_wmma.num_v_c - 1))))
+            if ctrl.wmma_setprio:
+                self._emit(f"s_setprio 0")
 
         def emit_extra_substeps():
             # k-sub-step 0's shared_load+wmma is always emitted at its original position

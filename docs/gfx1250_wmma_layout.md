@@ -3188,3 +3188,68 @@ EXEC-mask guards, per Phases 25/26) -- all flagged as future follow-ons in
 `python/operations/wmma_main_loop.py` -- `ctrl.s_tdm_k_remain`, per-iteration decrement;
 `python/igemm/igemm_fwd_gtc_wmma_nhwc.py` -- `s_tdm_k_remain` SGPR allocation + prologue
 init, `move_slice_window_a/b_functor`'s `tensor_dim0` rebuild.
+
+## Phase 32 (2026-08-27): `s_setprio` bracketing around WMMA issue
+
+First of three Tier 1 items from `docs/gfx1250_perf_parity_action_plan.md`'s cross-source
+synthesis. `s_setprio(1)`/`s_setprio(0)` (CDNA5 ISA doc 5.2/5.7.2.1: sets 2 bits of
+`USER_PRIO`, 0=low/3=high) bracketing a WMMA-issue burst was independently confirmed as
+real, shipping code in both CK's WMMA v1 pipeline and hipconv's `direct/kernel.hpp` --
+the strongest possible cross-project signal for a performance idea. Verified assembly
+syntax via `llvm-mc -show-encoding -mcpu=gfx1250` (`s_setprio 1`/`s_setprio 0`, clean
+4-byte encodings) before touching any kernel code.
+
+**Design**: new `wmma_setprio` tunable (default 0, every existing config byte-identical),
+wired through a new `ctrl.wmma_setprio` field on `ctrl_wmma_main_loop_t`. Brackets the
+ENTIRE body of `wmma_main_loop.py`'s `emit_wmma_tile()` (one call = one MAC-loop body's
+full back-to-back WMMA burst, `wave_repeat_m x wave_repeat_n` instructions) with
+`s_setprio 1` before the burst and `s_setprio 0` after -- matching CK's exact granularity
+("brackets the first WMMA issue of each MAC-loop body... closes the body with
+`s_setprio(0)`"), not per-individual-instruction. Since `emit_wmma_tile()` is a single
+shared nested function called from every main-loop variant (prefetched, interleaved,
+plain), this one change point covers all of them automatically. Also required a driver-
+side (`driver/igemm_gtc_base.h`) struct field + config-parsing + kernel-name fold, since
+the C++ driver reconstructs the kernel symbol name independently to look it up via
+`hipModuleGetFunction` -- without the fold, the driver would search for the wrong
+(unsuffixed) name for any `wmma_setprio=1` config.
+
+**Byte-identical regression sweep**: all 101 pre-existing gfx1250 configs regenerate
+identically to the pre-phase baseline; only the 3 new `_setprio`/`_gsplit_setprio` configs
+(fwd, bwd, wrw) differ, by construction.
+
+**Hardware validation**: `valid:y` across fwd (exact-multiple large shape, group>1), bwd
+(exact-multiple, group>1), and wrw (`_gsplit_setprio`, exact-multiple and the benchmark
+doc's worst-case shape `c=192,H=60,W=80,k=64,1x1`) -- correctness is solid, zero-risk
+scheduling hint confirmed to not change results anywhere tested.
+
+**Timing**: measured under severe, actively-worsening GPU contention this session --
+`rocm-smi --showuse --showpids` itself crashed with an internal assertion failure
+(`GetGPUMetricsFormat1`) partway through this phase's testing, and plain `rocm-smi`
+started reporting `get_power_avg`/`sclk` as unsupported -- both symptoms of a co-resident
+tenant's telemetry queries, not a MISA-caused GPU fault (confirmed: no `amdgpu`
+reset/hang/fault messages in `dmesg`, and kernels kept returning `valid:y` correctly
+throughout). wrw's worst-case shape showed genuinely bimodal timing at a FIXED, pinned
+split count (`IGEMM_GSPLIT_SWEEP=252`) -- roughly 0.085ms or 0.148ms depending on the run,
+no in-between -- consistent with an external contention window intermittently overlapping
+the kernel's dispatch. Under this noise, 8 runs each: **no-setprio landed in the fast mode
+2/8 times (median 0.148ms); setprio landed in the fast mode 6/8 times (median 0.086ms)**
+-- a directionally encouraging, ISA-doc-consistent result (wrw's split-K workgroups are
+exactly the "single wave per SIMD" low-occupancy regime the doc says this helps), but
+**explicitly not treated as a confirmed win given the contention severity and small
+sample** -- needs re-measurement on an idle GPU before being relied on. fwd (a well-
+occupied kernel, the regime the ISA doc warns setprio could instead HURT by blocking
+co-execution) showed no measurable difference either way (0.022-0.024ms both configs,
+well within noise) -- no detected regression, but also not a clean enough measurement
+environment to rule one out definitively.
+
+**Net result**: shipped as an opt-in, default-off, correctness-verified tunable. The
+performance verdict is genuinely unresolved pending a clean re-measurement -- ship the
+mechanism now (zero risk, real cross-project validation of the technique existing), defer
+the "should this be on by default" decision.
+
+**Critical files (Phase 32)**: `python/igemm/igemm_base.py` -- `wmma_setprio` tunable +
+kernel-name fold; `python/operations/wmma_main_loop.py` -- `ctrl.wmma_setprio`,
+`emit_wmma_tile()` bracketing; `python/igemm/igemm_{fwd,bwd,wrw}_gtc_wmma_nhwc.py` --
+`ctrl.wmma_setprio` wiring; `driver/igemm_gtc_base.h` -- struct field, config parsing,
+kernel-name fold; `config/igemm_{fwd,bwd}_gtc_gfx1250_nhwc_bf16_setprio.config`,
+`config/igemm_wrw_gtc_gfx1250_nhwc_bf16_gsplit_setprio.config` -- new.

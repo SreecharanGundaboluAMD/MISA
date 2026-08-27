@@ -243,6 +243,14 @@ class igemm_gtc_tunable_parameter_t(object):
             # own conclusion. Requires gemm_k_per_block > inst_wmma.k (k-sub-loop in use) and
             # is mutually exclusive with async_global_load.
             self.main_loop_interleave            = utility_dict_with_default_t(tunable_dict)('main_loop_interleave', 0)
+            # Phase 32: brackets each emit_wmma_tile() call's WMMA-issue burst with
+            # s_setprio 1 (before) / s_setprio 0 (after) -- a pure instruction-issue-priority
+            # hint (CDNA5 ISA doc 5.2, SYS_PRIO/USER_PRIO), no correctness or register
+            # implications, so no mutual-exclusion asserts needed. Independently confirmed as
+            # real, shipping code in both CK's WMMA v1 pipeline and hipconv's direct/kernel.hpp
+            # -- see docs/gfx1250_perf_parity_action_plan.md's Tier 1 item 1. Default 0 = every
+            # existing config byte-identical.
+            self.wmma_setprio                    = utility_dict_with_default_t(tunable_dict)('wmma_setprio', 0)
             # Phase 22 (VGPR-level prefetch): local_prefetch_num is read further below,
             # in the num_vgpr_accumulate_a/b section -- this __init__ has a later, shared
             # `self.local_prefetch_num = 1` default (for every fma_type) that runs AFTER
@@ -1088,6 +1096,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_f16acc"
         if tunable.wmma_acc_bf16:
             kernel_name += "_bf16acc"
+        if tunable.wmma_setprio:
+            kernel_name += "_setprio"
 
     if tunable.tensor_a_pass_through:
         kernel_name += "_pta"

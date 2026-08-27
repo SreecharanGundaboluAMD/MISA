@@ -1518,6 +1518,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.tdm_global_to_lds_a = self.tunable.tdm_global_load
         ctrl.tdm_global_to_lds_b = self.tunable.tdm_global_load   # Phase 30: B operand too
         ctrl.interleave = self.tunable.main_loop_interleave
+        ctrl.wmma_setprio = self.tunable.wmma_setprio
         ctrl.local_prefetch_num = self.tunable.local_prefetch_num
         # Phase 1 (k-sub-loop): both A and B are untransposed here (K contiguous within
         # an LDS row), so advancing inst_wmma.k K-elements is just inst_wmma.k*data_byte.

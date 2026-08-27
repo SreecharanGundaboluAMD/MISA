@@ -1063,6 +1063,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.async_global_to_lds_a = self.tunable.async_global_load
         ctrl.async_global_to_lds_b = False
         ctrl.local_prefetch_num = self.tunable.local_prefetch_num
+        ctrl.wmma_setprio = self.tunable.wmma_setprio
         # Phase 1 (k-sub-loop): A (grad_output/input, untransposed) advances K-contiguous
         # bytes; B (weight, TRANSPOSED -- [K rows][N cols] in LDS) advances whole K-rows,
         # i.e. inst_wmma.k * row_pitch (row_pitch = gemm_n_per_block*data_byte), matching

@@ -1001,6 +1001,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.lds_single_size  = self.lds_single_size
         ctrl.lds_buffer_num   = self.lds_buffer_num
         ctrl.local_prefetch_num = self.tunable.local_prefetch_num
+        ctrl.wmma_setprio = self.tunable.wmma_setprio
         # Phase 1 (k-sub-loop): both A (grad_output) and B (input) are TRANSPOSED here
         # ([K rows][M or N cols] in LDS), so advancing inst_wmma.k K-elements means
         # advancing inst_wmma.k whole K-rows, i.e. inst_wmma.k * row_pitch, matching each
