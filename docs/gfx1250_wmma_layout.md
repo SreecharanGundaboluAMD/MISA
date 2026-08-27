@@ -4769,3 +4769,109 @@ mutual-exclusion asserts), `python/igemm/igemm_base.py` (new int8/int4 +
 `gemm_k_global_split` shared assert), `driver/igemm_fwd_gtc_driver.h` (karg field,
 split-count heuristic, grid.z, zero-init prolog),
 `config/igemm_fwd_gtc_gfx1250_nhwc_{fp16,bf16,fp32}_gsplit.config` (new).
+
+## Phase 50 (2026-08-27): sane upper bound on `gemm_k_global_split`'s split count
+
+Found via a diverse 60-shape benchmark against real gfx950 MIOpen reference times
+(20 shapes each fwd/bwd/wrw, sampled from `convasmimplicitgemmgtcdynamic_*.txt` by
+FLOPs-size bucket, not hand-picked): one extreme wrw shape
+(`n=256,c=32,H=449,W=449,k=3,3x3`, gemm_m=3 tiny, gemm_k=n*ho*wo huge) made wrw's
+existing real-launch ternary search (Phase 20/33) try a **135000-way split-K**,
+taking minutes just to time that one candidate (massive atomic-add contention across
+that many `grid.z` shards, all targeting a handful of output elements). bwd/fwd's
+simpler heuristic (Phase 48/49) had the identical unbounded-target problem in
+principle, just not yet hit by an equally extreme shape.
+
+**Root cause**: neither heuristic had an upper sanity bound on how far it was willing
+to split. Added a shared helper, `igemm_gemm_k_global_split_cap(gemm_k,
+gemm_k_per_block)` (`driver/igemm_gtc_base.h`), combining two independent caps (the
+tighter wins):
+- **Absolute ceiling** (4096) -- gfx1250 has 256 CUs; splitting far beyond a modest
+  multiple of that has no more real parallelism left to exploit. Comfortably above
+  the largest split count previously measured-and-still-beneficial (wrw's Phase 41
+  gsplit_stagger testing went up to 1260 splits).
+- **Minimum K-elements-per-shard floor** (32, matching bf16/fp16's native
+  `gemm_k_per_block`) -- each shard should still cover a "real" amount of reduction
+  work to amortize the atomic-add's fixed per-shard overhead. This is what actually
+  fixes bwd/fwd's fp32 over-splitting gap (Phase 48/49): a total-workgroup-count-only
+  target can't see that fp32's `gemm_k_per_block=4` makes `num_k_blocks` 8x larger for
+  the same `gemm_k` than bf16/fp16's 32 -- the same "target split count" therefore
+  gave fp32 8x-finer real shards. Bounding K-per-shard directly closes this
+  precision-dependent blind spot without a real per-precision launch sweep.
+
+**Applied**: bwd/fwd's `target_splits` clamped through the cap before
+`largest_divisor_leq`. wrw's ternary search now filters its enumerated `divisors`
+list (and the heuristic candidate it adds) to the cap before ever real-launch-timing
+any of them; its `wrw_reduction_kernel` workspace allocation was also resized from
+`num_k_blocks` (unbounded, could be multi-GB for this class of shape) down to
+`min(num_k_blocks, split_cap)` partitions, matching what the search can now actually
+select. The `IGEMM_GSPLIT_SWEEP` manual research override remains uncapped (an
+explicit, deliberate user action, not the automatic heuristic).
+
+**Hardware validation**: the pathological wrw shape's split-K candidates now show
+capped, sane split counts (e.g. `gkgs[3375]`, `gkgs[1200]`, `gkgs[2500]` instead of
+135000) and each completes in milliseconds; the shape's overall candidate sweep still
+takes a while (its genuinely slow **non-split** candidates -- tiny `gemm_m`, huge
+`gemm_k` -- are a separate, expected characteristic, not a bug) but no longer hangs.
+bwd's fp32 Phase 46/48 target shape: heuristic now picks `gkgs[8]` automatically
+(6.1-6.7 TFLOPS, matching `bf16`'s already-validated split choice on the same shape)
+vs. the old heuristic's `gkgs[64]` (3.3 TFLOPS) -- roughly 2x better, automatically,
+with no manual `IGEMM_GSPLIT_SWEEP` tuning needed (not quite the exact 16-way peak
+found by hand-sweeping, ~7.2 TFLOPS, but a principled, non-overfit improvement).
+bf16's own already-validated `gkgs[8]` choice on that shape is unaffected (the cap
+formula agrees with it exactly, since bf16's `gemm_k_per_block=32` already limits
+`num_k_blocks` to the same value).
+
+**Critical files**: `driver/igemm_gtc_base.h` (new shared
+`igemm_gemm_k_global_split_cap` helper), `driver/igemm_bwd_gtc_driver.h`,
+`driver/igemm_fwd_gtc_driver.h` (target_splits clamped), `driver/igemm_wrw_gtc_driver.h`
+(divisor-list filtering, heuristic-candidate clamp, wsred workspace resize).
+
+## Phase 51 (2026-08-27): fixed `wmma_n_tail`'s `gemm_n % 4 != 0` epilogue gap
+
+Found via the same diverse benchmark: 2 of 20 fwd shapes (`c=2,k=1` and `c=256,k=3`,
+both 1x1) reported "not applicable" across every candidate -- both have `gemm_n` (=`k`)
+not a multiple of 4, a long-tracked, previously-unfixed gap
+(`docs/gfx1250_optimization_backlog.md`'s "New epilogue masking granularity for
+`gemm_n % 4 != 0` N-tail shapes" item): `coalescing_store_wmma.py`'s non-atomic
+epilogue stores `vector_write_out=4` elements per lane per instruction, but the old
+EXEC-mask guard only checked the group's *first* column -- a group whose 4 columns
+straddled a non-multiple-of-4 `gemm_n` silently wrote the out-of-range trailing
+columns too, so `tunable_is_valid()` (fwd/bwd/wrw) additionally required
+`gemm_n % 4 == 0` whenever `wmma_n_tail` was set, as a workaround.
+
+**Fix**: `v_tmp4` (the N-tail scratch register) now holds `remaining = gemm_n - col0`
+(signed), not a plain 0/1 flag -- `remaining > i` for `i=0..vwo-1` is the per-element
+validity check the fix needs (subsumes the old per-group flag exactly, since
+`remaining > 0` is just the `i=0` case). A **runtime** scalar branch (`gemm_n % vwo`,
+precomputed once, pass-invariant) picks per-pass between the original single
+vectorized store (exact-multiple case, byte-identical codegen to before this phase)
+and a new slow path decomposed into `vwo` individual masked scalar stores (only taken
+when `gemm_n` isn't a multiple of `vwo`). A compile-time-only gate (always taking the
+slow path whenever `wmma_n_tail` was set) was tried first and **measured to regress an
+already-working exact-multiple-of-4 shape ~24%** (0.132ms -> 0.164ms on
+`n=96,c=96,H=120,W=160,k=48`) -- the runtime branch avoids that entirely, confirmed
+back to 0.134ms (within noise) after the fix.
+
+**Scope**: only the standard f32-accumulate epilogue (`vector_write_out>1` and not
+`wmma_acc_f16`/`bf16acc`) -- `wmma_acc_f16`/`bf16acc` pack 2 elements per register (see
+the scatter's `ds_write_b16`/`_d16_hi` split), a genuinely different addressing scheme
+not audited here. No existing config combines the two; a new shared `igemm_base.py`
+assert (fwd/bwd/wrw, gated on wrw's atomic-vs-non-atomic epilogue choice) makes this a
+hard error instead of a silent future landmine. `tunable_is_valid()`'s `gemm_n % 4 ==
+0` restriction is lifted in all three drivers now that the underlying gap is fixed.
+
+**Hardware validation**: both originally-failing fwd shapes now `valid:y` (via their
+`mtail_ntail_ktail`/`tdm_mtail_ntail` candidates). Explicit remainder battery
+(`gemm_n % 4` = 1, 2, and 3, bf16/fp16/fp32, fwd and bwd) all `valid:y`. `group=2`
+combined with the new masking: `valid:y` (both fwd and bwd). Zero regression: the
+exact-multiple-of-4 case's performance is restored (see above); full
+`{bwd,fwd,wrw}_{bf16,fp16,fp32,int8}_all.config` master-build sweeps across
+representative shapes (K-tail, group=2, generic ResNet-ish, wrw's existing gsplit
+shape with 25 candidates) all remain `valid:y` with no `valid:n` anywhere.
+
+**Critical files**: `python/operations/coalescing_store_wmma.py` (remaining-based
+N-tail flag, runtime fast/slow store branch, new `s_tmp2` scratch parameter),
+`python/igemm/igemm_{fwd,bwd,wrw}_gtc_wmma_nhwc.py` (pass the new scratch register),
+`python/igemm/igemm_base.py` (new wmma_acc_f16/bf16acc exclusion assert),
+`driver/igemm_{fwd,bwd,wrw}_gtc_driver.h` (lifted `gemm_n % 4 == 0` restriction).

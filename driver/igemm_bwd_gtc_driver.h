@@ -531,11 +531,12 @@ public:
             // Phase 26a: wmma_m_tail relaxes the gemm_m exact-multiple requirement, mirroring
             // fwd's identical relax in igemm_fwd_gtc_driver.h (Phase 25) -- see that file's
             // comment for the rationale. New: wmma_n_tail/wmma_k_tail relax gemm_n/gemm_k the
-            // same way. wmma_n_tail additionally requires the real (unpadded) gemm_n to be a
-            // multiple of 4 -- same vectorized-4-wide-store hazard as fwd's identical
-            // restriction (coalescing_store_wmma.py's shared epilogue, vector_write_out=4;
-            // see igemm_fwd_gtc_driver.h's comment for the full derivation), independent of
-            // bwd's B-operand load-side masking being a different (new) mechanism from fwd's.
+            // same way. Phase 51: wmma_n_tail previously ALSO required the real (unpadded)
+            // gemm_n to be a multiple of 4 -- same vectorized-4-wide-store hazard as fwd's
+            // identical (now-fixed) restriction (coalescing_store_wmma.py's shared epilogue,
+            // vector_write_out=4; see igemm_fwd_gtc_driver.h's comment for the full
+            // derivation and the fix), independent of bwd's B-operand load-side masking being
+            // a different (new) mechanism from fwd's. Lifted for the same reason fwd's was.
             // Phase 42: tdm_global_load relaxes the gemm_k exact-multiple requirement the
             // same way fwd's Phase 31/39 does -- TDM's hardware OOB (tensor_dim0 for A,
             // tensor_dim1 for B, see igemm_bwd_gtc_wmma_nhwc.py's Phase 42 descriptor
@@ -549,7 +550,6 @@ public:
                 return false;
             if((!tunable->wmma_m_tail && gemm_m % gemm_m_per_block != 0) ||
                (!tunable->wmma_n_tail && gemm_n % gemm_n_per_block != 0) ||
-               (tunable->wmma_n_tail && gemm_n % 4 != 0) ||
                (!tunable->tdm_global_load && !tunable->wmma_k_tail && gemm_k % gemm_k_per_block != 0))
                 return false;
             return true;
@@ -750,6 +750,13 @@ public:
             // matching assert in igemm_bwd_gtc_wmma_nhwc.py), so every shard must get an
             // EXACT, equal share of gemm_k -- gemm_k_global_splits is always chosen to
             // evenly divide num_k_blocks.
+            // Phase 50: target_splits is now clamped through igemm_gemm_k_global_split_cap
+            // (igemm_gtc_base.h) -- fixes both the fp32 over-splitting gap found in Phase
+            // 48/49 (a total-workgroup-only target can't see that fp32's finer
+            // gemm_k_per_block=4 makes the same target 8x too fine relative to
+            // bf16/fp16's 32) and an absolute runaway-split sanity ceiling (found via a
+            // diverse gfx950-baseline benchmark sweep hitting a 135000-way split on an
+            // extreme small-gemm_m/n, huge-gemm_k shape).
             int gemm_k_global_splits = 1;
             if (tunable->gemm_k_global_split) {
                 auto largest_divisor_leq = [](int num_blocks, int target) -> int {
@@ -761,7 +768,8 @@ public:
                 int num_k_blocks = gemm_k / tunable->gemm_k_per_block;
                 int sweep_target = env_get_int("IGEMM_GSPLIT_SWEEP", 0);
                 int target_splits = sweep_target > 0 ? sweep_target :
-                    std::max(1, static_cast<int>((512 + grid_x * grid_y - 1) / (grid_x * grid_y)));
+                    std::min(std::max(1, static_cast<int>((512 + grid_x * grid_y - 1) / (grid_x * grid_y))),
+                             igemm_gemm_k_global_split_cap(gemm_k, tunable->gemm_k_per_block));
                 gemm_k_global_splits = largest_divisor_leq(num_k_blocks, target_splits);
                 karg.gemm_k_per_wg = (num_k_blocks / gemm_k_global_splits) * tunable->gemm_k_per_block;
             } else {

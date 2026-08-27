@@ -1798,7 +1798,8 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # docstring's group>1 note) -- s_gemm_n alone (per-group) is only correct for group=1.
         self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_k_total.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off(),
                     s.s_gemm_m.label if self.tunable.wmma_m_tail else None, v.v_m_tail_row() if self.tunable.wmma_m_tail else None,
-                    s.s_gemm_n.label if self.tunable.wmma_n_tail else None, v.v_n_tail_col() if self.tunable.wmma_n_tail else None))
+                    s.s_gemm_n.label if self.tunable.wmma_n_tail else None, v.v_n_tail_col() if self.tunable.wmma_n_tail else None,
+                    s.s_tmp(1) if self.tunable.wmma_n_tail else None))
         self._emit(f"s_wait_storecnt 0x0")
 
     def emit_kernel_body(self):

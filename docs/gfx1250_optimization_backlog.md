@@ -172,18 +172,25 @@ section for the record).
       catches much larger non-multiple-of-4 values already in the corpus, e.g.
       `gemm_n`=486/510/1001 for bwd). Revises overall NHWC-assumed coverage from 99.40%
       to 98.38% — see `docs/gfx1250_wmma_coverage_gap_analysis.md`'s updated tables.
-      Closing the underlying gap itself (not just the classifier) would need a new,
-      finer-grained per-element epilogue masking primitive — tracked as a genuinely new
-      Tier 2 item below (not yet attempted).
-- [ ] **New epilogue masking granularity for `gemm_n % 4 != 0` N-tail shapes**
-      (fwd/bwd) — found while fixing the classifier blind spot above. fwd/bwd's
-      non-atomic vectorized-4-wide-store epilogue (`coalescing_store_wmma.py`) can't
-      correctly handle a `gemm_n` that both needs N-tail relief AND isn't a multiple of
-      4 — the EXEC-mask guard only checks a group's first column, so out-of-range tail
-      columns within the same 4-wide group get written too. Closing this for real (not
-      just in the classifier) needs a per-element (not per-4-wide-group) masking
-      primitive in the shared epilogue, affecting both fwd and bwd. Real engineering
-      effort (Tier C), not a config-only fix — not yet attempted.
+      The underlying gap itself (not just the classifier) is now closed too — see
+      Phase 51 below. `script/classify_gfx1250_coverage.py`'s `gap_n_mod4_*`
+      categories are now stale (would still report these shapes as unsupported) but
+      were not updated in this pass — a small follow-up if the coverage doc is
+      regenerated again.
+- [x] **New epilogue masking granularity for `gemm_n % 4 != 0` N-tail shapes**
+      (fwd/bwd/wrw) — done 2026-08-27 (Phase 51), hardware-validated. Found again (as
+      "not applicable" on 2/20 shapes) via a diverse gfx950-baseline benchmark sweep.
+      `coalescing_store_wmma.py`'s non-atomic epilogue now decomposes its vectorized
+      store into per-element masked scalar stores via a **runtime** branch (only taken
+      when `gemm_n` isn't actually a multiple of `vector_write_out` this pass) — a
+      compile-time-only version was tried first and measured to regress an
+      already-working exact-multiple-of-4 shape ~24%, which the runtime branch avoids
+      entirely. `tunable_is_valid()`'s `gemm_n % 4 == 0` restriction is lifted in all
+      three drivers. Scoped to the standard f32-accumulate case only —
+      `wmma_acc_f16`/`bf16acc`'s packed-2-elements-per-register layout is a genuinely
+      different addressing scheme, not audited (no existing config combines the two;
+      now a hard `igemm_base.py` assert instead of a silent gap). See
+      `docs/gfx1250_wmma_layout.md`'s Phase 51.
 - [x] **Add a 32x32 bwd macro-tile for small-gemm_m/n occupancy** — done 2026-08-27
       (Phase 46), hardware-validated, all 3 precisions. Closes ~1.5x of a ~2.6x gap vs.
       CK found on a small-spatial/large-channel bwd shape. See
@@ -219,16 +226,32 @@ section for the record).
       a follow-up item (below) to make the heuristic `gemm_k_per_block`-aware.
       Not combined with `wmma_k_tail` or `tdm_global_load` in this pass (both
       explicitly asserted against) — see `docs/gfx1250_wmma_layout.md`'s Phase 48.
-- [ ] **bwd/fwd split-K driver heuristic over-splits for fp32** — opened 2026-08-27
-      (Phase 48), confirmed to also affect fwd (Phase 49). The `~512-total-workgroups`
-      heuristic in `driver/igemm_bwd_gtc_driver.h` and `driver/igemm_fwd_gtc_driver.h`
-      doesn't account for `gemm_k_per_block` varying by precision (fp32's WMMA K=4 vs.
-      bf16/fp16's K=32) — on bwd's Phase 46 target shape it picks a 64-way split
-      (3.3 TFLOPS) when a 16-way split (found via `IGEMM_GSPLIT_SWEEP`) gives 7.2
-      TFLOPS; fwd shows the identical pattern. Fix: scale the target total-workgroups
-      heuristic (or switch to wrw's fuller ternary-search-over-divisors approach, which
-      would also benefit wrw) by `gemm_k_per_block`. Low-to-moderate effort (Tier 1/2),
-      driver-only change, same fix would apply to all three directions at once.
+- [x] **bwd/fwd split-K driver heuristic over-splits for fp32** — fixed 2026-08-27
+      (Phase 50), hardware-validated. Root cause confirmed: the `~512-total-workgroups`
+      heuristic in `driver/igemm_bwd_gtc_driver.h`/`igemm_fwd_gtc_driver.h` targets a
+      *split count* independent of `gemm_k_per_block`, so fp32 (K=4, 8x finer than
+      bf16/fp16's K=32) got 8x-too-fine real shards for the same target. Fixed by
+      clamping `target_splits` through a new shared `igemm_gemm_k_global_split_cap`
+      helper (`driver/igemm_gtc_base.h`) that bounds K-elements-per-shard to a floor
+      (32) regardless of `gemm_k_per_block` — bwd's Phase 46 target shape now
+      auto-picks `gkgs[8]` (6.1-6.7 TFLOPS, ~2x better than the old `gkgs[64]`'s 3.3
+      TFLOPS) with no manual `IGEMM_GSPLIT_SWEEP` needed; bf16's own already-good
+      `gkgs[8]` choice is unaffected (the cap agrees with it exactly). Not a full
+      per-precision launch sweep (wrw's fuller ternary-search approach remains a
+      further option if the last ~15% to the hand-tuned peak ever matters) but a
+      principled, non-overfit fix. See `docs/gfx1250_wmma_layout.md`'s Phase 50.
+- [x] **split-K heuristics had no upper sanity bound on split count** — found and
+      fixed 2026-08-27 (Phase 50), hardware-validated. An extreme wrw shape
+      (`n=256,c=32,H=449,W=449,k=3`, tiny gemm_m, huge gemm_k) made wrw's existing
+      real-launch ternary search try a **135000-way split**, taking minutes to time
+      just that one candidate (massive atomic-add contention). Fixed via the same
+      shared `igemm_gemm_k_global_split_cap` helper above (absolute ceiling 4096,
+      comfortably above the largest previously-useful split count measured, 1260) —
+      applied to bwd/fwd's heuristic target and to wrw's enumerated divisor list (plus
+      its `wrw_reduction_kernel` workspace allocation, previously sized for the
+      uncapped `num_k_blocks`, a latent multi-GB-allocation risk for this shape class).
+      `IGEMM_GSPLIT_SWEEP`'s manual override remains intentionally uncapped. See
+      `docs/gfx1250_wmma_layout.md`'s Phase 50.
 - [x] **bwd `group>1` returns `valid:n`** — fixed 2026-08-27 (Phase 47). Root cause: a
       copy-paste-from-fwd bug in the weight operand's group-offset computation (used
       `gemm_n` instead of bwd's own `gemm_k` — see `docs/gfx1250_wmma_layout.md`'s Phase

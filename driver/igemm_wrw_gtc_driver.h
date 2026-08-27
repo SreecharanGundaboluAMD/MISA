@@ -276,12 +276,14 @@ public:
             // igemm_fwd_gtc_driver.h. Unlike fwd/bwd, wrw's M/N-tail must also work under
             // gemm_k_global_split (checked/asserted at the tunable-construction level in
             // igemm_base.py, not here), so no additional restriction is needed here for that.
-            // gemm_n%4==0 mirrors fwd's identical requirement (igemm_fwd_gtc_driver.h) for
-            // the NON-atomic epilogue only -- its store is vector_write_out=4-wide, and the
-            // EXEC-mask guard only checks a group's first column, so a group straddling a
-            // non-multiple-of-4 tail would silently write past the real gemm_n. The atomic
-            // epilogue (gemm_k_global_split) issues one scalar atomic per element (no 4-wide
-            // grouping), so this restriction does not apply there.
+            // Phase 51: gemm_n%4==0 previously mirrored fwd's identical (now-fixed)
+            // requirement for the NON-atomic epilogue -- its store is vector_write_out=4-
+            // wide, and the EXEC-mask guard only checked a group's first column, so a group
+            // straddling a non-multiple-of-4 tail silently wrote past the real gemm_n. Fixed
+            // with genuine per-element masking (coalescing_store_wmma.py's Phase 51 comment)
+            // -- lifted for the same reason fwd's was. The atomic epilogue
+            // (gemm_k_global_split) issues one scalar atomic per element (no 4-wide
+            // grouping) and was never affected by this in the first place.
             // Phase 45: tdm_global_load relaxes the gemm_k (wmma_gemm_k = n*ho*wo) exact-
             // multiple requirement the same way fwd's Phase 39/bwd's Phase 42 do -- TDM's
             // hardware OOB zero-fills the tail row on both A and B. Also mirrors those same
@@ -309,7 +311,6 @@ public:
                 return false;
             if((!tunable->wmma_m_tail && wmma_gemm_m % tunable->gemm_m_per_block != 0) ||
                (!tunable->wmma_n_tail && wmma_gemm_n % tunable->gemm_n_per_block != 0) ||
-               (tunable->wmma_n_tail && !tunable->gemm_k_global_split && wmma_gemm_n % 4 != 0) ||
                (!tunable->tdm_global_load && !tunable->wmma_k_tail && wmma_gemm_k % tunable->gemm_k_per_block != 0))
                 return false;
             return true;
@@ -796,15 +797,27 @@ public:
             // wmma_k_tail is unset (gemm_k is then required to be an exact multiple already,
             // per tunable_is_valid()).
             int gemm_k_tail = tunable->wmma_k_tail ? (gemm_k - num_k_blocks * tunable->gemm_k_per_block) : 0;
+            // Phase 50: sane upper bound on how far the search below is allowed to split --
+            // see igemm_gemm_k_global_split_cap's own comment (igemm_gtc_base.h). Without
+            // this, an extreme small-gemm_m/n (tiny output), huge-gemm_k (huge n*ho*wo)
+            // shape can produce num_k_blocks in the millions, and the ternary search below
+            // would REAL-LAUNCH-time a pathological divisor near it (a 135000-way split was
+            // observed taking minutes for a single candidate, dominated by atomic-add
+            // contention across that many workgroup-z shards all targeting a handful of
+            // output elements) -- found via a diverse gfx950-baseline benchmark sweep.
+            int split_cap = tunable->gemm_k_global_split
+                ? igemm_gemm_k_global_split_cap(gemm_k, tunable->gemm_k_per_block) : 1;
             std::vector<int> divisors;
             if (tunable->gemm_k_global_split) {
                 for (int i = 1; static_cast<long long>(i) * i <= num_k_blocks; i++) {
                     if (num_k_blocks % i == 0) {
-                        divisors.push_back(i);
-                        if (i != num_k_blocks / i) divisors.push_back(num_k_blocks / i);
+                        if (i <= split_cap) divisors.push_back(i);
+                        int j = num_k_blocks / i;
+                        if (j != i && j <= split_cap) divisors.push_back(j);
                     }
                 }
                 std::sort(divisors.begin(), divisors.end());
+                if (divisors.empty()) divisors.push_back(1);
             } else {
                 divisors.push_back(1);
             }
@@ -816,15 +829,18 @@ public:
             // writes disjoint per-shard partial sums into a workspace buffer instead of
             // atomic-accumulating directly into the real output -- a separate reduction
             // kernel (wrw_reduce_partials_f32) sums them afterward. Workspace is sized for
-            // num_k_blocks partitions (the largest split count the ternary search below
-            // could ever try), fp32-native regardless of the tunable's nominal precision
-            // (same rationale as the atomic path's always-fp32 output, see docs/
-            // gfx1250_wmma_layout.md's Phase 34/17), so every candidate fits without
-            // reallocating mid-search.
+            // min(num_k_blocks, split_cap) partitions (Phase 50: the largest split count the
+            // ternary search below could now ever try, since its divisor list is capped --
+            // previously sized for the uncapped num_k_blocks, which could be a multi-GB
+            // allocation for an extreme small-gemm_m/n, huge-gemm_k shape), fp32-native
+            // regardless of the tunable's nominal precision (same rationale as the atomic
+            // path's always-fp32 output, see docs/gfx1250_wmma_layout.md's Phase 34/17), so
+            // every candidate fits without reallocating mid-search.
             void *p_wei_workspace_wsred = nullptr;
             size_t wsred_output_size = static_cast<size_t>(group) * (k / group) * (c / group) * y * x;
             if (tunable->wrw_reduction_kernel) {
-                HIP_CALL(hipMalloc(&p_wei_workspace_wsred, static_cast<size_t>(num_k_blocks) * wsred_output_size * sizeof(float)));
+                size_t wsred_partitions = static_cast<size_t>(std::min(num_k_blocks, split_cap));
+                HIP_CALL(hipMalloc(&p_wei_workspace_wsred, wsred_partitions * wsred_output_size * sizeof(float)));
                 karg.p_out = p_wei_workspace_wsred;
             } else {
                 karg.p_out = p_wei;   // grad_weight (write)
@@ -873,7 +889,7 @@ public:
             if (tunable->gemm_k_global_split) {
                 int potential_occupancy = 1;
                 HIP_CALL(hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(&potential_occupancy, kernel_func, static_cast<int>(block_size), 0));
-                int heuristic_splits = compute_gemmk_global_splits(static_cast<int>(grid_x * grid_y), potential_occupancy);
+                int heuristic_splits = std::min(compute_gemmk_global_splits(static_cast<int>(grid_x * grid_y), potential_occupancy), split_cap);
                 int heuristic_candidate = largest_divisor_leq(num_k_blocks, heuristic_splits);
                 if (std::find(divisors.begin(), divisors.end(), heuristic_candidate) == divisors.end()) {
                     divisors.push_back(heuristic_candidate);

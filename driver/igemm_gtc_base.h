@@ -46,6 +46,7 @@ using float16 = int16_t;
 #include <functional>
 #include <stdint.h>
 #include <numeric>
+#include <algorithm>
 #include "magic_div.h"
 #include "shisa_dumps.h"
 
@@ -698,6 +699,36 @@ static inline int igemm_get_max_gks(int gemm_k, int gemm_k_per_block, int max_lo
     if(gks > max_log2_splits)
         gks = max_log2_splits;
     return gks;
+}
+
+// Phase 50: sane upper bound on gfx1250 WMMA gemm_k_global_split's split count, shared by
+// bwd/fwd/wrw's WMMA launch paths. Splitting the reduction axis across grid.z provides real
+// parallelism/occupancy benefit only up to a point; beyond it, atomic-add contention
+// dominates and further splitting can only hurt. Two independent caps combine (the tighter
+// one applies):
+//  - an absolute ceiling (gfx1250 has 256 CUs; splitting far beyond a modest multiple of
+//    that has no more real parallelism left to exploit). 4096 is comfortably above the
+//    largest split count previously measured-and-still-beneficial (wrw's Phase 41
+//    gsplit_stagger testing went up to 1260 splits), while cutting off genuinely runaway
+//    values -- an extreme small-gemm_m/n, huge-gemm_k wrw shape was observed picking a
+//    135000-way split (and taking minutes just to real-launch-time that one candidate)
+//    before this cap existed, see docs/gfx1250_wmma_layout.md's Phase 50.
+//  - a minimum K-elements-per-shard floor: each shard's own K-slice should still cover a
+//    "real" amount of reduction work to amortize the atomic-add's fixed per-shard overhead,
+//    independent of gemm_k_per_block. This is what actually fixes fp32
+//    (gemm_k_per_block=4) over-splitting relative to bf16/fp16 (gemm_k_per_block=32): a
+//    total-workgroup-count-only heuristic can't see that fp32's num_k_blocks is 8x larger
+//    for the same gemm_k, so the same "target split count" gives fp32 8x-finer real shards
+//    than bf16/fp16 at the identical shape -- bounding K elements per shard directly (32,
+//    matching bf16/fp16's own native gemm_k_per_block) closes this precision-dependent
+//    blind spot without needing a real per-precision launch sweep to discover it.
+static inline int igemm_gemm_k_global_split_cap(int gemm_k, int gemm_k_per_block)
+{
+    constexpr int MAX_GEMM_K_SPLITS = 4096;
+    constexpr int MIN_GEMM_K_PER_SHARD = 32;
+    int num_k_blocks = std::max(1, gemm_k / gemm_k_per_block);
+    int max_by_min_shard = std::max(1, gemm_k / MIN_GEMM_K_PER_SHARD);
+    return std::min({MAX_GEMM_K_SPLITS, num_k_blocks, max_by_min_shard});
 }
 
 // this is to support big tensor > 4G. need to decide how many splits needed

@@ -668,6 +668,12 @@ class igemm_gtc_tunable_parameter_t(object):
                 if self.direction == 'wrw':
                     assert not self.atomic_pack_bf16, \
                         "wmma_n_tail and atomic_pack_bf16 are mutually exclusive for now -- same reasoning as wmma_m_tail, see docs/gfx1250_wmma_layout.md's Phase 35"
+                    # Phase 51: only matters when wrw takes the shared NON-atomic epilogue
+                    # (gemm_k_global_split=0) -- the atomic path (scalar-per-element already)
+                    # is unaffected by this regardless of accumulate width. See the identical
+                    # assert/reasoning in the fwd/bwd branch below.
+                    assert self.gemm_k_global_split or not (self.wmma_acc_f16 or self.wmma_acc_bf16), \
+                        "wmma_n_tail's per-element epilogue masking is not yet implemented for wmma_acc_f16/bf16acc's packed 2-elements-per-register layout, see docs/gfx1250_wmma_layout.md's Phase 51"
                 else:
                     assert not self.gemm_k_global_split, \
                         "wmma_n_tail and gemm_k_global_split are mutually exclusive for now -- the atomic epilogue branch has no N-tail masking, see docs/gfx1250_wmma_layout.md's Phase 26b"
@@ -675,6 +681,16 @@ class igemm_gtc_tunable_parameter_t(object):
                         "wmma_n_tail and async_global_load are mutually exclusive for now -- global_load_async_to_lds_b128's masking was only ever validated for the A operand, see docs/gfx1250_wmma_layout.md's Phase 13/26b"
                     assert self.gemm_n_per_block // self.block_size == 1, \
                         "wmma_n_tail requires row_repeat_b == 1 -- rows 1+ have no flag of their own, see docs/gfx1250_wmma_layout.md's Phase 26b"
+                    # Phase 51: the new per-element (not per-vwo-group) epilogue masking that
+                    # lifts the gemm_n%4==0 restriction (coalescing_store_wmma.py) was only
+                    # implemented for the standard f32-accumulate layout, where each of the
+                    # vector_write_out elements occupies one whole VGPR -- wmma_acc_f16/
+                    # bf16acc pack TWO elements per register (see the scatter's ds_write_b16/
+                    # _d16_hi split), a genuinely different addressing scheme not audited
+                    # here. No existing config combines the two, so this is a forward-looking
+                    # guard, not a real regression.
+                    assert not (self.wmma_acc_f16 or self.wmma_acc_bf16), \
+                        "wmma_n_tail's per-element epilogue masking is not yet implemented for wmma_acc_f16/bf16acc's packed 2-elements-per-register layout, see docs/gfx1250_wmma_layout.md's Phase 51"
             # Phase 35 (GEMM_K tail, wrw): no precedent anywhere else in this codebase --
             # unlike the TDM-hardware-OOB K-tail fwd/1x1 uses (Phase 31), this is a genuine
             # software EXEC-mask mechanism, since wrw doesn't use TDM. Composes with

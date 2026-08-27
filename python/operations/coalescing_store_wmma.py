@@ -152,8 +152,14 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         mc_base_t.__init__(self, mc)
         assert type(ctrl) is ctrl_coalescing_store_wmma_t
         self.ctrl = ctrl
+        # Phase 51: per-pass fast/slow store branch labels (see __call__'s non-atomic path)
+        # -- id(self) keeps these unique across every kernel in an assembled multi-kernel
+        # file (each kernel builds its own igemm_coalescing_store_wmma_t instance, called
+        # exactly once, so a per-instance counter alone would collide across kernels
+        # sharing the same small counter values).
+        self._label_counter = 0
 
-    def __call__(self, v_c, v_gemm_im, v_gemm_in, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1, v_tid=None, v_gather=None, s_block_m_off=None, s_block_n_off=None, s_gemm_m=None, v_tmp3=None, s_gemm_n=None, v_tmp4=None):
+    def __call__(self, v_c, v_gemm_im, v_gemm_in, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1, v_tid=None, v_gather=None, s_block_m_off=None, s_block_n_off=None, s_gemm_m=None, v_tmp3=None, s_gemm_n=None, v_tmp4=None, s_tmp2=None):
         '''
         v_gemm_im/v_gemm_in: this thread's base (row, col) within the macro tile, from
             igemm_wmma_mapping_t.get_gemm_index_for_dst_matrix (row/col of wave_repeat
@@ -351,6 +357,10 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                 macro_tile_m = cxm.macro_tile_m
                 macro_tile_n = cxm.macro_tile_n
                 assert macro_tile_n % vwo == 0, f"macro_tile_n:{macro_tile_n} not divisible by vector_write_out:{vwo}"
+                if ctrl.wmma_n_tail and vwo > 1 and not ctrl.wmma_acc_f16:
+                    # Phase 51: dedicated scratch for the per-pass fast/slow store branch --
+                    # see the pass loop below.
+                    assert s_tmp2 is not None, "wmma_n_tail with vector_write_out>1 (the non-narrow-accumulate case) requires s_tmp2, see Phase 51"
                 total_elements = macro_tile_m * macro_tile_n
                 elements_per_thread = total_elements // ctrl.block_size
                 assert elements_per_thread % vwo == 0, f"elements_per_thread:{elements_per_thread} not divisible by vector_write_out:{vwo}"
@@ -476,14 +486,27 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                 self._emit(f"v_add_u32 v[{v_gather}], s[{s_block_n_off}], v[{v_gather}]   ; + block_n_off -> global col")
                 self._emit(f"v_add_u32 v[{v_tmp2}], s[{s_block_m_off}], v[{v_tmp2}]   ; + block_m_off -> global row")
                 if ctrl.wmma_n_tail:
-                    # Phase 26b: this lane's column-in-range flag, captured NOW -- v_gather
+                    # Phase 26b/51: this lane's column-in-range state, captured NOW -- v_gather
                     # itself is about to be reused as the gather's LDS-read destination
                     # register (v_gather_range aliases v_gather, see below), so its "global
                     # column" value would otherwise be gone before pass 0's guard needs it.
                     # Pass-invariant (column never changes across passes), so this is computed
-                    # once here, not per-pass.
-                    self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s_gemm_n}], v[{v_gather}]")
-                    self._emit(f"v_cndmask_b32 v[{v_tmp4}], 0, 1, vcc_lo   ; wmma_n_tail: col < real gemm_n")
+                    # once here, not per-pass. Phase 51: holds "remaining = gemm_n - col0"
+                    # (SIGNED), not a plain 0/1 flag -- "remaining > i" for i=0..vwo-1 is what
+                    # the per-element masking below needs (a per-GROUP flag, "remaining > 0",
+                    # is just the i=0 case of the same check, so this subsumes the old Phase
+                    # 26b behavior exactly for vwo==1 / non-straddling groups). Signed
+                    # subtraction/compare also correctly masks off every element when
+                    # gemm_n < vwo (remaining goes negative).
+                    self._emit(f"v_sub_i32 v[{v_tmp4}], s[{s_gemm_n}], v[{v_gather}]   ; wmma_n_tail: remaining = gemm_n - col0")
+                    if vwo > 1 and not ctrl.wmma_acc_f16:
+                        # Phase 51: gemm_n % vwo, computed ONCE (pass-invariant) into its own
+                        # dedicated scratch SGPR -- lets each pass cheaply branch straight to
+                        # the pre-Phase-51 fast (single vectorized store) path whenever the
+                        # real gemm_n happens to be an exact multiple of vwo, instead of always
+                        # paying the slower per-element decomposition (see the pass loop
+                        # below). vwo is a compile-time power of 2, so a plain AND suffices.
+                        self._emit(f"s_and_b32 s[{s_tmp2}], s[{s_gemm_n}], {vwo - 1}   ; wmma_n_tail: gemm_n % {vwo}")
                 if ctrl.wmma_m_tail:
                     # Phase 25: this lane's absolute row for pass 0, preserved across passes --
                     # v_tmp2 itself gets folded into a byte address on the next line, so it can't
@@ -501,24 +524,67 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                     # unpadded f32 case (elem_bytes=4).
                     self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * row_step_per_pass * padded_stride * elem_bytes}")
                     self._emit(f"s_wait_dscnt 0x0")
-                    if ctrl.wmma_m_tail:
-                        # Phase 25: EXEC-mask off lanes whose absolute row for this pass is in
-                        # the tail block's out-of-range tail (>= real gemm_m). Wave32-only idiom
-                        # (v_cmpx narrows EXEC directly, exec_lo restore afterward) -- mirrors
-                        # _emit_gld_chunk_load's existing v_flag masking in
-                        # igemm_fwd_gtc_wmma_nhwc.py, not XDLOPS's 64-bit saveexec/or pattern.
-                        self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
-                    if ctrl.wmma_n_tail:
-                        # Phase 26b: chained right after the M-tail guard (if any) -- wave32
-                        # v_cmpx intersects with the current EXEC rather than overwriting it,
-                        # so this further narrows to lanes that are ALSO column-in-range.
-                        # v_tmp4 holds the pass-invariant column flag computed once above (see
-                        # the flag idiom used by _emit_gld_chunk_load elsewhere in this
-                        # codebase: v_cmpx_le_u32 1, v[flag]).
-                        self._emit(f"v_cmpx_le_u32 1, v[{v_tmp4}]   ; wmma_n_tail: col < real gemm_n")
-                    self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
-                    if ctrl.wmma_m_tail or ctrl.wmma_n_tail:
+                    if ctrl.wmma_n_tail and vwo > 1 and not ctrl.wmma_acc_f16:
+                        # Phase 51: gemm_n is no longer guaranteed to be a multiple of vwo here
+                        # (that restriction -- previously required by tunable_is_valid()
+                        # whenever wmma_n_tail was set -- is exactly what this mechanism
+                        # lifts), so a single EXEC mask covering the whole vwo-wide vectorized
+                        # store can't correctly handle gemm_n falling STRICTLY INSIDE one
+                        # lane's group (the old mask only checked the group's first column,
+                        # silently writing up to vwo-1 out-of-range trailing columns too).
+                        #
+                        # A runtime scalar branch picks between the pre-Phase-51 fast path
+                        # (single vectorized store, exact-multiple case -- byte-identical to
+                        # before this phase) and a slow path decomposed into vwo individual
+                        # masked scalar stores (only the specific straddling group's write
+                        # differs from the fast path; every other lane's data is unaffected
+                        # either way) -- measured on real hardware to matter: without this
+                        # branch (always taking the slow path), an existing exact-multiple-of-4
+                        # shape regressed ~24% (0.132ms -> 0.164ms). gemm_n % vwo is pass-
+                        # invariant, precomputed once into s_tmp2 above. m_tail's row check
+                        # (if any) is cheaply recomputed fresh for each slow-path element (1
+                        # extra VALU instruction) rather than saving/restoring a partially-
+                        # narrowed EXEC state across elements -- avoids needing yet another
+                        # scratch register. Not yet extended to wmma_acc_f16/bf16acc's packed-
+                        # 2-elements-per-register layout (no existing config combines the two,
+                        # asserted against in igemm_base.py -- see
+                        # docs/gfx1250_optimization_backlog.md).
+                        self._label_counter += 1
+                        label_slow = f"L_cstore_{id(self)}_{self._label_counter}_ntail_slow"
+                        label_done = f"L_cstore_{id(self)}_{self._label_counter}_ntail_done"
+                        self._emit(f"s_cmp_eq_u32 s[{s_tmp2}], 0")
+                        self._emit(f"s_cbranch_scc0 {label_slow}   ; Phase 51: gemm_n % {vwo} != 0 this pass -> per-element masking")
+                        if ctrl.wmma_m_tail:
+                            self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (fast path)")
+                        self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n (fast path)")
+                        self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
                         self._emit(f"s_mov_b32 exec_lo, -1")
+                        self._emit(f"s_branch {label_done}")
+                        self._emit_front(f"{label_slow}:")
+                        for i in range(vwo):
+                            if ctrl.wmma_m_tail:
+                                self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (elem {i})")
+                            self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], {i}   ; wmma_n_tail: col0+{i} < real gemm_n")
+                            self._emit(f"global_store_dword v[{v_tmp2}], v[{v_gather}+{i}], s[{s_p_out}:{s_p_out}+1] offset:{i * elem_bytes}")
+                            self._emit(f"s_mov_b32 exec_lo, -1")
+                        self._emit_front(f"{label_done}:")
+                    else:
+                        if ctrl.wmma_m_tail:
+                            # Phase 25: EXEC-mask off lanes whose absolute row for this pass is in
+                            # the tail block's out-of-range tail (>= real gemm_m). Wave32-only idiom
+                            # (v_cmpx narrows EXEC directly, exec_lo restore afterward) -- mirrors
+                            # _emit_gld_chunk_load's existing v_flag masking in
+                            # igemm_fwd_gtc_wmma_nhwc.py, not XDLOPS's 64-bit saveexec/or pattern.
+                            self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
+                        if ctrl.wmma_n_tail:
+                            # Phase 26b: chained right after the M-tail guard (if any) -- wave32
+                            # v_cmpx intersects with the current EXEC rather than overwriting it,
+                            # so this further narrows to lanes that are ALSO column-in-range.
+                            # Phase 51: "remaining > 0" is exactly the old "col0 < gemm_n" flag.
+                            self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n")
+                        self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
+                        if ctrl.wmma_m_tail or ctrl.wmma_n_tail:
+                            self._emit(f"s_mov_b32 exec_lo, -1")
                     if it != num_passes - 1:
                         self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_tmp2}], s[{s_tmp1}]   ; advance to pass {it + 1}")
                         if ctrl.wmma_m_tail:

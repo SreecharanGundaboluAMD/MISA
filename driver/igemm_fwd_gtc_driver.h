@@ -453,22 +453,27 @@ public:
             // Phase 25: wmma_m_tail relaxes the gemm_m exact-multiple requirement -- the
             // kernel's v_flag/epilogue masking (see igemm_fwd_gtc_wmma_nhwc.py) handles the
             // partial tail block correctly. Phase 26b: wmma_n_tail does the same for gemm_n
-            // (B-operand load masking + a second epilogue guard) -- BUT the epilogue's
+            // (B-operand load masking + a second epilogue guard). Phase 51: the epilogue's
             // non-atomic store is vectorized 4 elements (fp32-accumulator dwords) at a time
-            // (coalescing_store_wmma.py's vector_write_out=4, not currently a config knob),
-            // and the EXEC-mask guard only checks the group's FIRST column -- a group whose
-            // 4 columns straddle a non-multiple-of-4 gemm_n would silently write the
+            // (coalescing_store_wmma.py's vector_write_out=4, not currently a config knob) --
+            // previously the EXEC-mask guard only checked the group's FIRST column, so a
+            // group whose 4 columns straddled a non-multiple-of-4 gemm_n silently wrote the
             // out-of-range tail columns too (confirmed on real hardware: valid:n for
-            // gemm_n%4 != 0, valid:y otherwise). So wmma_n_tail additionally requires the
-            // real (unpadded) gemm_n itself to be a multiple of 4 -- not just relaxed to
-            // "any" non-exact-multiple-of-gemm_n_per_block value. gemm_k still requires an
-            // exact multiple of gemm_k_per_block UNLESS tdm_global_load is set: TDM's
-            // hardware OOB (tensor_dim0 < tile_dim0 zero-fills the tail row, on both A and
-            // B since Phase 30) handles a genuinely partial last K-block with no software
-            // masking at all -- see Phase 31 in docs/gfx1250_wmma_layout.md. New: wmma_k_tail
-            // relaxes it the same way for multi-tap convs (TDM is 1x1-only) -- a genuinely
-            // different, software (fine-grained per-dword mask) mechanism, mutually
-            // exclusive with tdm_global_load, see Phase 38.
+            // gemm_n%4 != 0, valid:y otherwise) -- wmma_n_tail additionally required the real
+            // (unpadded) gemm_n itself to be a multiple of 4 to work around it. Now fixed with
+            // genuine per-element masking (decomposing the vectorized store into per-element
+            // masked scalar stores only for the specific group straddling the boundary, see
+            // coalescing_store_wmma.py's Phase 51 comment) -- the gemm_n%4==0 restriction is
+            // lifted (igemm_base.py's tunable-construction-time assert guarantees
+            // wmma_acc_f16/bf16acc, the one combination Phase 51 didn't extend to, can never
+            // reach here alongside wmma_n_tail). gemm_k still requires an exact multiple of
+            // gemm_k_per_block UNLESS tdm_global_load is set: TDM's hardware OOB
+            // (tensor_dim0 < tile_dim0 zero-fills the tail row, on both A and B since Phase
+            // 30) handles a genuinely partial last K-block with no software masking at all --
+            // see Phase 31 in docs/gfx1250_wmma_layout.md. New: wmma_k_tail relaxes it the
+            // same way for multi-tap convs (TDM is 1x1-only) -- a genuinely different,
+            // software (fine-grained per-dword mask) mechanism, mutually exclusive with
+            // tdm_global_load, see Phase 38.
             // Found while validating the master-config search (new): tdm_global_load's
             // "1x1/unit-stride only" restriction (docs/gfx1250_wmma_layout.md's Phase 28)
             // was previously enforced only at CONFIG level (igemm_base.py asserts nxe==0
@@ -481,7 +486,6 @@ public:
                 return false;
             if((!tunable->wmma_m_tail && gemm_m % gemm_m_per_block != 0) ||
                (!tunable->wmma_n_tail && gemm_n % gemm_n_per_block != 0) ||
-               (tunable->wmma_n_tail && gemm_n % 4 != 0) ||
                (!tunable->tdm_global_load && !tunable->wmma_k_tail && gemm_k % gemm_k_per_block != 0))
                 return false;
             return true;
@@ -699,6 +703,8 @@ public:
             // assert in igemm_fwd_gtc_wmma_nhwc.py), so every shard must get an EXACT, equal
             // share of gemm_k -- gemm_k_global_splits is always chosen to evenly divide
             // num_k_blocks.
+            // Phase 50: target_splits clamped through igemm_gemm_k_global_split_cap
+            // (igemm_gtc_base.h) -- see bwd driver's identical Phase 50 comment for why.
             int gemm_k_global_splits = 1;
             if (tunable->gemm_k_global_split) {
                 auto largest_divisor_leq = [](int num_blocks, int target) -> int {
@@ -710,7 +716,8 @@ public:
                 int num_k_blocks = gemm_k / tunable->gemm_k_per_block;
                 int sweep_target = env_get_int("IGEMM_GSPLIT_SWEEP", 0);
                 int target_splits = sweep_target > 0 ? sweep_target :
-                    std::max(1, static_cast<int>((512 + grid_x * grid_y - 1) / (grid_x * grid_y)));
+                    std::min(std::max(1, static_cast<int>((512 + grid_x * grid_y - 1) / (grid_x * grid_y))),
+                             igemm_gemm_k_global_split_cap(gemm_k, tunable->gemm_k_per_block));
                 gemm_k_global_splits = largest_divisor_leq(num_k_blocks, target_splits);
                 karg.gemm_k_per_wg = (num_k_blocks / gemm_k_global_splits) * tunable->gemm_k_per_block;
             } else {
