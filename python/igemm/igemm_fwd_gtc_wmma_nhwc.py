@@ -212,6 +212,21 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # reached from more than one place in the Python source (initial issue before the
         # loop, re-issue inside the loop body), each needing its own unique skip-label.
         self._tdm_label_counter = 0
+        # GEMM_K tail, non-TDM (new): fwd's A and B are BOTH "hard case" for K-tail (each
+        # lane owns one fixed row and reads gemm_k_per_block elements CONTIGUOUSLY in one
+        # shot -- confirmed via docs/gfx1250_wmma_layout.md's Phase 36 comparison: this is
+        # structurally identical to bwd's A, not bwd's B/wrw's B, since fwd's B is natural
+        # (non-transposed), not per-lane-one-K-position). EXEC can't gate a sub-range
+        # within one lane's own multi-element load, so this reuses bwd's fine-grained
+        # per-dword AND-mask primitive (_emit_tail_dword_mask/_emit_tail_dword_mask_guarded
+        # below) for BOTH operands, unlike bwd where only A needed it. Mutually exclusive
+        # with tdm_global_load (TDM already handles K-tail its own way, via hardware OOB --
+        # see Phase 31/37 -- for the 1x1-only case this new mechanism does NOT require).
+        assert not (tunable.wmma_k_tail and tunable.tdm_global_load), \
+            "wmma_k_tail (new, non-TDM) and tdm_global_load are mutually exclusive -- TDM already has its own K-tail mechanism"
+        assert not (tunable.wmma_k_tail and (self.row_repeat_a > 1 or self.row_repeat_b > 1)), \
+            "wmma_k_tail is not supported together with row_repeat_a/b > 1 (untested combination)"
+        self._tail_mask_label_id = 0
 
         # Phase 24/27: 'fp16_f16acc'/'bf16_bf16acc' are separate table keys (not fields), see
         # wmma_mapping.py -- pick the num_v_c=4 narrow-accumulate instruction instead of the
@@ -1093,6 +1108,16 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             # start of EVERY tap -- see _emit_lds_offset_setup's docstring for why.
             self._emit_lds_offset_setup()
         self._emit_tap_gather()
+        if self.tunable.wmma_k_tail:
+            # GEMM_K tail (new): this tap's first chunk (below) gets stored via
+            # shared_store_a/b_functor BEFORE wmma_main_loop.py's own "s_kitr = s_knum"
+            # init runs (that init happens right after this prologue block's
+            # f_sst_a()/f_sst_b() calls) -- so the masking code (which reads s_kitr as "how
+            # many valid elements remain from this tile's own start") needs it set fresh
+            # here first, once per tap. Harmless/redundant once wmma_main_loop.py sets it
+            # again moments later to the same value. See docs/gfx1250_wmma_layout.md's
+            # Phase 36 for the identical timing gap found in bwd.
+            self._emit(f"s_mov_b32 s[{s.s_kitr()}], s[{s.s_knum()}]   ; K-tail: needed before this tap's first chunk store")
         # ---- issue the first global loads for this tap (main loop expects this precondition;
         # global_load_a_functor re-zeros v_gld_a on every call, see its own docstring) ----
         self._emit(self.global_load_a_functor()())
@@ -1131,7 +1156,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             idx = chunk_idx * self.chunk_num_dwordx4 + i
             self._emit(f"ds_write_b128 v[{v_sst_os()}], v[{v_gld(i*4)}:{v_gld(i*4+3)}] offset:{sst_extra_off + idx*16}")
 
-    def _emit_sst_remaining_chunks(self, v_gld, v_addr, v_sst_os, sst_extra_off, v_flag=None):
+    def _emit_sst_remaining_chunks(self, v_gld, v_addr, v_sst_os, sst_extra_off, v_flag=None, tail_mask=None):
         '''
         Phase 1 (k-sub-loop): stores chunk 0 (already loaded+waited by the caller, via the
         EXISTING global_load_a/b_functor + outer s_wait_loadcnt call sequence in
@@ -1151,11 +1176,20 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         same region were guaranteed done) and produced silent wrong-answer corruption on
         real hardware starting at the 3rd within-workgroup K-block -- caught by comparing
         against naive_conv_fwd_nhwc, not by any assembler/compile-time check.
+
+        tail_mask (GEMM_K tail, new): optional (remaining_operand, skip_check_fn) tuple --
+        see _emit_tail_dword_mask_guarded. When set, applied to each chunk's data right
+        after it's loaded+waited, before that chunk is stored to LDS.
         '''
+        elem_per_dword = 4 // self.data_byte
+        if tail_mask is not None:
+            self._emit_tail_dword_mask_guarded(v_gld, self.chunk_num_dwords, 0, tail_mask)
         self._emit_sst_chunk(v_gld, v_sst_os, sst_extra_off, 0)
         for c in range(1, self.num_k_chunks):
             self._emit_gld_chunk_load(v_gld, v_addr, c, v_flag=v_flag)
             self._emit(f"s_wait_loadcnt 0x0")
+            if tail_mask is not None:
+                self._emit_tail_dword_mask_guarded(v_gld, self.chunk_num_dwords, c * self.chunk_num_dwords * elem_per_dword, tail_mask)
             self._emit_sst_chunk(v_gld, v_sst_os, sst_extra_off, c)
 
     def _emit_sst_all_chunks_row(self, v_gld, v_addr, v_sst_os, sst_extra_off, v_flag=None):
@@ -1168,12 +1202,62 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         would reuse v_gld_a while row 0's early load is still in flight). Fully sequential:
         each chunk is loaded, waited, and stored before the next starts, exactly like
         _emit_sst_remaining_chunks's chunks 1..N-1 -- just starting from chunk 0 instead.
-        Only reached for row_repeat_a > 1 (non-async only), never for any existing config.
+        Only reached for row_repeat_a > 1 (non-async only), never for any existing config,
+        and never together with wmma_k_tail (asserted in __init__).
         '''
         for c in range(self.num_k_chunks):
             self._emit_gld_chunk_load(v_gld, v_addr, c, v_flag=v_flag)
             self._emit(f"s_wait_loadcnt 0x0")
             self._emit_sst_chunk(v_gld, v_sst_os, sst_extra_off, c)
+
+    def _emit_tail_dword_mask(self, v_gld, num_dwords, elements_before, remaining_operand):
+        '''
+        GEMM_K tail (new, non-TDM -- see __init__'s docstring): zeros the invalid trailing
+        sub-elements of `num_dwords` dwords of already-loaded (not yet stored to LDS) data
+        in `v_gld`, given `remaining_operand` (a ready-to-use VALU source operand string,
+        "s[...]") holding "how many valid K-elements remain from this chunk's own start" --
+        uniform across every lane, since K validity only depends on the workgroup-wide loop
+        position (both A and B's per-lane granularity is a fixed row -- see __init__'s
+        docstring -- so K's remaining count is never per-lane here, unlike bwd's N-tail).
+
+        Ported verbatim from igemm_bwd_gtc_wmma_nhwc.py's identically-named method (Phase
+        36) -- see that file's docstring for the full derivation of the per-dword
+        clamp-then-byte-mask construction. Uses v_tmp(0..2) as scratch (safe: not live
+        across this call at either call site).
+        '''
+        v = self.vgpr
+        elem_per_dword = 4 // self.data_byte
+        bits_per_element = self.data_byte * 8
+        for d in range(num_dwords):
+            base = elements_before + d * elem_per_dword
+            self._emit(f"v_sub_u32 v[{v.v_tmp(0)}], {remaining_operand}, {base}   ; valid_raw, dword {d}")
+            self._emit(f"v_max_i32 v[{v.v_tmp(0)}], 0, v[{v.v_tmp(0)}]")
+            self._emit(f"v_min_i32 v[{v.v_tmp(0)}], {elem_per_dword}, v[{v.v_tmp(0)}]   ; valid_in_dword, clamped [0,{elem_per_dword}]")
+            for k in range(1, elem_per_dword + 1):
+                element_mask = (((1 << bits_per_element) - 1) << ((k - 1) * bits_per_element)) & 0xffffffff
+                self._emit(f"v_cmp_ge_i32 vcc_lo, v[{v.v_tmp(0)}], {k}")
+                dst = v.v_tmp(1) if k == 1 else v.v_tmp(2)
+                self._emit(f"v_cndmask_b32 v[{dst}], 0, {hex(element_mask)}, vcc_lo   ; element {k-1} keep-mask")
+                if k != 1:
+                    self._emit(f"v_or_b32 v[{v.v_tmp(1)}], v[{v.v_tmp(1)}], v[{v.v_tmp(2)}]")
+            self._emit(f"v_and_b32 v[{v_gld(d)}], v[{v.v_tmp(1)}], v[{v_gld(d)}]   ; apply mask")
+        self._emit_empty_line()
+
+    def _emit_tail_dword_mask_guarded(self, v_gld, num_dwords, elements_before, tail_mask):
+        '''
+        tail_mask = (remaining_operand, skip_check_fn): skip_check_fn(label) returns a list
+        of instruction strings ending in a conditional scalar branch to `label` when NO
+        masking is needed for this call at all (K-tail's case: s_kitr >= gemm_k_per_block,
+        i.e. this tile is fully valid). Keeps the ~10-15-instructions-per-dword mask
+        machinery off the hot path for the overwhelmingly common non-tail case.
+        '''
+        remaining_operand, skip_check_fn = tail_mask
+        self._tail_mask_label_id += 1
+        label = f"L_{self.name()}_tail_mask_{self._tail_mask_label_id}"
+        for line in skip_check_fn(label):
+            self._emit(line)
+        self._emit_tail_dword_mask(v_gld, num_dwords, elements_before, remaining_operand)
+        self._emit_front(f"{label}:")
 
     def _emit_gld_async_all_chunks(self, v_off, v_sst_os, sst_extra_off, s_saddr, v_flag=None):
         '''
@@ -1315,8 +1399,15 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
+                s = outer.sgpr
                 with outer._deferred_context():
-                    outer._emit_sst_remaining_chunks(v.v_gld_a, v.v_addr_a, v.v_sst_os, 0, v_flag=v.v_flag)
+                    k_tail = None
+                    if outer.tunable.wmma_k_tail:
+                        def _skip(label, s=s, outer=outer):
+                            return [f"s_cmp_ge_i32 s[{s.s_kitr()}], {outer.tunable.gemm_k_per_block}",
+                                    f"s_cbranch_scc1 {label}"]
+                        k_tail = (f"s[{s.s_kitr()}]", _skip)
+                    outer._emit_sst_remaining_chunks(v.v_gld_a, v.v_addr_a, v.v_sst_os, 0, v_flag=v.v_flag, tail_mask=k_tail)
                     for i in range(1, outer.row_repeat_a):
                         row_addr = lambda idx=0, i=i: v.v_addr_a(i * 2 + idx)
                         row_flag = lambda i=i: v.v_flag(i)
@@ -1336,8 +1427,18 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
+                s = outer.sgpr
                 with outer._deferred_context():
-                    outer._emit_sst_remaining_chunks(v.v_gld_b, v.v_addr_b, v.v_sst_os, outer.lds_a_size, v_flag=(v.v_flag_b if outer.tunable.wmma_n_tail else None))
+                    k_tail = None
+                    if outer.tunable.wmma_k_tail:
+                        # GEMM_K tail (new): B is natural/untransposed here (unlike bwd's B),
+                        # so it's the SAME "hard case" as A -- same s_kitr-based remaining
+                        # signal, same skip check.
+                        def _skip(label, s=s, outer=outer):
+                            return [f"s_cmp_ge_i32 s[{s.s_kitr()}], {outer.tunable.gemm_k_per_block}",
+                                    f"s_cbranch_scc1 {label}"]
+                        k_tail = (f"s[{s.s_kitr()}]", _skip)
+                    outer._emit_sst_remaining_chunks(v.v_gld_b, v.v_addr_b, v.v_sst_os, outer.lds_a_size, v_flag=(v.v_flag_b if outer.tunable.wmma_n_tail else None), tail_mask=k_tail)
                     for i in range(1, outer.row_repeat_b):
                         row_addr = lambda idx=0, i=i: v.v_addr_b(i * 2 + idx)
                         row_off  = outer.lds_a_size + i * outer.tunable.block_size * outer.bytes_per_row

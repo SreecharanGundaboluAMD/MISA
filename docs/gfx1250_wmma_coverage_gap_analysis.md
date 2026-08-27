@@ -19,16 +19,18 @@ and track the gap list here.
 across fwd/bwd/wrw. Running each one on real hardware is impractical and unnecessary for a
 *coverage* question -- this is answered by pure static analysis: compute each shape's
 GEMM_M/N/K per direction, and check it against MISA's known, already-documented mechanism
-support (from `docs/gfx1250_wmma_layout.md`'s Phase 5-37 history) via
+support (from `docs/gfx1250_wmma_layout.md`'s Phase 5-38 history) via
 `script/classify_gfx1250_coverage.py`.
 
-**This revision** reflects two rounds of follow-on work since the original analysis:
+**This revision** reflects three rounds of follow-on work since the original analysis:
 (1) bwd GEMM_N/K-tail (Phase 36) and fwd's TDM+GEMM_M/N-tail combination (Phase 37) closed
-the two biggest GEMM-shape mechanism gaps the original analysis found; (2) every remaining
+the two biggest GEMM-shape mechanism gaps the original analysis found; (2) every
 *config-only* gap (a mechanism that already existed in code but only had `.config` files
-for one precision) has now been closed with new, hardware-validated config files across
-fp16/bf16/fp32 for fwd/bwd/wrw. Layout conversion (NCHW<->NHWC) was **explicitly decided
-against** as a MISA-side feature -- see below.
+for one precision) was closed with new, hardware-validated config files across
+fp16/bf16/fp32 for fwd/bwd/wrw; (3) fwd's GEMM_K tail for multi-tap convolutions (Phase 38)
+-- the one remaining real mechanism gap -- is now closed. A classifier bug (depthwise
+detection) was also found and fixed along the way -- see below. Layout conversion
+(NCHW<->NHWC) remains an explicit non-goal for MISA -- see "Headline finding" below.
 
 ## Headline finding: layout is still the dominant gap in the real corpus, but it's an
 explicit non-goal for MISA
@@ -67,80 +69,63 @@ expected to close. The rest of this document therefore evaluates coverage two wa
 
 ## Coverage assuming layout is resolved upstream (`--assume-nhwc`)
 
-This is the relevant view for judging MISA's own GEMM-shape coverage, and the one that
-changed substantially this session:
+This is the relevant view for judging MISA's own GEMM-shape coverage:
 
-| Direction | Total entries | Supported today | Gap: real mechanism missing | Out of scope / degenerate |
-|---|---|---|---|---|
-| fwd | 17,772 | 14,335 (80.66%) | 2,936 (16.52%) | 501 (2.82%) |
-| bwd | 21,055 | 20,776 (98.67%) | 0 (0%) | 279 (1.33%) |
-| wrw | 56,239 | 55,772 (99.18%) | 0 (0%) | 467 (0.83%) |
-| **Overall** | **95,066** | **90,883 (95.60%)** | **2,936 (3.09%)** | **1,247 (1.31%)** |
-
-**bwd and wrw are now fully covered** (modulo depthwise/degenerate shapes, which aren't
-real coverage gaps -- see Methodology). **fwd's only remaining gap is K-tail for multi-tap
-(non-1x1) convolutions** (16.52% of fwd, 3.09% overall) -- fwd's only K-tail mechanism is
-TDM's hardware OOB (Phase 31/37), which is 1x1-conv-only by construction; a genuinely new
-software K-tail mechanism (mirroring wrw's Phase 35 design) would be needed to close it.
-
-Before this session's work, the same computation (real mechanism state as of the original
-analysis, still assuming layout resolved) gave: fwd 79.98%, bwd 85.69% (bwd's N/K-tail gap
-was 12.99% then, since Phase 36 hadn't landed), wrw 62.07% (37.12% was a bf16-only-config
-gap). **The 24.96-point jump to 95.60% overall came entirely from closing config-only
-gaps** (new `.config` files for mechanisms that already existed in code) -- no new codegen
-was needed for that portion; only bwd's N/K-tail and fwd's TDM+M/N-tail combination
-(Phases 36/37) required new mechanism work.
-
-### fwd -- the one real remaining gap
-
-| Category | Distinct shapes | Corpus entries | Effort |
+| Direction | Total entries | Supported today | Degenerate (not a real conv) |
 |---|---|---|---|
-| Supported (M/N-tail, `_mtail`/`_ntail`/`_mntail`) | 8,410 | 8,410 | - |
-| Supported (exact tile fit) | 4,744 | 4,744 | - |
-| **GAP: K-tail for multi-tap (non-1x1) convs** | 2,936 | 2,936 | **D** |
-| Supported (TDM K/M/N-tail combined, Phase 31/37) | 1,181 | 1,181 | - |
-| GAP: depthwise (g==c, out of scope) | 458 | 458 | D (architectural) |
-| Degenerate (zero valid output positions) | 43 | 43 | n/a |
+| fwd | 17,772 | 17,729 (99.76%) | 43 (0.24%) |
+| bwd | 21,055 | 20,850 (99.03%) | 205 (0.97%) |
+| wrw | 56,239 | 55,915 (99.44%) | 324 (0.58%) |
+| **Overall** | **95,066** | **94,494 (99.40%)** | **572 (0.60%)** |
 
-fwd's *only* K-tail mechanism is TDM's hardware OOB zero-fill, which requires `nxe=0`
-(1x1, unit stride, no padding) by construction -- Phase 37 combined it with M/N-tail, but
-that doesn't help multi-tap convs at all, since TDM itself was never extended past 1x1.
-Closing this would need a genuinely new *software* K-tail for fwd (fwd currently has no
-non-TDM K-tail mechanism whatsoever) -- wrw's Phase 35 K-tail (EXEC-mask based, works for
-any tap count) is the closest in-tree template, though fwd's non-transposed operand
-addressing differs enough from wrw's that it wouldn't be a direct port (see
-`docs/gfx1250_wmma_layout.md`'s Phase 36 for a worked example of how "looks like a port"
-can turn out to need new masking machinery once the actual per-lane addressing is checked).
+**Zero remaining GEMM-shape/mechanism gaps in this corpus, in any direction.** Every shape
+that isn't supported today is a degenerate non-conv edge case (see Methodology) -- not a
+capability gap. This is a real change from the original analysis, which found fwd 79.98%,
+bwd 85.69%, wrw 62.07% supported (config-only gaps) plus a then-unsolved fwd K-tail
+mechanism gap (3.09% of the overall corpus). All of that closed across three follow-on
+rounds this session:
 
-### bwd and wrw -- fully covered
+1. **bwd GEMM_N-tail + GEMM_K-tail** (Phase 36) -- bwd previously had M-tail only.
+2. **fwd TDM + GEMM_M/N-tail combined** (Phase 37) -- these existed independently but had
+   never been combined into one buildable config.
+3. **Every config-only gap closed** -- new fp16/bf16/fp32 config files for mechanisms that
+   already existed in code (wrw's M/N/K-tail was previously bf16-only; bwd's new N/K-tail
+   and fwd's new TDM+M/N-tail combo were initially fp16-only).
+4. **fwd GEMM_K-tail for multi-tap convolutions** (Phase 38) -- fwd's only K-tail mechanism
+   was TDM's hardware OOB, which is 1x1-only by construction; this added a genuinely new
+   software (non-TDM) K-tail mechanism for multi-tap convs, the one remaining real gap.
 
-Both directions now show `0` remaining GEMM-shape/mechanism gaps in this corpus (aside from
-depthwise and degenerate shapes, which are not real coverage gaps -- see Methodology).
-bwd's coverage came from Phase 36 (new GEMM_N/K-tail mechanism) plus new bf16/fp32 config
-files; wrw's came entirely from new fp16/fp32 config files for Phase 35's already-generic
-M/N/K-tail mechanism (no new codegen).
+See `docs/gfx1250_wmma_layout.md`'s Phase 35-38 for full designs, bugs found, and hardware
+validation batteries for each.
 
-## What changed this session
+### A classifier bug found and fixed along the way: "depthwise" was over-triggering
 
-1. **bwd GEMM_N-tail + GEMM_K-tail** (`docs/gfx1250_wmma_layout.md`'s Phase 36): bwd
-   previously had M-tail only. bwd's B (weight) operand is TRANSPOSED (unlike fwd's),
-   which inverts which axis is the "easy" per-lane EXEC-mask case vs. the "hard" new
-   fine-grained per-dword mask case -- discovered only by reading the actual per-lane
-   addressing, not by assuming fwd's N-tail pattern would port directly. New configs:
-   `igemm_bwd_gtc_gfx1250_nhwc_{fp16,bf16,fp32}_{ntail,ktail,mnktail}.config` (fp16's
-   `_k2x_ntail` additionally smoke-tests the multi-chunk masking path).
-2. **fwd TDM + GEMM_M/N-tail combined** (Phase 37): TDM's own descriptor now covers M/N
-   tail natively (`tensor_dim1` rebuilt relative to the block offset, mirroring how
-   `tensor_dim0` already covers K), grounded in the CDNA5 ISA doc's TDM section and
-   confirmed as a real hardware probe. New configs:
-   `igemm_fwd_gtc_gfx1250_nhwc_{fp16,bf16,fp32}_tdm_mntail.config`.
-3. **All remaining config-only gaps closed**: wrw's `_mntail`/`_ktail`/`_gsplit_mntail`/
-   `_gsplit_ktail`/`_gsplit_mnktail` mechanisms (Phase 35, previously bf16-only) now also
-   have fp16/fp32 configs; bwd's new N/K-tail mechanisms (previously fp16-only) now also
-   have bf16/fp32 configs; fwd's new TDM+M/N-tail combination (previously fp16-only) now
-   also has bf16/fp32 configs. All hardware-validated (`valid:y` against
-   `naive_conv_{fwd,bwd,wrw}_nhwc`) before being committed -- see each config's own header
-   comment and `docs/gfx1250_wmma_layout.md`'s Phase 35-37 for the validation batteries.
+The original analysis flagged 754 shapes across all three directions as "depthwise (g==c),
+architecturally out of scope." Checking directly: **every single one of those 754 shapes
+has `g=1`** (zero have `g>1`). A `g=1, c=1` shape technically satisfies the literal `g==c`
+check, but with only one group it's an entirely ordinary, non-grouped convolution -- the
+architectural concern behind excluding real depthwise (many tiny independent per-group
+GEMMs, a fundamentally different pattern from what an igemm approach is good at) only
+applies once `g` is actually large. The check was fixed to require `g == c and g > 1`;
+after the fix, the "depthwise" gap category disappears entirely from this corpus (0 shapes
+in all three directions) -- every one of the 754 shapes was correctly ordinary and mostly
+already covered by existing mechanisms. Whether *genuine* multi-group depthwise was ever
+exercised on MISA's gfx950 track could not be confirmed either way -- no corpus examined
+this session (including an earlier, separate 112-shape trace referenced in
+`docs/gfx1250_vendor_benchmark_vs_miopen.md`, which used the same unguarded check and may
+have the identical bug) contains a real `g>1` depthwise shape to test against. MISA's group
+handling is generic (`c/g`, `k/g`), so a real depthwise shape wouldn't hit a hard assert --
+it would just produce an extremely small `gemm_n` (or `gemm_m`), more a severe efficiency
+problem (wasting nearly the whole tile) than a correctness one.
+
+### What's left in "out of scope / degenerate"
+
+After the depthwise fix, only one bucket remains across all three directions: **degenerate
+zero-output shapes** -- `ho<=0` or `wo<=0` (computed via MISA's own `conv_out_size`
+formula), meaning the filter can't fit the input even once (e.g. a 3x3 filter on a 1x1
+input with no padding). These aren't real workloads -- they look like MIOpen
+solver-robustness/bounds-checking test cases, not throughput-relevant shapes. ~572 shapes
+total (0.60% of the corpus), spread fairly evenly across fwd/bwd/wrw.
 
 ## Precision coverage
 
@@ -149,8 +134,8 @@ counting `MIOpenDriver conv`/`convbfp16`/`convfp16`/`convint8` lines directly in
 `.txt` files (zero `convint8` lines in any of them). int8 gaps (fwd/bwd/wrw tail configs,
 wrw's int8 split-K epilogue) remain real, separately-tracked gaps -- see the catalog below
 -- but have **zero weight in this specific corpus**, so closing them would not move any of
-the percentages above. They were intentionally left open this round for that reason (this
-session's config-writing effort targeted the gaps this corpus actually shows).
+the percentages above. They were intentionally left open (this session's work targeted the
+gaps this corpus actually shows).
 
 ## Effort tiers (used consistently across this doc)
 
@@ -164,21 +149,17 @@ session's config-writing effort targeted the gaps this corpus actually shows).
   direction (though often a sibling direction's existing mechanism is a strong template),
   or is architecturally out of scope entirely.
 
-## Full gap catalog (ranked by real-corpus weight, i.e. how many actual entries -- not just
-distinct shapes -- fall into each; assumes layout resolved, since layout itself is a
-declared non-goal, not a ranked gap)
+## Full gap catalog (nothing with real corpus weight remains)
 
 | Rank | Gap | Distinct shapes | Corpus entries | Effort | Where to start |
 |---|---|---|---|---|---|
-| 1 | fwd K-tail for multi-tap convs | 2,936 | 2,936 | **D** | New software EXEC-mask K-tail for fwd (fwd currently only has TDM's 1x1-only K-tail) -- wrw's Phase 35 K-tail is the closest template, though check actual per-lane addressing before assuming it ports directly (see Phase 36's bwd surprise) |
-| 2 | Depthwise (g==c), all directions | 754 | 754 | D | Architectural -- not gfx1250-specific, out of scope for MISA's igemm approach on any architecture; not recommended to pursue |
 | - | Layout (NCHW/mixed), all directions | 87,313 (of the real, non-`--assume-nhwc` corpus) | ~94,335 | n/a | Explicit non-goal for MISA -- left to the caller (e.g. MIOpen's own solver-wrapping), see "Headline finding" above |
-| - | int8 tail/gsplit configs (fwd/bwd/wrw) | not in this corpus | 0 | B (tail configs) / D (wrw int8 gsplit specifically) | Config-only for most cases; wrw's int8 split-K epilogue was already flagged (Phase 17) as needing real new work, not just a config; bwd's int8 tail is Tier C (the elem_per_dword=4 masking case is wholly untested for bwd) |
+| - | int8 tail/gsplit/TDM/K-tail configs (fwd/bwd/wrw) | not in this corpus | 0 | B (config only, most cases) / D (wrw int8 split-K gsplit specifically) / C (bwd int8 tail -- the `elem_per_dword=4` masking case is wholly untested) | Config-only for most cases; wrw's int8 split-K epilogue was already flagged (Phase 17) as needing real new work, not just a config |
 
-**Recommendation**: fwd's multi-tap K-tail (rank 1) is now the *only* remaining GEMM-shape
-gap with real corpus weight. It is a genuine Tier D (new mechanism) item, unlike everything
-closed this session -- worth scoping as its own follow-on rather than assuming it's a quick
-config addition.
+Every GEMM-shape/mechanism gap this analysis originally found (fwd K-tail multi-tap gap,
+bwd's missing N/K-tail, every bf16-only/fp16-only config gap) has been closed. The only
+entries left in the catalog have zero weight in this corpus (int8) or are an explicit
+non-goal (layout).
 
 ## Reproduction
 
@@ -212,7 +193,7 @@ regenerate on demand.
 - Classification is **pure GEMM-dimension arithmetic** against known, already-hardware-
   validated mechanism support -- it does not itself run anything on hardware. A shape
   marked "supported" is asserting the same GEMM-shape/mechanism combination has been
-  validated elsewhere (this session's Phase 35-37 work, or earlier phases in
+  validated elsewhere (this session's Phase 35-38 work, or earlier phases in
   `docs/gfx1250_wmma_layout.md`), not that this *exact* shape has been individually tested.
 - `--assume-nhwc` models "every shape gets transposed to NHWC by the caller" -- it is a
   hypothetical for isolating GEMM-shape coverage, not a claim about MISA's actual behavior
@@ -223,8 +204,9 @@ regenerate on demand.
   for fp16/bf16, 4 for fp32) -- `_k2x`/`_k4x`-style wider K-per-block variants are a
   performance lever, not a coverage one (they only ever make the exact-fit divisibility
   requirement *stricter*), so they're intentionally not modeled here.
-- Depthwise detection uses `g == c` (each group has exactly one input channel) -- the same
-  check used throughout this session's own investigation.
+- Depthwise detection uses `g == c and g > 1` (each group has exactly one input channel,
+  AND there is more than one group -- see the classifier-bug note above for why the `g > 1`
+  qualifier is load-bearing, not defensive).
 - "Degenerate" shapes (computed `ho <= 0` or `wo <= 0`) were cross-checked against MISA's
   own `conv_out_size` formula (`driver/common.h`) -- the same formula the actual driver
   uses -- not a separate approximation.

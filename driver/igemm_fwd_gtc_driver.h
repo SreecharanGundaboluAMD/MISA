@@ -464,11 +464,14 @@ public:
             // exact multiple of gemm_k_per_block UNLESS tdm_global_load is set: TDM's
             // hardware OOB (tensor_dim0 < tile_dim0 zero-fills the tail row, on both A and
             // B since Phase 30) handles a genuinely partial last K-block with no software
-            // masking at all -- see Phase 31 in docs/gfx1250_wmma_layout.md.
+            // masking at all -- see Phase 31 in docs/gfx1250_wmma_layout.md. New: wmma_k_tail
+            // relaxes it the same way for multi-tap convs (TDM is 1x1-only) -- a genuinely
+            // different, software (fine-grained per-dword mask) mechanism, mutually
+            // exclusive with tdm_global_load, see Phase 38.
             if((!tunable->wmma_m_tail && gemm_m % gemm_m_per_block != 0) ||
                (!tunable->wmma_n_tail && gemm_n % gemm_n_per_block != 0) ||
                (tunable->wmma_n_tail && gemm_n % 4 != 0) ||
-               (!tunable->tdm_global_load && gemm_k % gemm_k_per_block != 0))
+               (!tunable->tdm_global_load && !tunable->wmma_k_tail && gemm_k % gemm_k_per_block != 0))
                 return false;
             return true;
         }

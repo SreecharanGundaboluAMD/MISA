@@ -641,10 +641,18 @@ class igemm_gtc_tunable_parameter_t(object):
             # simple per-lane EXEC-mask case.
             self.wmma_k_tail = utility_dict_with_default_t(tunable_dict)('wmma_k_tail', 0)
             if self.wmma_k_tail:
-                assert self.direction in ('wrw', 'bwd'), "wmma_k_tail is only implemented for wrw/bwd so far, see docs/gfx1250_wmma_layout.md's Phase 35"
+                assert self.direction in ('wrw', 'bwd', 'fwd'), "wmma_k_tail is only implemented for wrw/bwd/fwd so far, see docs/gfx1250_wmma_layout.md's Phase 35/36/38"
                 if self.direction == 'bwd':
                     assert not self.gemm_k_global_split, \
                         "wmma_k_tail is not implemented together with gemm_k_global_split for bwd -- bwd doesn't use split-K at all today"
+                if self.direction == 'fwd':
+                    # fwd (new): this is a genuinely DIFFERENT mechanism from TDM's K-tail
+                    # (Phase 31/37) -- TDM already handles K-tail via hardware OOB for the
+                    # 1x1-only case; this new software mechanism is for multi-tap convs,
+                    # which TDM was never extended to cover. Mutually exclusive by
+                    # construction (also asserted kernel-side).
+                    assert not self.tdm_global_load, \
+                        "wmma_k_tail (new, non-TDM) and tdm_global_load are mutually exclusive -- TDM already has its own K-tail mechanism"
             # Phase 35 (hipconv-style reduction-kernel epilogue): replaces the atomic epilogue
             # entirely for wrw's split-K path -- each shard writes a plain, non-atomic store
             # into its own disjoint slice of a workspace buffer (num_splits x output_size),

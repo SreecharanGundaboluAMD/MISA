@@ -161,9 +161,21 @@ def classify(shape, assume_nhwc=False):
     if d['c'] % d['g'] != 0 or d['k'] % d['g'] != 0:
         return 'gap_invalid_group', f"c={d['c']} or k={d['k']} not divisible by g={d['g']} -- malformed shape"
 
-    if d['g'] == d['c']:
+    if d['g'] == d['c'] and d['g'] > 1:
+        # NOTE: g>1 is load-bearing here, not defensive. g==c==1 (a single-group,
+        # single-input-channel conv) technically satisfies the textbook "group_count ==
+        # in_channels" depthwise definition too, but with only ONE group it degenerates
+        # to an entirely ordinary conv -- MISA's group handling is generic (group_idx=0
+        # trivially), there's nothing depthwise-specific about it, and it's structurally
+        # identical to any other real conv with a small channel count. The actual
+        # architectural pain (many tiny independent per-group GEMMs, hence a dedicated
+        # Toeplitz-style kernel elsewhere, not an igemm approach) only shows up once g is
+        # actually large. Verified against this corpus: every g==c shape here has g==1
+        # (checked directly, zero g>1 depthwise shapes exist in this corpus) -- an earlier
+        # version of this check flagged all of them as "depthwise" purely from g==c,
+        # which was wrong for every single one of them.
         return 'gap_depthwise', (
-            "g==c (depthwise) -- architecturally out of scope for MISA's igemm approach "
+            "g==c>1 (depthwise) -- architecturally out of scope for MISA's igemm approach "
             "on every architecture, not gfx1250-specific; a degenerate 1-wide GEMM per "
             "group has no efficient WMMA tile shape")
 
@@ -192,21 +204,27 @@ def classify(shape, assume_nhwc=False):
 
     if d['direction'] == 'fwd':
         if 'K' in needs:
-            if not is_1x1:
-                return 'gap_fwd_k_tail_multitap', (
-                    f"gk={gk} not a multiple of {base_k} and y={d['y']},x={d['x']} != 1x1 -- "
-                    f"fwd's only K-tail mechanism is TDM hardware OOB (Phase 31), 1x1-conv-only")
-            # Phase 37: TDM's own descriptor now covers M/N tail natively (tensor_dim1
-            # rebuilt relative to the block offset, same mechanism Phase 31 already used for
-            # K) -- any subset of M/N/K needed together is covered by ONE config
-            # (`_tdm_mntail`, wmma_m_tail=wmma_n_tail=1 unconditionally -- a no-op mask on
-            # shapes that don't actually need it, confirmed by hardware sanity checks), no
-            # gm/gn%128==0 requirement left at all. bf16/fp32 `_tdm_mntail` configs (written
-            # and hardware-validated right after Phase 37 landed) closed what was briefly a
-            # config-only gap for those precisions.
+            if is_1x1:
+                # Phase 37: TDM's own descriptor covers M/N tail natively (tensor_dim1
+                # rebuilt relative to the block offset, same mechanism Phase 31 already used
+                # for K) -- any subset of M/N/K needed together is covered by ONE config
+                # (`_tdm_mntail`, wmma_m_tail=wmma_n_tail=1 unconditionally -- a no-op mask
+                # on shapes that don't actually need it, confirmed by hardware sanity
+                # checks), no gm/gn%128==0 requirement left at all.
+                if prec == 'int8':
+                    return 'gap_config_int8_fwd_tdm', "mechanism (TDM K/M/N-tail) exists for fp16/bf16/fp32 only -- no int8 _tdm config"
+                return 'supported_tail_fwd_tdm', f"needs {sorted(needs)} (K and/or M/N), 1x1 -- covered by _tdm_mntail ({prec})"
+            # Phase 38: new non-TDM GEMM_K tail for multi-tap convs (TDM was never extended
+            # past 1x1). fwd's A and B are BOTH the "hard case" (fixed row per lane, K read
+            # contiguously in one shot -- unlike bwd's B, fwd's B is natural/untransposed),
+            # so this reuses bwd's Phase 36 fine-grained per-dword AND-mask primitive for
+            # both operands. Composes with the existing wmma_m_tail/wmma_n_tail EXEC-mask
+            # mechanisms (independent load-time vs. post-load masking, confirmed to compose
+            # via hardware validation) -- any subset of M/N/K is covered by _ktail (K alone)
+            # or _mnktail (all three).
             if prec == 'int8':
-                return 'gap_config_int8_fwd_tdm', "mechanism (TDM K/M/N-tail) exists for fp16/bf16/fp32 only -- no int8 _tdm config"
-            return 'supported_tail_fwd_tdm', f"needs {sorted(needs)} (K and/or M/N), 1x1 -- covered by _tdm_mntail ({prec})"
+                return 'gap_config_int8_fwd_ktail', "mechanism (non-TDM K-tail) exists for fp16/bf16/fp32 only -- no int8 _ktail/_mnktail config"
+            return 'supported_tail_fwd_ktail', f"needs {sorted(needs)} (K and/or M/N), multi-tap -- covered by _ktail/_mnktail ({prec})"
         else:
             if prec == 'int8':
                 return 'gap_config_int8_fwd_tail', f"needs {sorted(needs)} -- wmma_m_tail/wmma_n_tail exist for fp16/bf16/fp32 only, no int8 config"
@@ -239,6 +257,7 @@ CATEGORY_LABELS = {
     'supported_exact_fit': 'Supported today (exact tile fit, no relief needed)',
     'supported_tail_fwd_mn': 'Supported today (fwd M/N-tail)',
     'supported_tail_fwd_tdm': 'Supported today (fwd TDM K/M/N-tail, Phase 31/37)',
+    'supported_tail_fwd_ktail': 'Supported today (fwd non-TDM K-tail, multi-tap, Phase 38)',
     'supported_tail_bwd_mnk': 'Supported today (bwd M/N/K-tail, Phase 36)',
     'supported_tail_wrw': 'Supported today (wrw M/N/K-tail, Phase 35)',
     'gap_layout_not_nhwc': 'GAP: non-NHWC layout',
@@ -246,8 +265,8 @@ CATEGORY_LABELS = {
     'gap_depthwise': 'GAP: depthwise (architecturally out of scope)',
     'gap_invalid_group': 'GAP: malformed group count',
     'degenerate_zero_output': 'DEGENERATE: zero valid output positions (not a real conv)',
-    'gap_fwd_k_tail_multitap': 'GAP: fwd K-tail, multi-tap (no mechanism)',
     'gap_config_int8_fwd_tdm': 'GAP: fwd int8 TDM config missing',
+    'gap_config_int8_fwd_ktail': 'GAP: fwd int8 non-TDM K-tail config missing',
     'gap_config_int8_fwd_tail': 'GAP: fwd int8 M/N-tail config missing',
     'gap_config_int8_bwd_tail': 'GAP: bwd int8 tail config missing (any mechanism)',
     'gap_config_int8_wrw_tail': 'GAP: wrw int8 tail/gsplit config missing',
@@ -260,8 +279,8 @@ EFFORT_TIER = {
     'gap_depthwise': 'D (architectural: would need a fundamentally different codegen strategy)',
     'gap_invalid_group': 'n/a (malformed input, not a real gap)',
     'degenerate_zero_output': 'n/a (not a real conv, low priority even if closable)',
-    'gap_fwd_k_tail_multitap': 'D (new mechanism: fwd has no non-TDM K-tail; would need a wrw-K-tail-style port)',
     'gap_config_int8_fwd_tdm': 'B (config file + validation only)',
+    'gap_config_int8_fwd_ktail': 'B (config file + validation only)',
     'gap_config_int8_fwd_tail': 'B (config file + validation only)',
     'gap_config_int8_bwd_tail': 'C (config file + first-ever validation of the elem_per_dword=4 masking case for bwd)',
     'gap_config_int8_wrw_tail': 'D for gsplit (new mechanism, int8 gsplit doesn\'t exist) + B for tail (config only)',
