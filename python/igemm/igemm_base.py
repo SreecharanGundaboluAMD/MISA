@@ -573,6 +573,27 @@ class igemm_gtc_tunable_parameter_t(object):
                     "atomic_pack_bf16 is only implemented for bf16 precision so far, see docs/gfx1250_wmma_layout.md's Phase 34"
                 assert not self.atomic_cascade, \
                     "atomic_pack_bf16 and atomic_cascade are mutually exclusive for now -- not tested together"
+            # Phase 41 (gsplit_stagger): optional, defaults to 0 (today's behavior, every
+            # existing config unaffected). When 1, emits one S_SLEEP_VAR at kernel entry
+            # (right after blockIdx.z is decoded, before any of the group-decode/pointer-
+            # offset work) sleeping for (bz mod 128)*~64 cycles. Hypothesis: with many
+            # split-K shards launched close together in wall-clock time (this project's own
+            # wrw benchmark shapes observed up to 300+ splits), every shard's very first
+            # main-loop global load lands at the SAME relative offset within its own
+            # (disjoint) K-slice -- if that offset's low address bits happen to alias onto
+            # the same DRAM channel/bank subset across shards, the first iteration's loads
+            # could burst-contend even though each shard's overall address range is
+            # distinct. Spreading each shard's start in TIME (not touching which data it
+            # reads, its tile-visitation order, or K-tail masking at all) is a purely
+            # timing-side perturbation with no correctness surface -- see
+            # docs/gfx1250_optimization_backlog.md for the honest status: this project
+            # could not find a working reference for this idea in hipconv's actual source
+            # after a real search, so it is MISA's own untested hypothesis, not a ported
+            # technique; A/B measurement decides whether it earns a permanent home.
+            self.gsplit_stagger = utility_dict_with_default_t(tunable_dict)('gsplit_stagger', 0)
+            if self.gsplit_stagger:
+                assert self.gemm_k_global_split, \
+                    "gsplit_stagger only applies to the atomic (gemm_k_global_split) epilogue -- there is only one shard otherwise, nothing to stagger"
             # Phase 25 (GEMM_M tail): optional, defaults to 0 (today's exact-gemm_m-multiple-
             # only requirement, every existing config unaffected). When 1, the driver's
             # tunable_is_valid() allows gemm_m % gemm_m_per_block != 0, and this kernel emits
@@ -1183,6 +1204,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_pkatomic"
         if tunable.wrw_reduction_kernel:
             kernel_name += "_wsred"
+        if tunable.gsplit_stagger:
+            kernel_name += "_stagger"
         # Extends Phase 16's fold above to the M/N/K-tail EXEC-mask/fine-grained-mask
         # mechanisms (Phases 25/26b/35/36/38) -- these were pure masking additions with no
         # buffer-layout change, so folding them was skipped originally (every existing

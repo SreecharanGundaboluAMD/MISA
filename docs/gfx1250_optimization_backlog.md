@@ -59,15 +59,20 @@ section for the record).
       complete internal register-ID reference than what's currently available, or a
       vendor confirmation). Do not implement by guessing the hwreg ID.
 - [x] ~~**hipconv's staggered per-shard K-loop start phase**~~ — **investigated
-      2026-08-27, not implemented: could not verify the mechanism exists.** Searched
-      the actual local hipconv source (`~/hipconv/hipconv`, `~/rocm-ck-hipconv`,
-      `~/rocm-hipconv-pr`) directly for a split-K shard K-tile-start rotation. Found
-      only hipconv's unrelated intra-workgroup wave-role barrier stagger and CK's/
-      hipconv's ordinary contiguous split-K range assignment (same design MISA already
-      uses via `s_gemm_k_wg_off`). See `docs/gfx1250_perf_parity_action_plan.md`
-      Tier 2 item 7's correction for the full trail. Not re-opened unless a concrete
-      reference implementation is found — do not implement a fabricated mechanism just
-      to close this item.
+      2026-08-27 across every hipconv branch (`~/hipconv/hipconv`'s `main` plus all 12
+      wgrad/splitk-named branches), plus `~/rocm-ck-hipconv`/`~/rocm-hipconv-pr`: no
+      reference implementation exists anywhere.** Implemented MISA's own version of the
+      idea anyway (Phase 41, `docs/gfx1250_wmma_layout.md`): a
+      `gsplit_stagger` tunable emitting one `S_SLEEP_VAR` at kernel entry
+      (`(bz mod 128)*~64` cycles), pure timing perturbation, no addressing/masking
+      changes. Hardware-validated correct. Controlled A/B (pinned split counts via
+      `IGEMM_GSPLIT_SWEEP`, 3 repeats each): **small, consistent ~3-4% win at very high
+      split counts (1260, heavily over-subscribed occupancy)**; a wash at moderate
+      counts (525); too noisy to read at low counts (84, GPU under heavy external
+      contention at measurement time). Kept as an opt-in-only config
+      (`config/igemm_wrw_gtc_gfx1250_nhwc_bf16_gsplit_stagger.config`), NOT folded into
+      the master config union or enabled by default — re-measure on an idle GPU before
+      considering that.
 
 ## Tier 2 — medium effort (real codegen work, well-grounded)
 
@@ -142,3 +147,8 @@ section for the record).
   `python/igemm/igemm_wrw_gtc_wmma_nhwc.py`, closed 2026-08-27. Removes the per-iteration
   `s_wait_dscnt` and a kernel-lifetime VGPR; hardware-validated correct across 5 shapes,
   ~4-9% faster on the shapes tried (contention-noisy, directional only).
+- **wrw split-K launch stagger (`gsplit_stagger`)** — Phase 41,
+  `python/igemm/igemm_wrw_gtc_wmma_nhwc.py` / `python/igemm/igemm_base.py` /
+  `driver/igemm_gtc_base.h`, closed 2026-08-27. MISA's own mechanism (no verified
+  hipconv reference found despite a thorough search); ~3-4% faster at very high split
+  counts, inconclusive at lower counts. Opt-in config only, not a default.

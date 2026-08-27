@@ -549,6 +549,15 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"s_lshr_b32 s[{s.s_bz()}], ttmp7, 16")
         else:
             self._emit(f"s_mov_b32 s[{s.s_by()}], ttmp7")
+        if self.tunable.gemm_k_global_split and self.tunable.gsplit_stagger:
+            # Phase 41: stagger each split-K shard's first memory burst by (bz mod 128)
+            # * ~64 cycles via S_SLEEP_VAR -- as early as possible (right after bz is
+            # decoded, before ANY of the group-decode/pointer-offset prologue work or
+            # the first global load), so the entire rest of the prologue's wall-clock
+            # position is shifted too, not just the loop body. Pure timing -- doesn't
+            # touch s_bz itself, any address computation, or K-tail masking.
+            self._emit(f"s_and_b32 s[{s.s_tmp()}], s[{s.s_bz()}], 0x7f   ; gsplit_stagger: bz mod 128")
+            self._emit(f"s_sleep_var s[{s.s_tmp()}]")
         self._emit(f"s_wait_kmcnt 0x0")
         if self.tunable.gemm_k_global_split:
             self._emit(f"s_mul_i32 s[{s.s_gemm_k_wg_off()}], s[{s.s_bz()}], s[{s.s_gemm_k_per_wg()}]   ; this workgroup's K-slice base")

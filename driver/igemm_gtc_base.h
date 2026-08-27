@@ -219,6 +219,11 @@ typedef struct {
     // (partials, not final output), so IS folded into the kernel name (same category as
     // atomic_pack_bf16/wmma_setprio above).
     int wrw_reduction_kernel;
+    // Phase 41: optional S_SLEEP_VAR stagger at kernel entry for wrw's gemm_k_global_split
+    // path, scaled by (blockIdx.z mod 128) -- pure timing perturbation (no buffer/dispatch
+    // impact), folded into the kernel name for the same hipModuleGetFunction-lookup reason
+    // as every other folded flag above.
+    int gsplit_stagger;
     // Master-config phase (new): local_prefetch_num/atomic_scope/epilogue_lds_pad were
     // "purely internal-codegen choices" the driver never needed to know about, by the
     // ORIGINAL design -- true only as long as no two config sections of the SAME tile shape
@@ -309,6 +314,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.atomic_pack_bf16           = sec.count("atomic_pack_bf16") > 0 ? sec.at("atomic_pack_bf16").get_int() : 0;
                 tunable.wmma_k_tail                = sec.count("wmma_k_tail") > 0 ? sec.at("wmma_k_tail").get_int() : 0;
                 tunable.wrw_reduction_kernel       = sec.count("wrw_reduction_kernel") > 0 ? sec.at("wrw_reduction_kernel").get_int() : 0;
+                tunable.gsplit_stagger              = sec.count("gsplit_stagger") > 0 ? sec.at("gsplit_stagger").get_int() : 0;
                 tunable.local_prefetch_num         = sec.count("local_prefetch_num") > 0 ? sec.at("local_prefetch_num").get_int() : 1;
                 tunable.epilogue_lds_pad           = sec.count("epilogue_lds_pad") > 0 ? sec.at("epilogue_lds_pad").get_int() : 0;
                 tunable.atomic_scope               = sec.count("atomic_scope") > 0 ? sec.at("atomic_scope").get_string() : "SCOPE_SYS";
@@ -523,6 +529,8 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += std::string("_pkatomic");
         if(tunable->wrw_reduction_kernel)
             kernel_name += std::string("_wsred");
+        if(tunable->gsplit_stagger)
+            kernel_name += std::string("_stagger");
         // mirrors igemm_base.py's identical extension -- must stay in sync.
         if(tunable->wmma_m_tail)
             kernel_name += std::string("_mtail");

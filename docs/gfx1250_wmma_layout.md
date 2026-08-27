@@ -4072,3 +4072,85 @@ removed per iteration, 1 DS-class op replaced by 1 cheaper VALU op).
 
 **Critical files**: `python/operations/coalescing_store_wmma.py`,
 `python/igemm/igemm_wrw_gtc_wmma_nhwc.py`.
+
+## Phase 41 (2026-08-27): wrw split-K launch stagger (`gsplit_stagger`, S_SLEEP_VAR)
+
+`docs/gfx1250_perf_parity_action_plan.md`'s Tier 2 item 7 attributed "staggered
+per-shard K-loop start" to hipconv, motivating it as small/low-risk. A direct search of
+hipconv's actual source (`~/hipconv/hipconv`'s `main` branch AND every branch with
+"wgrad"/"splitk" in its name -- `feature/direct-cdna5-wgrad`, `feature/direct_wgrad`,
+`feature/grouped_*_wgrad*`, `jzhou/wgrad-hankel-cdna4`, etc., 12 branches total) found
+no such mechanism: hipconv's only "stagger" is `direct/kernel.hpp`'s intra-workgroup
+wave-role barrier phasing (unrelated -- about which *waves in one workgroup* run out of
+phase, not which *split-K workgroups* start their K-traversal at different offsets), and
+CK's `SplitKBatchOffset` uses the same plain contiguous-range assignment MISA already
+does. The action plan was corrected to reflect this (no verified reference exists).
+
+Per direct instruction, implemented MISA's own version of the idea anyway, since the
+underlying hypothesis is plausible independent of whether hipconv actually does it:
+wrw's `gemm_k_global_split` launches many shards (grid.z, up to 300-1260+ splits
+observed this session) that each start their own K-slice's traversal at the same
+*relative* offset (0) at roughly the same wall-clock time. If that shared relative
+offset's low address bits alias onto the same DRAM channel/bank subset across shards,
+the very first iteration's loads could burst-contend even though each shard's overall
+address range is disjoint.
+
+### Design
+
+Deliberately the lowest-risk possible implementation of this idea: a pure **timing**
+perturbation, touching no addressing, no tile-visitation order, no K-tail masking.
+`S_SLEEP_VAR` (confirmed via `llvm-mc -mcpu=gfx1250`: sleeps for
+`~SGPR_value[6:0]*64` cycles) is emitted once, immediately after `blockIdx.z` (`s_bz`)
+is decoded -- before any group-decode/pointer-offset prologue work, so the entire rest
+of the prologue (and the first real global load) shifts in wall-clock time too:
+
+```
+s_and_b32 s[s_tmp], s[s_bz], 0x7f   ; gsplit_stagger: bz mod 128
+s_sleep_var s[s_tmp]
+```
+
+New tunable `gsplit_stagger` (default 0, every existing config byte-identical),
+asserted to require `gemm_k_global_split` (there's only one shard otherwise -- nothing
+to stagger). Folded into the kernel name (`_stagger`) per the master-config phase's
+established discipline, mirrored in both `igemm_gtc_encode_kernel_name` and the C++
+`get_kernel_name()`.
+
+### Verification
+
+**Zero regression**: `igemm_wrw_gtc_gfx1250_nhwc_bf16_gsplit(.config)`,
+`_gsplit_pkatomic.config`, and the `_all.config` master file are byte-identical before/
+after (gsplit_stagger defaults to 0, unaffected).
+
+**Hardware correctness**: `conv_driver.exe`, `convbfp16`, both tile shapes --
+`n=42,c=192,H=60,W=80,k=64` (worst-case shape), `n=42,c=128,H=30,W=40,k=128`,
+`n=8,c=64,H=16,W=16,k=64`, `n=1,c=32,H=4,W=4,k=32` -- every applicable kernel reports
+`valid:y`.
+
+**Timing -- honest negative-leaning result, not a clear win**: an uncontrolled
+first comparison (via the driver's own split-count search, `-V 1`) looked like a
+20x regression, but that was a measurement artifact -- the search picked *different*
+split counts for the staggered vs. non-staggered build (contention-driven noise in the
+search's own cost model, plus `-V 1`'s verification overhead), not a real effect of the
+stagger itself. Repeating with `IGEMM_GSPLIT_SWEEP` pinning BOTH builds to the identical
+split count (`-V 0`, `IGEMM_WARMUP=2 IGEMM_REPEAT=10`, 3 repeats per point, same
+`c=192,H=60,W=80,k=64` shape):
+
+| Split count | No stagger | With stagger | Delta |
+|---|---|---|---|
+| 84 (under-subscribed) | 0.270-1.947ms (huge run-to-run spread) | 1.020-2.026ms (same spread) | too noisy to read -- GPU under confirmed heavy contention from other tenants at measurement time |
+| 525 (moderate) | 0.137ms | 0.138ms | ~0.7% worse, within noise |
+| 1260 (heavily over-subscribed) | 0.406/0.400/0.410ms (3 repeats) | 0.390/0.387/0.398ms (3 repeats) | **~3-4% faster, consistent across all 3 repeats** |
+
+The one consistent signal is at the highest split count -- exactly the regime where many
+shards must cycle through limited occupancy slots (this session's own Finding 3: 64x64
+tile tops out at 31.2% occupancy) and the "shared relative offset -> burst contention"
+hypothesis most plausibly applies. Not implemented as a default anywhere (kept in its
+own opt-in `config/igemm_wrw_gtc_gfx1250_nhwc_bf16_gsplit_stagger.config`, not folded
+into the master config union) -- the effect size is small and the low/moderate-split
+regime shows no reliable benefit, so this needs a clean re-measurement on an idle GPU
+before it earns a permanent home in the master search space.
+
+**Critical files**: `python/igemm/igemm_base.py` (tunable + kernel-name fold),
+`driver/igemm_gtc_base.h` (struct field, config parsing, kernel-name fold mirror),
+`python/igemm/igemm_wrw_gtc_wmma_nhwc.py` (emission site),
+`config/igemm_wrw_gtc_gfx1250_nhwc_bf16_gsplit_stagger.config` (new).
