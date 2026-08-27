@@ -97,22 +97,28 @@ class ctrl_coalescing_store_wmma_t(object):
         # instead of 4). See docs/gfx1250_wmma_layout.md's Phase 24.
         self.wmma_acc_f16 = 0
 
-        # Phase 25 (GEMM_M tail): non-atomic path only (see igemm_base.py's mutual-exclusion
-        # assert with gemm_k_global_split -- the atomic epilogue was never adapted for this).
-        # 0 (default) = today's unconditional store, every existing config unaffected. 1 =
-        # EXEC-mask each pass's global store off for lanes whose absolute row (block_m_off +
-        # this lane's tile-local row) is >= the real (unpadded) GEMM_M -- the tail block's
-        # out-of-range rows. Mirrors XDLOPS's coalescing_store.py v_cmp_gt_u32/saveexec guard,
-        # but using this file's existing v_cmpx/exec_lo idiom (see igemm_fwd_gtc_wmma_nhwc.py's
+        # Phase 25 (GEMM_M tail): originally non-atomic-path-only (fwd/bwd, where it's
+        # mutually exclusive with gemm_k_global_split -- that atomic epilogue branch was
+        # never adapted for fwd/bwd). Phase 35 adds masking for the PLAIN atomic branch too
+        # (wrw, whose gemm_k_global_split is its primary path) -- see that branch's
+        # v_tmp3-based per-element row guard below; NOT implemented for the atomic_pack_bf16
+        # branch (mutually exclusive at the igemm_base.py tunable level). 0 (default) =
+        # today's unconditional store, every existing config unaffected. 1 = EXEC-mask each
+        # store/atomic off for lanes whose absolute row (block_m_off + this lane's
+        # tile-local row) is >= the real (unpadded) GEMM_M -- the tail block's out-of-range
+        # rows. Mirrors XDLOPS's coalescing_store.py v_cmp_gt_u32/saveexec guard, but using
+        # this file's existing v_cmpx/exec_lo idiom (see igemm_fwd_gtc_wmma_nhwc.py's
         # _emit_gld_chunk_load) since WMMA is wave32-only -- no 64-bit saveexec needed, a plain
-        # exec_lo restore suffices. See docs/gfx1250_wmma_layout.md's Phase 25.
+        # exec_lo restore suffices. See docs/gfx1250_wmma_layout.md's Phase 25/35.
         self.wmma_m_tail = 0
 
-        # Phase 26b (GEMM_N tail): analogous to wmma_m_tail but for the column. 0 (default) =
-        # unaffected. 1 = a second EXEC-mask guard, chained right after the M-tail one (wave32
-        # v_cmpx intersects with the already-narrowed EXEC -- no extra VGPR needed here, since
-        # `v_gather` already holds this lane's global column for every pass, per its own
-        # comment below). Independent of wmma_m_tail -- either, both, or neither may be set.
+        # Phase 26b (GEMM_N tail): analogous to wmma_m_tail but for the column, same Phase 35
+        # atomic-branch extension. Non-atomic path: a second EXEC-mask guard chained right
+        # after the M-tail one (wave32 v_cmpx intersects with the already-narrowed EXEC -- no
+        # extra VGPR needed there, since `v_gather` already holds this lane's global column
+        # for every pass). Atomic path: recomputes the column fresh per i_rn (column doesn't
+        # depend on row/j, only on the compile-time-known i_rn index) into v_tmp4 before each
+        # guard. Independent of wmma_m_tail -- either, both, or neither may be set.
         self.wmma_n_tail = 0
 
         # Phase 34 (packed atomics): atomic path only, precision=='bf16' only (asserted in
@@ -130,6 +136,15 @@ class ctrl_coalescing_store_wmma_t(object):
         # precision on the K-split reduction -- a real numerical tradeoff, not free; see
         # docs/gfx1250_wmma_layout.md's Phase 34 for the accuracy validation.
         self.atomic_pack_bf16 = 0
+
+        # Phase 35 (hipconv-style reduction-kernel epilogue): atomic (gemm_k_global_split)
+        # path only, mutually exclusive with atomic_pack_bf16 (asserted in igemm_base.py).
+        # 0 (default) = today's global_atomic_add_f32. 1 = plain global_store_dword instead
+        # -- correct ONLY when the caller has arranged for s_p_out to already point at this
+        # shard's own disjoint slice of a workspace buffer (no concurrent writer ever
+        # targets the same address, so no atomic/ordering is needed at all) -- see
+        # docs/gfx1250_wmma_layout.md's Phase 35 and igemm_wrw_gtc_driver.h's WMMA run().
+        self.wrw_reduction_kernel = 0
 
 
 class igemm_coalescing_store_wmma_t(mc_base_t):
@@ -150,16 +165,19 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         v_tid/v_gather: only needed for the non-atomic (LDS-reshuffle) path -- v_tid is the
             kernel's persistent flat thread id, v_gather is a vector_write_out-wide scratch
             VGPR range (unused by the atomic path).
-        s_gemm_m/v_tmp3: only needed when ctrl.wmma_m_tail is set (non-atomic path only) --
-            s_gemm_m is the real (unpadded) GEMM_M scalar, v_tmp3 is 1 scratch VGPR used to
-            track each pass's absolute row for the EXEC-mask guard.
-        s_gemm_n/v_tmp4: only needed when ctrl.wmma_n_tail is set (non-atomic path only) --
-            s_gemm_n is the real (unpadded) GEMM_N scalar, v_tmp4 is 1 scratch VGPR holding
-            this lane's column-in-range flag (`v_gather` itself gets reused as the gather's
-            LDS-read destination, so its column value doesn't survive to pass 0's guard).
-            Phase 34 (ctrl.atomic_pack_bf16, atomic path only -- wmma_m_tail/wmma_n_tail are
-            mutually exclusive with gemm_k_global_split already, so reusing these same
-            three params here is safe): v_gather holds the partner-lane byte-index
+        s_gemm_m/v_tmp3: needed when ctrl.wmma_m_tail is set, for EITHER the non-atomic path
+            (Phase 25) or the plain-atomic path (Phase 35, wrw) -- s_gemm_m is the real
+            (unpadded) GEMM_M scalar, v_tmp3 is 1 scratch VGPR used to track each
+            pass/element's absolute row for the EXEC-mask guard.
+        s_gemm_n/v_tmp4: needed when ctrl.wmma_n_tail is set, same two-path support as
+            wmma_m_tail above -- s_gemm_n is the real (unpadded) GEMM_N scalar, v_tmp4 is 1
+            scratch VGPR holding this lane's column-in-range check (non-atomic path: a flag,
+            since `v_gather` itself gets reused as the gather's LDS-read destination and its
+            column value doesn't survive to pass 0's guard; atomic path: the raw recomputed
+            column value, compared fresh per i_rn).
+            Phase 34 (ctrl.atomic_pack_bf16, atomic path only -- mutually exclusive with
+            wmma_m_tail/wmma_n_tail at the igemm_base.py tunable level, so reusing these
+            same three params here is safe): v_gather holds the partner-lane byte-index
             (computed once, kernel-lifetime constant), v_tmp3 holds the cross-lane-
             exchanged partner value (per-iteration scratch), v_tmp4 holds the packed
             bf16x2 result (per-iteration scratch). v_tid is required (used for both the
@@ -206,10 +224,14 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         inst_wmma = cxm.inst_wmma
         assert cxm.wave_tile_m == 16 and cxm.wave_tile_n == 16
         if ctrl.wmma_m_tail:
-            assert not ctrl.gemm_k_global_split, "wmma_m_tail's masking is only implemented for the non-atomic epilogue branch"
+            # Phase 35: now implemented for BOTH the non-atomic and the plain-atomic
+            # (gemm_k_global_split, not atomic_pack_bf16) epilogue branches -- wrw's atomic
+            # path is scalar-per-element already, so masking it needs no extra grouping
+            # logic. atomic_pack_bf16 is separately excluded at the tunable level
+            # (igemm_base.py) since it needs the same v_tmp3/v_tmp4 slots for its own,
+            # unrelated cross-lane-exchange scratch.
             assert s_gemm_m is not None and v_tmp3 is not None
         if ctrl.wmma_n_tail:
-            assert not ctrl.gemm_k_global_split, "wmma_n_tail's masking is only implemented for the non-atomic epilogue branch"
             assert s_gemm_n is not None and v_tmp4 is not None
         if ctrl.atomic_pack_bf16:
             assert ctrl.gemm_k_global_split, "atomic_pack_bf16 only applies to the atomic epilogue branch"
@@ -265,14 +287,27 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                         cur, nxt = nxt, cur
                 self._emit_empty_line()
             elif ctrl.gemm_k_global_split:
-                self._emit(f"; wmma direct atomic-add epilogue, {cxm.wave_repeat_m}x{cxm.wave_repeat_n} tiles, "
-                           f"{inst_wmma.num_v_c} rows/tile")
+                # Phase 35: wrw_reduction_kernel replaces the atomic add with a plain store
+                # into this shard's own disjoint workspace slice (the shard offset is baked
+                # into s_p_out by the caller, before this function is even invoked -- see
+                # igemm_wrw_gtc_wmma_nhwc.py's prologue) -- simpler than the atomic case (no
+                # scope/ordering concerns at all), and the SAME per-element address/masking
+                # logic below applies unchanged either way.
+                self._emit(f"; wmma direct {'store (reduction-kernel epilogue)' if ctrl.wrw_reduction_kernel else 'atomic-add'} epilogue, "
+                           f"{cxm.wave_repeat_m}x{cxm.wave_repeat_n} tiles, {inst_wmma.num_v_c} rows/tile")
                 self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], 2   ; row-to-row byte stride")
                 for i_rm in range(cxm.wave_repeat_m):
                     row_off = i_rm * cxm.wave_tile_m
                     cur, nxt = v_tmp1, v_tmp2
                     # cur = byte address of (row_off, col 0), i.e. row = v_gemm_im + row_off
                     self._emit(f"v_add_u32 v[{cur}], {row_off}, v[{v_gemm_im}]" if row_off != 0 else f"v_mov_b32 v[{cur}], v[{v_gemm_im}]")
+                    if ctrl.wmma_m_tail:
+                        # Phase 35: v_tmp3 tracks this element's absolute row value in
+                        # PARALLEL with cur/nxt's byte-address ping-pong (cur/nxt get
+                        # overwritten with a multiplied+shifted byte address below, so the
+                        # raw row value must be captured separately, here, before that
+                        # happens) -- advanced by +1 alongside cur/nxt's per-j row advance.
+                        self._emit(f"v_mov_b32 v[{v_tmp3}], v[{cur}]   ; wmma_m_tail: absolute row (row {row_off}, j=0)")
                     self._emit(f"v_mul_lo_u32 v[{cur}], s[{s_gemm_m_stride}], v[{cur}]")
                     self._emit(f"v_add_u32 v[{cur}], v[{v_gemm_in}], v[{cur}]")
                     self._emit(f"v_lshlrev_b32 v[{cur}], 2, v[{cur}]  ; byte address, row {row_off}, col 0")
@@ -283,6 +318,13 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                             c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
                             col_off = i_rn * cxm.wave_tile_n * 4
                             offset_str = f" offset:{col_off}" if col_off != 0 else ""
+                            masked = ctrl.wmma_m_tail or ctrl.wmma_n_tail
+                            if ctrl.wmma_m_tail:
+                                self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
+                            if ctrl.wmma_n_tail:
+                                col_val = i_rn * cxm.wave_tile_n
+                                self._emit(f"v_add_u32 v[{v_tmp4}], {col_val}, v[{v_gemm_in}]" if col_val != 0 else f"v_mov_b32 v[{v_tmp4}], v[{v_gemm_in}]")
+                                self._emit(f"v_cmpx_gt_u32 s[{s_gemm_n}], v[{v_tmp4}]   ; wmma_n_tail: col < real gemm_n")
                             # scope:SCOPE_SYS (or SCOPE_DEV, Phase 23) is load-bearing, not
                             # decoration: a bare global_atomic_add_f32 defaults to a narrower
                             # (CU/WGP-local) cache scope on gfx1250, which silently drops
@@ -290,9 +332,19 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                             # compute units -- confirmed on hardware. See
                             # docs/gfx1250_wmma_layout.md. th:{th} (Phase 23, optional) marks
                             # a cascading/deferred-scope atomic -- see ctrl.atomic_cascade.
-                            th_str = f" th:{ctrl.atomic_th}" if ctrl.atomic_cascade else ""
-                            self._emit(f"global_atomic_add_f32 v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str} scope:{ctrl.atomic_scope}{th_str}")
+                            # Phase 35: wrw_reduction_kernel needs neither -- it's a plain,
+                            # non-atomic store (no concurrent writers ever target the same
+                            # workspace address, so no ordering/scope concern exists).
+                            if ctrl.wrw_reduction_kernel:
+                                self._emit(f"global_store_dword v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str}")
+                            else:
+                                th_str = f" th:{ctrl.atomic_th}" if ctrl.atomic_cascade else ""
+                                self._emit(f"global_atomic_add_f32 v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str} scope:{ctrl.atomic_scope}{th_str}")
+                            if masked:
+                                self._emit(f"s_mov_b32 exec_lo, -1")
                         cur, nxt = nxt, cur
+                        if ctrl.wmma_m_tail and j != inst_wmma.num_v_c - 1:
+                            self._emit(f"v_add_u32 v[{v_tmp3}], 1, v[{v_tmp3}]   ; wmma_m_tail: advance to row {row_off + j + 1}")
                 self._emit_empty_line()
             else:
                 # ---- non-atomic: LDS-reshuffle coalescing store ----

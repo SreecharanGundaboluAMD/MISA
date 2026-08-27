@@ -259,3 +259,23 @@ void tensor_cast_fp32_bf16acc_1d(float* output, ushort* input, int total_length)
         }
     }
 }
+
+// Phase 35 (hipconv-style reduction-kernel epilogue): sums `num_partitions` disjoint
+// fp32 slices of `workspace` (each `output_size` elements, laid out contiguously --
+// partition p occupies workspace[p*output_size : (p+1)*output_size)) into `output`. Used
+// by wrw's gemm_k_global_split + wrw_reduction_kernel mode as a non-atomic alternative to
+// accumulating partial sums directly into the real output buffer -- see
+// docs/gfx1250_wmma_layout.md's Phase 35 and igemm_wrw_gtc_driver.h's WMMA run(). A plain
+// grid-stride loop (not the unroll-8/tail-remainder shape the cast kernels above use) is
+// sufficient here: no vectorized load/store width concern, plain fp32 in and out.
+extern "C"
+__global__ __launch_bounds__(256,2)
+void wrw_reduce_partials_f32(float* output, float* workspace, int num_partitions, int output_size)
+{
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < output_size; i += gridDim.x * blockDim.x) {
+        float sum = 0.f;
+        for (int p = 0; p < num_partitions; p++)
+            sum += workspace[static_cast<size_t>(p) * output_size + i];
+        output[i] = sum;
+    }
+}

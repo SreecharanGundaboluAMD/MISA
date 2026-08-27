@@ -187,6 +187,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # funnel into it.
         ctrl_coalescing_store_wmma.wmma_acc_f16 = tunable.wmma_acc_f16 or tunable.wmma_acc_bf16
         ctrl_coalescing_store_wmma.atomic_pack_bf16 = tunable.atomic_pack_bf16
+        # Phase 35: wire wrw's M/N-tail into the epilogue (fwd/bwd already do this).
+        ctrl_coalescing_store_wmma.wmma_m_tail = tunable.wmma_m_tail
+        ctrl_coalescing_store_wmma.wmma_n_tail = tunable.wmma_n_tail
+        ctrl_coalescing_store_wmma.wrw_reduction_kernel = tunable.wrw_reduction_kernel
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
 
         # A-region (grad_output) and B-region (input): both natural [GEMM_K rows][M or N
@@ -276,6 +280,15 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self.s_bz             = sym_t('s_bz'             , sseq(1))   # workgroup_id_z -> this workgroup's K-slice index
             self.s_gemm_k_per_wg  = sym_t('s_gemm_k_per_wg'  , sseq(1))   # kernarg: this workgroup's K-slice length
             self.s_gemm_k_wg_off  = sym_t('s_gemm_k_wg_off'  , sseq(1))   # = s_bz * s_gemm_k_per_wg
+            if outer.tunable.wmma_k_tail and outer.tunable.gemm_k_global_split:
+                # Phase 35: only meaningful (and only loaded) when K-tail must compose with
+                # split-K -- a plain (non-split) wmma_k_tail build needs neither kernarg,
+                # since s_knum is already exactly s_gemm_k (the true, unpadded value) in that
+                # case. gemm_k_tail = the remainder R (gemm_k - num_k_blocks*gemm_k_per_block,
+                # computed driver-side); gemm_k_num_splits = the launched grid.z, so "am I the
+                # last shard" is a simple s_bz == s_gemm_k_num_splits-1 compare.
+                self.s_gemm_k_tail       = sym_t('s_gemm_k_tail'       , sseq(1))
+                self.s_gemm_k_num_splits = sym_t('s_gemm_k_num_splits' , sseq(1))
             self.s_tmp         = sym_t('s_tmp'         , sseq(4))
             self.s_end         = sym_t('s_end'         , sseq())
 
@@ -306,6 +319,15 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             # move_slice_window_a incrementally bumps v_addr_a across a tap's own K-loop.
             self.v_addr_a_base = sym_t('v_addr_a_base' , vseq(2, 2))
             self.v_addr_out    = sym_t('v_addr_out'    , vseq(2))    # scratch used by coalescing_store_wmma (ping-pong pair)
+            if outer.tunable.wmma_m_tail:
+                # Phase 35: extra scratch for coalescing_store_wmma's per-element absolute-row
+                # EXEC-mask guard (both the non-atomic and atomic epilogue branches) -- only
+                # allocated when wmma_m_tail is set, mirrors fwd's identically-named register.
+                self.v_m_tail_row = sym_t('v_m_tail_row' , vseq(1))
+            if outer.tunable.wmma_n_tail:
+                # Phase 35: extra scratch for coalescing_store_wmma's column-in-range guard --
+                # only allocated when wmma_n_tail is set, mirrors fwd's v_n_tail_col.
+                self.v_n_tail_col = sym_t('v_n_tail_col' , vseq(1))
             self.v_sst_os      = sym_t('v_sst_os'      , vseq(1))    # shared store offset (same for A/B region)
             self.v_sld_a_os    = sym_t('v_sld_a_os'    , vseq(1))    # transposed byte offset (side='m')
             self.v_sld_b_os    = sym_t('v_sld_b_os'    , vseq(1))    # transposed byte offset (side='n')
@@ -321,6 +343,31 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self.v_b_col_off   = sym_t('v_b_col_off'   , vseq(1))    # (block_n_off+col_start)*databyte, fixed
             self.v_flag        = sym_t('v_flag'        , vseq(1))
             self.v_gtc_tmp     = sym_t('v_gtc_tmp'     , vseq(5))
+            if outer.tunable.wmma_m_tail:
+                # Phase 35: A's (grad_output) absolute-GEMM_M-index-in-range flag. Unlike B's
+                # v_flag (recomputed every iteration, GEMM_K being spatial), A's GEMM_M
+                # position is a true per-lane kernel-lifetime constant (move_slice_window_a
+                # only advances the K-axis stride) -- computed once in emit_kernel_prologue.
+                self.v_flag_a_mtail = sym_t('v_flag_a_mtail', vseq(1))
+            if outer.tunable.wmma_n_tail:
+                # Phase 35: B's (input) absolute-GEMM_N-index-in-range flag -- also a
+                # kernel-lifetime constant (B's column position never changes), ANDed into
+                # B's own per-iteration v_flag inside _emit_b_gather (not a replacement).
+                self.v_flag_b_ntail = sym_t('v_flag_b_ntail', vseq(1))
+            if outer.tunable.wmma_k_tail:
+                # Phase 35: A's per-iteration GEMM_K-in-range flag -- unlike M-tail's, this
+                # MUST be recomputed every iteration (mirrors B's own v_flag). If wmma_m_tail
+                # is also set, v_flag_a_mtail is ANDed into this each time it's recomputed.
+                self.v_flag_a_ktail = sym_t('v_flag_a_ktail', vseq(1))
+                # Phase 35: B's per-iteration GEMM_K-in-range flag, computed in _emit_b_gather.
+                # MUST be a dedicated register, not `v_tmp` scratch -- the div/rem macro
+                # (.v_u32_div_rem_vs_gfx1250) clobbers ALL FOUR v_tmp registers internally as
+                # part of its own division algorithm, which silently destroyed this flag when
+                # it was (incorrectly) computed into v_tmp(1) before the div/rem calls that
+                # follow it in _emit_b_gather -- a real bug found via multi-tap hardware
+                # testing (single-tap shapes happened to not expose it, depending on what
+                # garbage the division scratch left behind).
+                self.v_flag_b_ktail = sym_t('v_flag_b_ktail', vseq(1))
             if outer.tunable.atomic_pack_bf16:
                 # Phase 34: packed-bf16 atomic epilogue scratch -- v_pk_idx (partner-lane
                 # byte-index for ds_bpermute_b32, kernel-lifetime constant once computed),
@@ -369,6 +416,13 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # policy). Always present in the karg layout (even for non-split kernels, which
         # simply never load it) so both variants share one struct on the driver side.
         kas.append(amdgpu_kernel_arg_t('gemm_k_per_wg', 4, 88, 'by_value', 'i32'))
+        # Phase 35: only needed when K-tail must compose with split-K (a plain, non-split
+        # wmma_k_tail build needs neither -- see kernel_sgpr_t's identical comment). Gated
+        # (not always-present like gemm_k_per_wg above) so every existing config's
+        # kernarg_segment_byte_size stays byte-identical.
+        if self.tunable.wmma_k_tail and self.tunable.gemm_k_global_split:
+            kas.append(amdgpu_kernel_arg_t('gemm_k_tail', 4, 92, 'by_value', 'i32'))
+            kas.append(amdgpu_kernel_arg_t('gemm_k_num_splits', 4, 96, 'by_value', 'i32'))
         return kas
 
     def get_kernel_code(self):
@@ -395,7 +449,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             'enable_sgpr_workgroup_id_y'       :   1,
             'enable_vgpr_workitem_id'          :   0,
             'workgroup_group_segment_byte_size':   max(self.lds_single_size * self.lds_buffer_num, epilogue_lds_bytes),
-            'kernarg_segment_byte_size'         :   92,
+            'kernarg_segment_byte_size'         :   100 if (self.tunable.wmma_k_tail and self.tunable.gemm_k_global_split) else 92,
             'wavefront_sgpr_count'              :   self.sgpr.s_end.value + 2 * 3,
             'workitem_vgpr_count'               :   self.vgpr.v_end.value,
             'wavefront_size'                    :   32,
@@ -476,6 +530,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_load_dword s[{s.s_group()}], s[{s.s_ka()}:{s.s_ka(1)}], 84")
         if self.tunable.gemm_k_global_split:
             self._emit(f"s_load_dword s[{s.s_gemm_k_per_wg()}], s[{s.s_ka()}:{s.s_ka(1)}], 88")
+        if self.tunable.wmma_k_tail and self.tunable.gemm_k_global_split:
+            self._emit(f"s_load_dword s[{s.s_gemm_k_tail()}], s[{s.s_ka()}:{s.s_ka(1)}], 92")
+            self._emit(f"s_load_dword s[{s.s_gemm_k_num_splits()}], s[{s.s_ka()}:{s.s_ka(1)}], 96")
         self._emit(f"v_mov_b32 v[{v.v_tid()}], v0")
         # gfx1250 delivers workgroup id via ttmp9/ttmp7 -- see docs/gfx1250_wmma_layout.md.
         # ttmp9 is a clean, unpacked blockIdx.x. ttmp7 PACKS blockIdx.y (low 16 bits) and
@@ -537,6 +594,16 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_lshl_b32 s[{s.s_block_n_off()}], s[{s.s_by()}], {utility_log2(self.tunable.gemm_n_per_block)}   ; *gemm_n_per_block")
         if self.tunable.gemm_k_global_split:
             self._emit(f"s_mov_b32 s[{s.s_knum()}], s[{s.s_gemm_k_per_wg()}]   ; this workgroup only reduces its own K-slice")
+            if self.tunable.wmma_k_tail:
+                # Phase 35: shard bases (s_gemm_k_wg_off = bz*gemm_k_per_wg) are exact
+                # multiples of gemm_k_per_block and contiguous by construction -- only the
+                # LAST shard's range needs extending to cover gemm_k's true (possibly
+                # non-exact-multiple) end. No overlap, no gap: every other shard's range is
+                # already provably within [0, gemm_k).
+                self._emit(f"s_add_u32 s[{s.s_tmp(0)}], s[{s.s_bz()}], 1")
+                self._emit(f"s_cmp_eq_u32 s[{s.s_tmp(0)}], s[{s.s_gemm_k_num_splits()}]   ; am I the last shard?")
+                self._emit(f"s_cselect_b32 s[{s.s_tmp(0)}], s[{s.s_gemm_k_tail()}], 0")
+                self._emit(f"s_add_u32 s[{s.s_knum()}], s[{s.s_knum()}], s[{s.s_tmp(0)}]   ; wmma_k_tail: extend last shard's range by the remainder")
         else:
             self._emit(f"s_mov_b32 s[{s.s_knum()}], s[{s.s_gemm_k()}]")
         # A's per-K-block (32 rows) global stride depends on a runtime tensor extent (K_out) --
@@ -577,6 +644,22 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {out_elem_byte_shift_group}   ; D-operand is fp32/int32 (4B) normally, fp16 (2B) under wmma_acc_f16")
         self._emit(f"s_add_u32 s[{s.s_p_out()}], s[{s.s_p_out()}], s[{s.s_tmp(0)}]")
         self._emit(f"s_addc_u32 s[{s.s_p_out(1)}], s[{s.s_p_out(1)}], 0")
+        if self.tunable.wrw_reduction_kernel:
+            # Phase 35: shift s_p_out to point at THIS shard's own disjoint slice of the
+            # workspace buffer (driver already redirected p_out to the workspace base --
+            # see igemm_wrw_gtc_driver.h's WMMA run()). Slice size = the TOTAL output size
+            # across all groups (group*gemm_m*wei_row_c, matching the driver's
+            # wsred_output_size), always fp32 (4 bytes) -- asserted mutually exclusive with
+            # wmma_acc_f16/bf16 in igemm_base.py, so no other byte-width case applies here.
+            # Added once here (like the group offset above), so every tap's s_p_out_tap
+            # (recomputed fresh FROM s_p_out) automatically inherits it.
+            self._emit(f"; wrw_reduction_kernel: shard offset = bz * group * gemm_m * wei_row_c elements")
+            self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group()}], s[{s.s_gemm_m()}]")
+            self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_wei_row_c()}]")
+            self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_bz()}]")
+            self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], 2   ; workspace is always fp32 (4B)")
+            self._emit(f"s_add_u32 s[{s.s_p_out()}], s[{s.s_p_out()}], s[{s.s_tmp(0)}]")
+            self._emit(f"s_addc_u32 s[{s.s_p_out(1)}], s[{s.s_p_out(1)}], 0")
         self._emit_empty_line()
 
         # ---- global address for this thread's chunk of the A tile (grad_output, natural [GEMM_K][GEMM_M]) ----
@@ -597,6 +680,14 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], {col_start_shift}, v[{v.v_tmp(1)}]      ; col_start = col_group*{self.tunable.gemm_k_per_block}")
         self._emit(f"v_add_u32 v[{v.v_tmp()}], v[{v.v_tmp(1)}], v[{v.v_tmp()}]")
         self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_block_m_off()}], v[{v.v_tmp()}]")
+        if self.tunable.wmma_m_tail:
+            # Phase 35: v_tmp(1) still holds col_start (this thread's position within the
+            # GEMM_M block, untouched by the row-major flat-index accumulation above, which
+            # only ever writes v_tmp()) -- block_m_off + col_start is this thread's absolute
+            # GEMM_M index, independent of which K-row (row_local) it's on.
+            self._emit(f"v_add_u32 v[{v.v_tmp(2)}], s[{s.s_block_m_off()}], v[{v.v_tmp(1)}]   ; wmma_m_tail: absolute GEMM_M index")
+            self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_gemm_m()}], v[{v.v_tmp(2)}]")
+            self._emit(f"v_cndmask_b32 v[{v.v_flag_a_mtail()}], 0, 1, vcc_lo")
         if self.tunable.gemm_k_global_split:
             self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_gemm_k_wg_off()}], s[{s.s_a_m_total()}]   ; this workgroup's K-slice base, in A row units")
             self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_tmp(2)}], v[{v.v_tmp()}]")
@@ -614,6 +705,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"v_and_b32 v[{v.v_tmp()}], {num_col_groups - 1}, v[{v.v_tid()}]            ; col_group = tid&{num_col_groups - 1}")
         self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {col_start_shift}, v[{v.v_tmp()}]        ; col_start = col_group*{self.tunable.gemm_k_per_block}")
         self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_block_n_off()}], v[{v.v_tmp()}]")
+        if self.tunable.wmma_n_tail:
+            self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_gemm_n()}], v[{v.v_tmp()}]")
+            self._emit(f"v_cndmask_b32 v[{v.v_flag_b_ntail()}], 0, 1, vcc_lo   ; wmma_n_tail: persistent, ANDed into per-iteration v_flag in _emit_b_gather")
         self._emit(f"v_lshlrev_b32 v[{v.v_b_col_off()}], {utility_log2(self.data_byte)}, v[{v.v_tmp()}]")
         self._emit_empty_line()
 
@@ -667,6 +761,8 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # ---- B's initial (k_block_off=0) gather for this tap's first global load -- reads
         # the CURRENT s_iy/s_ix live, so no special-casing needed here ----
         self._emit_b_gather(None)
+        if self.tunable.wmma_k_tail:
+            self._emit_a_kflag(None)
         self._emit_empty_line()
 
         # ---- issue the first global loads for this tap (main loop expects this precondition) ----
@@ -702,11 +798,19 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_addc_u32 s[{s.s_p_out_tap(1)}], s[{s.s_p_out(1)}], 0")
         # Phase 34: atomic_pack_bf16 needs genuine scratch for v_gather/v_tmp3/v_tmp4 (the
         # non-packed atomic path never touches them, so v_c() is passed as a harmless
-        # unused placeholder there -- see coalescing_store_wmma.py's docstring).
+        # unused placeholder there -- see coalescing_store_wmma.py's docstring). Phase 35:
+        # wmma_m_tail/wmma_n_tail reuse those same v_tmp3/v_tmp4 slots for their own
+        # row/col-in-range scratch (v_m_tail_row/v_n_tail_col) -- mutually exclusive with
+        # atomic_pack_bf16 for now (asserted in igemm_base.py) to avoid a slot conflict and
+        # the unreviewed partner-lane-out-of-range wrinkle a packed cross-lane exchange would
+        # introduce for tail masking.
         if self.tunable.atomic_pack_bf16:
             self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_pk_idx(), s.s_block_m_off(), s.s_block_n_off(), None, v.v_pk_partner(), None, v.v_pk_packed()))
         else:
-            self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off()))
+            self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(),
+                    s.s_block_m_off(), s.s_block_n_off(),
+                    s.s_gemm_m.label if self.tunable.wmma_m_tail else None, v.v_m_tail_row() if self.tunable.wmma_m_tail else None,
+                    s.s_gemm_n.label if self.tunable.wmma_n_tail else None, v.v_n_tail_col() if self.tunable.wmma_n_tail else None))
         self._emit(f"s_wait_storecnt 0x0")
         self._emit_empty_line()
 
@@ -741,6 +845,16 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"v_mov_b32 v[{v.v_gtc_tmp(0)}], v[{v.v_row_local()}]   ; k_abs (k_block_off=0, within this workgroup's K-slice)")
         if self.tunable.gemm_k_global_split:
             self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], s[{s.s_gemm_k_wg_off()}]   ; += this workgroup's K-slice base")
+        if self.tunable.wmma_k_tail:
+            # Phase 35: capture the K-in-range check NOW, while v_gtc_tmp(0) still holds the
+            # raw global k_abs -- it's about to be destroyed by the div/rem decomposition
+            # below. MUST use the dedicated v_flag_b_ktail register, NOT v_tmp scratch -- the
+            # div/rem macro below clobbers ALL FOUR v_tmp registers internally (its own
+            # division algorithm's scratch), which would silently destroy a v_tmp-based flag
+            # before it's consumed by the v_flag AND further down (a real bug found via
+            # multi-tap hardware testing).
+            self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_gemm_k()}], v[{v.v_gtc_tmp(0)}]")
+            self._emit(f"v_cndmask_b32 v[{v.v_flag_b_ktail()}], 0, 1, vcc_lo   ; wmma_k_tail: k_abs < real gemm_k")
         self._emit(m_int_div_rem_vs(v.v_gtc_tmp(1), v.v_gtc_tmp(2), v.v_gtc_tmp(0), s.s_ho_wo(), v.v_tmp(), s.s_tmp()))
         self._emit(f"; v_gtc_tmp(1)=hw_idx (rem), v_gtc_tmp(2)=n_idx (quo)")
         self._emit(m_int_div_rem_vs(v.v_gtc_tmp(3), v.v_gtc_tmp(4), v.v_gtc_tmp(1), s.s_wo(), v.v_tmp(), s.s_tmp()))
@@ -763,6 +877,13 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"v_cndmask_b32 v[{v.v_flag()}], 0, 1, vcc_lo")
         self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_wi()}], v[{v.v_gtc_tmp(3)}]")
         self._emit(f"v_cndmask_b32 v[{v.v_flag()}], 0, v[{v.v_flag()}], vcc_lo")
+        if self.tunable.wmma_n_tail:
+            # Phase 35: AND in B's persistent (kernel-lifetime-constant) column-in-range flag
+            # -- v_flag_b_ntail was computed once in the prologue, not recomputed here.
+            self._emit(f"v_and_b32 v[{v.v_flag()}], v[{v.v_flag()}], v[{v.v_flag_b_ntail()}]   ; wmma_n_tail")
+        if self.tunable.wmma_k_tail:
+            # Phase 35: AND in the K-in-range check captured into v_flag_b_ktail above.
+            self._emit(f"v_and_b32 v[{v.v_flag()}], v[{v.v_flag()}], v[{v.v_flag_b_ktail()}]   ; wmma_k_tail")
         self._emit_empty_line()
 
         self._emit(f"; row_idx = n_idx*(hi*wi) + hi_idx*wi + wi_idx (meaningless but harmless if")
@@ -835,6 +956,21 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"s_wait_loadcnt 0x0")
             self._emit_sst_chunk(v_gld, v_sst_os, sst_extra_off, c)
 
+    def _a_flag_symbol(self):
+        '''
+        Phase 35: which VGPR (if any) masks A's (grad_output) load. When wmma_k_tail is set,
+        v_flag_a_ktail already has wmma_m_tail's flag ANDed into it every time it's
+        recomputed (see _emit_a_kflag), so it alone is the correct combined flag whenever
+        K-tail is active, regardless of whether M-tail is also active. When only wmma_m_tail
+        is set, its own persistent flag is used directly. Returns None (no masking) when
+        neither is set -- every existing config's byte-identical behavior.
+        '''
+        if self.tunable.wmma_k_tail:
+            return self.vgpr.v_flag_a_ktail
+        if self.tunable.wmma_m_tail:
+            return self.vgpr.v_flag_a_mtail
+        return None
+
     def global_load_a_functor(self):
         ''' Phase 1: only issues chunk 0's load when num_k_chunks==1 (no clobbering risk
         then, since emit_extra_substeps() never runs) -- see _emit_sst_all_chunks. '''
@@ -844,7 +980,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 v = outer.vgpr
                 with outer._deferred_context():
                     if outer.num_k_chunks == 1:
-                        outer._emit_gld_chunk_load(v.v_gld_a, v.v_addr_a, 0, v_flag=None)
+                        outer._emit_gld_chunk_load(v.v_gld_a, v.v_addr_a, 0, v_flag=outer._a_flag_symbol())
                 return outer._get_deferred()
             def get_issues(self):
                 return outer.chunk_num_dwordx4
@@ -879,9 +1015,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 v = outer.vgpr
                 with outer._deferred_context():
                     if outer.num_k_chunks == 1:
-                        outer._emit_sst_remaining_chunks(v.v_gld_a, v.v_addr_a, v.v_sst_os, 0, v_flag=None)
+                        outer._emit_sst_remaining_chunks(v.v_gld_a, v.v_addr_a, v.v_sst_os, 0, v_flag=outer._a_flag_symbol())
                     else:
-                        outer._emit_sst_all_chunks(v.v_gld_a, v.v_addr_a, v.v_sst_os, 0, v_flag=None)
+                        outer._emit_sst_all_chunks(v.v_gld_a, v.v_addr_a, v.v_sst_os, 0, v_flag=outer._a_flag_symbol())
                 return outer._get_deferred()
             def get_issues(self):
                 return outer.chunk_num_dwordx4
@@ -983,6 +1119,30 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 return outer._get_deferred()
         return functor_t()
 
+    def _emit_a_kflag(self, s_k_block_off):
+        '''
+        Phase 35: A's (grad_output) per-iteration GEMM_K-in-range flag, mirroring
+        _emit_b_gather's k_abs computation but using A's own persistent row-within-K-block
+        value (v_row_local -- the SAME formula/value B uses, since A and B share the same
+        num_col_groups/col_group_bits tiling scheme, see class docstring). Unlike B, A has no
+        spatial decomposition to do, so this only ever needs the boolean flag itself. Writes
+        into v_flag_a_ktail; if wmma_m_tail is also set, ANDs its persistent flag in here too
+        (rather than merging the two elsewhere) so v_flag_a_ktail is always the single,
+        ready-to-use combined flag for A's loads (see _a_flag_symbol()).
+        '''
+        s = self.sgpr
+        v = self.vgpr
+        if s_k_block_off is not None:
+            self._emit(f"v_add_u32 v[{v.v_flag_a_ktail()}], s[{s_k_block_off}], v[{v.v_row_local()}]   ; k_abs (within this workgroup's K-slice)")
+        else:
+            self._emit(f"v_mov_b32 v[{v.v_flag_a_ktail()}], v[{v.v_row_local()}]   ; k_abs (k_block_off=0, within this workgroup's K-slice)")
+        if self.tunable.gemm_k_global_split:
+            self._emit(f"v_add_u32 v[{v.v_flag_a_ktail()}], v[{v.v_flag_a_ktail()}], s[{s.s_gemm_k_wg_off()}]   ; += this workgroup's K-slice base")
+        self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_gemm_k()}], v[{v.v_flag_a_ktail()}]")
+        self._emit(f"v_cndmask_b32 v[{v.v_flag_a_ktail()}], 0, 1, vcc_lo   ; wmma_k_tail: k_abs < real gemm_k")
+        if self.tunable.wmma_m_tail:
+            self._emit(f"v_and_b32 v[{v.v_flag_a_ktail()}], v[{v.v_flag_a_ktail()}], v[{v.v_flag_a_mtail()}]   ; wmma_m_tail")
+
     def move_slice_window_a_functor(self):
         outer = self
         class functor_t:
@@ -992,6 +1152,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 with outer._deferred_context():
                     outer._emit(f"v_add_co_u32 v[{v.v_addr_a()}], vcc_lo, s[{s.s_a_k_stride()}], v[{v.v_addr_a()}]")
                     outer._emit(f"v_add_co_ci_u32 v[{v.v_addr_a(1)}], vcc_lo, 0, v[{v.v_addr_a(1)}], vcc_lo")
+                    if outer.tunable.wmma_k_tail:
+                        outer._emit(f"s_sub_i32 s[{s.s_tmp(1)}], s[{s.s_knum()}], s[{s.s_kitr()}]   ; k_block_off")
+                        outer._emit_a_kflag(s.s_tmp(1))
                 return outer._get_deferred()
         return functor_t()
 

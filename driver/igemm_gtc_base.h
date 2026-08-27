@@ -71,6 +71,15 @@ typedef struct {
     int total_length;
 } __attribute__((packed)) tensor_cast_karg_t;
 
+// Phase 35: karg for wrw_reduce_partials_f32 (driver/gpu_tensor_cast/gpu_tensor_cast.cpp) --
+// sums num_partitions disjoint output_size-element fp32 slices of workspace into output.
+typedef struct {
+    void* output;
+    void* workspace;
+    int num_partitions;
+    int output_size;
+} __attribute__((packed)) wrw_reduce_karg_t;
+
 static inline size_t get_data_byte(driverDataType_t dtype)
 {
     if(dtype == driverHalf)
@@ -199,6 +208,17 @@ typedef struct {
     // EXEC-mask guard. Independent flag (not folded into wmma_m_tail) so M-only, N-only, and
     // M+N configs can all exist. Same not-folded-into-kernel-name rationale as wmma_m_tail.
     int wmma_n_tail;
+    // Phase 35: GEMM_K tail for wrw -- relaxes gemm_k%gemm_k_per_block==0. Unlike
+    // wmma_m_tail/wmma_n_tail this composes with gemm_k_global_split by construction (only
+    // the last split-K shard's loop range gets extended); see gemm_k_tail/gemm_k_num_splits
+    // in the wrw karg struct. Pure codegen/validity behavior, not folded into the kernel name.
+    int wmma_k_tail;
+    // Phase 35: hipconv-style reduction-kernel epilogue for wrw's gemm_k_global_split path --
+    // replaces the atomic epilogue with plain per-shard stores into a workspace buffer plus a
+    // separate reduction kernel pass. Changes what the main kernel's epilogue produces
+    // (partials, not final output), so IS folded into the kernel name (same category as
+    // atomic_pack_bf16/wmma_setprio above).
+    int wrw_reduction_kernel;
 } igemm_gtc_tunable_t;
 
 static inline std::string get_igemm_gtc_fma_type(std::string arch_string, const config_section_t &sec){
@@ -269,6 +289,8 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.wmma_n_tail               = sec.count("wmma_n_tail") > 0 ? sec.at("wmma_n_tail").get_int() : 0;
                 tunable.wmma_setprio               = sec.count("wmma_setprio") > 0 ? sec.at("wmma_setprio").get_int() : 0;
                 tunable.atomic_pack_bf16           = sec.count("atomic_pack_bf16") > 0 ? sec.at("atomic_pack_bf16").get_int() : 0;
+                tunable.wmma_k_tail                = sec.count("wmma_k_tail") > 0 ? sec.at("wmma_k_tail").get_int() : 0;
+                tunable.wrw_reduction_kernel       = sec.count("wrw_reduction_kernel") > 0 ? sec.at("wrw_reduction_kernel").get_int() : 0;
             }
             else{
                 tunable.wave_tile_m              = sec.at("wave_tile_m").get_int();
@@ -478,6 +500,8 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += std::string("_setprio");
         if(tunable->atomic_pack_bf16)
             kernel_name += std::string("_pkatomic");
+        if(tunable->wrw_reduction_kernel)
+            kernel_name += std::string("_wsred");
     }
     if(tensor_a_pass_through)
         kernel_name += std::string("_pta");

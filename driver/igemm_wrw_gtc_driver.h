@@ -98,6 +98,13 @@ typedef struct {
     int   gemm_k_per_wg;    // gemm_k_global_split: this workgroup's K-slice length. Always
                              // present (even for non-split kernels, which never read it) --
                              // see python/igemm/igemm_wrw_gtc_wmma_nhwc.py's karg comment.
+    int   gemm_k_tail;         // Phase 35: wmma_k_tail remainder R = gemm_k - num_k_blocks*
+                                // gemm_k_per_block. Always present in this C++ struct (same
+                                // "always present" convention as gemm_k_per_wg above), but
+                                // only declared/read on the device side when wmma_k_tail AND
+                                // gemm_k_global_split are both set -- see get_kernel_args().
+    int   gemm_k_num_splits;   // Phase 35: the launched grid.z (== splits), so the device can
+                                // tell "am I the last shard" via bz == gemm_k_num_splits-1.
 } __attribute__((packed)) igemm_wrw_gtc_wmma_nhwc_karg_t;
 
 static void dump_wrw_karg(igemm_wrw_gtc_karg_t * karg){
@@ -264,7 +271,21 @@ public:
             int wmma_gemm_m = k / group;
             int wmma_gemm_n = c / group;
             int wmma_gemm_k = n * ho * wo;
-            if(wmma_gemm_m % tunable->gemm_m_per_block != 0 || wmma_gemm_n % tunable->gemm_n_per_block != 0 || wmma_gemm_k % tunable->gemm_k_per_block != 0)
+            // Phase 35: wmma_m_tail/wmma_n_tail/wmma_k_tail each independently relax their own
+            // axis's exact-multiple requirement -- mirrors fwd's identical relax pattern in
+            // igemm_fwd_gtc_driver.h. Unlike fwd/bwd, wrw's M/N-tail must also work under
+            // gemm_k_global_split (checked/asserted at the tunable-construction level in
+            // igemm_base.py, not here), so no additional restriction is needed here for that.
+            // gemm_n%4==0 mirrors fwd's identical requirement (igemm_fwd_gtc_driver.h) for
+            // the NON-atomic epilogue only -- its store is vector_write_out=4-wide, and the
+            // EXEC-mask guard only checks a group's first column, so a group straddling a
+            // non-multiple-of-4 tail would silently write past the real gemm_n. The atomic
+            // epilogue (gemm_k_global_split) issues one scalar atomic per element (no 4-wide
+            // grouping), so this restriction does not apply there.
+            if((!tunable->wmma_m_tail && wmma_gemm_m % tunable->gemm_m_per_block != 0) ||
+               (!tunable->wmma_n_tail && wmma_gemm_n % tunable->gemm_n_per_block != 0) ||
+               (tunable->wmma_n_tail && !tunable->gemm_k_global_split && wmma_gemm_n % 4 != 0) ||
+               (!tunable->wmma_k_tail && wmma_gemm_k % tunable->gemm_k_per_block != 0))
                 return false;
             return true;
         }
@@ -744,6 +765,12 @@ public:
                 return 1;
             };
             int num_k_blocks = gemm_k / tunable->gemm_k_per_block;
+            // Phase 35: wmma_k_tail's remainder -- the portion of gemm_k not covered by any
+            // exact gemm_k_per_block-sized block. Only the LAST split-K shard's s_knum gets
+            // extended by this (see igemm_wrw_gtc_wmma_nhwc.py's emit_kernel_prologue); 0 when
+            // wmma_k_tail is unset (gemm_k is then required to be an exact multiple already,
+            // per tunable_is_valid()).
+            int gemm_k_tail = tunable->wmma_k_tail ? (gemm_k - num_k_blocks * tunable->gemm_k_per_block) : 0;
             std::vector<int> divisors;
             if (tunable->gemm_k_global_split) {
                 for (int i = 1; static_cast<long long>(i) * i <= num_k_blocks; i++) {
@@ -760,7 +787,23 @@ public:
             igemm_wrw_gtc_wmma_nhwc_karg_t karg;
             karg.p_in     = p_out;   // grad_output (read)
             karg.p_wei    = p_in;    // input (read)
-            karg.p_out    = p_wei;   // grad_weight (write)
+            // Phase 35 (hipconv-style reduction-kernel epilogue): when set, the main kernel
+            // writes disjoint per-shard partial sums into a workspace buffer instead of
+            // atomic-accumulating directly into the real output -- a separate reduction
+            // kernel (wrw_reduce_partials_f32) sums them afterward. Workspace is sized for
+            // num_k_blocks partitions (the largest split count the ternary search below
+            // could ever try), fp32-native regardless of the tunable's nominal precision
+            // (same rationale as the atomic path's always-fp32 output, see docs/
+            // gfx1250_wmma_layout.md's Phase 34/17), so every candidate fits without
+            // reallocating mid-search.
+            void *p_wei_workspace_wsred = nullptr;
+            size_t wsred_output_size = static_cast<size_t>(group) * (k / group) * (c / group) * y * x;
+            if (tunable->wrw_reduction_kernel) {
+                HIP_CALL(hipMalloc(&p_wei_workspace_wsred, static_cast<size_t>(num_k_blocks) * wsred_output_size * sizeof(float)));
+                karg.p_out = p_wei_workspace_wsred;
+            } else {
+                karg.p_out = p_wei;   // grad_weight (write)
+            }
             karg.gemm_m   = gemm_m;
             karg.gemm_n   = gemm_n;
             karg.gemm_k   = gemm_k;
@@ -839,16 +882,30 @@ public:
             // count there would write past the actual (half-sized) allocation.
             size_t gsplit_zero_elem_byte = tunable->atomic_pack_bf16 ? 2 : sizeof(float);
             auto wrw_gsplit_prolog = std::function<float()>{[&]() -> float {
-                if (tunable->gemm_k_global_split)
+                // Phase 35: wrw_reduction_kernel's main kernel does plain (non-atomic)
+                // per-shard stores, not accumulation -- every partition slot gets fully
+                // overwritten every dispatch, so no re-zero is needed (and zeroing at
+                // wsred_output_size here would be the wrong size anyway -- the workspace is
+                // num_k_blocks*wsred_output_size).
+                if (tunable->gemm_k_global_split && !tunable->wrw_reduction_kernel)
                     HIP_CALL(hipMemset(p_wei, 0, static_cast<size_t>(group) * (k / group) * (c / group) * y * x * gsplit_zero_elem_byte));
                 return .0;
             }};
+
+            // Phase 35: reduction kernel function, loaded once (reused across every
+            // candidate split count the search below tries).
+            hipFunction_t wrw_reduce_func;
+            if (tunable->wrw_reduction_kernel) {
+                HIP_CALL(hipModuleGetFunction(&wrw_reduce_func, module_tensor_cast, "wrw_reduce_partials_f32"));
+            }
 
             std::string dump_dir = env_get_str("IGEMM_DUMPDIR_ALL", "");
             // Actually launches and times `splits` for real (karg.gemm_k_per_wg + grid.z),
             // via the same per-iteration zero-init prolog every other launch path uses.
             auto time_split = [&](int splits) -> float {
                 karg.gemm_k_per_wg = (num_k_blocks / splits) * tunable->gemm_k_per_block;
+                karg.gemm_k_tail = gemm_k_tail;
+                karg.gemm_k_num_splits = splits;
                 size_t grid_z = static_cast<size_t>(splits);
 
                 result.dumpdata.clear();
@@ -859,7 +916,35 @@ public:
                 result.dumpdata.push_back(kernel_launchers.back());
                 result.dumpdata.back().ktype = kargtype_t::igemm_wrw_gtc_wmma_nhwc_karg_t;
 
-                float duration = igemm_launch_kernels(kernel_launchers, wrw_gsplit_prolog, noop, this->warmup, this->repeat);
+                // Phase 35: reduction pass, timed together with the main kernel (same
+                // pattern as the XDLOPS path's wrw_postlog/tensor_cast_func) -- this
+                // `splits` is the number of partitions this specific candidate actually
+                // wrote (workspace slots beyond it, up to num_k_blocks, are simply unused
+                // for this launch).
+                auto wrw_reduce_postlog = std::function<float()>{[&, splits]() -> float {
+                    if (tunable->wrw_reduction_kernel) {
+                        wrw_reduce_karg_t karg_reduce;
+                        karg_reduce.output = p_wei;
+                        karg_reduce.workspace = p_wei_workspace_wsred;
+                        karg_reduce.num_partitions = splits;
+                        karg_reduce.output_size = static_cast<int>(wsred_output_size);
+                        size_t karg_reduce_size = sizeof(karg_reduce);
+                        // igemm_launch_kernel_single's grid_size is in units of WORKITEMS
+                        // (total threads), not blocks, and hipExtModuleLaunchKernel requires
+                        // it to be an EXACT multiple of block_size -- round output_size up to
+                        // the next multiple of 256, matching the existing tensor_cast kernel
+                        // call sites' identical rounding pattern (see wrw_postlog's
+                        // thread_length_cast above). A bare (output_size+255)/256 (a BLOCK
+                        // count, not a workitem count) is NOT valid here -- confirmed on real
+                        // hardware ("invalid argument" whenever that block count itself isn't
+                        // also a multiple of 256).
+                        size_t grid_reduce = (wsred_output_size + 255) / 256 * 256;
+                        igemm_launch_kernel_single(wrw_reduce_func, &karg_reduce, karg_reduce_size, {grid_reduce, 1, 1}, {256, 1, 1});
+                    }
+                    return .0;
+                }};
+
+                float duration = igemm_launch_kernels(kernel_launchers, wrw_gsplit_prolog, wrw_reduce_postlog, this->warmup, this->repeat);
                 if (dump_dir.size())
                     dump_shader_args(dump_dir, result.dumpheader, result.dumpdata, result.kernel_name);
                 return duration;
@@ -903,6 +988,8 @@ public:
             result.return_code = 0;
             result.duration_ms = min_duration;
             result.gks = selected_splits;
+            if (p_wei_workspace_wsred != nullptr)
+                HIP_CALL(hipFree(p_wei_workspace_wsred));
 #ifdef IGEMM_SPLIT_KERNEL
             HIP_CALL(hipModuleUnload(cur_kernel_module));
 #endif

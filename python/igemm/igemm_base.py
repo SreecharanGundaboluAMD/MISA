@@ -558,43 +558,13 @@ class igemm_gtc_tunable_parameter_t(object):
                 assert not self.gemm_k_global_split, \
                     "wmma_acc_bf16 and gemm_k_global_split are mutually exclusive -- the atomic epilogue branch was never adapted to read a packed accumulator, see wmma_acc_f16's identical Phase 24 reasoning"
                 assert not self.wmma_acc_f16, "wmma_acc_bf16 and wmma_acc_f16 are mutually exclusive (different precisions)"
-            # Phase 25 (GEMM_M tail): optional, defaults to 0 (today's exact-gemm_m-multiple-
-            # only requirement, every existing config unaffected). When 1, the driver's
-            # tunable_is_valid() allows gemm_m % gemm_m_per_block != 0, and this kernel emits
-            # extra masking: the A-operand v_flag computation also checks the lane's absolute
-            # flattened row index against the real (unpadded) GEMM_M, and the epilogue
-            # EXEC-masks stores whose absolute row index is out of range. fwd (Phase 25) and
-            # bwd (Phase 26a) so far -- wrw's GEMM_M semantics and gemm_k_global_split-as-
-            # primary-path interaction haven't been reviewed for this yet.
-            self.wmma_m_tail = utility_dict_with_default_t(tunable_dict)('wmma_m_tail', 0)
-            if self.wmma_m_tail:
-                assert self.direction in ('fwd', 'bwd'), "wmma_m_tail is only implemented for fwd/bwd so far, see docs/gfx1250_wmma_layout.md's Phase 25/26"
-                assert not self.gemm_k_global_split, \
-                    "wmma_m_tail and gemm_k_global_split are mutually exclusive for now -- the atomic epilogue branch has no M-tail masking, see docs/gfx1250_wmma_layout.md's Phase 25"
-            # Phase 26b (GEMM_N tail): analogous to wmma_m_tail but for GEMM_N -- the
-            # B-operand load gains a persistent (kernel-lifetime-constant, not per-tap) flag
-            # checking this lane's absolute column against the real GEMM_N, and the epilogue
-            # gets a second EXEC-mask guard chained after the M-tail one (wave32 v_cmpx
-            # intersects with the already-narrowed EXEC). fwd only so far. NOTE: the driver's
-            # tunable_is_valid() additionally requires the real gemm_n to be a multiple of 4 --
-            # the epilogue's non-atomic store is 4-elements-per-group vectorized, and the
-            # guard only checks a group's first column, so a group straddling a
-            # non-multiple-of-4 tail would silently write past the real gemm_n (confirmed on
-            # hardware). See docs/gfx1250_wmma_layout.md's Phase 26b.
-            self.wmma_n_tail = utility_dict_with_default_t(tunable_dict)('wmma_n_tail', 0)
-            if self.wmma_n_tail:
-                assert self.direction == 'fwd', "wmma_n_tail is only implemented for fwd so far, see docs/gfx1250_wmma_layout.md's Phase 26b"
-                assert not self.gemm_k_global_split, \
-                    "wmma_n_tail and gemm_k_global_split are mutually exclusive for now -- the atomic epilogue branch has no N-tail masking, see docs/gfx1250_wmma_layout.md's Phase 26b"
-                assert not self.async_global_load, \
-                    "wmma_n_tail and async_global_load are mutually exclusive for now -- global_load_async_to_lds_b128's masking was only ever validated for the A operand, see docs/gfx1250_wmma_layout.md's Phase 13/26b"
-                assert self.gemm_n_per_block // self.block_size == 1, \
-                    "wmma_n_tail requires row_repeat_b == 1 -- rows 1+ have no flag of their own, see docs/gfx1250_wmma_layout.md's Phase 26b"
             # Phase 34 (packed-bf16 atomics): atomic path only, bf16 precision only (packed
             # bf16 atomics need bf16-native memory, and the accuracy tradeoff of packing was
             # only measured for bf16 -- see docs/gfx1250_wmma_layout.md's Phase 34). Halves
             # the number of actual atomic ops the K-split epilogue issues, at the cost of
-            # bf16 (not fp32) precision on the K-split reduction itself.
+            # bf16 (not fp32) precision on the K-split reduction itself. Defined here (before
+            # wmma_m_tail/wmma_n_tail) since wrw's tail tunables below need to reference it
+            # in their own mutual-exclusion asserts.
             self.atomic_pack_bf16 = utility_dict_with_default_t(tunable_dict)('atomic_pack_bf16', 0)
             if self.atomic_pack_bf16:
                 assert self.gemm_k_global_split, \
@@ -603,6 +573,79 @@ class igemm_gtc_tunable_parameter_t(object):
                     "atomic_pack_bf16 is only implemented for bf16 precision so far, see docs/gfx1250_wmma_layout.md's Phase 34"
                 assert not self.atomic_cascade, \
                     "atomic_pack_bf16 and atomic_cascade are mutually exclusive for now -- not tested together"
+            # Phase 25 (GEMM_M tail): optional, defaults to 0 (today's exact-gemm_m-multiple-
+            # only requirement, every existing config unaffected). When 1, the driver's
+            # tunable_is_valid() allows gemm_m % gemm_m_per_block != 0, and this kernel emits
+            # extra masking: the A-operand v_flag computation also checks the lane's absolute
+            # flattened row index against the real (unpadded) GEMM_M, and the epilogue
+            # EXEC-masks stores whose absolute row index is out of range. fwd (Phase 25) and
+            # bwd (Phase 26a) so far. Phase 35 adds wrw: unlike fwd/bwd, wrw's split-K
+            # (gemm_k_global_split) is its PRIMARY path, not an edge case, so wrw's M-tail
+            # must (and does) also mask the atomic epilogue branch -- no exclusion needed.
+            self.wmma_m_tail = utility_dict_with_default_t(tunable_dict)('wmma_m_tail', 0)
+            if self.wmma_m_tail:
+                assert self.direction in ('fwd', 'bwd', 'wrw'), "wmma_m_tail is only implemented for fwd/bwd/wrw so far, see docs/gfx1250_wmma_layout.md's Phase 25/26/35"
+                if self.direction != 'wrw':
+                    assert not self.gemm_k_global_split, \
+                        "wmma_m_tail and gemm_k_global_split are mutually exclusive for now -- the atomic epilogue branch has no M-tail masking, see docs/gfx1250_wmma_layout.md's Phase 25"
+                else:
+                    assert not self.atomic_pack_bf16, \
+                        "wmma_m_tail and atomic_pack_bf16 are mutually exclusive for now -- both need the same coalescing_store v_tmp3/v_tmp4 scratch slots for unrelated purposes, and tail-masking a packed cross-lane exchange (a lane's partner may be in-range while it isn't) hasn't been reviewed, see docs/gfx1250_wmma_layout.md's Phase 35"
+            # Phase 26b (GEMM_N tail): analogous to wmma_m_tail but for GEMM_N -- the
+            # B-operand load gains a persistent (kernel-lifetime-constant, not per-tap) flag
+            # checking this lane's absolute column against the real GEMM_N, and the epilogue
+            # gets a second EXEC-mask guard chained after the M-tail one (wave32 v_cmpx
+            # intersects with the already-narrowed EXEC). fwd only so far, Phase 35 adds wrw
+            # (same split-K-must-compose reasoning as wmma_m_tail above -- wrw's atomic
+            # epilogue is scalar-per-element already, so the vectorized-store granularity
+            # issue below that forces fwd's gemm_n%4==0 restriction does not apply to wrw's
+            # atomic branch). NOTE: the driver's tunable_is_valid() additionally requires the
+            # real gemm_n to be a multiple of 4 for fwd/bwd's non-atomic epilogue -- that
+            # epilogue's store is 4-elements-per-group vectorized, and the guard only checks a
+            # group's first column, so a group straddling a non-multiple-of-4 tail would
+            # silently write past the real gemm_n (confirmed on hardware). See
+            # docs/gfx1250_wmma_layout.md's Phase 26b.
+            self.wmma_n_tail = utility_dict_with_default_t(tunable_dict)('wmma_n_tail', 0)
+            if self.wmma_n_tail:
+                assert self.direction in ('fwd', 'wrw'), "wmma_n_tail is only implemented for fwd/wrw so far, see docs/gfx1250_wmma_layout.md's Phase 26b/35"
+                if self.direction == 'wrw':
+                    assert not self.atomic_pack_bf16, \
+                        "wmma_n_tail and atomic_pack_bf16 are mutually exclusive for now -- same reasoning as wmma_m_tail, see docs/gfx1250_wmma_layout.md's Phase 35"
+                else:
+                    assert not self.gemm_k_global_split, \
+                        "wmma_n_tail and gemm_k_global_split are mutually exclusive for now -- the atomic epilogue branch has no N-tail masking, see docs/gfx1250_wmma_layout.md's Phase 26b"
+                    assert not self.async_global_load, \
+                        "wmma_n_tail and async_global_load are mutually exclusive for now -- global_load_async_to_lds_b128's masking was only ever validated for the A operand, see docs/gfx1250_wmma_layout.md's Phase 13/26b"
+                    assert self.gemm_n_per_block // self.block_size == 1, \
+                        "wmma_n_tail requires row_repeat_b == 1 -- rows 1+ have no flag of their own, see docs/gfx1250_wmma_layout.md's Phase 26b"
+            # Phase 35 (GEMM_K tail, wrw only): no precedent anywhere else in this codebase --
+            # unlike the TDM-hardware-OOB K-tail fwd/1x1 uses (Phase 31), this is a genuine
+            # software EXEC-mask mechanism, since wrw doesn't use TDM. Composes with
+            # gemm_k_global_split by construction (only the LAST split-K shard's loop range
+            # gets extended to cover the true, non-padded gemm_k -- see driver's
+            # gemm_k_tail/gemm_k_num_splits kernarg fields). See docs/gfx1250_wmma_layout.md's
+            # Phase 35.
+            self.wmma_k_tail = utility_dict_with_default_t(tunable_dict)('wmma_k_tail', 0)
+            if self.wmma_k_tail:
+                assert self.direction == 'wrw', "wmma_k_tail is only implemented for wrw so far, see docs/gfx1250_wmma_layout.md's Phase 35"
+            # Phase 35 (hipconv-style reduction-kernel epilogue): replaces the atomic epilogue
+            # entirely for wrw's split-K path -- each shard writes a plain, non-atomic store
+            # into its own disjoint slice of a workspace buffer (num_splits x output_size),
+            # then a separate reduction kernel (driver/gpu_tensor_cast/gpu_tensor_cast.cpp)
+            # sums the partitions into the real output. No atomics anywhere in the main
+            # kernel. This is a buffer-layout-changing tunable (the kernel writes partials,
+            # not final output) so -- unlike wmma_m_tail/wmma_n_tail/wmma_k_tail, which are
+            # pure masking -- it IS folded into the kernel name (see
+            # igemm_gtc_encode_kernel_name below). See docs/gfx1250_wmma_layout.md's Phase 35.
+            self.wrw_reduction_kernel = utility_dict_with_default_t(tunable_dict)('wrw_reduction_kernel', 0)
+            if self.wrw_reduction_kernel:
+                assert self.direction == 'wrw', "wrw_reduction_kernel is only implemented for wrw, see docs/gfx1250_wmma_layout.md's Phase 35"
+                assert self.gemm_k_global_split, \
+                    "wrw_reduction_kernel only makes sense when gemm_k_global_split is set (it replaces that path's atomic epilogue)"
+                assert not self.atomic_pack_bf16, \
+                    "wrw_reduction_kernel and atomic_pack_bf16 are mutually exclusive -- this mode has no atomics at all"
+                assert not self.wmma_acc_f16 and not self.wmma_acc_bf16, \
+                    "wrw_reduction_kernel keeps the D-operand plain fp32 (matching the workspace's fixed fp32 layout) -- not combined with the packed-accumulator precision tricks for now"
             if self.wmma_acc_f16:
                 wmma_mapping_key = self.precision + '_f16acc'
             elif self.wmma_acc_bf16:
@@ -1113,6 +1156,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_setprio"
         if tunable.atomic_pack_bf16:
             kernel_name += "_pkatomic"
+        if tunable.wrw_reduction_kernel:
+            kernel_name += "_wsred"
 
     if tunable.tensor_a_pass_through:
         kernel_name += "_pta"

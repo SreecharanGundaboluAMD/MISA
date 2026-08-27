@@ -3415,3 +3415,203 @@ field, config parsing, kernel-name fold; `driver/igemm_wrw_gtc_driver.h` -- gspl
 zero-init size fix (`gsplit_zero_elem_byte`); `driver/conv_driver.cpp` --
 `is_wmma_atomic_pack_bf16` dtype/verification wiring (reads bf16 directly, no cast kernel);
 `config/igemm_wrw_gtc_gfx1250_nhwc_bf16_gsplit_pkatomic.config` -- new.
+
+## Phase 35 (2026-08-27): wrw GEMM_M/N/K tail relief, hipconv-style reduction-kernel
+epilogue, and tile widening -- closing wrw's coverage/performance gap vs gfx950/XDLOPS
+
+The three highest-confidence items from `docs/gfx1250_perf_parity_action_plan.md`, done
+together in one continuous push per explicit user direction: wrw's WMMA path had ZERO
+boundary/tail handling (gemm_m, gemm_n, gemm_k all had to be exact tile multiples --
+the single biggest shape-coverage gap vs fwd/bwd and vs the mature XDLOPS track), no
+alternative to atomic-accumulate for its split-K epilogue, and only two `gemm_k_per_block`
+values (32, 64 via `_k2x`) versus CK's instance library going up to 256.
+
+### Mechanism 1+2: wrw M-tail and N-tail
+
+Ported fwd/bwd's existing `wmma_m_tail`/`wmma_n_tail` pattern to wrw, widening each
+tunable's direction gate in `python/igemm/igemm_base.py`. The key deviation from
+fwd/bwd's precedent: wrw's `gemm_k_global_split` (atomic split-K) is its **primary** path,
+not an edge case, so unlike fwd/bwd (which simply exclude tail tunables from split-K),
+wrw's M/N-tail had to mask BOTH the non-atomic epilogue (already generic/shared code,
+needed no changes) AND the plain-atomic epilogue (new code, `coalescing_store_wmma.py`'s
+`elif ctrl.gemm_k_global_split:` branch) from day one. Turned out simpler than feared:
+that branch is already scalar-per-element (no `vector_write_out=4` grouping), so fwd's
+own N-tail bug class (a vectorized-store-group straddling the tail boundary) can't recur
+there -- only the non-atomic path still needs `gemm_n % 4 == 0` (mirrored exactly from
+fwd's existing driver check).
+
+**Real bug found and fixed via hardware testing**: the very first N-tail test (`c=129`,
+otherwise exact) failed with widespread small-magnitude corruption across the ENTIRE
+output, not just the tail boundary -- traced to forgetting to add wrw's own
+`gemm_n % 4 == 0` restriction (mirroring fwd's identical, already-documented
+`igemm_fwd_gtc_driver.h` requirement) to `igemm_wrw_gtc_driver.h`'s `tunable_is_valid()`
+for the non-atomic path specifically (the atomic path's per-element masking has no such
+restriction). Once added, all shapes passed.
+
+**Hardware validation**: full degenerate/one-short/one-over/exact-noop battery on both
+the non-atomic and atomic epilogues, group>1, and M+N combined -- all `valid:y`. Byte-
+identical regression confirmed for every pre-existing config (9 configs spot-checked
+during this mechanism, full 104-config sweep at the end of this phase).
+
+### Mechanism 3: wrw K-tail -- genuinely new, no precedent anywhere in this codebase
+
+Unlike M/N-tail (a direct port), K-tail had zero prior art: the only existing WMMA
+K-boundary mechanism is Phase 31's TDM-hardware-OOB zero-fill (fwd, 1x1-only, relies on
+gfx1250's `tensor_load_to_lds` own OOB behavior -- inapplicable to wrw, which doesn't use
+TDM). Verified directly against the code (not assumed) that this needed far less new
+machinery than expected: `wmma_main_loop.py`'s main loop is a signed decrement-until-
+non-positive loop (`s_kitr = s_knum; ...; s_kitr -= unroll_k; s_cbranch_scc0 _last`) that
+already tolerates any `s_knum`, and `_emit_gld_chunk_load` already zero-inits its
+destination before a masked load. So K-tail reduced to: (a) get `s_knum` correct per
+split-K shard, (b) mask the final iteration's out-of-range lanes.
+
+**(a)**: two new kernarg fields (`gemm_k_tail` = the remainder, `gemm_k_num_splits` = the
+launched `grid.z`), gated to only exist in the kernarg layout when `wmma_k_tail` AND
+`gemm_k_global_split` are both set (a plain non-split K-tail build needs neither -- `s_knum`
+is already exactly `s_gemm_k` in that case, zero code change). Only the LAST split-K shard
+(`bz == gemm_k_num_splits-1`) gets its `s_knum` extended by the remainder -- shard bases
+stay exact multiples and contiguous by construction, so this is the only place a gap could
+exist.
+
+**(b)**: B's `_emit_b_gather` already computes the global absolute `k_abs` before decomposing
+it -- one more `v_cmp_gt_u32`/`v_cndmask_b32` there, ANDed into the existing per-iteration
+`v_flag`. A had no per-iteration flag mechanism at all (its GEMM_M flag is a true kernel-
+lifetime constant); added a new `_emit_a_kflag` mirroring `_emit_b_gather`'s dual-call-site
+pattern (tap start + `move_slice_window_a_functor`), reusing the SAME persistent
+`v_row_local` value B already maintains (A and B share the same K-position formula).
+
+**Real bug found and fixed via hardware testing (the significant one)**: initial
+implementation stored B's K-tail flag in `v_tmp(1)` (presumed free scratch). Multi-tap
+shapes (and even single-tap shapes once M/N were also active) showed widespread, small-
+magnitude corruption -- eventually isolated (by selectively disabling the A-side and then
+the B-side masking independently) to `v_tmp(1)` specifically. Root cause: the
+`.v_u32_div_rem_vs_gfx1250` macro used immediately afterward (to decompose `k_abs` into
+`n_idx`/`ho_idx`/`wo_idx`) clobbers **all four** `v_tmp` registers internally as part of
+its own division algorithm (verified by reading the macro's expansion) -- not just
+`v_tmp(0)` as assumed. Fixed by allocating a genuinely dedicated register
+(`v_flag_b_ktail`) instead of reusing `v_tmp` scratch. A lesson for this codebase generally:
+`v_tmp` is only safe as scratch immediately before a division macro call, never for a value
+that needs to survive past one.
+
+**Hardware validation**: non-split (the cheapest, zero-code-change case) and split-K
+(exercising the new kernarg/last-shard logic) each got degenerate/one-short/one-over/
+exact-noop, forced non-power-of-2 split counts (2, 3, 7-snapped-to-3), group>1, and
+multi-tap (3x3) -- all `valid:y` after the fix. Full M+N+K combination also validated
+(64x64 tile only -- see VGPR note below).
+
+### VGPR ceiling: not every tail combination fits at 128x128
+
+Combining all three tails (M+N+K) with `gemm_k_global_split` at the 128x128 tile overflows
+the 256-VGPR hard limit by exactly 1 (257 used) -- a real hardware ceiling, not a bug, same
+class of wall bwd's plain `wmma_m_tail` alone already hit historically. 64x64 has ample
+headroom (177/256). Any TWO of the three tails combine fine at 128x128 (validated
+separately); the fully-combined config (`_gsplit_mnktail`) ships 64x64-only, documented
+in the config file itself.
+
+### Mechanism 4: hipconv-style reduction-kernel epilogue
+
+New `wrw_reduction_kernel` tunable (name-folded as `_wsred` -- unlike the pure-masking tail
+tunables, this one changes what the kernel's epilogue produces, the same class of change
+Phase 16 established requires the two-sided driver/Python name-fold treatment). Per
+`docs/gfx1250_hipconv_deep_dive.md`: instead of every split-K shard atomic-adding directly
+into the real output, each shard does a plain, non-atomic store into its own disjoint slice
+of a workspace buffer (`num_partitions x output_size`, sized for the largest split count
+the ternary search could try), then a new, plain HIP kernel (`wrw_reduce_partials_f32`,
+added to `driver/gpu_tensor_cast/gpu_tensor_cast.cpp` -- a simple grid-stride sum over
+partitions, reusing the existing `module_tensor_cast` infrastructure) sums the partitions
+into the real output as a second, separately-timed dispatch.
+
+**Design**: the main kernel's own codegen needed surprisingly little new code --
+`coalescing_store_wmma.py`'s existing atomic branch (row/col address computation + M/N-tail
+masking, all reused unchanged) just swaps `global_atomic_add_f32` for a plain
+`global_store_dword` when `wrw_reduction_kernel` is set. The shard's disjoint workspace
+offset (`bz * group*gemm_m*wei_row_c * 4 bytes`) is added to `s_p_out` ONCE in the prologue
+(mirroring the existing group-offset pattern), so every tap's `s_p_out_tap` (recomputed
+fresh FROM `s_p_out`) automatically inherits it -- no epilogue-side changes needed for
+shard addressing at all. Kept fp32-only (asserted mutually exclusive with
+`wmma_acc_f16`/`bf16`/`atomic_pack_bf16`) to avoid a byte-width combinatorial headache,
+matching the workspace's fixed-fp32 design. Driver-side, `conv_driver.cpp` needed **zero**
+changes -- from its perspective this looks exactly like a plain, unspecialized `is_wmma`
+wrw kernel (fp32 output, no special dtype casing), since the workspace redirection is
+entirely internal to `igemm_wrw_gtc_driver.h`'s own `run()`.
+
+**Real bug found and fixed via hardware testing**: the reduction kernel's own launch
+failed with `hipExtModuleLaunchKernel(...)`: `invalid argument` on any shape with
+`output_size` large enough that `ceil(output_size/256)` (a **block count**) itself wasn't a
+multiple of 256. Root cause: `igemm_launch_kernel_single`'s `grid_size` parameter is
+documented (in its own header comment, missed on first read) to be in **workitem units**
+(total threads), not blocks, and `hipExtModuleLaunchKernel` requires it to be an exact
+multiple of `block_size` -- passing a bare block count only "worked" by accident for small
+shapes (values under 256 apparently get silently clamped to one full block; the failure
+threshold was empirically bisected to somewhere in (256, 320]). Fixed by rounding
+`output_size` up to the next multiple of 256 directly (`(output_size+255)/256*256`) and
+passing THAT as `grid_size`, matching the existing `tensor_cast` kernels' own identical
+rounding convention (their `thread_length_cast` calculation does the same up-front
+rounding before being used directly as a workitem count).
+
+**Hardware validation**: basic 1x1, group>1, multi-tap (3x3, the shape that originally
+exposed the launch bug), forced non-power-of-2 splits, and a larger worst-case-style
+shape -- all `valid:y` after the fix.
+
+**Timing -- the strongest result of this whole phase**: on wrw's documented worst-case
+shape (`c=192,H=60,W=80,k=64,1x1`, same shape used in Phases 32-34), the reduction-kernel
+epilogue measured **~0.011ms vs the plain atomic epilogue's ~0.022-0.023ms -- a consistent,
+reproducible ~2x speedup**, with none of the atomic path's usual bimodal noise (three
+repeated runs all landed within 0.011-0.011ms, vs the atomic path's own 0.022/0.022/0.051ms
+spread on the same shape under the same contention). This does not contradict Phase 34's
+rocprof finding of zero atomic-*conflict* stalls -- conflict-freedom doesn't mean zero
+atomic overhead; removing the atomic RMW round-trip entirely (not just avoiding conflicts
+on it) is evidently a real, separate win for this kernel's profile.
+
+### Mechanism 5: tile widening (`gemm_k_per_block=128`)
+
+Config-only -- `gemm_k_per_block` was already a fully generic tunable, and the k-sub-loop
+already generic over its value (only `inst_wmma.k`, fixed at 32, and tile shape affect
+`v_a`/`v_b`/`v_gld_a`/`v_gld_b`/`v_c` sizing, confirmed by reading `__init__`, not assumed).
+New `_k4x` configs (128x128, `gemm_k_per_block=128`, single-buffered -- LDS lands exactly at
+the 64KB/workgroup limit, no room for double-buffering) for plain and `bf16acc` bf16.
+Plain fits at 251/256 VGPRs (no accumulate-precision trick even needed); `bf16acc` fits at
+187/256 (extra headroom, shipped as a second precision/VGPR-tradeoff point mirroring the
+existing `k2x_bf16acc` precedent).
+
+**Hardware validation**: exact-multiple, group>1, and 3x3 multi-tap, both variants -- all
+`valid:y` (bf16acc shows the expected higher-but-still-passing nrms from its reduced
+precision).
+
+**Timing**: on a small single-K-block shape, `_k4x` was actually slightly SLOWER than
+`_k2x` (a wash within noise) -- expected, since that shape isn't wrw's actual failure mode
+(plenty of workgroups, not occupancy-starved). On the ACTUAL intended failure mode (a
+single 128x128 workgroup doing one long, serial K-reduction, `gemm_k=131072`), `_k4x`
+showed a real, reproducible **~5% win** (13.14ms vs `_k2x`'s 13.86ms, consistent across
+repeated runs) -- confirming CK's own rationale (fewer, cheaper main-loop iterations
+amortize per-iteration overhead specifically when occupancy is already saturated by a
+single serially-bound workgroup).
+
+### Final regression sweep
+
+Byte-identical `.inc` diff across all 104 pre-existing gfx1250 configs (fwd/bwd/wrw x
+fp16/bf16/fp32/int8 x every existing tunable combination) confirmed clean -- every new
+tunable in this phase defaults to 0 and gates 100% of new codegen; nothing pre-existing
+changed by even one byte.
+
+**Net result**: wrw's shape-coverage gap vs fwd/bwd (and vs the mature XDLOPS track) is
+substantially closed -- M/N/K tail relief unlocks the same class of previously-unbuildable
+shapes fwd's own tail work unlocked in Phases 25/26/31. The reduction-kernel epilogue is a
+genuine, reproducible ~2x win on wrw's worst-case shape and is the standout result of this
+phase; tile widening is a smaller but real ~5% win on its own specific failure mode. All
+five mechanisms shipped as opt-in, default-off, fully hardware-validated tunables.
+
+**Critical files (Phase 35)**: `python/igemm/igemm_wrw_gtc_wmma_nhwc.py` -- A/B load
+functors, `_emit_b_gather`, `_emit_a_kflag` (new), `move_slice_window_a/b_functor`,
+`emit_kernel_prologue` (M/N-tail flags, K-tail kernarg loads + `s_knum` extension, wsred
+shard offset), `emit_kernel_tap_loop`, `kernel_vgpr_t`/`kernel_sgpr_t` (new dedicated
+registers), `get_kernel_args`/`get_kernel_code` (K-tail kernarg fields); `python/operations/
+coalescing_store_wmma.py` -- atomic-branch M/N-tail guards (new), plain-store branch for
+`wrw_reduction_kernel` (new); `python/igemm/igemm_base.py` -- `wmma_m_tail`/`wmma_n_tail`
+direction-gate widening, new `wmma_k_tail`/`wrw_reduction_kernel` tunables + asserts +
+name-fold; `driver/igemm_gtc_base.h` -- `wrw_reduction_kernel` two-sided struct/config/
+name-mirror; `driver/igemm_wrw_gtc_driver.h` -- `tunable_is_valid()` relaxes, K-tail
+kernarg computation, workspace allocation + reduction-kernel launch sequencing, the
+`gemm_n%4` non-atomic-path restriction; `driver/gpu_tensor_cast/gpu_tensor_cast.cpp` --
+new `wrw_reduce_partials_f32` kernel; new configs: `igemm_wrw_gtc_gfx1250_nhwc_bf16_{mntail,
+ktail,gsplit_mntail,gsplit_ktail,gsplit_mnktail,gsplit_wsred,k4x,k4x_bf16acc}.config`.
