@@ -3741,3 +3741,89 @@ flagged as a separate follow-up.
 `s_kitr` init), `emit_kernel_epilogue` (N-tail params), `kernel_vgpr_t`/`kernel_sgpr_t` (new
 registers); `driver/igemm_bwd_gtc_driver.h` -- `tunable_is_valid()` relaxes; `python/igemm/
 igemm_base.py` -- direction-gate widening for `wmma_n_tail`/`wmma_k_tail`.
+
+## Phase 37: fwd GEMM_M/N tail via TDM's own hardware OOB (combined with `tdm_global_load`)
+
+Per the coverage gap analysis, fwd's TDM-based K-tail (Phase 31, 1x1-only) and its
+EXEC-mask-based M-tail/N-tail (Phases 25/26b) had never been combined into one buildable
+config -- each worked independently, but `tdm_global_load`'s own load path bypasses the
+functors `wmma_m_tail`/`wmma_n_tail`'s EXEC-mask flags live in entirely (confirmed by
+reading `global_load_a/b_functor`: the TDM branch never references `v.v_flag`/`v.v_flag_b`
+at all), so setting all three together previously built but silently produced WRONG
+numerics for any M/N-boundary element (the flags were computed but never consulted).
+
+**Approach, per user decision ("probe first, then decide")**: rather than trying EXEC-mask
+tricks against TDM's wave-wide, non-per-lane load model (architecturally impossible -- TDM
+has no EXEC concept at all), extend TDM's OWN descriptor to cover the M/N axis the same way
+Phase 31 already covers K -- `tensor_dim1` (gemm_m for A, gemm_n for B) had always been set
+to the *absolute* gemm_m/gemm_n, never rebuilt relative to the block's own offset, unlike
+`tensor_dim0` (which Phase 31 already rebuilds every iteration from `s_tdm_k_remain`).
+
+**Ground truth before writing any code**: read the CDNA5 ISA doc's TDM section (10.11.2)
+directly rather than assuming Phase 31's K-axis finding generalizes by analogy alone --
+`global_addr`: "Global memory address of the **start of the tile within the tensor** (not
+the start of the tensor)"; `tensor_dim[0-4]`: "Size of the tensor... **used for detecting
+out-of-bounds**." Crucially, the D# descriptor has no field anywhere for an absolute tensor
+origin -- only `global_addr` (already tile-adjusted per-call) and `tensor_dim` (compared
+against tile-local iteration indices in the addressing formula, `Maddr = global_addr +
+data_size*(y*tensor_dim0_stride + ...)` for `y` in `0..tile_dim1`). This means "OOB relative
+to the current global_addr" isn't just Phase 31's empirical K-axis finding by coincidence --
+it's the *only* semantics `tensor_dim1` can architecturally have, since the hardware has no
+other reference point to compare against. `tensor_dim0` and `tensor_dim1` are the same
+descriptor mechanism, just gating the X-loop vs the Y-loop of the same 2D tile fetch.
+
+**Design**: new persistent SGPRs `s_tdm_m_remain`/`s_tdm_n_remain` (gated on
+`tdm_global_load and wmma_m_tail` / `tdm_global_load and wmma_n_tail`), computed ONCE in
+`emit_kernel_prologue` as `gemm_m - block_m_off` / `gemm_n - block_n_off` -- unlike
+`s_tdm_k_remain`, these don't need per-iteration decrementing (the M/N block offset is fixed
+for the whole kernel, only K advances through the main loop). `_emit_tdm_descriptor_setup_a/b`
+and `move_slice_window_a/b_functor`'s existing `tensor_dim0`-rebuild code (which also re-OR's
+`tensor_dim1`'s bits fresh each time, since they share packed SGPRs) now use
+`s_tdm_m_remain`/`s_tdm_n_remain` in place of the absolute `s_gemm_m`/`s_gemm_n` whenever
+`wmma_m_tail`/`wmma_n_tail` is set -- byte-identical for every existing TDM-only or tail-only
+config, since both new SGPRs are only allocated/referenced when both tunables are set
+together. **No driver change needed**: `tunable_is_valid()`'s three tail-tunable conditions
+(`wmma_m_tail`, `wmma_n_tail`, `tdm_global_load`) were already fully OR-independent.
+**No epilogue change needed**: `coalescing_store_wmma.py`'s existing M/N-tail EXEC-mask
+guards (which prevent an out-of-bounds *store*, a completely separate concern from TDM's
+load-side zero-fill) are keyed only on `wmma_m_tail`/`wmma_n_tail`, not the load mechanism --
+already correct and unmodified.
+
+**VGPR headroom, measured not assumed**: the combined `_tdm_mntail` config (128x128, fp16)
+came in at **255/256 VGPRs** -- 3 more than the TDM-only baseline's 252, extremely tight
+(1 register of headroom) but not overflowing. bf16 measured identically at 255/256. Flagged
+here as a hard ceiling for this tile shape: any further per-lane state addition to this
+exact config would overflow.
+
+**Zero-regression**: byte-identical `.s` diff across all 46 pre-existing gfx1250 fwd configs
+(clean `git worktree` checkout of the pre-phase commit vs. the post-phase tree) -- the new
+SGPRs and codegen only exist when both `tdm_global_load` and `wmma_m_tail`/`wmma_n_tail` are
+set together, a combination no pre-existing config uses.
+
+**Hardware validation** (`conv_driver.exe`, fp16 unless noted, 128x128x32 tile, 1x1 conv --
+`tdm_global_load` is 1x1-only): exact-multiple sanity with both tails forced on (`gemm_m`=
+`gemm_n`=128) -- `valid:y`. Single-block partial M-tail (`gemm_m`=120), single-block partial
+N-tail (`gemm_n`=124), and both together -- **3/3 `valid:y`** (this is the actual probe: had
+`tensor_dim1`'s OOB semantics been anything other than relative-to-`global_addr`, these would
+have shown corrupted or garbage results, not `valid:y`). Multi-block-then-tail (the more
+representative real case -- full block(s) followed by one partial tail block, confirming the
+"remaining" computation correctly reports MORE than the tile width for early, fully-valid
+blocks): `gemm_m`=316 (3 blocks, last partial), `gemm_n`=196 (2 blocks, last partial), both
+M+N spanning multiple blocks simultaneously (`gemm_m`=`gemm_n`=260) -- **3/3 `valid:y`**.
+Degenerate one-over-an-exact-multiple (`gemm_m`=129) -- `valid:y`. `group=2` combined with
+both tails short -- `valid:y`. bf16, same shape battery -- `valid:y`.
+
+**Net result**: confirms the ISA-doc-grounded hypothesis on real hardware -- TDM's hardware
+OOB zero-fill natively covers the M/N axis with the exact same mechanism Phase 31 already
+uses for K, needing no EXEC-masking machinery at all (which would have been architecturally
+impossible against TDM's wave-wide load model regardless). fwd now has a single config that
+combines TDM's K-tail with M/N-tail, closing the gap the coverage analysis flagged, at the
+cost of the tightest VGPR margin of any config in this codebase.
+
+**New config**: `igemm_fwd_gtc_gfx1250_nhwc_fp16_tdm_mntail.config`.
+
+**Critical files (Phase 37)**: `python/igemm/igemm_fwd_gtc_wmma_nhwc.py` -- `kernel_sgpr_t`
+(new `s_tdm_m_remain`/`s_tdm_n_remain`), `emit_kernel_prologue` (their computation, before
+each descriptor setup call), `_emit_tdm_descriptor_setup_a/b` and
+`move_slice_window_a/b_functor` (use the new SGPRs in place of the absolute
+`s_gemm_m`/`s_gemm_n` when tail is active).

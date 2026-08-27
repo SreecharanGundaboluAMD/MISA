@@ -356,6 +356,22 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 # before every re-issue so TDM's hardware OOB correctly zero-fills a
                 # genuinely partial last K-tile.
                 self.s_tdm_k_remain = sym_t('s_tdm_k_remain', sseq(1))
+                # M/N-tail via TDM's own hardware OOB (new): TDM's OOB check is relative to
+                # the descriptor's OWN global_addr ("start of the tile within the tensor, not
+                # the start of the tensor" -- CDNA5 ISA doc 10.11.2), exactly like
+                # tensor_dim0/K above -- confirmed identical descriptor mechanism for
+                # tensor_dim1, not just by analogy: the descriptor has no field at all for an
+                # absolute tensor origin, only global_addr (already tile-adjusted) and
+                # tensor_dim (used for OOB relative to it), so "relative to global_addr" is
+                # architecturally the only semantics tensor_dim1 CAN have. Unlike
+                # s_tdm_k_remain, these don't need per-iteration decrementing (the M/N block
+                # offset is fixed for the whole kernel) -- computed once in the prologue,
+                # right before the descriptor setup call, from the already-available
+                # s_gemm_m/s_block_m_off (A) or s_gemm_n/s_block_n_off (B).
+                if outer.tunable.wmma_m_tail:
+                    self.s_tdm_m_remain = sym_t('s_tdm_m_remain', sseq(1))
+                if outer.tunable.wmma_n_tail:
+                    self.s_tdm_n_remain = sym_t('s_tdm_n_remain', sseq(1))
             self.s_tmp         = sym_t('s_tmp'         , sseq(4))
             self.s_end         = sym_t('s_end'         , sseq())
 
@@ -630,9 +646,13 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_mov_b32 s[{s.s_tdm_g1(0)}], {data_size_code << 16}")
         self._emit(f"s_lshl_b32 s[{s.s_tdm_g1(1)}], s[{s.s_gemm_k()}], 16   ; tensor_dim0 (gemm_k) lo16 -> [31:16]")
         self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_gemm_k()}], 16   ; tensor_dim0 hi16")
-        self._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_gemm_m()}], 16   ; tensor_dim1 (gemm_m) lo16")
+        # M-tail via TDM (new): tensor_dim1 uses the block-relative remaining count instead
+        # of the absolute gemm_m -- see s_tdm_m_remain's declaration for why this is the
+        # architecturally-correct (not just plausible) semantics.
+        m_operand = s.s_tdm_m_remain() if self.tunable.wmma_m_tail else s.s_gemm_m()
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{m_operand}], 16   ; tensor_dim1 (gemm_m, or remaining-from-block if M-tail) lo16")
         self._emit(f"s_or_b32 s[{s.s_tdm_g1(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
-        self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_gemm_m()}], 16   ; tensor_dim1 hi16")
+        self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{m_operand}], 16   ; tensor_dim1 hi16")
         self._emit(f"s_or_b32 s[{s.s_tdm_g1(3)}], s[{s.s_tmp(0)}], {tile_dim0 << 16}   ; | tile_dim0 (compile-time)")
         self._emit(f"s_mov_b32 s[{s.s_tdm_g1(4)}], {tile_dim1}   ; tile_dim1 (compile-time), tile_dim2 unused")
         self._emit(f"s_mov_b32 s[{s.s_tdm_g1(5)}], s[{s.s_in_c_total()}]   ; tensor_dim0_stride lo32 (elements)")
@@ -682,9 +702,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_mov_b32 s[{s.s_tdm_g1_b(0)}], {data_size_code << 16}")
         self._emit(f"s_lshl_b32 s[{s.s_tdm_g1_b(1)}], s[{s.s_gemm_k()}], 16   ; tensor_dim0 (gemm_k) lo16 -> [31:16]")
         self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_gemm_k()}], 16   ; tensor_dim0 hi16")
-        self._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_gemm_n()}], 16   ; tensor_dim1 (gemm_n) lo16")
+        # N-tail via TDM (new): mirrors A's M-tail treatment above.
+        n_operand = s.s_tdm_n_remain() if self.tunable.wmma_n_tail else s.s_gemm_n()
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{n_operand}], 16   ; tensor_dim1 (gemm_n, or remaining-from-block if N-tail) lo16")
         self._emit(f"s_or_b32 s[{s.s_tdm_g1_b(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
-        self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_gemm_n()}], 16   ; tensor_dim1 hi16")
+        self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{n_operand}], 16   ; tensor_dim1 hi16")
         self._emit(f"s_or_b32 s[{s.s_tdm_g1_b(3)}], s[{s.s_tmp(0)}], {tile_dim0 << 16}   ; | tile_dim0 (compile-time)")
         self._emit(f"s_mov_b32 s[{s.s_tdm_g1_b(4)}], {tile_dim1}   ; tile_dim1 (compile-time), tile_dim2 unused")
         self._emit(f"s_mov_b32 s[{s.s_tdm_g1_b(5)}], s[{s.s_wei_k_stride()}]   ; tensor_dim0_stride lo32 (elements)")
@@ -830,6 +852,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             # _emit_tdm_descriptor_setup_a/b below set tensor_dim0 to directly) -- see
             # move_slice_window_a/b_functor for where this is decremented and consumed.
             self._emit(f"s_mov_b32 s[{s.s_tdm_k_remain()}], s[{s.s_gemm_k()}]")
+            if self.tunable.wmma_m_tail:
+                # M-tail via TDM (new): remaining valid M-rows from THIS block's start --
+                # fixed for the whole kernel (block offset doesn't change across the K loop),
+                # unlike s_tdm_k_remain, so computed once here, not decremented anywhere.
+                self._emit(f"s_sub_i32 s[{s.s_tdm_m_remain()}], s[{s.s_gemm_m()}], s[{s.s_block_m_off()}]   ; M-tail via TDM: remaining valid M-rows from this block")
             self._emit_tdm_descriptor_setup_a()
 
         # ---- one-time decomposition of this thread's GEMM_M index into (n_idx, ho_idx, wo_idx),
@@ -867,6 +894,9 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit_empty_line()
 
         if self.tunable.tdm_global_load:
+            if self.tunable.wmma_n_tail:
+                # N-tail via TDM (new): mirrors the M-tail computation above, for B.
+                self._emit(f"s_sub_i32 s[{s.s_tdm_n_remain()}], s[{s.s_gemm_n()}], s[{s.s_block_n_off()}]   ; N-tail via TDM: remaining valid N-cols from this block")
             self._emit_tdm_descriptor_setup_b()
 
         # ---- B's fixed per-thread row base (this tap's column offset is added fresh every
@@ -1458,7 +1488,12 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                         # re-derived fresh here too, alongside tensor_dim0's hi16.
                         outer._emit(f"s_lshl_b32 s[{s.s_tdm_g1(1)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim0 (remaining K) lo16 -> [31:16]")
                         outer._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim0 hi16")
-                        outer._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_gemm_m()}], 16   ; tensor_dim1 (gemm_m) lo16")
+                        # M-tail via TDM (new): re-derive from s_tdm_m_remain (kernel-lifetime
+                        # constant, not decremented) instead of the absolute s_gemm_m -- must
+                        # stay consistent with what _emit_tdm_descriptor_setup_a's initial
+                        # value used, since this rebuild re-OR's BOTH halves of g1(2) fresh.
+                        m_operand = s.s_tdm_m_remain() if outer.tunable.wmma_m_tail else s.s_gemm_m()
+                        outer._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{m_operand}], 16   ; tensor_dim1 (gemm_m, or remaining-from-block if M-tail) lo16")
                         outer._emit(f"s_or_b32 s[{s.s_tdm_g1(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
                     elif outer.tunable.async_global_load:
                         # Phase 13: v_off_a is a plain 32-bit byte OFFSET (no base pointer
@@ -1494,7 +1529,9 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                         # against B's own tensor_dim1 (gemm_n, not gemm_m).
                         outer._emit(f"s_lshl_b32 s[{s.s_tdm_g1_b(1)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim0 (remaining K) lo16 -> [31:16]")
                         outer._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim0 hi16")
-                        outer._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_gemm_n()}], 16   ; tensor_dim1 (gemm_n) lo16")
+                        # N-tail via TDM (new): mirrors A's M-tail treatment above.
+                        n_operand = s.s_tdm_n_remain() if outer.tunable.wmma_n_tail else s.s_gemm_n()
+                        outer._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{n_operand}], 16   ; tensor_dim1 (gemm_n, or remaining-from-block if N-tail) lo16")
                         outer._emit(f"s_or_b32 s[{s.s_tdm_g1_b(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
                     elif outer.tunable.async_global_load:
                         outer._emit(f"v_add_u32 v[{v.v_off_b()}], {outer.bytes_per_row}, v[{v.v_off_b()}]")
