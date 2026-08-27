@@ -155,7 +155,25 @@ kernel" range; wrw needs `gemm_k_global_split` (or equivalent K-split) before it
 these shapes, and that conclusion now has two independent (if both contended) measurements
 behind it rather than one.
 
-## How to reproduce
+## Automated reproduction
+
+`script/benchmark_gfx1250_vs_miopen.py` automates the manual reproduce steps below for
+all 38 shapes in this doc's tables (embeds the shape list, per-shape MISA config choice,
+and the MIOpen/gfx950 + MIOpen/gfx1250 reference numbers, so it has no dependency on the
+trace JSON files being present on whatever machine runs it). Builds each needed MISA
+config on first use (cached after that; pass `--rebuild` to force), runs `conv_driver.exe`
+for every shape, and prints/writes a Markdown table with MISA's time next to both MIOpen
+references and the ratio. Usage:
+
+```
+python3 script/benchmark_gfx1250_vs_miopen.py [--direction fwd|bwd|wrw|all] [--rebuild] \
+    [--warmup N] [--repeat N] [--verify] [--markdown-out FILE]
+```
+
+Prints a `rocm-smi --showuse --showpids` snapshot before running (advisory, not blocking)
+given how often GPU contention has muddied the exact numbers in this doc.
+
+## How to reproduce (manual)
 
 1. Build the direction's combined bf16 config: `python3 igemm_codegen.py
    config/igemm_<dir>_gtc_gfx1250_nhwc_bf16.config` (no `-s`/`--split_kernel` — that flag drops
