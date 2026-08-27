@@ -214,12 +214,11 @@ section for the record).
       `gemm_k_per_wg`/`s_gemm_k_wg_off` kernarg/SGPR fields, `wmma_k_tail`-style
       last-shard clamp) fairly closely. Real engineering effort (Tier B/C), not
       attempted.
-- [ ] **bwd `group>1` returns `valid:n`** — re-confirmed 2026-08-27 while validating
-      Phase 46 (pre-existing, not introduced by that phase: reproduces identically on
-      the unmodified 64x64/128x128 bf16 configs at the same shape/group=2). Originally
-      surfaced in Phase 43's investigation (see that phase's note) but never actually
-      root-caused or fixed. Out of scope for every phase that's touched it so far —
-      still open.
+- [x] **bwd `group>1` returns `valid:n`** — fixed 2026-08-27 (Phase 47). Root cause: a
+      copy-paste-from-fwd bug in the weight operand's group-offset computation (used
+      `gemm_n` instead of bwd's own `gemm_k` — see `docs/gfx1250_wmma_layout.md`'s Phase
+      47). One-line fix, hardware-validated across group=1/2/4, all precisions, every
+      tile.
 
 ## Tier 3 — bigger bets (largest structural change, longest-term)
 

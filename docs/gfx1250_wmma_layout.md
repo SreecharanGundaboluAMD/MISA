@@ -4544,3 +4544,31 @@ dimension at a time). **Not attempted this phase** -- recorded as a backlog item
 
 **Critical files**: `python/operations/wmma_mapping.py` (new 32x32 table entries, 3
 precisions), `config/igemm_bwd_gtc_gfx1250_nhwc_{fp16,bf16,fp32}_32x32.config` (new).
+
+## Phase 47 (2026-08-27): fixed bwd's `group>1` correctness bug
+
+Root-caused (via targeted investigation, not guessing) the `group>1` `valid:n` bug
+re-confirmed in Phase 46: `igemm_bwd_gtc_wmma_nhwc.py`'s B (weight) group-offset
+computation used `gemm_n` (C_in per group) where it needed `gemm_k` (K_out per group,
+bwd's actual GEMM_K = k/group) -- a straight copy-paste-from-fwd bug. fwd's identical-
+looking code is correct *for fwd* because fwd's own GEMM_N happens to equal k/group;
+bwd's GEMM roles are swapped (`gemm_k = k/group` there), so blindly reusing "gemm_n"
+silently scaled the weight tensor's group offset by the wrong per-group count whenever
+`gemm_n != gemm_k` for that shape (always true unless C_in/group happens to equal
+K_out/group) -- producing silently wrong, non-NaN results.
+
+**Fix**: one line, `s.s_gemm_n()` -> `s.s_gemm_k()` in the weight group-offset
+computation (`emit_kernel_prologue`), plus the emitted assembly comment string. A
+(grad_output) and output (grad_input) group-offset logic were already correct and
+untouched.
+
+**Hardware validation**: exact Phase 46 target shape at `group=2`: `valid:y` across
+every tile (128x128, 64x64, 32x32, and every existing variant -- async/dbuf/ktail/
+ldspad/mtail/ntail/mtail_ntail_ktail), fp16/bf16/int8. `group=1` (regression check,
+same shape): unaffected, still `valid:y` (group_idx=0 makes the group-offset term zero
+regardless of which SGPR it reads, by construction, for the single-group case). `group=4`
+on a different, larger shape (`n=2,c=256,H=60,W=80,k=512`, gemm_n=64 vs gemm_k=128 --
+a case where the old bug's C_in/K_out mismatch is even larger): `valid:y`.
+
+**Critical files**: `python/igemm/igemm_bwd_gtc_wmma_nhwc.py` (one-line fix in
+`emit_kernel_prologue`'s B group-offset computation).

@@ -733,8 +733,16 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_lshl_b32 s[{s.s_wei_k_stride()}], s[{s.s_wei_row_c()}], {utility_log2(self.data_byte * self.tunable.gemm_k_per_block)}   ; wei_row_c * databyte * {self.tunable.gemm_k_per_block}")
         self._emit_empty_line()
 
-        self._emit(f"; group>1: B (weight) group offset = group_idx * gemm_n * wei_row_c elements")
-        self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group_idx()}], s[{s.s_gemm_n()}]")
+        # Phase 47: fixed a copy-paste-from-fwd bug -- weight's group split is along
+        # bwd's own GEMM_K (K_out per group, the row-count dimension for the weight
+        # tensor's [G][K_per_group][Y][X][C_per_group] layout), NOT gemm_n (C_in per
+        # group). fwd's identical-looking code correctly uses gemm_n there because
+        # fwd's own GEMM_N happens to equal k/group -- bwd's GEMM roles are swapped
+        # (gemm_k = k/group here), so blindly reusing "gemm_n" silently scaled the
+        # group offset by the wrong (and differently-valued) per-group count,
+        # producing valid:n for any group>1 shape where gemm_n != gemm_k.
+        self._emit(f"; group>1: B (weight) group offset = group_idx * gemm_k * wei_row_c elements")
+        self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group_idx()}], s[{s.s_gemm_k()}]")
         self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_wei_row_c()}]")
         self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {utility_log2(self.data_byte)}")
         self._emit(f"s_add_u32 s[{s.s_p_wei()}], s[{s.s_p_wei()}], s[{s.s_tmp(0)}]")
