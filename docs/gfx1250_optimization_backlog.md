@@ -58,11 +58,16 @@ section for the record).
       open but is not actionable without the actual register ID/encoding** (from a more
       complete internal register-ID reference than what's currently available, or a
       vendor confirmation). Do not implement by guessing the hwreg ID.
-- [ ] **hipconv's staggered per-shard K-loop start phase** for wrw's
-      `gemm_k_global_split` path — rotate each split-K workgroup's first K-tile index by
-      a per-shard offset, reducing simultaneous-burst memory contention at kernel
-      launch. Real codegen change to wrw's split-K initialization
-      (`driver/igemm_wrw_gtc_driver.h` / `python/igemm/igemm_wrw_gtc_wmma_nhwc.py`).
+- [x] ~~**hipconv's staggered per-shard K-loop start phase**~~ — **investigated
+      2026-08-27, not implemented: could not verify the mechanism exists.** Searched
+      the actual local hipconv source (`~/hipconv/hipconv`, `~/rocm-ck-hipconv`,
+      `~/rocm-hipconv-pr`) directly for a split-K shard K-tile-start rotation. Found
+      only hipconv's unrelated intra-workgroup wave-role barrier stagger and CK's/
+      hipconv's ordinary contiguous split-K range assignment (same design MISA already
+      uses via `s_gemm_k_wg_off`). See `docs/gfx1250_perf_parity_action_plan.md`
+      Tier 2 item 7's correction for the full trail. Not re-opened unless a concrete
+      reference implementation is found — do not implement a fabricated mechanism just
+      to close this item.
 
 ## Tier 2 — medium effort (real codegen work, well-grounded)
 

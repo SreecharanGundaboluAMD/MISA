@@ -100,10 +100,24 @@ worth prototyping only after (a)/(b) are exhausted.
    this hardware/problem class supports. Real codegen work (new `gemm_k_per_block`/
    `gemm_m_per_block` values need VGPR/LDS re-derivation, not a flag flip), medium-to-large
    effort, but the CK finding specifically targets wrw's exact failure mode.
-7. **hipconv's staggered per-shard K-loop start phase** for `gemm_k_global_split` (rotate
-   each split-K workgroup's first K-tile index by a per-shard offset, reducing
-   simultaneous-burst memory contention at kernel launch) — small, low-risk, easy to A/B
-   against the existing search.
+7. ~~**hipconv's staggered per-shard K-loop start phase** for `gemm_k_global_split`~~ —
+   **correction, 2026-08-27: could not verify this against hipconv's actual source.**
+   Searched the local hipconv checkouts (`~/hipconv/hipconv`,
+   `~/rocm-ck-hipconv`, `~/rocm-hipconv-pr`) directly for any mechanism rotating a
+   split-K shard's *starting K-tile index* (as opposed to its assigned K-range, which is
+   always a plain contiguous `shard_id * k_per_shard` offset, identical in spirit to
+   MISA's own `s_gemm_k_wg_off`). Found none. The only "stagger" in hipconv's actual
+   code is `direct/kernel.hpp`'s intra-workgroup wave-role barrier stagger (half the
+   waves in a *single* workgroup barrier one step out of phase with the other half, to
+   overlap load-issue with compute) — already correctly described in
+   `docs/gfx1250_hipconv_deep_dive.md`'s section 1, and not applicable here: it's about
+   which *waves within one workgroup* run out of phase, not about *different split-K
+   workgroups* starting their K-traversal at different tile offsets. CK's
+   `SplitKBatchOffset` (`ck_tile/ops/gemm/kernel/universal_gemm_kernel.hpp`) is the same
+   plain contiguous-range assignment as MISA's, no rotation either. This item is likely
+   a synthesis inaccuracy from an earlier pass rather than a real, verified technique —
+   downgraded out of the actionable list; see
+   `docs/gfx1250_optimization_backlog.md` for the current status.
 
 ## Tier 3 — exploratory / longer-term, lower immediate priority
 
