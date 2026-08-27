@@ -135,19 +135,25 @@ def fits_tile(dim):
     return dim % 128 == 0 or dim % 64 == 0
 
 
-def classify(shape):
+def classify(shape, assume_nhwc=False):
     """Returns (category, note) -- category is a short machine-readable tag, note is
     a one-line human-readable reason, used both for aggregation and for picking
-    representative examples."""
+    representative examples.
+
+    assume_nhwc: when True, skips the layout check entirely (models the hypothetical
+    "every shape gets transposed to NHWC before dispatch, by MIOpen or otherwise" --
+    NOT something MISA itself does today, see docs/gfx1250_wmma_layout.md's decision
+    to leave layout conversion to the caller) so the remaining classification reflects
+    pure GEMM-shape/mechanism coverage on the NHWC-only subset.
+    """
     d = shape
 
-    if d['in_layout'] != 'NHWC' or d['fil_layout'] != 'NHWC' or d['out_layout'] != 'NHWC':
+    if not assume_nhwc and (d['in_layout'] != 'NHWC' or d['fil_layout'] != 'NHWC' or d['out_layout'] != 'NHWC'):
         return 'gap_layout_not_nhwc', (
             f"layout={d['in_layout']}/{d['fil_layout']}/{d['out_layout']} -- gfx1250 WMMA "
-            f"kernels are NHWC-only; MISA already has gpu_nchw2nhwc/gpu_nhwc2nchw transpose "
-            f"kernels (driver/gpu_nchw_nhwc_transpose.h) but conv_driver.cpp's WMMA dispatch "
-            f"path never wraps a layout-mismatched request with them (hard asserts layout=="
-            f"tensor_layout instead) -- closable via driver-level integration, no new kernel math")
+            f"kernels are NHWC-only; MISA deliberately does not transpose NCHW<->NHWC itself "
+            f"(left to the caller, e.g. MIOpen's own solver-wrapping) -- see "
+            f"docs/gfx1250_wmma_layout.md")
 
     if d['precision'] not in BASE_GEMM_K_PER_BLOCK:
         return 'gap_precision_unsupported', f"precision={d['precision']} has no gfx1250 WMMA support at all"
@@ -190,52 +196,50 @@ def classify(shape):
                 return 'gap_fwd_k_tail_multitap', (
                     f"gk={gk} not a multiple of {base_k} and y={d['y']},x={d['x']} != 1x1 -- "
                     f"fwd's only K-tail mechanism is TDM hardware OOB (Phase 31), 1x1-conv-only")
-            if needs - {'K'}:
-                return 'gap_fwd_tdm_plus_mntail_uncombined', (
-                    f"needs {sorted(needs)} together -- TDM's K-tail (fwd, 1x1) and "
-                    f"wmma_m_tail/wmma_n_tail have never been combined into one config; "
-                    f"each mechanism exists and is additive in principle, not yet built/validated together")
-            if gm % 128 != 0 or gn % 128 != 0:
-                return 'gap_fwd_tdm_requires_128_tile', (
-                    f"gm={gm},gn={gn} -- fwd's _tdm config is 128x128-only, no 64x64 TDM build exists")
+            # Phase 37: TDM's own descriptor now covers M/N tail natively (tensor_dim1
+            # rebuilt relative to the block offset, same mechanism Phase 31 already used for
+            # K) -- any subset of M/N/K needed together is covered by ONE config
+            # (`_tdm_mntail`, wmma_m_tail=wmma_n_tail=1 unconditionally -- a no-op mask on
+            # shapes that don't actually need it, confirmed by hardware sanity checks), no
+            # gm/gn%128==0 requirement left at all. bf16/fp32 `_tdm_mntail` configs (written
+            # and hardware-validated right after Phase 37 landed) closed what was briefly a
+            # config-only gap for those precisions.
             if prec == 'int8':
-                return 'gap_config_int8_fwd_tdm', "mechanism (TDM K-tail) exists for fp16/bf16/fp32 only -- no int8 _tdm config"
-            return 'supported_tail_fwd_tdm', f"needs K-tail only, 1x1, gm/gn both %128==0 -- covered by _tdm ({prec})"
+                return 'gap_config_int8_fwd_tdm', "mechanism (TDM K/M/N-tail) exists for fp16/bf16/fp32 only -- no int8 _tdm config"
+            return 'supported_tail_fwd_tdm', f"needs {sorted(needs)} (K and/or M/N), 1x1 -- covered by _tdm_mntail ({prec})"
         else:
             if prec == 'int8':
                 return 'gap_config_int8_fwd_tail', f"needs {sorted(needs)} -- wmma_m_tail/wmma_n_tail exist for fp16/bf16/fp32 only, no int8 config"
             return 'supported_tail_fwd_mn', f"needs {sorted(needs)} -- covered by _mtail/_ntail/_mntail ({prec})"
 
     if d['direction'] == 'bwd':
-        if needs - {'M'}:
-            return 'gap_bwd_no_n_or_k_tail', (
-                f"needs {sorted(needs)} -- bwd has NO N-tail or K-tail mechanism at all "
-                f"(only M-tail exists, Phase 26a) -- this is a genuine missing-code gap, not just a config gap")
+        # Phase 36: N-tail and K-tail now exist for bwd (in addition to M-tail, Phase 26a) --
+        # B's transposed addressing meant N-tail/K-tail needed a genuinely new fine-grained
+        # per-dword masking primitive (not a port of fwd's), but the mechanism itself is
+        # precision-generic (data_byte-driven, like the rest of this kernel). bf16/fp32
+        # _ntail/_ktail/_mnktail configs (written and hardware-validated right after Phase 36
+        # landed, exercising bf16's identical-to-fp16 elem_per_dword=2 path and fp32's
+        # distinct elem_per_dword=1 path) closed what was briefly a config-only gap.
         if prec == 'int8':
-            return 'gap_config_int8_bwd_mtail', "wmma_m_tail exists for fp16/bf16/fp32 only, no int8 _mtail config"
-        return 'supported_tail_bwd_m', f"needs M-tail only -- covered by _mtail ({prec})"
+            return 'gap_config_int8_bwd_tail', f"needs {sorted(needs)} -- no int8 config exists for ANY bwd tail mechanism (not even pre-existing M-tail), and int8's elem_per_dword=4 masking case is wholly untested"
+        return 'supported_tail_bwd_mnk', f"needs {sorted(needs)} -- covered by _mtail/_ntail/_ktail/_mnktail ({prec})"
 
-    # wrw (post Phase 35: M/N/K-tail all exist in code, bf16-config-only; gsplit exists
-    # fp16/bf16/fp32 but not int8)
+    # wrw (post Phase 35: M/N/K-tail all exist in code; fp16/bf16/fp32 all have committed
+    # tail-relief configs now, gsplit exists fp16/bf16/fp32 but not int8)
     if prec == 'int8':
         return 'gap_config_int8_wrw_tail', f"needs {sorted(needs)} -- wrw has no tail-relief config for int8 at all (and no int8 gsplit either)"
-    if prec != 'bf16':
-        return 'gap_config_fp16_fp32_wrw_tail', (
-            f"needs {sorted(needs)} -- wmma_m_tail/wmma_n_tail/wmma_k_tail all exist in code "
-            f"(Phase 35) and are precision-generic, but only bf16 .config files have been "
-            f"written/validated so far -- closable via new config files + hardware validation, no code changes expected")
     if needs == {'M', 'N', 'K'}:
         note = f"needs all three (M+N+K) -- covered by _gsplit_mnktail, 64x64-tile-only (128x128 overflows 256 VGPRs by 1)"
     else:
-        note = f"needs {sorted(needs)} -- covered by _mntail/_ktail/_gsplit_mntail/_gsplit_ktail/_gsplit_mnktail (bf16)"
+        note = f"needs {sorted(needs)} -- covered by _mntail/_ktail/_gsplit_mntail/_gsplit_ktail/_gsplit_mnktail ({prec})"
     return 'supported_tail_wrw', note
 
 
 CATEGORY_LABELS = {
     'supported_exact_fit': 'Supported today (exact tile fit, no relief needed)',
     'supported_tail_fwd_mn': 'Supported today (fwd M/N-tail)',
-    'supported_tail_fwd_tdm': 'Supported today (fwd TDM K-tail)',
-    'supported_tail_bwd_m': 'Supported today (bwd M-tail)',
+    'supported_tail_fwd_tdm': 'Supported today (fwd TDM K/M/N-tail, Phase 31/37)',
+    'supported_tail_bwd_mnk': 'Supported today (bwd M/N/K-tail, Phase 36)',
     'supported_tail_wrw': 'Supported today (wrw M/N/K-tail, Phase 35)',
     'gap_layout_not_nhwc': 'GAP: non-NHWC layout',
     'gap_precision_unsupported': 'GAP: unsupported precision (int4 etc.)',
@@ -243,14 +247,10 @@ CATEGORY_LABELS = {
     'gap_invalid_group': 'GAP: malformed group count',
     'degenerate_zero_output': 'DEGENERATE: zero valid output positions (not a real conv)',
     'gap_fwd_k_tail_multitap': 'GAP: fwd K-tail, multi-tap (no mechanism)',
-    'gap_fwd_tdm_plus_mntail_uncombined': 'GAP: fwd TDM + M/N-tail not combined',
-    'gap_fwd_tdm_requires_128_tile': 'GAP: fwd TDM needs a 64x64 build',
     'gap_config_int8_fwd_tdm': 'GAP: fwd int8 TDM config missing',
     'gap_config_int8_fwd_tail': 'GAP: fwd int8 M/N-tail config missing',
-    'gap_bwd_no_n_or_k_tail': 'GAP: bwd N-tail/K-tail (no mechanism at all)',
-    'gap_config_int8_bwd_mtail': 'GAP: bwd int8 M-tail config missing',
+    'gap_config_int8_bwd_tail': 'GAP: bwd int8 tail config missing (any mechanism)',
     'gap_config_int8_wrw_tail': 'GAP: wrw int8 tail/gsplit config missing',
-    'gap_config_fp16_fp32_wrw_tail': 'GAP: wrw fp16/fp32 tail config missing (code exists)',
 }
 
 # Rough, qualitative effort tiers for the write-up.
@@ -261,14 +261,10 @@ EFFORT_TIER = {
     'gap_invalid_group': 'n/a (malformed input, not a real gap)',
     'degenerate_zero_output': 'n/a (not a real conv, low priority even if closable)',
     'gap_fwd_k_tail_multitap': 'D (new mechanism: fwd has no non-TDM K-tail; would need a wrw-K-tail-style port)',
-    'gap_fwd_tdm_plus_mntail_uncombined': 'C (combine two existing, independently-working mechanisms + validate)',
-    'gap_fwd_tdm_requires_128_tile': 'C (new TDM+64x64 address-math variant + validate)',
     'gap_config_int8_fwd_tdm': 'B (config file + validation only)',
     'gap_config_int8_fwd_tail': 'B (config file + validation only)',
-    'gap_bwd_no_n_or_k_tail': 'D (new mechanism: port wrw/fwd\'s N-tail and K-tail patterns to bwd)',
-    'gap_config_int8_bwd_mtail': 'B (config file + validation only)',
+    'gap_config_int8_bwd_tail': 'C (config file + first-ever validation of the elem_per_dword=4 masking case for bwd)',
     'gap_config_int8_wrw_tail': 'D for gsplit (new mechanism, int8 gsplit doesn\'t exist) + B for tail (config only)',
-    'gap_config_fp16_fp32_wrw_tail': 'B (config file + validation only -- code is precision-generic)',
 }
 
 
@@ -280,12 +276,15 @@ def main():
     ap.add_argument('--csv-out', default=None)
     ap.add_argument('--md-out', default=None)
     ap.add_argument('--examples-per-category', type=int, default=4)
+    ap.add_argument('--assume-nhwc', action='store_true',
+                     help="skip the layout check -- models 'every shape gets transposed to "
+                          "NHWC by the caller' and reports pure GEMM-shape/mechanism coverage")
     args = ap.parse_args()
 
     all_shapes = []
     for path, direction in [(args.fwd_file, 'fwd'), (args.bwd_file, 'bwd'), (args.wrw_file, 'wrw')]:
         for shape in parse_file(path, direction):
-            cat, note = classify(shape)
+            cat, note = classify(shape, assume_nhwc=args.assume_nhwc)
             shape['category'] = cat
             shape['note'] = note
             all_shapes.append(shape)
