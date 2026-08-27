@@ -34,8 +34,10 @@ IGEMM_HOST_USE_XDNN = False
 IGEMM_HOST_USE_MAGIC_DIV = True
 IGEMM_HOST_USE_HIPCC = True # hipclang perfer use hipcc to compile host code
 
+ROCM_PATH = '/home/sgundabo/rocm-10.1'
+
 def _check_hip_clang():
-    return os.path.exists('/opt/rocm/llvm/bin/clang++')
+    return os.path.exists(f'{ROCM_PATH}/llvm/bin/clang++')
 
 class compile_hip_t(object):
     def __init__(self, arch_config, hip_file_name, target_hsaco = ''):
@@ -52,9 +54,9 @@ class compile_hip_t(object):
         arch_str = amdgpu_arch_to_string(self.arch_config.arch)
         use_hip_clang = _check_hip_clang()
         if use_hip_clang:
-            cmd = ['/opt/rocm/bin/hipcc']
+            cmd = [f'{ROCM_PATH}/bin/hipcc']
         else:
-            cmd = ['/opt/rocm/bin/hipcc']
+            cmd = [f'{ROCM_PATH}/bin/hipcc']
         cmd += ['-x', 'hip']
         cmd += ['--cuda-gpu-arch={}'.format(arch_str)]
         cmd += ['--cuda-device-only', '-c', '-O3']
@@ -90,7 +92,7 @@ class compile_asm_t(object):
         arch_str = amdgpu_arch_to_string(self.mc.arch_config.arch)
         use_hip_clang = _check_hip_clang()
         if use_hip_clang:
-            cmd = ['/opt/rocm/llvm/bin/clang++']
+            cmd = [f'{ROCM_PATH}/llvm/bin/clang++']
         else:
             cmd = ['/opt/rocm/hcc/bin/clang']
         cmd += ['-x', 'assembler']
@@ -128,7 +130,7 @@ class compile_disass_t(object):
         arch_str = amdgpu_arch_to_string(self.mc.arch_config.arch)
         use_hip_clang = _check_hip_clang()
         if use_hip_clang:
-            cmd = ['/opt/rocm/llvm/bin/llvm-objdump']
+            cmd = [f'{ROCM_PATH}/llvm/bin/llvm-objdump']
             cmd += ['--disassemble']
             cmd += ['--mcpu={}'.format(arch_str)]
         else:
@@ -176,10 +178,10 @@ class compile_host_t(object):
         xdnnroot ='2f6f70742f696e74656c2f696e74656c6f6e656170692f6f6e65444e4e2f6c61746573742f6370755f676f6d702f'
         if use_hip_clang:
             if IGEMM_HOST_USE_HIPCC:
-                cmd = ['/opt/rocm/bin/hipcc']
+                cmd = [f'{ROCM_PATH}/bin/hipcc']
                 cmd += ['-std=c++17']
                 cmd += ['-pthread']
-                cmd += ['-I/opt/rocm/include/half/']
+                cmd += [f'-I{ROCM_PATH}/include/half/']
             else:
                 cmd = ['g++']
                 cmd += ['-D__HIP_PLATFORM_HCC__=','-I/opt/rocm/hip/include', '-I/opt/rocm/hcc/include', '-I/opt/rocm/hsa/include']
