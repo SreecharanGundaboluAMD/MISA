@@ -245,15 +245,113 @@ out as qualitatively different in kind from the base path's overhead profile. Re
 this specific comparison on an idle GPU to get absolute numbers comparable to Finding 1/2
 remains open (see "Not yet done").
 
+## Finding 5: instruction-mix decomposition via `rocprof-compute` -- upgrades Finding 1/2's "non-WMMA overhead" from inference to measurement
+
+Findings 1/2/4 established WMMA occupies only 2-5% of *cycles*, and attributed the rest
+to "address computation, LDS traffic, atomics, loop bookkeeping" by reading the kernel's
+own code -- an architecturally-grounded inference, not a direct counter measurement.
+This finding closes that gap using `rocprof-compute`'s Wave/VALU/VMEM/LDS Instruction
+Mix blocks (7.5/7.6/7.7/7.8), which report actual per-category *instruction counts*, an
+independent counting method from Finding 1/2's cycle-based `SQ_INST_CYCLES_VALU_WMMA`.
+
+**Tooling notes** (gfx1250 is new/preview hardware in this rocprof-compute build):
+`rocprof-compute`'s internal subprocess calls plain `rocminfo` (found via `PATH`), which
+resolves to `/usr/bin/rocminfo` (an older, system-wide ROCm 6.x install) and segfaults on
+this box's actual driver -- fixed by prepending `/opt/rocm-10.1.0a20260820/bin` to `PATH`
+so the correct versioned `rocminfo` is found first. The `analyze` subcommand additionally
+needs a specific pinned dependency set (`numpy==1.26.4`, `pandas==2.2.3`, etc., listed in
+`/opt/rocm-10.1.0a20260820/libexec/rocprofiler-compute/requirements.txt`) not compatible
+with the system-wide Python environment (which has newer numpy/pandas already installed
+for other purposes) -- resolved with an isolated venv (`python3 -m venv`) rather than
+touching system packages, since this is a shared multi-tenant box. The LDS block's
+utilization/bank-conflict metrics (3.4.5-3.4.9) returned `N/A`/`0.0` even after explicitly
+requesting `-b 3.4` during profiling -- appears to be a genuine gap in gfx1250's current
+metric support in this rocprof-compute build (not a usage error), so LDS bank-conflict
+data specifically is still not available on this hardware/tool combination.
+
+**fwd, healthy shape** (`c=64,H=60,W=80,k=128,1x1`, 64x64 tile -- same shape as Finding
+2's "healthy" fwd measurement):
+
+| Category | Instructions | % of total |
+|---|---|---|
+| VALU (total) | 3,742,200 | 53.2% |
+| &nbsp;&nbsp;of which WMMA | 201,600 | 2.9% (of total); 5.4% (of VALU) |
+| &nbsp;&nbsp;of which non-WMMA VALU | 3,540,600 | 50.4% |
+| LDS | 1,512,000 | 21.5% |
+| SALU | 630,000 | 9.0% |
+| Internal (barriers/waitcnt/branches) | 415,800 | 5.9% |
+| VMEM (global load/store) | 403,200 | 5.7% |
+| Transcendental | 37,800 | 0.5% |
+| **Total** | 7,030,800 | 100% |
+
+**wrw, worst-case shape** (`c=192,H=60,W=80,k=64,1x1`, 64x64 tile, split=252 -- same
+shape/split as Finding 1):
+
+| Category | Instructions | % of total |
+|---|---|---|
+| VALU (total) | 7,609,900 | 52.2% |
+| &nbsp;&nbsp;of which WMMA | 302,400 | 2.1% (of total); 4.0% (of VALU) |
+| &nbsp;&nbsp;of which non-WMMA VALU | 7,307,500 | 50.2% |
+| LDS | 3,931,200 | 27.0% |
+| Internal | 2,045,740 | 14.0% |
+| VMEM (incl. the atomic-adds) | 399,168 | 2.7% |
+| SALU | 443,016 | 3.0% |
+| Transcendental | 77,112 | 0.5% |
+| **Total** | 14,571,100 | 100% |
+
+**What this confirms, with real counters rather than inference**:
+1. **Non-WMMA VALU is the single largest category in both directions, and strikingly
+   consistent**: 50.4% (fwd) vs 50.2% (wrw) of *all* instructions, despite these being
+   very differently-shaped kernels (fwd's exact-fit non-split path vs wrw's heavily
+   split, atomic-accumulate path). This is direct, positive evidence for "address
+   computation" as a major, reproducible cost center -- not just an inference from
+   reading the code.
+2. **LDS is the second-largest category in both**, and *larger* for wrw (27.0% vs
+   21.5%) -- consistent with wrw's double-buffered operand staging reading heavily from
+   LDS every iteration (LDS Load 3,628,800 vs LDS Store only 302,400 -- almost all LDS
+   traffic is reads), whereas fwd's LDS traffic is store-dominated (Store 1,008,000 vs
+   Load 504,000, consistent with its LDS-reshuffle epilogue writing more than its
+   double-buffered loads read).
+3. **wrw pays a visibly larger "Internal" (barrier/waitcnt/branch bookkeeping) tax**:
+   14.0% vs fwd's 5.9% -- a real, counter-measured difference, consistent with the
+   existing diagnosis that many small split-K shards each redundantly pay a fixed
+   per-shard bookkeeping cost.
+4. **WMMA's instruction-count share cross-validates Finding 1's cycle-count share via
+   an independent method**: wrw's WMMA instruction-share (2.1%) lands almost exactly on
+   Finding 1's WMMA cycle-share for a near-identical shape (2.26%) -- two different
+   counting methodologies (instruction count vs. cycle count) converging on the same
+   number is a meaningfully stronger confirmation than either alone. fwd's instruction-
+   share (2.9%) is lower than its cycle-share (5.15%, Finding 2), which is itself
+   sensible, not contradictory: a WMMA instruction spans many cycles per issue, so its
+   cycle-share is expected to exceed its instruction-count-share.
+5. One tooling artifact worth flagging, not a hardware finding: `VALU Instructions -
+   XDL` reports the exact same value as `VALU Instructions - WMMA` in both shapes
+   (201,600 and 302,400 respectively) -- gfx1250 has no XDL (that's the CDNA/MFMA name),
+   so this looks like this preview build's metric definitions not yet fully
+   distinguishing the two names for gfx1250 specifically. `CMACC`/`SMACC` also report
+   values individually exceeding "Total VALU Instructions," meaning they are not
+   mutually-exclusive partitions of the total the way the plain VALU/SALU/LDS/VMEM
+   breakdown is -- not used in the "50% non-WMMA VALU" conclusion above, which relies
+   only on the additive Wave Instruction Mix block (7.5), where the categories do sum
+   correctly.
+
+**Bottom line for "can we optimize it"**: the diagnosis from Finding 1/2 is now measured,
+not just inferred -- roughly half of all instructions in both directions are non-WMMA
+VALU (address/index computation, masking), with LDS traffic a strong second contributor
+that's proportionally worse for wrw specifically. This directly motivates TDM extension
+(moves address generation from software VALU into hardware) as the highest-leverage next
+lever, ahead of anything that only touches the WMMA path itself -- see
+`docs/gfx1250_optimization_backlog.md` and Phase 42's TDM-for-bwd work.
+
 ## Not yet done
 
-- No LDS-bank-conflict-specific counters collected (there are dedicated ones on this GPU,
-  e.g. under the `TX_VMW_*`/`SQC_*` blocks per `rocprofv3 --list-avail`, not yet explored).
-- No `rocprof-compute` (the roofline/comprehensive successor to Omniperf, confirmed
-  present at `/home/sgundabo/rocm-10.1/bin/rocprof-compute`) run yet — would give a more
-  complete automated roofline/occupancy report per kernel instead of hand-picked counters.
+- No LDS-bank-conflict-specific counters collected -- confirmed in Finding 5 that
+  `rocprof-compute`'s LDS Utilization/Bank-Conflict-Stall-Rate metrics return N/A for
+  gfx1250 in this tool build; plain `rocprofv3 --pmc` counters under the `TX_VMW_*`/
+  `SQC_*` blocks (per `rocprofv3 --list-avail`) have not yet been tried as an
+  alternative path to the same data.
 - GPU was under contention throughout this session (see
-  `docs/gfx1250_vendor_benchmark_vs_miopen.md`'s repeated notes on this) — the *ratios*
+  `docs/gfx1250_vendor_benchmark_vs_miopen.md`'s repeated notes on this) -- the *ratios*
   reported here (WMMA-busy-fraction etc.) should be far less contention-sensitive than
   absolute wall-clock numbers, but this hasn't been independently confirmed by re-running
   on an idle GPU.

@@ -33,13 +33,24 @@ section for the record).
       kernels (currently only within-run relative comparisons are trustworthy for
       Finding 4). Blocked on GPU availability, not effort — check `rocm-smi --showuse`
       shows 0% from other tenants before running.
-- [ ] **No LDS-bank-conflict-specific counters collected** — dedicated counters exist on
-      this GPU under the `TX_VMW_*`/`SQC_*` blocks (`rocprofv3 --list-avail`), not yet
-      explored. Cheap to add to the existing `--pmc` invocation once picked.
-- [ ] **Run `rocprof-compute`** (the roofline/comprehensive successor to Omniperf,
-      confirmed present at `/home/sgundabo/rocm-10.1/bin/rocprof-compute` and presumably
-      also under `/opt/rocm-10.1.0a20260820/`) for an automated roofline/occupancy report
-      per kernel instead of hand-picked counters.
+- [ ] **No LDS-bank-conflict-specific counters collected** — `rocprof-compute`'s LDS
+      Utilization/Bank-Conflict-Stall-Rate metrics (block 3.4) return N/A for gfx1250 in
+      the currently-installed build (confirmed 2026-08-27, see
+      `docs/gfx1250_rocprof_profiling.md` Finding 5 — a tooling gap, not a usage error).
+      Plain `rocprofv3 --pmc` counters under the `TX_VMW_*`/`SQC_*` blocks
+      (`rocprofv3 --list-avail`) not yet tried as an alternative path to the same data.
+- [x] **Run `rocprof-compute`** — done 2026-08-27, see
+      `docs/gfx1250_rocprof_profiling.md` Finding 5: real instruction-mix counters
+      (Wave/VALU/VMEM/LDS Instruction Mix blocks), upgrading the "address computation,
+      LDS traffic, bookkeeping" claim from architectural inference to direct
+      measurement. Result: non-WMMA VALU is ~50% of all instructions in BOTH fwd and
+      wrw (a striking, reproducible signature), LDS traffic is the second-largest
+      category (21.5% fwd, 27.0% wrw), and WMMA's instruction-count share
+      cross-validates Finding 1's cycle-count share via an independent counting method.
+      Needed a `PATH` workaround (the tool's internal `rocminfo` call resolves to an
+      incompatible system-wide install) and an isolated venv for `analyze`'s pinned
+      dependencies (not installed system-wide, to avoid touching a shared box's Python
+      environment).
 
 ## Tier 1 — small effort (cross-validated or ISA-doc-motivated, cheap to try)
 
@@ -140,8 +151,9 @@ section for the record).
   yet attempted — re-add as a new Tier 1/2 item if pursued).
 - **wrw split-K choice cross-check against CK's occupancy formula** — Phase 33,
   `driver/igemm_wrw_gtc_driver.h`.
-- **Occupancy measurement** and **rocprof extension to bwd/fwd-tail** — see Tier 0
-  above, both closed 2026-08-27.
+- **Occupancy measurement**, **rocprof extension to bwd/fwd-tail**, and
+  **`rocprof-compute` instruction-mix decomposition** — see Tier 0 above, all closed
+  2026-08-27.
 - **`V_PERMLANE_XOR_B32` swap for Phase 34's cross-lane exchange** — Phase 40,
   `python/operations/coalescing_store_wmma.py` /
   `python/igemm/igemm_wrw_gtc_wmma_nhwc.py`, closed 2026-08-27. Removes the per-iteration
