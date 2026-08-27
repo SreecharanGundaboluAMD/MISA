@@ -662,11 +662,10 @@ class igemm_gtc_tunable_parameter_t(object):
             # gemm_k_global_split by construction (only the LAST split-K shard's loop range
             # gets extended to cover the true, non-padded gemm_k -- see driver's
             # gemm_k_tail/gemm_k_num_splits kernarg fields). See docs/gfx1250_wmma_layout.md's
-            # Phase 35. bwd (new): bwd never splits K at all, so this is simpler in one
-            # respect (no shard bookkeeping) but needs a genuinely different masking
-            # mechanism from wrw's: bwd's A(grad_output) operand loads gemm_k_per_block
-            # elements CONTIGUOUSLY per lane (one lane, one M-row, all K at once) -- unlike
-            # wrw's per-lane-per-K-row B addressing, EXEC can't gate a sub-range within one
+            # Phase 35. bwd (new): needs a genuinely different masking mechanism from
+            # wrw's: bwd's A(grad_output) operand loads gemm_k_per_block elements
+            # CONTIGUOUSLY per lane (one lane, one M-row, all K at once) -- unlike wrw's
+            # per-lane-per-K-row B addressing, EXEC can't gate a sub-range within one
             # lane's own load, so A's K-tail uses the same new fine-grained per-dword
             # AND-mask as bwd's N-tail (see wmma_n_tail's docstring above). B's K-tail (bwd's
             # B is TRANSPOSED, so row_local really is a fixed per-lane K position) stays the
@@ -676,7 +675,7 @@ class igemm_gtc_tunable_parameter_t(object):
                 assert self.direction in ('wrw', 'bwd', 'fwd'), "wmma_k_tail is only implemented for wrw/bwd/fwd so far, see docs/gfx1250_wmma_layout.md's Phase 35/36/38"
                 if self.direction == 'bwd':
                     assert not self.gemm_k_global_split, \
-                        "wmma_k_tail is not implemented together with gemm_k_global_split for bwd -- bwd doesn't use split-K at all today"
+                        "wmma_k_tail is not implemented together with gemm_k_global_split for bwd yet -- bwd got split-K support in Phase 48 but without a last-shard remainder clamp (no wrw-style s_gemm_k_tail/s_gemm_k_num_splits pattern ported yet), see docs/gfx1250_wmma_layout.md's Phase 48"
                     # Phase 42: mirrors fwd's identical mutual-exclusion -- TDM already
                     # handles K-tail via hardware OOB for the 1x1-only case.
                     assert not self.tdm_global_load, \

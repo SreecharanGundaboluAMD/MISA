@@ -4572,3 +4572,109 @@ a case where the old bug's C_in/K_out mismatch is even larger): `valid:y`.
 
 **Critical files**: `python/igemm/igemm_bwd_gtc_wmma_nhwc.py` (one-line fix in
 `emit_kernel_prologue`'s B group-offset computation).
+
+## Phase 48 (2026-08-27): ported `gemm_k_global_split` (split-K) to bwd
+
+bwd previously had zero split-K support at all (`wrw` and `fwd` already had it). This
+matters independent of the Phase 46 gap-closing motivation: any bwd shape with a small
+GEMM_K (K_out/group) and few spatial workgroups leaves most of a 256-CU gfx1250 part
+idle, and split-K is the standard fix -- shard GEMM_K across `grid.z`, accumulate
+partial sums into `grad_input` via atomic add.
+
+**Ported from wrw's already-working implementation**, adapting for bwd's swapped GEMM
+roles (bwd's `gemm_k = k/group`, not wrw's `gemm_k = n*ho*wo`):
+- New SGPR fields `s_bz` (workgroup_id_z), `s_gemm_k_per_wg` (kernarg, this workgroup's
+  K-slice length), `s_gemm_k_wg_off = s_bz * s_gemm_k_per_wg` -- **always declared**,
+  mirroring wrw's own precedent of a uniform register layout between split and
+  non-split kernel variants (see `igemm_wrw_gtc_wmma_nhwc.py`'s identical comment) --
+  this is why `kernarg_segment_byte_size` moved unconditionally from 88 to 92 bytes for
+  *every* bwd kernel, split or not (confirmed zero functional impact, see Regression
+  below).
+- `ttmp7` (workgroup ID pack) bit-split into `s_by` (low 16) / `s_bz` (high 16) only
+  when `gemm_k_global_split` is set; `s_knum` becomes `s_gemm_k_per_wg` instead of the
+  un-sharded `s_gemm_k` in that case.
+- **A (grad_output)'s shard offset is a flat byte add** (`s_gemm_k_wg_off * data_byte`
+  folded into A's existing group-offset accumulator) -- bwd's A has GEMM_K as its
+  *contiguous* axis, unlike wrw's A.
+- **B (weight)'s shard offset is a stride-multiply** (`s_gemm_k_wg_off * s_wei_row_c`,
+  via a new scratch SGPR, folded into `v_addr_b_base`'s row accumulator) -- bwd's B has
+  GEMM_K as its *row* axis, structurally identical to wrw's A.
+- Epilogue: `ctrl_coalescing_store_wmma.gemm_k_global_split = tunable.gemm_k_global_split`
+  is the only wiring needed -- the shared `coalescing_store_wmma.py` epilogue switch
+  (direct-store vs. atomic-add) is already direction-agnostic, confirming the earlier
+  research pass's claim that no changes there were needed.
+- **Explicitly out of scope for this pass** (both asserted against in `__init__`):
+  combining with `tdm_global_load` (TDM's `s_tdm_k_remain` init would need `s_knum`,
+  not the un-sharded `s_gemm_k`) and combining with `wmma_k_tail` (no last-shard
+  remainder clamp implemented -- wrw's `s_gemm_k_tail`/`s_gemm_k_num_splits` pattern is
+  the documented path if this is needed later). Both are real, narrower follow-up items,
+  not full blockers -- plain (non-K-tail) split-K is fully working and is what most
+  large-GEMM_K shapes want anyway.
+
+**Driver** (`driver/igemm_bwd_gtc_driver.h`): added `gemm_k_per_wg` to the karg struct;
+a single-heuristic split-count pick (`largest_divisor_leq` targeting ~512 total
+workgroups, i.e. `grid_x*grid_y*splits ~= 512`) with an `IGEMM_GSPLIT_SWEEP` env var
+override for manual tuning -- **not** wrw's full ternary search over every divisor
+(deliberately simpler for this initial port; the search itself is an independent
+enhancement that would benefit wrw and fwd too, not a bwd-specific gap); grid.z set to
+the computed split count; a `bwd_gsplit_prolog` lambda that zero-inits `p_in`
+(grad_input, the atomic-add target) before each launch, wired into the existing
+`igemm_launch_kernels` prolog/postlog mechanism (already invoked per-launch, required
+so repeated warmup/benchmark launches don't accumulate onto stale results from the
+previous launch).
+
+**New config files**: `config/igemm_bwd_gtc_gfx1250_nhwc_{fp16,bf16,fp32}_gsplit.config`
+(128x128 and 64x64 tiles, `gemm_k_global_split=1`, mirroring wrw's own gsplit config
+structure).
+
+**Hardware validation** -- Phase 46's target shape (`n=4,c=512,H=8,W=8,k=256,y=1,x=3`,
+bf16, the CK-comparison shape): **`valid:y`, cost 0.017-0.022ms, 9.1-12.1 TFLOPS across
+repeated runs, using `gkgs[8]` (8-way split) on both the 128x128 and 64x64 tiles** --
+this **matches or exceeds CK's own reported 0.0215ms/9382 GFLOPS on this exact shape**,
+fully closing the gap the Phase 46 investigation set out to close (see "Result vs. CK"
+below -- Item 3, the 2-wave/32x32 generalization, turned out to be unnecessary for this
+shape once split-K was available; occupancy was the right diagnosis, split-K the more
+general fix).
+- fp16, same shape: `valid:y`, 0.019ms, 10.8 TFLOPS -- matches bf16.
+- fp32, same shape: driver's default heuristic picks `gkgs[64]` (fp32's
+  `gemm_k_per_block=4` is far finer-grained than bf16/fp16's 32, so the ~512-workgroup
+  heuristic over-splits) -- `valid:y` but only 3.3 TFLOPS at 64-way; `IGEMM_GSPLIT_SWEEP`
+  sweep found 16-way split is far better (7.2 TFLOPS, 0.028ms). This is an honest,
+  documented heuristic tuning gap (recorded in the fp32 gsplit config's own comment and
+  in the backlog), not a correctness issue -- the fix is a better driver-side heuristic
+  that accounts for `gemm_k_per_block`, not a code change to the kernel itself.
+- `group=2` and `group=4` combined with split-K (using Phase 47's already-fixed
+  group-offset logic), bf16, target shape: both `valid:y` -- confirms the group-offset
+  and split-K shard-offset compose correctly (they scale two different, independent
+  SGPR terms).
+- Odd/non-evenly-divisible `gemm_k` (e.g. `k=257`, prime-ish, no clean divisor for any
+  split count > 1): driver correctly reports the split-K candidate as "not applicable"
+  and falls back to the non-split kernel from the same combined candidate list (verified
+  in a build containing both `igemm_bwd_gtc_gfx1250_nhwc_bf16.config` and
+  `..._bf16_gsplit.config` together) -- `wmma_k_tail` composition remains the documented
+  path for non-evenly-divisible K with split-K, not yet implemented (see scope note
+  above).
+- A generic ResNet-ish shape with small `gemm_k` (`n=2,c=64,H=56,W=56,k=64,y=3,x=3`):
+  split-K correctly activates and wins over non-split on the small-K tiles where it
+  applies, `valid:y`.
+
+**Regression** -- full `igemm_bwd_gtc_gfx1250_nhwc_{bf16,fp16,fp32,int8}_all.config`
+sweeps (every existing tile/variant: 128x128, 64x64, 32x32, async, dbuf, k2x, ktail,
+ldspad, mtail, ntail, mtail_ntail_ktail, tdm, setprio, lp2): every candidate still
+`valid:y` across representative shapes (exact-multiple K, K-tail, group=2, generic
+ResNet-ish) -- confirms the unconditional SGPR-layout/kernarg-size change (Item 2's
+"always declared" fields) has zero functional impact on non-split kernels, matching
+wrw's own precedent for the same design choice. int8 (which has no gsplit config and
+was not otherwise touched) also unaffected.
+
+**Result vs. CK**: gap fully closed on the Phase 46 target shape via split-K alone
+(0.017-0.022ms vs. CK's 0.0215ms) -- no further tile-occupancy work needed for *this*
+shape. The 2-wave/32x32 generalization (Item 3) remains a real, independently-motivated
+backlog item for shapes where split-K doesn't apply as cleanly (e.g. very small
+`gemm_k` with no useful divisor, or split-K's atomic-add overhead outweighing the
+occupancy win at small problem sizes) -- see `docs/gfx1250_optimization_backlog.md`.
+
+**Critical files**: `python/igemm/igemm_bwd_gtc_wmma_nhwc.py` (SGPR fields, kernarg,
+prologue offset injection, epilogue flag, mutual-exclusion asserts),
+`driver/igemm_bwd_gtc_driver.h` (karg field, split-count heuristic, grid.z, zero-init
+prolog), `config/igemm_bwd_gtc_gfx1250_nhwc_{fp16,bf16,fp32}_gsplit.config` (new).

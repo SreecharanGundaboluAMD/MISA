@@ -190,30 +190,43 @@ section for the record).
       `docs/gfx1250_wmma_layout.md`'s Phase 46 for the full derivation. Two follow-ups
       opened by this work, both below.
 - [ ] **Generalize row_repeat_a/b for block_size > macro_tile in BOTH dimensions at
-      once** — opened 2026-08-27 (Phase 46), not attempted. The existing
-      128x64/64x128 asymmetric tile entries in `wmma_mapping.py` already generalize
-      `block_size` exceeding `gemm_m_per_block` OR `gemm_n_per_block` (one dimension at
-      a time, via `row_repeat_a`/`row_repeat_b`). A tile like 32x32-with-2-waves
-      (needed to fully match CK's occupancy on the Phase 46 shape — CK's own tuned
-      instance uses `BlockSize=64` i.e. 2 waves per 32x32 tile, `MRepeat=2,NRepeat=1`
-      per wave, splitting N across the 2 waves) needs `block_size` to exceed the
-      macro-tile in **both** dimensions simultaneously relative to a single wave's own
-      coverage — a case the existing row_repeat generalization doesn't cover. Would
-      close the remaining ~1.8x gap (0.039ms → CK's 0.0215ms is a 256-total-wave vs.
-      Phase 46's 128-total-wave story, all else equal). Real engineering effort (Tier
-      C), touches `python/operations/wmma_mapping.py`'s wave-grid math and likely each
-      of fwd/bwd/wrw's global-load thread-mapping.
-- [ ] **bwd has no `gemm_k_global_split` (split-K) support at all** — noted 2026-08-27
-      while investigating the Phase 46 gap (confirmed via direct grep:
-      `python/igemm/igemm_bwd_gtc_wmma_nhwc.py` has zero occurrences of
-      `gemm_k_global_split`, vs. 22 in wrw's equivalent file). Not needed for the
-      specific shape Phase 46 targeted (CK's own tuned instance for that shape uses
-      `k_batch=1`, no split-K either), but a real, structural asymmetry vs. fwd/wrw
-      that will matter for other bwd shapes with small gemm_m/n and large gemm_k.
-      Porting it would follow wrw's existing pattern (atomic epilogue,
-      `gemm_k_per_wg`/`s_gemm_k_wg_off` kernarg/SGPR fields, `wmma_k_tail`-style
-      last-shard clamp) fairly closely. Real engineering effort (Tier B/C), not
-      attempted.
+      once** — opened 2026-08-27 (Phase 46), downgraded in priority 2026-08-27 (Phase
+      48): split-K (below) fully closed the gap on the Phase 46 target shape without
+      needing this, so this is no longer required to match CK on *that* shape. Still a
+      real, independently-motivated gap for shapes where split-K doesn't apply as
+      cleanly (very small `gemm_k` with no useful divisor for any split count > 1, or
+      shapes small enough that atomic-add overhead outweighs the occupancy win). The
+      existing 128x64/64x128 asymmetric tile entries in `wmma_mapping.py` already
+      generalize `block_size` exceeding `gemm_m_per_block` OR `gemm_n_per_block` (one
+      dimension at a time, via `row_repeat_a`/`row_repeat_b`). A tile like
+      32x32-with-2-waves (CK's own tuned instance for the Phase 46 shape uses
+      `BlockSize=64` i.e. 2 waves per 32x32 tile, `MRepeat=2,NRepeat=1` per wave,
+      splitting N across the 2 waves) needs `block_size` to exceed the macro-tile in
+      **both** dimensions simultaneously relative to a single wave's own coverage — a
+      case the existing row_repeat generalization doesn't cover; needs a new
+      thread-folding scheme (2 threads cooperate per LDS row), not a simple extension.
+      Real engineering effort (Tier C), touches `python/operations/wmma_mapping.py`'s
+      wave-grid math and likely each of fwd/bwd/wrw's global-load thread-mapping.
+- [x] **bwd has no `gemm_k_global_split` (split-K) support at all** — done 2026-08-27
+      (Phase 48), hardware-validated. Ported from wrw's pattern, adapted for bwd's
+      swapped GEMM roles (A's shard offset is a flat byte add, B's is a stride-multiply
+      — mirror image of wrw's A/B). On the Phase 46 target shape: `valid:y`,
+      0.017-0.022ms / 9.1-12.1 TFLOPS at `gkgs[8]` (bf16/fp16) — **matches or exceeds
+      CK's own reported 0.0215ms/9382 GFLOPS on this exact shape**, fully closing the
+      gap Phase 46 set out to close. fp32's driver-heuristic split count is
+      over-aggressive (fp32's `gemm_k_per_block=4` is much finer-grained than
+      bf16/fp16's 32) — `IGEMM_GSPLIT_SWEEP` finds a much better split count manually;
+      a follow-up item (below) to make the heuristic `gemm_k_per_block`-aware.
+      Not combined with `wmma_k_tail` or `tdm_global_load` in this pass (both
+      explicitly asserted against) — see `docs/gfx1250_wmma_layout.md`'s Phase 48.
+- [ ] **bwd split-K driver heuristic over-splits for fp32** — opened 2026-08-27 (Phase
+      48). The `~512-total-workgroups` heuristic in `driver/igemm_bwd_gtc_driver.h`
+      doesn't account for `gemm_k_per_block` varying by precision (fp32's WMMA K=4 vs.
+      bf16/fp16's K=32) — on the Phase 46 target shape it picks a 64-way split
+      (3.3 TFLOPS) when a 16-way split (found via `IGEMM_GSPLIT_SWEEP`) gives 7.2
+      TFLOPS. Fix: scale the target total-workgroups heuristic (or switch to wrw's
+      fuller ternary-search-over-divisors approach, which would also benefit wrw/fwd)
+      by `gemm_k_per_block`. Low-to-moderate effort (Tier 1/2), driver-only change.
 - [x] **bwd `group>1` returns `valid:n`** — fixed 2026-08-27 (Phase 47). Root cause: a
       copy-paste-from-fwd bug in the weight operand's group-offset computation (used
       `gemm_n` instead of bwd's own `gemm_k` — see `docs/gfx1250_wmma_layout.md`'s Phase
