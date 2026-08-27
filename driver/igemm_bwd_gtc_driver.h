@@ -526,8 +526,16 @@ public:
             int gemm_k = k / group;
             // Phase 26a: wmma_m_tail relaxes the gemm_m exact-multiple requirement, mirroring
             // fwd's identical relax in igemm_fwd_gtc_driver.h (Phase 25) -- see that file's
-            // comment for the rationale. gemm_n/gemm_k still require an exact multiple.
-            if((!tunable->wmma_m_tail && gemm_m % gemm_m_per_block != 0) || gemm_n % gemm_n_per_block != 0 || gemm_k % gemm_k_per_block != 0)
+            // comment for the rationale. New: wmma_n_tail/wmma_k_tail relax gemm_n/gemm_k the
+            // same way. wmma_n_tail additionally requires the real (unpadded) gemm_n to be a
+            // multiple of 4 -- same vectorized-4-wide-store hazard as fwd's identical
+            // restriction (coalescing_store_wmma.py's shared epilogue, vector_write_out=4;
+            // see igemm_fwd_gtc_driver.h's comment for the full derivation), independent of
+            // bwd's B-operand load-side masking being a different (new) mechanism from fwd's.
+            if((!tunable->wmma_m_tail && gemm_m % gemm_m_per_block != 0) ||
+               (!tunable->wmma_n_tail && gemm_n % gemm_n_per_block != 0) ||
+               (tunable->wmma_n_tail && gemm_n % 4 != 0) ||
+               (!tunable->wmma_k_tail && gemm_k % gemm_k_per_block != 0))
                 return false;
             return true;
         }

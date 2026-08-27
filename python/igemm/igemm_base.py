@@ -604,10 +604,16 @@ class igemm_gtc_tunable_parameter_t(object):
             # epilogue's store is 4-elements-per-group vectorized, and the guard only checks a
             # group's first column, so a group straddling a non-multiple-of-4 tail would
             # silently write past the real gemm_n (confirmed on hardware). See
-            # docs/gfx1250_wmma_layout.md's Phase 26b.
+            # docs/gfx1250_wmma_layout.md's Phase 26b. bwd (new): B/weight is TRANSPOSED
+            # (see igemm_bwd_gtc_wmma_nhwc_t's docstring) -- each lane's own chunk load
+            # spans multiple consecutive N-values (not a single fixed column like fwd's
+            # natural-layout B), so bwd's N-tail masking is a fine-grained per-dword AND-mask
+            # applied to the loaded data, NOT the simple per-lane EXEC-mask fwd/wrw use --
+            # a different (new) mechanism sharing only the tunable name and the driver-side/
+            # epilogue-side plumbing.
             self.wmma_n_tail = utility_dict_with_default_t(tunable_dict)('wmma_n_tail', 0)
             if self.wmma_n_tail:
-                assert self.direction in ('fwd', 'wrw'), "wmma_n_tail is only implemented for fwd/wrw so far, see docs/gfx1250_wmma_layout.md's Phase 26b/35"
+                assert self.direction in ('fwd', 'bwd', 'wrw'), "wmma_n_tail is only implemented for fwd/bwd/wrw so far, see docs/gfx1250_wmma_layout.md's Phase 26b/35"
                 if self.direction == 'wrw':
                     assert not self.atomic_pack_bf16, \
                         "wmma_n_tail and atomic_pack_bf16 are mutually exclusive for now -- same reasoning as wmma_m_tail, see docs/gfx1250_wmma_layout.md's Phase 35"
@@ -618,16 +624,27 @@ class igemm_gtc_tunable_parameter_t(object):
                         "wmma_n_tail and async_global_load are mutually exclusive for now -- global_load_async_to_lds_b128's masking was only ever validated for the A operand, see docs/gfx1250_wmma_layout.md's Phase 13/26b"
                     assert self.gemm_n_per_block // self.block_size == 1, \
                         "wmma_n_tail requires row_repeat_b == 1 -- rows 1+ have no flag of their own, see docs/gfx1250_wmma_layout.md's Phase 26b"
-            # Phase 35 (GEMM_K tail, wrw only): no precedent anywhere else in this codebase --
+            # Phase 35 (GEMM_K tail, wrw): no precedent anywhere else in this codebase --
             # unlike the TDM-hardware-OOB K-tail fwd/1x1 uses (Phase 31), this is a genuine
             # software EXEC-mask mechanism, since wrw doesn't use TDM. Composes with
             # gemm_k_global_split by construction (only the LAST split-K shard's loop range
             # gets extended to cover the true, non-padded gemm_k -- see driver's
             # gemm_k_tail/gemm_k_num_splits kernarg fields). See docs/gfx1250_wmma_layout.md's
-            # Phase 35.
+            # Phase 35. bwd (new): bwd never splits K at all, so this is simpler in one
+            # respect (no shard bookkeeping) but needs a genuinely different masking
+            # mechanism from wrw's: bwd's A(grad_output) operand loads gemm_k_per_block
+            # elements CONTIGUOUSLY per lane (one lane, one M-row, all K at once) -- unlike
+            # wrw's per-lane-per-K-row B addressing, EXEC can't gate a sub-range within one
+            # lane's own load, so A's K-tail uses the same new fine-grained per-dword
+            # AND-mask as bwd's N-tail (see wmma_n_tail's docstring above). B's K-tail (bwd's
+            # B is TRANSPOSED, so row_local really is a fixed per-lane K position) stays the
+            # simple per-lane EXEC-mask case.
             self.wmma_k_tail = utility_dict_with_default_t(tunable_dict)('wmma_k_tail', 0)
             if self.wmma_k_tail:
-                assert self.direction == 'wrw', "wmma_k_tail is only implemented for wrw so far, see docs/gfx1250_wmma_layout.md's Phase 35"
+                assert self.direction in ('wrw', 'bwd'), "wmma_k_tail is only implemented for wrw/bwd so far, see docs/gfx1250_wmma_layout.md's Phase 35"
+                if self.direction == 'bwd':
+                    assert not self.gemm_k_global_split, \
+                        "wmma_k_tail is not implemented together with gemm_k_global_split for bwd -- bwd doesn't use split-K at all today"
             # Phase 35 (hipconv-style reduction-kernel epilogue): replaces the atomic epilogue
             # entirely for wrw's split-K path -- each shard writes a plain, non-atomic store
             # into its own disjoint slice of a workspace buffer (num_splits x output_size),

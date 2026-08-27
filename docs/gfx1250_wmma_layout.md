@@ -3615,3 +3615,129 @@ kernarg computation, workspace allocation + reduction-kernel launch sequencing, 
 `gemm_n%4` non-atomic-path restriction; `driver/gpu_tensor_cast/gpu_tensor_cast.cpp` --
 new `wrw_reduce_partials_f32` kernel; new configs: `igemm_wrw_gtc_gfx1250_nhwc_bf16_{mntail,
 ktail,gsplit_mntail,gsplit_ktail,gsplit_mnktail,gsplit_wsred,k4x,k4x_bf16acc}.config`.
+
+## Phase 36: bwd GEMM_N tail + GEMM_K tail
+
+Per `docs/gfx1250_wmma_coverage_gap_analysis.md`'s real-corpus gap analysis, bwd was the
+direction furthest behind on tail/boundary-mechanism completeness within the NHWC-only
+subset -- M-tail only (Phase 26a), vs fwd's M+N+TDM-K and wrw's full M+N+K (Phase 35). This
+phase adds bwd N-tail (`gemm_n = c/group`) and K-tail (`gemm_k = k/group`), completing bwd's
+tail coverage. bwd never uses split-K/atomic accumulation at all (unlike wrw, where split-K
+is the primary path), so neither mechanism needs any shard bookkeeping.
+
+**A genuine surprise, found only by reading the actual per-lane addressing, not by analogy
+to fwd's existing N-tail**: bwd's B (weight) operand is TRANSPOSED (see
+`igemm_bwd_gtc_wmma_nhwc_t`'s class docstring -- this is fundamental to how bwd gets a
+WMMA-consumable B operand at all). Concretely: fwd's B is natural `[K][N]` with each lane
+owning one FIXED N-column and reading `gemm_k_per_block` elements CONTIGUOUSLY ALONG K --
+so fwd's N-tail is a simple per-lane, whole-chunk EXEC-mask decision (this lane's column is
+either in range or not, for its entire load). bwd's B is the opposite: each lane owns one
+FIXED `row_local` (K-position) and reads `gemm_k_per_block` elements CONTIGUOUSLY ALONG N.
+This inverts which axis is "easy" (a whole-lane EXEC decision) vs "hard" (a boundary that
+can fall in the middle of ONE LANE's own multi-element load, which EXEC alone cannot
+express -- EXEC only gates whole lanes, not sub-ranges within one lane's data):
+
+- **B's K-tail is the easy case**: `row_local` (a persistent, prologue-computed VGPR,
+  `v_b_row_local`) IS the per-lane K position for that lane's whole chunk -- a plain
+  `v_cmp_gt_i32`/`v_cndmask_b32` EXEC-mask flag (`v_flag_b_ktail`), recomputed fresh in
+  `global_load_b_functor` every call since the workgroup's K position (`s_kitr`) changes
+  every K-loop iteration. Reuses `_emit_gld_chunk_load`'s existing zero-then-masked-load
+  path unmodified, same idiom wrw's B K-tail (Phase 35) established.
+- **B's N-tail is the hard case**: the N boundary can land inside one lane's own 32-wide (or
+  wider) contiguous chunk. A has no N-axis role at all (A/grad_output only has M and K), but
+  A's K-tail is ALSO the hard case for the identical structural reason (each lane owns one
+  fixed M-row and reads `gemm_k_per_block` K-elements contiguously -- the K boundary can fall
+  mid-chunk). Both needed a genuinely new masking primitive, not a port of any existing
+  mechanism.
+
+**New primitive: per-dword fine-grained AND-mask** (`_emit_tail_dword_mask` /
+`_emit_tail_dword_mask_guarded` in `igemm_bwd_gtc_wmma_nhwc.py`), inserted between a chunk's
+global-load-and-wait and its LDS store (`_emit_sst_remaining_chunks`/`_emit_sst_all_chunks`,
+both extended with an optional `tail_mask` parameter). For each dword of the just-loaded
+chunk: `valid_in_dword = clamp(remaining - elements_before, 0, elem_per_dword)` (computed via
+`v_sub_u32`/`v_max_i32`/`v_min_i32` -- confirmed via `llvm-mc -mcpu=gfx1250` that a
+scalar-SGPR-or-per-lane-VGPR source works identically for these VALU ops, so ONE instruction
+sequence serves both K-tail's scalar `remaining` (`s_kitr`, uniform across every lane, since
+K validity depends only on the workgroup-wide loop position) and N-tail's per-lane
+`remaining` (`v_n_valid_base`, since N validity depends on each lane's own `col_group`).
+`valid_in_dword`'s clamped range (0..`elem_per_dword`, at most 4) is turned into a byte-lane
+keep-mask via one `v_cmp_ge_i32`/`v_cndmask_b32`/`v_or_b32` triple per possible element
+count, then ANDed into the dword. Wrapped in a cheap 2-3-instruction scalar skip-branch
+(`_emit_tail_dword_mask_guarded`) checking whether ANY masking is needed at all for this
+particular chunk/lane-range -- keeps the ~10-15-instructions-per-dword cost off the hot path
+for the overwhelmingly common non-tail case (every iteration except the actual tail one for
+K-tail; every lane except those in the last, partially-valid `col_group` for N-tail).
+
+**K-tail's `s_kitr` timing subtlety**: `wmma_main_loop.py`'s own `s_kitr = s_knum` init runs
+too late for chunk 0's masking -- it's emitted right after the prologue's initial
+`f_sst_a()`/`f_sst_b()` calls, which is exactly when chunk 0's mask needs a valid `s_kitr`.
+Fixed with a redundant, harmless `s_kitr = s_knum` in `emit_kernel_tap_loop`, emitted before
+the tap's first global loads (re-set moments later to the identical value by
+`wmma_main_loop.py`'s own init). This reuses `s_kitr`/`s_knum` directly as the "remaining
+valid elements from this tile's start" signal -- no new SGPR needed for K-tail's remaining
+count (unlike wrw's K-tail, which needed new `gemm_k_tail`/`gemm_k_num_splits` kernarg
+fields for its split-K shard bookkeeping; bwd needs neither, since `s_knum` is already the
+true unpadded `gemm_k` with zero driver/kernarg change).
+
+**N-tail's kernel-lifetime-constant timing**: unlike K-tail, N-tail's boundary
+(`col_start_abs = block_n_off + col_start`, and derived `n_valid_base = gemm_n -
+col_start_abs`) doesn't depend on the K-loop at all -- computed once in
+`emit_kernel_prologue` (persisted out of the existing row_local/col_start computation,
+non-destructively, right before each value would otherwise be consumed/overwritten by the
+pre-existing `v_addr_b_base` address arithmetic) and reused unchanged by every
+`shared_store_b_functor` call.
+
+**Driver**: `driver/igemm_bwd_gtc_driver.h`'s `tunable_is_valid()` gains
+`!wmma_n_tail`/`!wmma_k_tail`-gated relaxations of the `gemm_n`/`gemm_k` exact-multiple
+checks, mirroring fwd's Phase 25/26b pattern -- including the same `gemm_n % 4 == 0`
+restriction under `wmma_n_tail` (bwd shares fwd's exact vectorized-4-wide non-atomic
+epilogue store via `coalescing_store_wmma.py`, so the identical hazard applies). No new
+C++ struct/kernarg fields needed (`wmma_n_tail`/`wmma_k_tail` were already generic,
+non-per-direction fields from wrw's Phase 35 work). `python/igemm/igemm_base.py`'s
+`wmma_n_tail`/`wmma_k_tail` direction-gate asserts widened to include `'bwd'`.
+
+**Epilogue**: bwd's non-atomic (LDS-reshuffle) epilogue already had a generic
+`ctrl.wmma_n_tail` code path (added alongside fwd's Phase 26b, just never wired up for bwd)
+-- `emit_kernel_epilogue` now sets `ctrl_coalescing_store_wmma.wmma_n_tail` and passes
+`s_gemm_n`/a new `v_n_tail_col` scratch VGPR, identical to how M-tail's `s_gemm_m`/
+`v_m_tail_row` were already wired. Zero epilogue-side code changes needed beyond that.
+
+**VGPR cost** (64x64 tile, fp16/bf16): N-tail adds 3 VGPRs (`v_n_tail_col`,
+`v_b_col_start_abs`, `v_n_valid_base`), K-tail adds 2 (`v_b_row_local`, `v_flag_b_ktail`).
+Measured via `.vgpr_count` after generating (not assumed): N-tail alone 179, K-tail alone
+178, all three tails (M+N+K) combined 182, k-sub-loop (`gemm_k_per_block=64`) + N-tail 179
+-- all comfortably within the 256/wave limit at 64x64 (unlike wrw's Phase 35, which hit the
+limit exactly at 128x128 combining all three tails with split-K).
+
+**Zero-regression**: byte-identical `.s` diff across all 31 pre-existing gfx1250 bwd
+configs (fwd/wrw untouched by this phase's files entirely) -- generated from a clean
+`git worktree` checkout of the pre-phase commit vs the post-phase tree, confirming every
+new tunable defaults to 0 and gates 100% of new codegen.
+
+**Hardware validation** (`conv_driver.exe`, fp16 unless noted, against `naive_conv_bwd_nhwc`,
+64x64x32 tile): N-tail alone -- `gemm_n` one-short/one-over/two-blocks-minus-4/exact-forced-on
+(c=60/68/124/64, n=1,H=W=8,k=64, 1x1) -- **4/4 `valid:y`**. K-tail alone -- same battery on
+`gemm_k` (k=28/36/60/32) -- **4/4 `valid:y`**. Combined M+N+K tail -- 1x1 with `gemm_m` also
+one-short (n=1,H=9,W=7,c=60,k=28); 3x3 stride1/pad1 multi-tap (n=2,H=W=10,c=124,k=36); 3x3
+stride2/pad1/dilation2 (n=1,H=17,W=13,c=68,k=60); exact-multiple sanity with all three tails
+forced on (n=1,H=W=8,c=64,k=32) -- **4/4 `valid:y`**. Multi-chunk masking path
+(`gemm_k_per_block=64`, `num_k_chunks=2`, N-tail) -- `gemm_n` one-short/two-blocks-minus-4
+(c=60/124) -- **2/2 `valid:y`**. bf16 combined M+N+K tail (same shape as the 1x1 fp16 case
+above) -- **1/1 `valid:y`**.
+
+**One pre-existing, out-of-scope finding**: `group=2` on the 64x64 tile produces `valid:n`
+even on the PLAIN (no new tunables set) existing `igemm_bwd_gtc_gfx1250_nhwc_fp16.config`'s
+64x64 tunable -- confirmed pre-existing (this exact `.s` was byte-identical before/after
+this phase's changes) and unrelated to N/K-tail specifically; not investigated further here,
+flagged as a separate follow-up.
+
+**New configs**: `igemm_bwd_gtc_gfx1250_nhwc_fp16_{ntail,ktail,mnktail,k2x_ntail}.config`.
+
+**Critical files (Phase 36)**: `python/igemm/igemm_bwd_gtc_wmma_nhwc.py` -- new
+`_emit_tail_dword_mask`/`_emit_tail_dword_mask_guarded` methods, `_emit_sst_remaining_chunks`/
+`_emit_sst_all_chunks` (new `tail_mask` parameter), `global_load_b_functor` (K-tail flag),
+`shared_store_a/b_functor` (tail_mask wiring), `emit_kernel_prologue` (persist
+`v_b_row_local`/`v_b_col_start_abs`/`v_n_valid_base`), `emit_kernel_tap_loop` (redundant
+`s_kitr` init), `emit_kernel_epilogue` (N-tail params), `kernel_vgpr_t`/`kernel_sgpr_t` (new
+registers); `driver/igemm_bwd_gtc_driver.h` -- `tunable_is_valid()` relaxes; `python/igemm/
+igemm_base.py` -- direction-gate widening for `wmma_n_tail`/`wmma_k_tail`.
