@@ -184,6 +184,42 @@ section for the record).
       just in the classifier) needs a per-element (not per-4-wide-group) masking
       primitive in the shared epilogue, affecting both fwd and bwd. Real engineering
       effort (Tier C), not a config-only fix — not yet attempted.
+- [x] **Add a 32x32 bwd macro-tile for small-gemm_m/n occupancy** — done 2026-08-27
+      (Phase 46), hardware-validated, all 3 precisions. Closes ~1.5x of a ~2.6x gap vs.
+      CK found on a small-spatial/large-channel bwd shape. See
+      `docs/gfx1250_wmma_layout.md`'s Phase 46 for the full derivation. Two follow-ups
+      opened by this work, both below.
+- [ ] **Generalize row_repeat_a/b for block_size > macro_tile in BOTH dimensions at
+      once** — opened 2026-08-27 (Phase 46), not attempted. The existing
+      128x64/64x128 asymmetric tile entries in `wmma_mapping.py` already generalize
+      `block_size` exceeding `gemm_m_per_block` OR `gemm_n_per_block` (one dimension at
+      a time, via `row_repeat_a`/`row_repeat_b`). A tile like 32x32-with-2-waves
+      (needed to fully match CK's occupancy on the Phase 46 shape — CK's own tuned
+      instance uses `BlockSize=64` i.e. 2 waves per 32x32 tile, `MRepeat=2,NRepeat=1`
+      per wave, splitting N across the 2 waves) needs `block_size` to exceed the
+      macro-tile in **both** dimensions simultaneously relative to a single wave's own
+      coverage — a case the existing row_repeat generalization doesn't cover. Would
+      close the remaining ~1.8x gap (0.039ms → CK's 0.0215ms is a 256-total-wave vs.
+      Phase 46's 128-total-wave story, all else equal). Real engineering effort (Tier
+      C), touches `python/operations/wmma_mapping.py`'s wave-grid math and likely each
+      of fwd/bwd/wrw's global-load thread-mapping.
+- [ ] **bwd has no `gemm_k_global_split` (split-K) support at all** — noted 2026-08-27
+      while investigating the Phase 46 gap (confirmed via direct grep:
+      `python/igemm/igemm_bwd_gtc_wmma_nhwc.py` has zero occurrences of
+      `gemm_k_global_split`, vs. 22 in wrw's equivalent file). Not needed for the
+      specific shape Phase 46 targeted (CK's own tuned instance for that shape uses
+      `k_batch=1`, no split-K either), but a real, structural asymmetry vs. fwd/wrw
+      that will matter for other bwd shapes with small gemm_m/n and large gemm_k.
+      Porting it would follow wrw's existing pattern (atomic epilogue,
+      `gemm_k_per_wg`/`s_gemm_k_wg_off` kernarg/SGPR fields, `wmma_k_tail`-style
+      last-shard clamp) fairly closely. Real engineering effort (Tier B/C), not
+      attempted.
+- [ ] **bwd `group>1` returns `valid:n`** — re-confirmed 2026-08-27 while validating
+      Phase 46 (pre-existing, not introduced by that phase: reproduces identically on
+      the unmodified 64x64/128x128 bf16 configs at the same shape/group=2). Originally
+      surfaced in Phase 43's investigation (see that phase's note) but never actually
+      root-caused or fixed. Out of scope for every phase that's touched it so far —
+      still open.
 
 ## Tier 3 — bigger bets (largest structural change, longest-term)
 

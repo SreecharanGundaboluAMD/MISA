@@ -4475,3 +4475,72 @@ again: **always pass the mode string matching the tunable's precision.**
 `move_slice_window_a/b_functor`, `_emit_wave0_only`), `python/igemm/igemm_base.py`
 (widened the `tdm_global_load` direction assert to include `wrw`),
 `driver/igemm_wrw_gtc_driver.h` (`tunable_is_valid()`'s TDM+split-K exact-multiple fix).
+
+## Phase 46 (2026-08-27): 32x32 bwd tile to close a real occupancy gap vs. CK
+
+Motivated by a direct MISA-vs-CK comparison on a small-spatial/large-channel bwd shape
+(`n=4,c=512,H=W=8,k=256`, 1x3 filter, bf16): CK's `ConvHipImplicitGemmGroupBwdXdlops`
+solver hit 0.0215ms / 9382 GFLOPS; MISA's best (64x64 tile) was 0.057ms / ~3.6 TFLOPS,
+a ~2.6x gap.
+
+**Root-caused via CK source + the local MIOpen tuning DB, not guessed**: the "Xdlops"
+solver name is legacy -- on gfx11/gfx12 (`is_gfx11`/`is_gfx12` in
+`conv_hip_implicit_gemm_grouped_bwd_xdlops.cpp`) it dispatches an entirely different,
+WMMA-based CK device-op family (`DeviceGroupedConvBwdDataMultipleD_Wmma_CShuffleV3`), not
+real XDLOPS/MFMA -- this is a WMMA-vs-WMMA comparison, not a hardware-class difference.
+The cached tuning-DB entry for this exact shape (`~/.config/miopen/gfx1250100.*.udb.txt`)
+resolves to `MPerBlock=32, NPerBlock=32, KPerBlock=128, BlockSize=64` (2 waves/block,
+no split-K, k_batch=1). For this shape (`gemm_m=n*hi*wi=256, gemm_n=c=512`), that tile
+produces `ceil(256/32)*ceil(512/32) = 128` workgroups x 2 waves = **256 total waves --
+exactly one wave per CU** on this 256-CU part. MISA's 64x64 tile only produces
+`ceil(256/64)*ceil(512/64) = 32` workgroups x 2 waves = 64 total waves. The gap is pure
+occupancy, not an algorithmic or instruction-set difference (confirmed: CK also folds
+the multi-tap (Y=1,X=3) dimension directly into its GEMM_K via its Y-tilde/X-tilde
+transform -- effective K=768, not 256 -- but that only changes how CK *reports* GFLOPS
+for the same total work, not the occupancy story, since MISA's runtime-tap-loop already
+does the same total FLOPs across 3 separate K=256 passes instead of one K=768 pass).
+
+**Implementation**: a new 32x32 macro-tile entry in `ctrl_wmma_mapping_table`
+(`python/operations/wmma_mapping.py`) for fp16/bf16/fp32 -- `waves=1` (single wave,
+block_size=32), `wave_repeat_m=wave_repeat_n=2` (the only valid factorization at
+macro_tile=32 under the existing "block_size must equal both macro_tile_m and
+macro_tile_n exactly" constraint documented at the 64x64 entry -- see that comment).
+Because block_size already equals both macro-tile dimensions directly, this needed
+**zero changes to the row_repeat_a/b global-load thread-mapping machinery** (unlike the
+128x64/64x128 asymmetric entries) -- structurally identical to the existing
+64x64/128x128 entries, just smaller. New config files:
+`config/igemm_bwd_gtc_gfx1250_nhwc_{fp16,bf16,fp32}_32x32.config`.
+
+**Hardware validation**: exact target shape, all 3 precisions -- `valid:y`. bf16/fp16:
+0.038-0.039ms, ~5.1-5.3 TFLOPS/~6.1-6.3% efficiency (up from 0.057-0.058ms/~3.6
+TFLOPS/~4.2% at 64x64 -- **~1.5x faster**, confirmed stable across repeated runs).
+fp32: 0.150ms/1.34 TFLOPS (expected to be much lower than fp16/bf16 -- fp32 WMMA has
+K=4 per instruction vs K=32). Non-exact-multiple gemm_m/n correctly reports "not
+applicable" (no wmma_m_tail/n_tail/k_tail wired up for this tile yet, matching the
+existing 64x64/128x128 base configs' own initial state before their own tail variants
+were added separately). `group=2` was NOT validated here -- confirmed this is a
+pre-existing, out-of-scope bwd issue unrelated to this tile: the existing, unmodified
+64x64 and 128x128 configs both also return `valid:n` at `group=2` for this same shape.
+Full master-config search (`igemm_bwd_gtc_gfx1250_nhwc_bf16_all.config`, 14 candidates
+including the new tile): every candidate `valid:y`, and the 32x32 tile is automatically
+selected as fastest.
+
+**Zero regression**: git-worktree diff of the pre-Phase-46 commit vs. this tree for
+`igemm_bwd_gtc_gfx1250_nhwc_bf16.config` (unmodified by this phase) -- generated
+`.inc`/`.hsaco` byte-identical.
+
+**Result vs. CK**: 0.039ms vs. CK's 0.0215ms -- roughly **1.8x still behind**, not fully
+closed. This 32x32/single-wave tile only reaches 128 total waves (half of CK's 256),
+because MISA's existing global-load thread-mapping requires `block_size ==
+gemm_m_per_block == gemm_n_per_block` exactly (see the 64x64 entry's comment in
+`wmma_mapping.py`) -- a single wave cannot productively split across a SECOND wave
+without exceeding the tile in one dimension, which is exactly the case CK's `BlockSize=64`
+(2 waves covering one 32x32 tile, `MRepeat=2,NRepeat=1` per wave) represents. Reaching
+that requires generalizing MISA's row_repeat_a/b mechanism to a case it doesn't cover
+today: block_size *larger than* macro_tile in **both** dimensions simultaneously (the
+existing 128x64/64x128 entries only handle block_size exceeding macro_tile in one
+dimension at a time). **Not attempted this phase** -- recorded as a backlog item (see
+`docs/gfx1250_optimization_backlog.md`) with this exact technical scope for a follow-up.
+
+**Critical files**: `python/operations/wmma_mapping.py` (new 32x32 table entries, 3
+precisions), `config/igemm_bwd_gtc_gfx1250_nhwc_{fp16,bf16,fp32}_32x32.config` (new).

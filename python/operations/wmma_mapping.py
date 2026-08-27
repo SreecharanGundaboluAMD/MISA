@@ -229,10 +229,27 @@ class igemm_wmma_mapping_t(mc_base_t):
 # accumulate_a=2*8=16, accumulate_b=4*8=32 -- total 112 VGPRs vs 192 for fp16/bf16/int8's
 # existing 128x128/4x4 shape, a real if more modest reduction than a naive symmetric 2x2 split
 # would have given (which is NOT valid here -- see above).
+#
+# A 32x32 entry (2026-08-27, bwd occupancy investigation): waves_per_m=waves_per_n=1 (the
+# ONLY valid factorization at macro_tile=32 under the same block_size==macro_tile_m==
+# macro_tile_n constraint above -- (1,1) is the (1,1)(->32x32) case the 64x64 comment
+# calls out as the excluded alternative there) -> wave_repeat_m=wave_repeat_n=2
+# (macro_tile=16*2*1=32 each), waves=1 (block_size=32, a single wave, no row_repeat_a/b
+# generalization needed at all since block_size already equals both macro_tile dims
+# directly -- same structural category as the existing 64x64/128x128 entries, just
+# smaller). Motivation: CK's tuned instance for a small-spatial/large-channel bwd shape
+# (n=4,c=512,H=W=8,k=256, see docs/gfx1250_wmma_layout.md's Phase 46) uses an MPerBlock=
+# NPerBlock=32 tile specifically to maximize workgroup count (occupancy) on gfx1250's
+# 256 CUs when gemm_m/gemm_n are individually too small for 64x64 to produce enough
+# workgroups -- this entry is the equivalent occupancy lever available to MISA's own
+# tiling scheme without inventing new machinery. accumulate_c=2*2*8=32, accumulate_a=
+# accumulate_b=2*8=16 -- 64 VGPRs total, half of 64x64's 112.
 ctrl_wmma_mapping_table = {
     'fp16': [
         ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x32_f16),
         ctrl_wmma_mapping_t(64,  64,  16, 16, 2, 2, 4, v_wmma_f32_16x16x32_f16),
+        # 32x32, single wave (see table-level comment above for the derivation).
+        ctrl_wmma_mapping_t(32,  32,  16, 16, 1, 2, 2, v_wmma_f32_16x16x32_f16),
         # Asymmetric first shape (2026-08-25): waves_per_m=2 (128/(4*16)), waves_per_n=1
         # (64/(4*16)), waves=2 -> block_size=64. block_size == gemm_n_per_block(64) already
         # (B needs zero changes), but block_size < gemm_m_per_block(128) -- A's global-load
@@ -262,6 +279,8 @@ ctrl_wmma_mapping_table = {
     'bf16': [
         ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x32_bf16),
         ctrl_wmma_mapping_t(64,  64,  16, 16, 2, 2, 4, v_wmma_f32_16x16x32_bf16),
+        # 32x32, single wave (see table-level comment above the 'fp16' entry for the derivation).
+        ctrl_wmma_mapping_t(32,  32,  16, 16, 1, 2, 2, v_wmma_f32_16x16x32_bf16),
         # Asymmetric shapes (2026-08-25): mechanical port of fp16's 128x64/64x128 entries --
         # the row_repeat mechanism operates purely on gemm_m/n_per_block vs block_size and is
         # already precision-generic (uses self.data_byte throughout), same as the 64x64 port.
@@ -296,6 +315,8 @@ ctrl_wmma_mapping_table = {
     'fp32': [
         ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x4_f32),
         ctrl_wmma_mapping_t(64,  64,  16, 16, 2, 2, 4, v_wmma_f32_16x16x4_f32),
+        # 32x32, single wave (see table-level comment above the 'fp16' entry for the derivation).
+        ctrl_wmma_mapping_t(32,  32,  16, 16, 1, 2, 2, v_wmma_f32_16x16x4_f32),
         # Asymmetric shapes (2026-08-25): mechanical port, see fp16/bf16's entries above.
         ctrl_wmma_mapping_t(128, 64,  16, 16, 2, 4, 4, v_wmma_f32_16x16x4_f32),
         ctrl_wmma_mapping_t(64,  128, 16, 16, 2, 4, 4, v_wmma_f32_16x16x4_f32),
