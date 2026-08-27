@@ -28,9 +28,21 @@ the two biggest GEMM-shape mechanism gaps the original analysis found; (2) every
 *config-only* gap (a mechanism that already existed in code but only had `.config` files
 for one precision) was closed with new, hardware-validated config files across
 fp16/bf16/fp32 for fwd/bwd/wrw; (3) fwd's GEMM_K tail for multi-tap convolutions (Phase 38)
--- the one remaining real mechanism gap -- is now closed. A classifier bug (depthwise
-detection) was also found and fixed along the way -- see below. Layout conversion
-(NCHW<->NHWC) remains an explicit non-goal for MISA -- see "Headline finding" below.
+-- the one remaining real mechanism gap at the time -- was closed. A classifier bug
+(depthwise detection) was also found and fixed along the way -- see below. Layout
+conversion (NCHW<->NHWC) remains an explicit non-goal for MISA -- see "Headline finding"
+below.
+
+**Update (2026-08-27, later)**: a second classifier blind spot was found and fixed --
+fwd/bwd's non-atomic vectorized-4-wide-store epilogue requires `gemm_n % 4 == 0` whenever
+`wmma_n_tail` is active (confirmed unbuildable on real hardware, not just inferred), and
+the classifier previously didn't model this sub-constraint at all, silently over-counting
+coverage for every N-tail-needing shape whose `gemm_n` isn't a multiple of 4. This is a
+real, currently-unbuildable gap (not a config-only one -- closing it needs a new,
+finer-grained epilogue masking primitive), now tracked as `gap_n_mod4_fwd`/
+`gap_n_mod4_bwd` in `script/classify_gfx1250_coverage.py` and in
+`docs/gfx1250_optimization_backlog.md`. This revises the "zero remaining GEMM-shape gaps"
+claim below -- see the updated table.
 
 ## Headline finding: layout is still the dominant gap in the real corpus, but it's an
 explicit non-goal for MISA
@@ -71,19 +83,24 @@ expected to close. The rest of this document therefore evaluates coverage two wa
 
 This is the relevant view for judging MISA's own GEMM-shape coverage:
 
-| Direction | Total entries | Supported today | Degenerate (not a real conv) |
-|---|---|---|---|
-| fwd | 17,772 | 17,729 (99.76%) | 43 (0.24%) |
-| bwd | 21,055 | 20,850 (99.03%) | 205 (0.97%) |
-| wrw | 56,239 | 55,915 (99.44%) | 324 (0.58%) |
-| **Overall** | **95,066** | **94,494 (99.40%)** | **572 (0.60%)** |
+| Direction | Total entries | Supported today | GAP: `gemm_n%4!=0` (new) | Degenerate (not a real conv) |
+|---|---|---|---|---|
+| fwd | 17,772 | 17,099 (96.21%) | 630 (3.54%) | 43 (0.24%) |
+| bwd | 21,055 | 20,514 (97.43%) | 336 (1.60%) | 205 (0.97%) |
+| wrw | 56,239 | 55,915 (99.42%) | n/a (scalar atomic epilogue, no `%4` constraint) | 324 (0.58%) |
+| **Overall** | **95,066** | **93,528 (98.38%)** | **966 (1.02%)** | **572 (0.60%)** |
 
-**Zero remaining GEMM-shape/mechanism gaps in this corpus, in any direction.** Every shape
-that isn't supported today is a degenerate non-conv edge case (see Methodology) -- not a
-capability gap. This is a real change from the original analysis, which found fwd 79.98%,
-bwd 85.69%, wrw 62.07% supported (config-only gaps) plus a then-unsolved fwd K-tail
-mechanism gap (3.09% of the overall corpus). All of that closed across three follow-on
-rounds this session:
+**One real GEMM-shape/mechanism gap remains, found after the original "zero gaps" claim
+below was written**: fwd/bwd's non-atomic epilogue needs `gemm_n % 4 == 0` whenever
+`wmma_n_tail` is active (a real hardware constraint, not a classifier quirk -- confirmed
+unbuildable via direct hardware testing), and the classifier didn't model it until this
+pass. wrw is unaffected (its atomic epilogue is scalar-per-element, no vectorized-store
+grouping at all). See "A second classifier blind spot" below for the fix and its effort
+tier. Everything else below (the "3.09% -> 0%" mechanism-gap-closing narrative) is
+unchanged and still accurate for the mechanisms it covers -- this is an *additional*,
+previously-unmodeled constraint on top of that work, not a regression in it. Three
+follow-on rounds this session had, at the time, closed every OTHER known GEMM-shape
+mechanism gap:
 
 1. **bwd GEMM_N-tail + GEMM_K-tail** (Phase 36) -- bwd previously had M-tail only.
 2. **fwd TDM + GEMM_M/N-tail combined** (Phase 37) -- these existed independently but had
@@ -93,10 +110,27 @@ rounds this session:
    and fwd's new TDM+M/N-tail combo were initially fp16-only).
 4. **fwd GEMM_K-tail for multi-tap convolutions** (Phase 38) -- fwd's only K-tail mechanism
    was TDM's hardware OOB, which is 1x1-only by construction; this added a genuinely new
-   software (non-TDM) K-tail mechanism for multi-tap convs, the one remaining real gap.
+   software (non-TDM) K-tail mechanism for multi-tap convs.
 
 See `docs/gfx1250_wmma_layout.md`'s Phase 35-38 for full designs, bugs found, and hardware
 validation batteries for each.
+
+### A second classifier blind spot: `gemm_n % 4 == 0` for fwd/bwd's vectorized-store epilogue
+
+fwd/bwd's non-atomic epilogue (`coalescing_store_wmma.py`'s LDS-reshuffle path) stores in
+vectorized 4-wide chunks. When `wmma_n_tail` is active, the EXEC-mask guard only checks a
+group's FIRST column -- a 4-column group straddling a non-multiple-of-4 `gemm_n` silently
+writes the out-of-range tail columns too. Confirmed unbuildable on real hardware
+(`fwd fp32 n=1,c=1,k=1,H=W=1760` and `n=256,c=3,k=3,H=W=32`, both `gemm_n=k` in `{1,3}` --
+every kernel in the master config reports "not applicable"). The classifier never modeled
+this sub-constraint, so every N-tail-needing shape was reported "supported" regardless of
+`gemm_n mod 4` -- not just the tiny `gemm_n` cases above: the fix also catches much larger
+non-multiple-of-4 values already present in this corpus (e.g. `gemm_n` = 486, 510, 1001 for
+bwd). wrw's atomic epilogue is scalar-per-element (no vectorized grouping), so it's
+unaffected. Fixed in `script/classify_gfx1250_coverage.py` (`gap_n_mod4_fwd`/
+`gap_n_mod4_bwd` categories); tracked as an open Tier 2 item in
+`docs/gfx1250_optimization_backlog.md` (effort tier C -- needs a new, finer-grained
+per-element epilogue masking primitive, not just a config file).
 
 ### A classifier bug found and fixed along the way: "depthwise" was over-triggering
 

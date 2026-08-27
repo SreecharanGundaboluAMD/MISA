@@ -119,14 +119,28 @@ section for the record).
       bigger design departure than bwd turned out to be (bwd's operands were direct
       structural matches for the existing descriptor abstraction once worked through);
       multi-tap would need TDM's per-tap gather-free assumption re-examined entirely.
-- [ ] **Fix `script/classify_gfx1250_coverage.py`'s `gemm_n % 4 == 0` blind spot** — the
-      static-analysis classifier doesn't model fwd/bwd's non-atomic epilogue's
-      `gemm_n % 4 == 0` sub-constraint (needed when `wmma_n_tail` is active, from the
-      vectorized 4-wide store), so it over-reports some very-small-`gemm_n` shapes as
-      "supported" when they're actually unbuildable today. Confirmed via direct
-      hardware testing (`fwd fp32 n=1,c=1,k=1,H=W=1760` and
-      `fwd fp32 n=256,c=3,k=3,H=W=32`, both `gemm_n=k∈{1,3}`, all kernels report "not
-      applicable"). Found during the benchmark exercise (2026-08-27), not yet fixed.
+- [x] **Fix `script/classify_gfx1250_coverage.py`'s `gemm_n % 4 == 0` blind spot** — done
+      2026-08-27 (CPU-only, no GPU execution needed — pure static analysis script).
+      Added `gap_n_mod4_fwd`/`gap_n_mod4_bwd` categories, gated on `'N' in needs and
+      gemm_n % 4 != 0`, for fwd/bwd only (wrw's scalar atomic epilogue has no vectorized
+      grouping, unaffected). Re-ran against the full 95,066-entry corpus: 630 fwd + 336
+      bwd distinct-entry-weighted shapes reclassified from "supported" to this new gap
+      category (not just the tiny `gemm_n∈{1,3}` cases originally found — the fix also
+      catches much larger non-multiple-of-4 values already in the corpus, e.g.
+      `gemm_n`=486/510/1001 for bwd). Revises overall NHWC-assumed coverage from 99.40%
+      to 98.38% — see `docs/gfx1250_wmma_coverage_gap_analysis.md`'s updated tables.
+      Closing the underlying gap itself (not just the classifier) would need a new,
+      finer-grained per-element epilogue masking primitive — tracked as a genuinely new
+      Tier 2 item below (not yet attempted).
+- [ ] **New epilogue masking granularity for `gemm_n % 4 != 0` N-tail shapes**
+      (fwd/bwd) — found while fixing the classifier blind spot above. fwd/bwd's
+      non-atomic vectorized-4-wide-store epilogue (`coalescing_store_wmma.py`) can't
+      correctly handle a `gemm_n` that both needs N-tail relief AND isn't a multiple of
+      4 — the EXEC-mask guard only checks a group's first column, so out-of-range tail
+      columns within the same 4-wide group get written too. Closing this for real (not
+      just in the classifier) needs a per-element (not per-4-wide-group) masking
+      primitive in the shared epilogue, affecting both fwd and bwd. Real engineering
+      effort (Tier C), not a config-only fix — not yet attempted.
 
 ## Tier 3 — bigger bets (largest structural change, longest-term)
 

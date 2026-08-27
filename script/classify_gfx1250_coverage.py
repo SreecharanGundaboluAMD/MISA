@@ -200,9 +200,30 @@ def classify(shape, assume_nhwc=False):
     if not needs:
         return 'supported_exact_fit', f"gm={gm},gn={gn},gk={gk} all fit a 128 or 64 tile exactly"
 
+    # fwd/bwd's non-atomic epilogue (coalescing_store_wmma.py's LDS-reshuffle path) stores
+    # in vectorized 4-wide chunks (vector_write_out=4) -- when wmma_n_tail is active (i.e.
+    # 'N' in needs here, since every _mtail/_ntail/_mntail/_tdm/_ktail config that covers an
+    # N-needing shape necessarily sets wmma_n_tail=1), the EXEC-mask guard only checks the
+    # group's FIRST column, so a 4-column group straddling a non-multiple-of-4 gemm_n writes
+    # the out-of-range tail columns too -- confirmed unbuildable on real hardware
+    # (fwd fp32 n=1,c=1,k=1,H=W=1760 and n=256,c=3,k=3,H=W=32, both gemm_n=k in {1,3}, every
+    # kernel reports "not applicable"). wrw's atomic epilogue is scalar-per-element (no
+    # vectorized grouping at all), so this constraint does NOT apply there. Previously
+    # unmodeled here -- this classifier reported every N-tail-needing shape as "supported"
+    # regardless of gemm_n's value mod 4, silently over-counting coverage for any gemm_n
+    # that isn't a multiple of 4 (not just the tiny gemm_n=1/3 cases above -- e.g. gemm_n=130
+    # also needs N-relief and also fails this check, 130%4=2).
+    n_tail_mod4_violation = ('N' in needs) and (gn % 4 != 0)
+
     is_1x1 = (d['y'] == 1 and d['x'] == 1)
 
     if d['direction'] == 'fwd':
+        if n_tail_mod4_violation:
+            return 'gap_n_mod4_fwd', (
+                f"gm={gm},gn={gn},gk={gk}: N needs tail relief but gn={gn} is not a "
+                f"multiple of 4 -- fwd's non-atomic vectorized-4-wide-store epilogue "
+                f"requires this (confirmed unbuildable on real hardware), no config covers "
+                f"it today ({prec})")
         if 'K' in needs:
             if is_1x1:
                 # Phase 37: TDM's own descriptor covers M/N tail natively (tensor_dim1
@@ -238,6 +259,12 @@ def classify(shape, assume_nhwc=False):
         # _ntail/_ktail/_mnktail configs (written and hardware-validated right after Phase 36
         # landed, exercising bf16's identical-to-fp16 elem_per_dword=2 path and fp32's
         # distinct elem_per_dword=1 path) closed what was briefly a config-only gap.
+        if n_tail_mod4_violation:
+            return 'gap_n_mod4_bwd', (
+                f"gm={gm},gn={gn},gk={gk}: N needs tail relief but gn={gn} is not a "
+                f"multiple of 4 -- bwd shares fwd's non-atomic vectorized-4-wide-store "
+                f"epilogue (coalescing_store_wmma.py), same hardware constraint, no config "
+                f"covers it today ({prec})")
         if prec == 'int8':
             return 'gap_config_int8_bwd_tail', f"needs {sorted(needs)} -- no int8 config exists for ANY bwd tail mechanism (not even pre-existing M-tail), and int8's elem_per_dword=4 masking case is wholly untested"
         return 'supported_tail_bwd_mnk', f"needs {sorted(needs)} -- covered by _mtail/_ntail/_ktail/_mnktail ({prec})"
@@ -270,6 +297,8 @@ CATEGORY_LABELS = {
     'gap_config_int8_fwd_tail': 'GAP: fwd int8 M/N-tail config missing',
     'gap_config_int8_bwd_tail': 'GAP: bwd int8 tail config missing (any mechanism)',
     'gap_config_int8_wrw_tail': 'GAP: wrw int8 tail/gsplit config missing',
+    'gap_n_mod4_fwd': 'GAP: fwd gemm_n needs tail but not a multiple of 4 (vectorized-store epilogue limit)',
+    'gap_n_mod4_bwd': 'GAP: bwd gemm_n needs tail but not a multiple of 4 (vectorized-store epilogue limit)',
 }
 
 # Rough, qualitative effort tiers for the write-up.
@@ -284,6 +313,8 @@ EFFORT_TIER = {
     'gap_config_int8_fwd_tail': 'B (config file + validation only)',
     'gap_config_int8_bwd_tail': 'C (config file + first-ever validation of the elem_per_dword=4 masking case for bwd)',
     'gap_config_int8_wrw_tail': 'D for gsplit (new mechanism, int8 gsplit doesn\'t exist) + B for tail (config only)',
+    'gap_n_mod4_fwd': 'C (new epilogue masking granularity -- shared coalescing_store_wmma.py mechanism change, affects fwd+bwd)',
+    'gap_n_mod4_bwd': 'C (new epilogue masking granularity -- shared coalescing_store_wmma.py mechanism change, affects fwd+bwd)',
 }
 
 
