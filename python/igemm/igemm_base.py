@@ -590,6 +590,19 @@ class igemm_gtc_tunable_parameter_t(object):
                     "wmma_n_tail and async_global_load are mutually exclusive for now -- global_load_async_to_lds_b128's masking was only ever validated for the A operand, see docs/gfx1250_wmma_layout.md's Phase 13/26b"
                 assert self.gemm_n_per_block // self.block_size == 1, \
                     "wmma_n_tail requires row_repeat_b == 1 -- rows 1+ have no flag of their own, see docs/gfx1250_wmma_layout.md's Phase 26b"
+            # Phase 34 (packed-bf16 atomics): atomic path only, bf16 precision only (packed
+            # bf16 atomics need bf16-native memory, and the accuracy tradeoff of packing was
+            # only measured for bf16 -- see docs/gfx1250_wmma_layout.md's Phase 34). Halves
+            # the number of actual atomic ops the K-split epilogue issues, at the cost of
+            # bf16 (not fp32) precision on the K-split reduction itself.
+            self.atomic_pack_bf16 = utility_dict_with_default_t(tunable_dict)('atomic_pack_bf16', 0)
+            if self.atomic_pack_bf16:
+                assert self.gemm_k_global_split, \
+                    "atomic_pack_bf16 only applies to the atomic (gemm_k_global_split) epilogue, see docs/gfx1250_wmma_layout.md's Phase 34"
+                assert self.precision == 'bf16', \
+                    "atomic_pack_bf16 is only implemented for bf16 precision so far, see docs/gfx1250_wmma_layout.md's Phase 34"
+                assert not self.atomic_cascade, \
+                    "atomic_pack_bf16 and atomic_cascade are mutually exclusive for now -- not tested together"
             if self.wmma_acc_f16:
                 wmma_mapping_key = self.precision + '_f16acc'
             elif self.wmma_acc_bf16:
@@ -1098,6 +1111,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_bf16acc"
         if tunable.wmma_setprio:
             kernel_name += "_setprio"
+        if tunable.atomic_pack_bf16:
+            kernel_name += "_pkatomic"
 
     if tunable.tensor_a_pass_through:
         kernel_name += "_pta"

@@ -670,6 +670,11 @@ int main(int argc, char **argv) {
     // Phase 27: bf16 analog of is_wmma_f16_acc above -- same 2-byte-native-role-buffer
     // situation, just gated to wmma_acc_bf16.
     bool is_wmma_bf16_acc = is_wmma && tunables[0].wmma_acc_bf16 != 0;
+    // Phase 34: wrw's gemm_k_global_split atomic epilogue, packed-bf16 variant -- same
+    // 2-byte-native-role-buffer situation as is_wmma_f16_acc/is_wmma_bf16_acc above (the
+    // kernel writes grad_weight directly at bf16 width, no fp32 workspace), just gated to
+    // atomic_pack_bf16 instead of an accumulate-precision tunable.
+    bool is_wmma_atomic_pack_bf16 = is_wmma && tunables[0].atomic_pack_bf16 != 0;
 
     hipModule_t module;
 #ifndef IGEMM_SPLIT_KERNEL
@@ -772,7 +777,7 @@ int main(int argc, char **argv) {
     // -- e.g. a pure fp32 build defines none of them, and previously (a Phase 24 regression,
     // caught by this branch's own byte-identical-assembly regression sweep) those lambdas
     // failed to compile with "use of undeclared identifier 'dtype_alloc_byte'".
-    size_t dtype_alloc_byte = (is_wmma_f16_acc || is_wmma_bf16_acc) ? data_byte : (is_wmma ? sizeof(float) : data_byte);
+    size_t dtype_alloc_byte = (is_wmma_f16_acc || is_wmma_bf16_acc || is_wmma_atomic_pack_bf16) ? data_byte : (is_wmma ? sizeof(float) : data_byte);
 #if defined(USE_HALF) || defined(USE_INT8) || defined(USE_BF16) || defined(USE_INT4)
     host_input_dtype  = malloc(n * c * hi * wi * dtype_alloc_byte);
     host_weight_dtype = malloc(k * c * y * x * dtype_alloc_byte);
@@ -1399,6 +1404,18 @@ int main(int argc, char **argv) {
                                    hipMemcpyDeviceToHost));
                     is_valid = valid_vector<float>(host_weight, static_cast<float*>(device_weight_to_host),
                                         static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x, nrms);
+                }else if(is_wmma_atomic_pack_bf16){
+                    // Phase 34: the packed-bf16 atomic epilogue writes grad_weight directly
+                    // at native bf16 width -- no fp32 workspace, no cast kernel needed,
+                    // unlike is_wmma_f16_acc/is_wmma_bf16_acc above (those exist because
+                    // WMMA's plain epilogue accumulates in a wider VGPR role that still
+                    // needs casting down; here the packed atomic already produced the
+                    // final bf16 values in memory).
+                    HIP_CALL(hipMemcpy(device_weight_to_host, device_weight_dtype,
+                                   static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x * data_byte,
+                                   hipMemcpyDeviceToHost));
+                    is_valid = valid_vector<bfloat16>(host_weight, static_cast<bfloat16*>(device_weight_to_host),
+                                    static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x, nrms);
                 }else if(is_wmma){
                     // WMMA always writes grad_weight at full width (fp32, or int32 for int8) --
                     // see the equivalent fwd/bwd comment near is_wmma.

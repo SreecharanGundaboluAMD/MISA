@@ -115,6 +115,22 @@ class ctrl_coalescing_store_wmma_t(object):
         # comment below). Independent of wmma_m_tail -- either, both, or neither may be set.
         self.wmma_n_tail = 0
 
+        # Phase 34 (packed atomics): atomic path only, precision=='bf16' only (asserted in
+        # igemm_base.py). 0 (default) = today's scalar global_atomic_add_f32, one per lane.
+        # 1 = pack ADJACENT columns (lane L and lane L^1, which per wmma_mapping.py's
+        # `lane % 16 -> column` are always adjacent columns within the same 16-lane half)
+        # into one global_atomic_pk_add_bf16, halving the number of actual atomic RMW ops
+        # hitting memory -- independently confirmed as a real technique by both FlyDSL's
+        # gfx1250 MoE split-K GEMM and rocKE's wgrad conv epilogue, see
+        # docs/gfx1250_perf_parity_action_plan.md's Tier 1 item 2. Needs a genuine
+        # cross-lane exchange (ds_bpermute_b32) since each lane only ever holds its OWN
+        # column's fp32 accumulator value -- verified correct (exchange pairing, packing
+        # byte order, multi-block atomic accumulation) via a standalone hardware probe
+        # before landing here. Trades scalar-fp32-atomic precision for packed-bf16-atomic
+        # precision on the K-split reduction -- a real numerical tradeoff, not free; see
+        # docs/gfx1250_wmma_layout.md's Phase 34 for the accuracy validation.
+        self.atomic_pack_bf16 = 0
+
 
 class igemm_coalescing_store_wmma_t(mc_base_t):
     def __init__(self, mc, ctrl):
@@ -141,16 +157,37 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
             s_gemm_n is the real (unpadded) GEMM_N scalar, v_tmp4 is 1 scratch VGPR holding
             this lane's column-in-range flag (`v_gather` itself gets reused as the gather's
             LDS-read destination, so its column value doesn't survive to pass 0's guard).
+            Phase 34 (ctrl.atomic_pack_bf16, atomic path only -- wmma_m_tail/wmma_n_tail are
+            mutually exclusive with gemm_k_global_split already, so reusing these same
+            three params here is safe): v_gather holds the partner-lane byte-index
+            (computed once, kernel-lifetime constant), v_tmp3 holds the cross-lane-
+            exchanged partner value (per-iteration scratch), v_tmp4 holds the packed
+            bf16x2 result (per-iteration scratch). v_tid is required (used for both the
+            partner-index computation and the even/odd EXEC-mask guard).
 
         ctrl.gemm_k_global_split selects between two structurally different epilogues:
 
-        Atomic path (gemm_k_global_split=True): unchanged from before -- one
-        global_atomic_add_f32 per accumulator element, no LDS traffic. There is no wide/
-        packed fp32 atomic-add on this ISA (confirmed against the CDNA5 ISA doc), so this
-        can't be vectorized; v_tmp1/v_tmp2 ping-pong as the "current row"/"next row"
-        address so the row-advance add has no data dependency on the in-flight atomics
-        (different register), instead of serializing all row addresses through one
-        register. Column offset is folded into the atomic's immediate offset.
+        Atomic path (gemm_k_global_split=True): by default, one global_atomic_add_f32 per
+        accumulator element, no LDS traffic (there is no wide/packed fp32 atomic-add on
+        this ISA, confirmed against the CDNA5 ISA doc, so the plain fp32 path can't be
+        vectorized). v_tmp1/v_tmp2 ping-pong as the "current row"/"next row" address so
+        the row-advance add has no data dependency on the in-flight atomics (different
+        register), instead of serializing all row addresses through one register. Column
+        offset is folded into the atomic's immediate offset. When ctrl.atomic_pack_bf16 is
+        set instead: every lane exchanges its fp32 value with its column-adjacent partner
+        (ds_bpermute_b32, lane XOR 1 -- valid since `lane % 16 -> column` in
+        wmma_mapping.py always makes adjacent lanes adjacent columns within a 16-lane
+        half), packs (own, partner) into one bf16x2 with the lower column in the packed
+        value's low 16 bits (matching row-major memory layout), then only EVEN lanes
+        issue one global_atomic_pk_add_bf16 covering both columns -- halving the number
+        of actual atomic ops hitting memory at the cost of bf16 (not fp32) intermediate
+        precision on the K-split reduction. The exchange needs FULL EXEC (both lanes of
+        every pair must be enabled for the gather to see real, not disabled-lane-zeroed,
+        values), so EXEC is narrowed to even-lanes-only only for the pack+atomic step and
+        restored before the next iteration's exchange -- this repeats every (i_rm, j,
+        i_rn) iteration, a real per-iteration cost this phase accepts as correctness-
+        first, not yet optimized (mirrors Phase 28's TDM pilot's own "known, deliberate
+        inefficiency" framing).
 
         Non-atomic path (gemm_k_global_split=False): LDS-reshuffle coalescing store, see
         docs/gfx1250_wmma_layout.md's LDS-reshuffle phase for the full derivation. A single
@@ -174,9 +211,60 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         if ctrl.wmma_n_tail:
             assert not ctrl.gemm_k_global_split, "wmma_n_tail's masking is only implemented for the non-atomic epilogue branch"
             assert s_gemm_n is not None and v_tmp4 is not None
+        if ctrl.atomic_pack_bf16:
+            assert ctrl.gemm_k_global_split, "atomic_pack_bf16 only applies to the atomic epilogue branch"
+            assert v_tid is not None and v_gather is not None and v_tmp3 is not None and v_tmp4 is not None
 
         with self._deferred_context():
-            if ctrl.gemm_k_global_split:
+            if ctrl.gemm_k_global_split and ctrl.atomic_pack_bf16:
+                # ---- Phase 34: packed-bf16 atomic-add epilogue ----
+                self._emit(f"; wmma packed-bf16 atomic-add epilogue, {cxm.wave_repeat_m}x{cxm.wave_repeat_n} tiles, "
+                           f"{inst_wmma.num_v_c} rows/tile")
+                self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], 1   ; row-to-row byte stride (bf16, 2 bytes/elem)")
+                # partner-lane byte-index for ds_bpermute_b32 (kernel-lifetime constant,
+                # computed once): partner = this lane XOR 1, index is in bytes (*4).
+                self._emit(f"v_xor_b32 v[{v_gather}], 1, v[{v_tid}]   ; partner lane = this lane XOR 1")
+                self._emit(f"v_lshlrev_b32 v[{v_gather}], 2, v[{v_gather}]   ; ds_bpermute_b32 index is in bytes")
+                self._emit_empty_line()
+                for i_rm in range(cxm.wave_repeat_m):
+                    row_off = i_rm * cxm.wave_tile_m
+                    cur, nxt = v_tmp1, v_tmp2
+                    self._emit(f"v_add_u32 v[{cur}], {row_off}, v[{v_gemm_im}]" if row_off != 0 else f"v_mov_b32 v[{cur}], v[{v_gemm_im}]")
+                    self._emit(f"v_mul_lo_u32 v[{cur}], s[{s_gemm_m_stride}], v[{cur}]")
+                    self._emit(f"v_add_u32 v[{cur}], v[{v_gemm_in}], v[{cur}]")
+                    self._emit(f"v_lshlrev_b32 v[{cur}], 1, v[{cur}]  ; byte address (bf16), row {row_off}, col 0")
+                    for j in range(inst_wmma.num_v_c):
+                        if j != inst_wmma.num_v_c - 1:
+                            self._emit(f"v_add_u32 v[{nxt}], v[{cur}], s[{s_tmp1}]   ; precompute row {row_off + j + 1} address")
+                        for i_rn in range(cxm.wave_repeat_n):
+                            c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
+                            col_off = i_rn * cxm.wave_tile_n * 2
+                            offset_str = f" offset:{col_off}" if col_off != 0 else ""
+                            # exchange needs FULL EXEC -- both lanes of every pair must be
+                            # enabled or the gather sees a disabled-lane zero, not the real
+                            # partner value (CDNA5 ISA doc 11.2.3).
+                            self._emit(f"ds_bpermute_b32 v[{v_tmp3}], v[{v_gather}], v[{v_c}+{c_index}]")
+                            # ds_bpermute_b32 is a DS-class instruction tracked by DSCNT (CDNA5
+                            # ISA doc: DS return-value ops "use DSCNT to determine when this
+                            # instruction has executed") -- its result is NOT safely readable
+                            # by the very next instruction the way a plain VALU-to-VALU
+                            # dependency is. Found by a real hardware miscompare (only the
+                            # FIRST couple of (i_rm,j,i_rn) iterations showed corrupted hi16
+                            # values; later iterations happened to have enough natural
+                            # instruction-issue delay to mask the race) before this wait was
+                            # added -- see docs/gfx1250_wmma_layout.md's Phase 34.
+                            self._emit(f"s_wait_dscnt 0x0")
+                            self._emit(f"v_cvt_pk_bf16_f32 v[{v_tmp4}], v[{v_c}+{c_index}], v[{v_tmp3}]   ; lo16=this lane's col, hi16=partner's -- only correct if this lane is even")
+                            # only even lanes issue the packed atomic (their own column is
+                            # the pair's lower/base column); narrow EXEC, issue, restore.
+                            self._emit(f"v_and_b32 v[{v_tmp3}], 1, v[{v_tid}]")
+                            self._emit(f"v_cmpx_eq_u32 0, v[{v_tmp3}]   ; EXEC = (this lane is even)")
+                            th_str = f" th:{ctrl.atomic_th}" if ctrl.atomic_cascade else ""
+                            self._emit(f"global_atomic_pk_add_bf16 v[{cur}], v[{v_tmp4}], s[{s_p_out}:{s_p_out}+1]{offset_str} scope:{ctrl.atomic_scope}{th_str}")
+                            self._emit(f"s_mov_b32 exec_lo, -1   ; restore full EXEC for the next iteration's exchange")
+                        cur, nxt = nxt, cur
+                self._emit_empty_line()
+            elif ctrl.gemm_k_global_split:
                 self._emit(f"; wmma direct atomic-add epilogue, {cxm.wave_repeat_m}x{cxm.wave_repeat_n} tiles, "
                            f"{inst_wmma.num_v_c} rows/tile")
                 self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], 2   ; row-to-row byte stride")

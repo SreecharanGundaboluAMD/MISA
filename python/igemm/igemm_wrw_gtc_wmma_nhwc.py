@@ -186,6 +186,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # actual behavior is precision-agnostic (2-byte-packed accumulator), so both tunables
         # funnel into it.
         ctrl_coalescing_store_wmma.wmma_acc_f16 = tunable.wmma_acc_f16 or tunable.wmma_acc_bf16
+        ctrl_coalescing_store_wmma.atomic_pack_bf16 = tunable.atomic_pack_bf16
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
 
         # A-region (grad_output) and B-region (input): both natural [GEMM_K rows][M or N
@@ -320,6 +321,15 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self.v_b_col_off   = sym_t('v_b_col_off'   , vseq(1))    # (block_n_off+col_start)*databyte, fixed
             self.v_flag        = sym_t('v_flag'        , vseq(1))
             self.v_gtc_tmp     = sym_t('v_gtc_tmp'     , vseq(5))
+            if outer.tunable.atomic_pack_bf16:
+                # Phase 34: packed-bf16 atomic epilogue scratch -- v_pk_idx (partner-lane
+                # byte-index for ds_bpermute_b32, kernel-lifetime constant once computed),
+                # v_pk_partner (cross-lane-exchanged value, per-iteration scratch),
+                # v_pk_packed (packed bf16x2 result, per-iteration scratch). Only allocated
+                # when atomic_pack_bf16 is set (every existing config byte-identical).
+                self.v_pk_idx     = sym_t('v_pk_idx'     , vseq(1))
+                self.v_pk_partner = sym_t('v_pk_partner' , vseq(1))
+                self.v_pk_packed  = sym_t('v_pk_packed'  , vseq(1))
             self.v_end         = sym_t('v_end'         , vseq())
 
         def emit(self):
@@ -555,7 +565,12 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # per-tap offset automatically inherits this block-constant group shift. ----
         # Phase 24: shift must follow the D-operand's real width (4 bytes normally, 2 under
         # wmma_acc_f16) -- same bug class as emit_kernel_tap_loop's per-tap offset above.
-        out_elem_byte_shift_group = 1 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16) else 2
+        # Phase 34: atomic_pack_bf16 is a THIRD case with a 2-byte-native output buffer,
+        # same shift as wmma_acc_f16/bf16 even though it's a completely different
+        # mechanism (packed-atomic epilogue, not a packed-accumulator VGPR layout) --
+        # found via a real hardware miscompare on group>1 (g=1 has a zero group offset
+        # regardless of this shift's value, masking the bug entirely).
+        out_elem_byte_shift_group = 1 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16 or self.tunable.atomic_pack_bf16) else 2
         self._emit(f"; output (grad_weight): group offset = group_idx * gemm_m * wei_row_c elements")
         self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group_idx()}], s[{s.s_gemm_m()}]")
         self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_wei_row_c()}]")
@@ -674,7 +689,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # is the only place outside coalescing_store_wmma.py that independently computes a
         # byte address into the WMMA-native output buffer. f16acc halves that buffer's
         # element width to 2 bytes, so this must shift by 1, not 2, in that case.
-        out_elem_byte_shift = 1 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16) else 2
+        # atomic_pack_bf16 (Phase 34) is the same 2-byte-native case for a different reason
+        # (packed-atomic epilogue writes bf16 directly) -- see out_elem_byte_shift_group above.
+        out_elem_byte_shift = 1 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16 or self.tunable.atomic_pack_bf16) else 2
         self._emit(f"; s_p_out_tap = p_out + (iy*x+ix)*gemm_n*{1 << out_elem_byte_shift} bytes (WMMA D-operand is")
         self._emit(f"; fp32/int32 (4B) normally, or fp16 (2B) under wmma_acc_f16 -- see coalescing_store_wmma.py)")
         self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_iy()}], s[{s.s_x()}]")
@@ -683,7 +700,13 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_lshl_b32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], {out_elem_byte_shift}   ; tap byte offset")
         self._emit(f"s_add_u32 s[{s.s_p_out_tap()}], s[{s.s_p_out()}], s[{s.s_tmp(2)}]")
         self._emit(f"s_addc_u32 s[{s.s_p_out_tap(1)}], s[{s.s_p_out(1)}], 0")
-        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off()))
+        # Phase 34: atomic_pack_bf16 needs genuine scratch for v_gather/v_tmp3/v_tmp4 (the
+        # non-packed atomic path never touches them, so v_c() is passed as a harmless
+        # unused placeholder there -- see coalescing_store_wmma.py's docstring).
+        if self.tunable.atomic_pack_bf16:
+            self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_pk_idx(), s.s_block_m_off(), s.s_block_n_off(), None, v.v_pk_partner(), None, v.v_pk_packed()))
+        else:
+            self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off()))
         self._emit(f"s_wait_storecnt 0x0")
         self._emit_empty_line()
 

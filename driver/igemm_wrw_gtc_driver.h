@@ -832,10 +832,15 @@ public:
             // iteration's already-written result. WMMA output is always allocated/written as
             // fp32 regardless of the tunable's nominal precision (conv_driver.cpp's is_wmma
             // dtype_alloc_byte override, and this kernel's D-operand-always-4-bytes epilogue),
-            // so zero by element count * sizeof(float), not data_byte.
+            // so zero by element count * sizeof(float), not data_byte -- EXCEPT Phase 34's
+            // atomic_pack_bf16, which writes the output at its native bf16 (2-byte) width
+            // instead (conv_driver.cpp's dtype_alloc_byte override handles this the same way
+            // it already does for wmma_acc_f16/wmma_acc_bf16) -- zeroing at the fp32 element
+            // count there would write past the actual (half-sized) allocation.
+            size_t gsplit_zero_elem_byte = tunable->atomic_pack_bf16 ? 2 : sizeof(float);
             auto wrw_gsplit_prolog = std::function<float()>{[&]() -> float {
                 if (tunable->gemm_k_global_split)
-                    HIP_CALL(hipMemset(p_wei, 0, static_cast<size_t>(group) * (k / group) * (c / group) * y * x * sizeof(float)));
+                    HIP_CALL(hipMemset(p_wei, 0, static_cast<size_t>(group) * (k / group) * (c / group) * y * x * gsplit_zero_elem_byte));
                 return .0;
             }};
 

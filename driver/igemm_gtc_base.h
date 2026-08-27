@@ -180,6 +180,12 @@ typedef struct {
     // get_kernel_name() reconstructs the same suffixed symbol name Python's codegen actually
     // emitted -- otherwise hipModuleGetFunction would look up the wrong (unsuffixed) name.
     int wmma_setprio;
+    // Phase 34: packed-bf16 atomic epilogue for wrw's gemm_k_global_split path -- changes
+    // the OUTPUT (grad_weight) buffer's native width from fp32 to bf16 (2 bytes), so the
+    // driver's dtype_alloc_byte override and wrw_post's verification path need to know
+    // about it (same category as wmma_acc_f16/wmma_acc_bf16 above), and it's folded into
+    // the kernel name for the same hipModuleGetFunction-lookup reason as wmma_setprio.
+    int atomic_pack_bf16;
     // Phase 25: when set, relaxes fwd's WMMA-only gemm_m%gemm_m_per_block==0 validity
     // requirement (tunable_is_valid()) and turns on the kernel's GEMM_M tail-masking codegen
     // (v_flag OOB check on the A-operand load, EXEC-masked store in the epilogue). Purely a
@@ -262,6 +268,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.wmma_m_tail               = sec.count("wmma_m_tail") > 0 ? sec.at("wmma_m_tail").get_int() : 0;
                 tunable.wmma_n_tail               = sec.count("wmma_n_tail") > 0 ? sec.at("wmma_n_tail").get_int() : 0;
                 tunable.wmma_setprio               = sec.count("wmma_setprio") > 0 ? sec.at("wmma_setprio").get_int() : 0;
+                tunable.atomic_pack_bf16           = sec.count("atomic_pack_bf16") > 0 ? sec.at("atomic_pack_bf16").get_int() : 0;
             }
             else{
                 tunable.wave_tile_m              = sec.at("wave_tile_m").get_int();
@@ -469,6 +476,8 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += std::string("_bf16acc");
         if(tunable->wmma_setprio)
             kernel_name += std::string("_setprio");
+        if(tunable->atomic_pack_bf16)
+            kernel_name += std::string("_pkatomic");
     }
     if(tensor_a_pass_through)
         kernel_name += std::string("_pta");

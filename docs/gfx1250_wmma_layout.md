@@ -3317,3 +3317,101 @@ contention, safe either way.
 block in the WMMA `run()` method, reusing the existing `compute_gemmk_global_splits`/
 `largest_divisor_leq` helpers with a real `hipModuleOccupancyMaxActiveBlocksPerMultiprocessor`
 query.
+
+## Phase 34 (2026-08-27): packed 2-wide bf16 atomics for wrw's split-K epilogue
+
+Third and last of the three Tier 1 items from `docs/gfx1250_perf_parity_action_plan.md`.
+Both rocKE and FlyDSL pack two adjacent bf16 partial-sum elements into one 32-bit lane
+before issuing `global_atomic_pk_add_bf16`, halving the atomic instruction count (and the
+memory traffic each one generates) versus wrw's existing plain scalar-fp32 atomic epilogue.
+Full-implementation scope, at the user's explicit direction, rather than a probe-first
+partial pass.
+
+**Design**: new `atomic_pack_bf16` tunable (default 0, asserts `gemm_k_global_split` set,
+`precision=='bf16'`, `not atomic_cascade`). Per adjacent-lane pair: `ds_bpermute_b32`
+exchanges each lane's fp32 partial sum with its XOR-1 partner, `v_cvt_pk_bf16_f32` packs
+own-value (lo16) + partner-value (hi16) into one VGPR, then a parity-narrowed
+`global_atomic_pk_add_bf16` (only even lanes issue, each covering its own+partner's output
+slot) writes the packed pair in a single 2-wide atomic. Because the packed atomic already
+produces final bf16 values directly, no separate cast kernel is needed (unlike
+`wmma_acc_f16`/`wmma_acc_bf16`, which still need one). Register reuse: `v_gather`/
+`v_tmp3`/`v_tmp4` were considered for the exchange/pack scratch (already unused whenever
+`gemm_k_global_split` is set, since they exist for `wmma_m_tail`/`wmma_n_tail`, asserted
+mutually exclusive with gsplit) but the existing non-packed call site passes `v.v_c()` as
+a dummy placeholder for `v_gather` -- harmless today, but would silently corrupt the
+accumulator if reused here -- so 3 new dedicated VGPRs (`v_pk_idx`, `v_pk_partner`,
+`v_pk_packed`) were allocated instead, gated behind `atomic_pack_bf16`.
+
+**Two real bugs found and fixed during hardware bring-up**:
+1. **Missing `s_wait_dscnt`**: `ds_bpermute_b32` is a DS-class instruction tracked by
+   `DSCNT` (confirmed in the CDNA5 ISA doc), but its result was consumed by the immediately
+   -following `v_cvt_pk_bf16_f32` with no wait -- a genuine race, silently masked on most
+   loop iterations by incidental issue-latency, causing only the first couple of K-split
+   iterations to actually corrupt (nrms ~0.17-0.20 on affected shapes). Fixed by emitting
+   `s_wait_dscnt 0x0` between the two instructions. Diagnosed via the driver's existing
+   `PER_PIXEL_CHECK`/`PRINT_NRMS` infrastructure, not the standalone hardware probes used
+   earlier in the investigation (those hit their own, unrelated raw-inline-asm artifact
+   that turned into a debugging detour -- see the probe notes below).
+2. **`out_elem_byte_shift`/`out_elem_byte_shift_group` didn't account for the new bf16
+   -native (2-byte) output width**: both existed already, gating fp32 (shift=2) vs
+   `wmma_acc_f16`/`wmma_acc_bf16`'s narrower buffer (shift=1), but neither checked the new
+   `atomic_pack_bf16` case, which is a THIRD, unrelated mechanism that also produces a
+   2-byte-native output buffer. Silently masked for group=1/1x1 shapes (the multiplied
+   quantities being shifted are zero regardless of the shift constant), but caused real
+   corruption for group>1 (nrms 0.165, `valid:n`) and multi-tap 3x3 (NaN, from a
+   badly-offset tap address) -- both only surfaced once those shape categories were tried
+   for the first time. Fixed by adding `or self.tunable.atomic_pack_bf16` to both
+   conditions in `igemm_wrw_gtc_wmma_nhwc.py`.
+
+**Debugging note on standalone probes**: a probe using raw inline asm (`asm volatile(...)`)
+for `ds_bpermute_b32` gave wrong results even in isolation, while an equivalent probe using
+the `__builtin_amdgcn_ds_bpermute` compiler builtin worked correctly for the SAME
+instruction -- a reminder that hand-written inline asm in a C++ probe can have its own
+register-allocation/scheduling artifacts distinct from MISA's actual hand-assembled `.s`
+output, and isn't a substitute for testing the real generated kernel.
+
+**Byte-identical regression check**: confirmed for a representative pre-existing config
+(`igemm_wrw_gtc_gfx1250_nhwc_bf16_gsplit.config`, plain non-packed) -- both `.inc` files
+regenerate byte-for-byte identical to pre-phase HEAD; the only diff anywhere was the
+disassembler's embedded source-path comment in `.disass.s`. Expected and safe: both bug
+fixes are additive `or self.tunable.atomic_pack_bf16` clauses on conditions that were
+already false for every config not opting in.
+
+**Hardware validation**: `valid:y`, low nrms (~0.0007-0.006) across every shape category
+tried post-fix: 1x1/group=1, group=2, and 3x3 multi-tap/group=1 and group=2 -- the exact
+categories that had exposed the two bugs above now pass cleanly.
+
+**Timing**: mixed, not a clean win. On wrw's documented worst-case shape
+(`c=192,H=60,W=80,k=64,1x1`, the same shape used in Phases 32/33), the packed-atomic
+64x64 kernel was consistently **slower** than the plain scalar-fp32 epilogue across 6 runs
+each (~0.032-0.034ms vs ~0.022-0.023ms, a clean ~40-50% gap, well outside this session's
+usual contention noise band) -- the opposite of the expected direction. On a smaller
+group=2 shape the result was mixed instead: the 64x64 kernel was faster packed
+(~0.010-0.011ms vs ~0.013-0.014ms) while the 128x128 kernel was slightly slower
+(~0.020-0.024ms vs ~0.017ms). Two plausible, non-exclusive explanations: (a) the packed
+path costs 3 extra VGPRs (174 vs 171 for the 64x64 kernel) which can cross an occupancy
+-affecting allocation boundary depending on shape/launch geometry; (b) more fundamentally,
+`docs/gfx1250_rocprof_profiling.md`'s own rocprof measurement on this exact worst-case
+shape found `TX_VMW_ATOMIC_SETCONFLICT_STALL` at exactly **zero** -- i.e. atomic-address
+contention was never actually the bottleneck for MISA's wrw kernel on this hardware, so
+halving atomic traffic doesn't buy back the added cross-lane-exchange ALU cost
+(`ds_bpermute_b32` + `s_wait_dscnt` + `v_cvt_pk_bf16_f32`) the way it evidently does for
+rocKE/FlyDSL's own pipelines.
+
+**Net result**: shipped as an opt-in, default-off, now fully correctness-verified tunable
+-- the mechanism works and matches its source projects' design, but is not a confirmed
+performance win for MISA's current wrw kernel shape/occupancy profile, and measured
+slower on the profiled worst-case shape specifically. Recommendation: leave off by default;
+revisit only if a future wrw redesign changes the occupancy/VGPR balance enough to make the
+atomic-bandwidth halving pay for its own overhead, or if a workload is found where atomic
+conflicts (unlike this session's profiled shape) are a genuine measured bottleneck.
+
+**Critical files (Phase 34)**: `python/operations/coalescing_store_wmma.py` --
+`atomic_pack_bf16` field, packed-atomic branch (exchange + pack + narrowed atomic, with the
+`s_wait_dscnt` fix); `python/igemm/igemm_base.py` -- tunable + asserts + kernel-name fold
+`_pkatomic`; `python/igemm/igemm_wrw_gtc_wmma_nhwc.py` -- dedicated VGPRs, wiring, the
+`out_elem_byte_shift`/`out_elem_byte_shift_group` fix; `driver/igemm_gtc_base.h` -- struct
+field, config parsing, kernel-name fold; `driver/igemm_wrw_gtc_driver.h` -- gsplit
+zero-init size fix (`gsplit_zero_elem_byte`); `driver/conv_driver.cpp` --
+`is_wmma_atomic_pack_bf16` dtype/verification wiring (reads bf16 directly, no cast kernel);
+`config/igemm_wrw_gtc_gfx1250_nhwc_bf16_gsplit_pkatomic.config` -- new.
