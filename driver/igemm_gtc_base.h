@@ -197,21 +197,21 @@ typedef struct {
     int atomic_pack_bf16;
     // Phase 25: when set, relaxes fwd's WMMA-only gemm_m%gemm_m_per_block==0 validity
     // requirement (tunable_is_valid()) and turns on the kernel's GEMM_M tail-masking codegen
-    // (v_flag OOB check on the A-operand load, EXEC-masked store in the epilogue). Purely a
-    // codegen/validity behavior change like local_prefetch_num/atomic_scope -- doesn't change
-    // buffer layout -- so NOT folded into the kernel name; by convention (see epilogue_lds_pad's
-    // config-file precedent) an _mtail config must not combine both a plain and an _mtail
-    // section of the SAME tile shape in one file, since they'd otherwise collide on name.
+    // (v_flag OOB check on the A-operand load, EXEC-masked store in the epilogue). Master-
+    // config phase (new): NOW folded into the kernel name -- see local_prefetch_num/
+    // atomic_scope/epilogue_lds_pad below for why this changed from the original "not
+    // folded" design (real name collisions once multiple tail-flag combinations of the
+    // same tile shape needed to coexist in one comprehensive config file).
     int wmma_m_tail;
     // Phase 26b: analogous to wmma_m_tail but for GEMM_N (fwd only so far) -- relaxes
     // gemm_n%gemm_n_per_block==0 and turns on B-operand load masking + a second epilogue
     // EXEC-mask guard. Independent flag (not folded into wmma_m_tail) so M-only, N-only, and
-    // M+N configs can all exist. Same not-folded-into-kernel-name rationale as wmma_m_tail.
+    // M+N configs can all exist. Now folded into the kernel name, same reason as wmma_m_tail.
     int wmma_n_tail;
     // Phase 35: GEMM_K tail for wrw -- relaxes gemm_k%gemm_k_per_block==0. Unlike
     // wmma_m_tail/wmma_n_tail this composes with gemm_k_global_split by construction (only
     // the last split-K shard's loop range gets extended); see gemm_k_tail/gemm_k_num_splits
-    // in the wrw karg struct. Pure codegen/validity behavior, not folded into the kernel name.
+    // in the wrw karg struct. Now folded into the kernel name, same reason as wmma_m_tail.
     int wmma_k_tail;
     // Phase 35: hipconv-style reduction-kernel epilogue for wrw's gemm_k_global_split path --
     // replaces the atomic epilogue with plain per-shard stores into a workspace buffer plus a
@@ -219,6 +219,24 @@ typedef struct {
     // (partials, not final output), so IS folded into the kernel name (same category as
     // atomic_pack_bf16/wmma_setprio above).
     int wrw_reduction_kernel;
+    // Master-config phase (new): local_prefetch_num/atomic_scope/epilogue_lds_pad were
+    // "purely internal-codegen choices" the driver never needed to know about, by the
+    // ORIGINAL design -- true only as long as no two config sections of the SAME tile shape
+    // differing ONLY in one of these ever needed to coexist in one file. Assembling the
+    // first comprehensive per-(direction,precision) master config surfaced exactly that
+    // collision (e.g. a plain vs _lp2 section of the identical tile shape). Now tracked and
+    // folded into the kernel name for the same hipModuleGetFunction-lookup reason as every
+    // other folded flag above. atomic_scope is a string ('SCOPE_SYS' default, 'SCOPE_DEV'
+    // for wrw's _scopedev configs) -- stored as-is, not reduced to a bool, so the fold logic
+    // can match Python's exact string comparison.
+    int local_prefetch_num = 1;
+    int epilogue_lds_pad = 0;
+    // Default-member-initialized (unlike the int fields above, which zero-init safely via
+    // aggregate-init anyway) so a default-constructed igemm_gtc_tunable_t{} -- e.g.
+    // driver_mode_heuristic's still-unimplemented heuristic_select_kernel() stub -- doesn't
+    // produce an empty-string atomic_scope that would incorrectly fold into "_ascope" with
+    // no scope name.
+    std::string atomic_scope = "SCOPE_SYS";
 } igemm_gtc_tunable_t;
 
 static inline std::string get_igemm_gtc_fma_type(std::string arch_string, const config_section_t &sec){
@@ -291,6 +309,9 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.atomic_pack_bf16           = sec.count("atomic_pack_bf16") > 0 ? sec.at("atomic_pack_bf16").get_int() : 0;
                 tunable.wmma_k_tail                = sec.count("wmma_k_tail") > 0 ? sec.at("wmma_k_tail").get_int() : 0;
                 tunable.wrw_reduction_kernel       = sec.count("wrw_reduction_kernel") > 0 ? sec.at("wrw_reduction_kernel").get_int() : 0;
+                tunable.local_prefetch_num         = sec.count("local_prefetch_num") > 0 ? sec.at("local_prefetch_num").get_int() : 1;
+                tunable.epilogue_lds_pad           = sec.count("epilogue_lds_pad") > 0 ? sec.at("epilogue_lds_pad").get_int() : 0;
+                tunable.atomic_scope               = sec.count("atomic_scope") > 0 ? sec.at("atomic_scope").get_string() : "SCOPE_SYS";
             }
             else{
                 tunable.wave_tile_m              = sec.at("wave_tile_m").get_int();
@@ -502,6 +523,20 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += std::string("_pkatomic");
         if(tunable->wrw_reduction_kernel)
             kernel_name += std::string("_wsred");
+        // mirrors igemm_base.py's identical extension -- must stay in sync.
+        if(tunable->wmma_m_tail)
+            kernel_name += std::string("_mtail");
+        if(tunable->wmma_n_tail)
+            kernel_name += std::string("_ntail");
+        if(tunable->wmma_k_tail)
+            kernel_name += std::string("_ktail");
+        // mirrors igemm_base.py's identical extension -- must stay in sync.
+        if(tunable->epilogue_lds_pad)
+            kernel_name += std::string("_ldspad");
+        if(tunable->local_prefetch_num != 1)
+            kernel_name += std::string("_lp") + std::to_string(tunable->local_prefetch_num);
+        if(tunable->atomic_scope != "SCOPE_SYS")
+            kernel_name += (tunable->atomic_scope == "SCOPE_DEV") ? std::string("_scopedev") : (std::string("_ascope") + tunable->atomic_scope);
     }
     if(tensor_a_pass_through)
         kernel_name += std::string("_pta");

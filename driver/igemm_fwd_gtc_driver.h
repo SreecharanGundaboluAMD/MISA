@@ -468,6 +468,16 @@ public:
             // relaxes it the same way for multi-tap convs (TDM is 1x1-only) -- a genuinely
             // different, software (fine-grained per-dword mask) mechanism, mutually
             // exclusive with tdm_global_load, see Phase 38.
+            // Found while validating the master-config search (new): tdm_global_load's
+            // "1x1/unit-stride only" restriction (docs/gfx1250_wmma_layout.md's Phase 28)
+            // was previously enforced only at CONFIG level (igemm_base.py asserts nxe==0
+            // for the tunable itself) -- nothing here checked that the RUNTIME-requested
+            // shape actually IS a unit conv before dispatching to it. A multi-tap/strided/
+            // padded/dilated shape would previously run a TDM kernel anyway and silently
+            // produce wrong results (valid:n) instead of being correctly rejected as "not
+            // applicable" the way every other inapplicable combination already is.
+            if(tunable->tdm_global_load && !unit_conv)
+                return false;
             if((!tunable->wmma_m_tail && gemm_m % gemm_m_per_block != 0) ||
                (!tunable->wmma_n_tail && gemm_n % gemm_n_per_block != 0) ||
                (tunable->wmma_n_tail && gemm_n % 4 != 0) ||

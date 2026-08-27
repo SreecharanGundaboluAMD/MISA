@@ -1183,6 +1183,39 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_pkatomic"
         if tunable.wrw_reduction_kernel:
             kernel_name += "_wsred"
+        # Extends Phase 16's fold above to the M/N/K-tail EXEC-mask/fine-grained-mask
+        # mechanisms (Phases 25/26b/35/36/38) -- these were pure masking additions with no
+        # buffer-layout change, so folding them was skipped originally (every existing
+        # config keeps a distinct name per tile shape regardless). That becomes a real
+        # problem once multiple tail-flag combinations of the SAME tile shape need to
+        # coexist as separate, simultaneously-searchable kernels in one combined "master"
+        # config file (mirroring gfx950/942's single comprehensive per-direction/precision
+        # file, see docs/gfx1250_wmma_layout.md's master-config phase) -- without this,
+        # they'd collide on symbol name and fail to assemble together. Only added when set
+        # (every existing config has all three at their default 0), so no existing kernel
+        # name changes for non-tail configs; tail-enabled configs' names DO change (gain a
+        # suffix) -- a one-time, intentional rename, not a regression (the compiled
+        # instruction bodies are unaffected).
+        if tunable.wmma_m_tail:
+            kernel_name += "_mtail"
+        if tunable.wmma_n_tail:
+            kernel_name += "_ntail"
+        if tunable.wmma_k_tail:
+            kernel_name += "_ktail"
+        # Found while assembling the master config files (new): three more WMMA-only
+        # tunables were unfolded and produced real, previously-undetected kernel-name
+        # collisions between separate config files that happened to differ ONLY in one of
+        # these (e.g. igemm_wrw_gtc_gfx1250_nhwc_bf16_k2x_bf16acc.config vs its own _lp2
+        # sibling; igemm_bwd_gtc_gfx1250_nhwc_bf16.config's 64x64 section vs
+        # _ldspad.config's). Gated to WMMA only, matching every other fold in this block --
+        # gfx908/90a/942/950's XDLOPS/DLOPS/MAC kernel names are completely unaffected
+        # regardless of these tunables' values there.
+        if tunable.epilogue_lds_pad:
+            kernel_name += "_ldspad"
+        if tunable.local_prefetch_num != 1:
+            kernel_name += f"_lp{tunable.local_prefetch_num}"
+        if tunable.atomic_scope != 'SCOPE_SYS':
+            kernel_name += "_scopedev" if tunable.atomic_scope == 'SCOPE_DEV' else f"_ascope{tunable.atomic_scope}"
 
     if tunable.tensor_a_pass_through:
         kernel_name += "_pta"

@@ -3902,3 +3902,106 @@ the entire 95k-shape real corpus this analysis was built from.
 (tail_mask wiring), `emit_kernel_tap_loop` (redundant `s_kitr` init); `driver/
 igemm_fwd_gtc_driver.h` -- `tunable_is_valid()` relaxes; `python/igemm/igemm_base.py` --
 direction-gate widening for `wmma_k_tail` (now `wrw`/`bwd`/`fwd`).
+
+## Phase 39: master config files (one comprehensive per-direction/precision search, matching gfx950/942)
+
+gfx950/942's real workflow (confirmed by reading `README.md` and `script/
+gen_gfx950_conv_split_kernel.sh` directly, not from memory): one comprehensive `.config`
+file per (direction, precision) with ~90-200 tunable sections spanning many tile shapes and
+knobs, one `conv_driver.exe` binary, one brute-force search loop (`driver_mode_normal`,
+literally commented `// bench all solutions` in `igemm_gtc_base.h`) that tries every
+tunable and reports the single fastest. gfx1250's WMMA track had drifted from this during
+this session's incremental mechanism-by-mechanism development: each new tail/relief/perf
+tunable got its own narrow, single-mechanism config file (for isolating correctness while
+building it, a reasonable choice at the time) -- but nobody had since assembled a
+comprehensive file, so a user wanting "the best gfx1250 kernel for shape X" had to run each
+config file's binary separately and compare results manually. This phase closes that gap.
+
+**A real naming-collision problem, found immediately**: `wmma_m_tail`/`wmma_n_tail`/
+`wmma_k_tail` (Phases 25/26b/35/36/38) were never folded into the kernel name (unlike
+`tdm_global_load`/`lds_double_buffer`/etc., folded since Phase 16) -- harmless as long as no
+two sections of the identical tile shape differing only in one of these ever needed to
+coexist in one file, which was true right up until this phase tried to union everything
+into one file. Fixed by extending Phase 16's exact same fold pattern
+(`igemm_gtc_encode_kernel_name` in `igemm_base.py`, mirrored in `get_kernel_name()` in
+`driver/igemm_gtc_base.h`) to these three tunables (`_mtail`/`_ntail`/`_ktail` suffixes).
+Verified byte-identical instruction bodies for every existing config before/after (a
+plain kernel-name substitution recovers an exact match) -- this is a pure rename, not a
+behavior change, for every kernel that already existed.
+
+**Two more collisions, found only once the actual union was attempted**: `local_prefetch_num`,
+`epilogue_lds_pad`, and `atomic_scope` were *also* unfolded (by original, explicit design --
+see the old comments this phase replaces in `driver/igemm_gtc_base.h`) and produced real
+collisions once files differing ONLY in one of these (e.g. a plain vs `_lp2` section of the
+identical tile shape) were unioned. Folded the same way (`_lp2`/`_ldspad`/`_scopedev`
+suffixes) -- required adding these three as actual C++ struct fields (`driver/
+igemm_gtc_base.h`) for the first time, since the driver previously never needed to know
+their values at all (only Python's codegen used them). `atomic_scope` is stored as a
+string with an explicit default member initializer (`"SCOPE_SYS"`) rather than relying on
+`std::string`'s empty-string default, so a default-constructed `igemm_gtc_tunable_t{}`
+(e.g. `driver_mode_heuristic`'s still-unimplemented `heuristic_select_kernel()` stub)
+doesn't fold into a wrong, empty-scope-name suffix.
+
+**A real driver bug, found only by the comprehensive search actually exercising it**:
+`conv_driver.cpp` computes `is_wmma_f16_acc`/`is_wmma_bf16_acc`/`is_wmma_atomic_pack_bf16`
+(and the derived `dtype_alloc_byte` output-buffer width) ONCE from `tunables[0]`, not
+per-tunable inside the search loop -- since output buffers are allocated once, upfront,
+before the search loop starts. Mixing an accumulate-width-variant kernel (`wmma_acc_f16`/
+`wmma_acc_bf16`/`atomic_pack_bf16`, all of which use a narrower native output buffer) into
+a file whose first tunable doesn't share that width silently corrupts verification for it
+(confirmed: the exact same kernel reports `valid:y` run standalone, `valid:n` in the
+combined file). gfx950/942 never had a per-tunable output-width concept at all, so this
+never surfaced there. **Not fixed at the driver level** (would need buffer allocation
+restructured to happen per-tunable, a substantial and riskier change) -- instead,
+`script/build_gfx1250_master_configs.py` excludes any section setting one of these three
+flags from the master file, with a clear comment explaining why. These remain fully usable
+via their own existing individual config files.
+
+**A second real, pre-existing bug, found by the same mechanism**: `tdm_global_load`'s
+"1x1/unit-stride only" restriction was previously enforced ONLY at config-authoring time
+(`igemm_base.py` asserts `nxe==0` on the tunable itself) -- nothing in
+`tunable_is_valid()` checked that the RUNTIME-requested shape actually WAS a unit conv
+before dispatching to a TDM kernel. A multi-tap/strided/padded/dilated shape would
+previously run a TDM kernel anyway and silently produce `valid:n` instead of being
+rejected as "not applicable" the way every other inapplicable combination already is --
+never caught before because no test battery had previously run a TDM config against a
+disqualifying shape it wasn't excluded from at the config level. Fixed by reusing the
+already-computed `unit_conv` local in `driver/igemm_fwd_gtc_driver.h` (previously computed
+but never consulted for the WMMA/TDM path): `if(tunable->tdm_global_load && !unit_conv)
+return false;`.
+
+**`script/build_gfx1250_master_configs.py`** (new): a pure text-level union tool, not a
+code generator -- reads every `config/igemm_{fwd,bwd,wrw}_gtc_gfx1250_nhwc_{precision}_*.config`
+file, extracts each `[igemm_..._gtc]` section verbatim, deduplicates by normalized content,
+excludes accumulate-width-variant sections (see above), and writes
+`igemm_{direction}_gtc_gfx1250_nhwc_{precision}_all.config`. No tunable values are invented;
+re-run after adding a new gfx1250 config file to pick it up.
+
+**Zero-regression**: byte-identical instruction bodies (post name-substitution) across all
+176 pre-existing gfx1250 tunable sections -- 105 completely untouched (no folded flag set),
+71 gained a name suffix from the new folds (expected, not a regression).
+
+**Kernel counts per master file** (deduplicated, accumulate-width-variants excluded): fwd
+15-17 kernels per precision, bwd 11-12, wrw 16-24 (wrw's split-K search multiplies its own
+candidate count) -- smaller than gfx950's 194 (a much more mature, longer-tuned track with
+far more tile-shape variants), but every one of this session's validated mechanisms is now
+in the same searchable set.
+
+**Hardware validation** (`conv_driver.exe`, `IGEMM_LOG_FASTEST_CONFIG=1`): ran the master
+files against exact-fit shapes (many kernels apply, all `valid:y`, fastest correctly
+identified), tail-requiring shapes (most report "not applicable", the tail-capable kernel(s)
+correctly `valid:y`), and confirmed the two bugs above were real by reproducing them,
+applying the fixes, and re-confirming clean results -- across fwd/bwd/wrw.
+
+**Net result**: gfx1250 now has the same "run everything, get the true fastest" experience
+gfx950/942 always had, for every mechanism validated so far in this codebase, plus two
+previously-undiscovered correctness gaps closed as a direct side effect of exercising a much
+broader kernel combination space than any single narrow config file ever had.
+
+**Critical files (Phase 39)**: `python/igemm/igemm_base.py` -- `igemm_gtc_encode_kernel_name`
+(new `_mtail`/`_ntail`/`_ktail`/`_lp{n}`/`_ldspad`/`_scopedev` folds); `driver/
+igemm_gtc_base.h` -- `get_kernel_name()` mirror, new `local_prefetch_num`/`epilogue_lds_pad`/
+`atomic_scope` struct fields + config parsing; `driver/igemm_fwd_gtc_driver.h` --
+`tunable_is_valid()`'s new `unit_conv` check for `tdm_global_load`; `script/
+build_gfx1250_master_configs.py` (new); `config/igemm_{fwd,bwd,wrw}_gtc_gfx1250_nhwc_
+{fp16,bf16,fp32,int8}_all.config` (new, 12 files).
