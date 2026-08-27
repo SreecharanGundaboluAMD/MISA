@@ -208,6 +208,10 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             "tdm_global_load is not yet supported together with row_repeat_a > 1"
         assert not (tunable.tdm_global_load and tunable.local_prefetch_num > 1), \
             "tdm_global_load is not yet supported together with local_prefetch_num > 1"
+        # Phase 29: fresh-label counter for _emit_wave0_only -- the TDM issue site is
+        # reached from more than one place in the Python source (initial issue before the
+        # loop, re-issue inside the loop body), each needing its own unique skip-label.
+        self._tdm_label_counter = 0
 
         # Phase 24/27: 'fp16_f16acc'/'bf16_bf16acc' are separate table keys (not fields), see
         # wmma_mapping.py -- pick the num_v_c=4 narrow-accumulate instruction instead of the
@@ -338,6 +342,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 # tdm_global_load is set (every existing config byte-identical).
                 self.s_tdm_g0  = sym_t('s_tdm_g0'      , sseq(4, 4))
                 self.s_tdm_g1  = sym_t('s_tdm_g1'      , sseq(8, 4))
+                # Phase 29: this wave's index within the workgroup (0, 1, 2, ...), used to
+                # gate TDM issue to a single wave -- TDM instructions ignore EXEC entirely
+                # (not per-lane), so a scalar branch on this is the only way to suppress
+                # redundant per-wave issues.
+                self.s_wave_id = sym_t('s_wave_id'     , sseq(1))
             self.s_tmp         = sym_t('s_tmp'         , sseq(4))
             self.s_end         = sym_t('s_end'         , sseq())
 
@@ -622,6 +631,31 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_mov_b32 s[{s.s_tdm_g1(7)}], 0   ; tensor_dim1_stride unused (2D tensor)")
         self._emit_empty_line()
 
+    def _emit_wave0_only(self, body_fn):
+        '''
+        Phase 29 (single-issuer-wave): wraps body_fn() -- a callable that emits
+        instructions via self._emit -- in a scalar branch so only wave 0 (of however many
+        waves make up this workgroup) executes it. TDM instructions ignore EXEC entirely
+        (confirmed against the CDNA5 ISA doc: "issued no matter if EXEC==0... makes no
+        difference which lanes are enabled or disabled"), so an EXEC-mask/v_cmpx approach
+        -- which works for every OTHER per-lane masking mechanism in this kernel -- cannot
+        suppress a redundant TDM issue on non-issuing waves; only a genuine s_cbranch can.
+
+        Every call gets a FRESH label (self._tdm_label_counter) even though this method may
+        be invoked multiple times across the kernel's source (initial issue before the main
+        loop, re-issue inside the loop body) -- each is a distinct physical instruction
+        stream (the loop body's copy executes many times at runtime via s_branch, but the
+        Python-level emission happens once per call site), so each needs its own unique
+        skip-target label to avoid an assembler "duplicate symbol" error.
+        '''
+        s = self.sgpr
+        self._tdm_label_counter += 1
+        label = f"L_{self.name()}_wave0_only_{self._tdm_label_counter}"
+        self._emit(f"s_cmp_eq_u32 s[{s.s_wave_id()}], 0")
+        self._emit(f"s_cbranch_scc0 {label}")
+        body_fn()
+        self._emit_front(f"{label}:")
+
     def emit_kernel_prologue(self):
         s = self.sgpr
         v = self.vgpr
@@ -643,6 +677,12 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_load_dword s[{s.s_dilation_w()}], s[{s.s_ka()}:{s.s_ka(1)}], 80")
         self._emit(f"s_load_dword s[{s.s_group()}], s[{s.s_ka()}:{s.s_ka(1)}], 84")
         self._emit(f"v_mov_b32 v[{v.v_tid()}], v0")
+        if self.tunable.tdm_global_load:
+            # Phase 29: derive this wave's index within the workgroup, once, while EXEC is
+            # still fully enabled (kernel entry, before any lane-disabling branch) -- lane 0
+            # is guaranteed to be the "first active lane" v_readfirstlane_b32 reads here.
+            self._emit(f"v_readfirstlane_b32 s[{s.s_wave_id()}], v[{v.v_tid()}]   ; Phase 29: lane 0's flat tid = this wave's base")
+            self._emit(f"s_lshr_b32 s[{s.s_wave_id()}], s[{s.s_wave_id()}], 5   ; wave index within workgroup")
         # gfx1250 delivers workgroup id via ttmp9/ttmp7 (verified empirically against a
         # disassembled HIP-compiled kernel using blockIdx.x/.y on this hardware/toolchain --
         # NOT via classical pre-loaded system SGPRs, regardless of the
@@ -1122,10 +1162,13 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 s = outer.sgpr
                 with outer._deferred_context():
                     if outer.tunable.tdm_global_load:
-                        # Phase 28: one TDM instruction moves the whole gemm_m_per_block x
+                        # Phase 28/29: one TDM instruction moves the whole gemm_m_per_block x
                         # gemm_k_per_block tile straight into LDS -- no VGPR staging, no
-                        # per-lane masking (EXEC is ignored by tensor instructions).
-                        outer._emit(f"tensor_load_to_lds s[{s.s_tdm_g0()}:{s.s_tdm_g0(3)}], s[{s.s_tdm_g1()}:{s.s_tdm_g1(7)}]")
+                        # per-lane masking (EXEC is ignored by tensor instructions). Phase 29:
+                        # only wave 0 issues it -- see _emit_wave0_only's docstring for why a
+                        # scalar branch, not EXEC-masking, is required to suppress this on
+                        # non-issuing waves.
+                        outer._emit_wave0_only(lambda: outer._emit(f"tensor_load_to_lds s[{s.s_tdm_g0()}:{s.s_tdm_g0(3)}], s[{s.s_tdm_g1()}:{s.s_tdm_g1(7)}]"))
                     elif outer.tunable.async_global_load:
                         outer._emit_gld_async_all_chunks(v.v_off_a, v.v_sst_os, 0, outer.sgpr.s_p_in, v_flag=v.v_flag)
                     else:

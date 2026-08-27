@@ -3006,3 +3006,53 @@ these attempted yet -- decide next steps after this pilot's findings are reviewe
 - `config/igemm_fwd_gtc_gfx1250_nhwc_{bf16,fp16,fp32}_tdm.config` -- new
 - `docs/gfx1250_external_research_findings.md` -- new, the full FlyDSL/hipconv research
   writeup this phase is based on
+
+## Phase 29 (2026-08-27): single-issuer-wave fix for the TDM pilot
+
+Fixes Phase 28's known, deliberate inefficiency: every wave in the workgroup was issuing
+an identical, redundant `tensor_load_to_lds`. TDM instructions ignore EXEC entirely
+("issued no matter if EXEC==0... makes no difference which lanes are enabled or
+disabled" -- ISA doc), so no per-lane EXEC-mask trick (the idiom used everywhere else in
+this codebase) can suppress the redundant issue on non-issuing waves -- only a genuine
+scalar branch can.
+
+**Design**: a persistent `s_wave_id` scalar is derived once in the prologue, right after
+`v_tid` is set (`v_readfirstlane_b32` off lane 0's flat tid, then `s_lshr_b32` by 5 --
+safe at that point since no lanes are disabled yet). A new helper,
+`_emit_wave0_only(body_fn)`, wraps a callable in `s_cmp_eq_u32 s[s_wave_id], 0` /
+`s_cbranch_scc0 <fresh-label>` / `body_fn()` / `<label>:`, using this codebase's existing
+`_emit_front`-for-labels idiom. Each call site gets its own label
+(`self._tdm_label_counter`) since the guarded `tensor_load_to_lds` is reached from two
+distinct points in the Python source (the initial issue before the main loop, and the
+re-issue inside the loop body) even though neither is unrolled per iteration. Only the
+`tensor_load_to_lds` instruction itself is gated -- `_emit_tdm_descriptor_setup_a` and the
+per-iteration descriptor advance (`move_slice_window_a_functor`) stay unconditional
+(cheap, per-wave-independent SALU; gating them would only save a few cycles on
+non-issuing waves for no correctness benefit). The centralized `s_wait_tensorcnt 0` (in
+`wmma_main_loop.py`, unchanged from Phase 28) needed no gating either: non-issuing waves
+have `TENSORcnt=0` already, so waiting on it is a harmless no-op, and wave 0's own wait
+still correctly precedes the barrier that publishes the loaded tile to the other waves.
+
+**Byte-identical regression sweep**: all 98 non-TDM gfx1250 configs regenerate identically
+to the pre-phase baseline (commit `c6f222e`); the 3 `_tdm` configs (bf16/fp16/fp32) show
+exactly the expected diff -- one new `s_wave_id` SGPR, two new
+`s_cmp_eq_u32`/`s_cbranch_scc0`/label triples wrapping the two `tensor_load_to_lds` call
+sites, and `.amdhsa_next_free_sgpr` bumped by 1.
+
+**Hardware validation**: bf16/fp16/fp32 all `valid:y` across the exact-multiple large
+shape (n=8,c=k=2048,H=W=32), a multi-K-block shape (32 main-loop iterations, confirming
+the wave-0 gate and descriptor advance both stay correct across many iterations), and
+group>1 (g=2). Timing on the exact-multiple bf16 shape (this shape has real run-to-run
+noise, so multiple runs of each were taken): `_tdm` clusters tightly at 604-606 tflops
+(0.113-0.114ms) across 5 runs; `_async` on the same shape varies more, 602-687 tflops
+across 4 runs (mean ~660). That puts the TDM pilot at roughly **7-9% slower than
+`_async`**, down from Phase 28's ~20% -- a real improvement, consistent with hipconv's
+measured -3% to -7% single-issuer-wave gain (the larger observed improvement here likely
+reflects that this shape is K-loop-bound, so eliminating 4x redundant global-memory
+bandwidth consumption has an outsized effect). Still not at parity with `_async`; not
+investigated further this phase (single-issuer-wave was the specific, scoped ask).
+
+**Critical files (Phase 29)**: `python/igemm/igemm_fwd_gtc_wmma_nhwc.py` --
+`s_wave_id` SGPR allocation, prologue derivation, `_emit_wave0_only` helper,
+`_tdm_label_counter`, `global_load_a_functor`'s TDM branch now wrapped in
+`_emit_wave0_only`.
