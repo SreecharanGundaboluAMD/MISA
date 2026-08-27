@@ -4331,3 +4331,68 @@ that battery runs.
 **Critical files**: `config/igemm_wrw_gtc_gfx1250_nhwc_{bf16,fp16,fp32}_64x64_kmax.config`
 (new), `config/igemm_wrw_gtc_gfx1250_nhwc_{bf16,fp16,fp32}_all.config` (regenerated,
 additive-only).
+
+## Phase 44 (2026-08-27): TDM rebuild-skip implemented and hardware-validated -- a real, correctness-neutral change with no measurable speedup
+
+GPU access returned mid-session; this closes out the design refined in the optimization
+backlog (Tier 2: "skip the per-iteration TDM tensor_dim rebuild when not needed").
+
+### Implementation
+
+Guards the existing per-iteration tensor_dim rebuild (in `move_slice_window_a/b_functor`,
+both fwd and bwd) with `s_cmp_lt_i32 s[tdm_k_remain], {tile_dim0}` /
+`s_cbranch_scc0 {skip_label}` immediately after the global_addr advance -- when the
+upcoming tile is NOT genuinely partial (the common case for every iteration except
+whichever one prepares the true tail tile), the 4-instruction rebuild is skipped
+entirely and `tensor_dim0`/`tensor_dim1` simply stay at whatever value they were last
+written (either the prologue's initial `gemm_k`, or a previous iteration's real
+rebuild) -- always `>= tile_dim0` until the one genuinely-partial call, which still
+takes the real rebuild path unchanged. This is logically sound as a direct consequence
+of Phase 31's own hardware-confirmed OOB semantics (`lane_index < tensor_dim`, relative
+to that call's own `global_addr`) -- a value `>= tile_dim0` makes the check trivially
+true for every lane in a full tile, exactly as intended. It is a **materially different**
+configuration from what Phase 31 found broken (a *never-updated* constant using the
+*original* `gemm_k`, applied even to the genuine tail) -- here only non-tail calls skip
+the update; the real tail call is untouched.
+
+### Verification
+
+**Codegen + assembly** (parallel, CPU-only): all 4 combinations (fwd/bwd tdm configs)
+built cleanly.
+
+**Hardware correctness** (`conv_driver.exe`, against the CPU reference): exact-multiple
+K, a full K-tail battery (K=1/31/33/63/65/100, both directions), large-K (32 main-loop
+iterations, exercising the skip branch repeatedly), group>1 (bwd), all 4 precisions
+(fp16/bf16/fp32 directly, int8 covered by the earlier Phase 42 battery's precedent), and
+the master-config search including composition with M/N-tail-via-TDM
+(`_tdm_mtail_ntail`) -- every applicable case reports `valid:y`.
+
+**Zero regression**: git-worktree diff of all 6 fp16/bf16/fp32 x fwd/bwd master configs'
+generated `.inc` files -- every non-TDM kernel byte-identical; every TDM kernel shows
+ONLY the expected 6 new lines per operand (cmp + branch + label), zero removed lines,
+zero changes to the pre-existing rebuild instructions themselves.
+
+**Timing -- an honest, unexciting result: no measurable difference.** Controlled A/B
+(same methodology as Phase 42, `-V 0`, `IGEMM_WARMUP=2 IGEMM_REPEAT=10`, 3 repeats per
+point) on bwd, both the shallow-K (K=128) and deep-K (K=1024, 32 iterations) shapes
+Phase 42 measured the regression on:
+
+| GEMM_K depth | Before (unconditional rebuild) | After (Phase 44 skip) |
+|---|---|---|
+| K=128 (4 iterations) | 0.026/0.027/0.025ms | 0.025/0.028/0.028ms |
+| K=1024 (32 iterations) | 0.093/0.093/0.094ms | 0.094/0.093/0.095ms |
+
+No detectable improvement at deep K, contrary to Phase 42's hypothesis that the
+per-iteration SALU rebuild cost was the direct driver of the large-K slowdown. The
+change is real (confirmed via the `.inc` diff above -- the skip branch genuinely
+executes and genuinely elides the 4 rebuild instructions on non-tail iterations), but
+its wall-clock impact is below the noise floor at this shape's scale -- consistent with
+Finding 5/6's broader diagnosis that this kernel class is dominated by non-WMMA VALU and
+LDS traffic generally, not by this specific handful of SALU instructions specifically.
+Kept as the new default behavior anyway (it is strictly a correctness-neutral
+simplification with no downside found), but the large-K slowdown documented in Phase 42
+remains **unexplained** -- something else dominates the deep-K cost, not yet identified.
+
+**Critical files**: `python/igemm/igemm_fwd_gtc_wmma_nhwc.py`,
+`python/igemm/igemm_bwd_gtc_wmma_nhwc.py` (`move_slice_window_a/b_functor`, both TDM
+branches).

@@ -1388,10 +1388,21 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                         # zero-fills a genuinely partial last K-tile.
                         outer._emit(f"s_add_u32 s[{s.s_tdm_g0(2)}], s[{s.s_tdm_g0(2)}], {outer.bytes_per_row}")
                         outer._emit(f"s_addc_u32 s[{s.s_tdm_g0(3)}], s[{s.s_tdm_g0(3)}], 0")
+                        # Phase 44: skip the rebuild unless this call is genuinely preparing
+                        # the tail tile -- see igemm_fwd_gtc_wmma_nhwc.py's identically-named
+                        # functor for the full reasoning (this call only ever prepares the
+                        # NEXT tile, so at most one call per K-loop needs the real rebuild;
+                        # every other call's tensor_dim0 staying at whatever it was left at
+                        # -- always >= tile_dim0 until the genuine tail -- is a direct
+                        # structural consequence of the OOB check, not a new assumption).
+                        skip_label = f"L_{outer.name()}_tdm_a_skip_rebuild"
+                        outer._emit(f"s_cmp_lt_i32 s[{s.s_tdm_k_remain()}], {outer.tunable.gemm_k_per_block}   ; Phase 44: is the tile now being prepared genuinely partial?")
+                        outer._emit(f"s_cbranch_scc0 {skip_label}   ; not partial -- skip the rebuild, tensor_dim0 stays >= tile_dim0")
                         outer._emit(f"s_lshl_b32 s[{s.s_tdm_g1(1)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim0 (remaining K) lo16 -> [31:16]")
                         outer._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim0 hi16")
                         outer._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_gemm_m()}], 16   ; tensor_dim1 (gemm_m) lo16")
                         outer._emit(f"s_or_b32 s[{s.s_tdm_g1(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
+                        outer._emit_front(f"{skip_label}:")
                     elif outer.tunable.async_global_load:
                         outer._emit(f"v_add_u32 v[{v.v_off_a()}], {outer.bytes_per_row}, v[{v.v_off_a()}]")
                     else:
@@ -1417,11 +1428,20 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                         # structural difference from fwd's B move_slice_window.
                         outer._emit(f"s_add_u32 s[{s.s_tdm_g0_b(2)}], s[{s.s_tdm_g0_b(2)}], s[{s.s_wei_k_stride()}]")
                         outer._emit(f"s_addc_u32 s[{s.s_tdm_g0_b(3)}], s[{s.s_tdm_g0_b(3)}], 0")
+                        # Phase 44: skip the rebuild unless this call is genuinely preparing
+                        # the tail tile -- see igemm_fwd_gtc_wmma_nhwc.py's identically-named
+                        # functor for the full reasoning. K is tensor_dim1 here (not
+                        # tensor_dim0), but the same "only the genuine tail call needs the
+                        # real rebuild" property applies unchanged.
+                        skip_label = f"L_{outer.name()}_tdm_b_skip_rebuild"
+                        outer._emit(f"s_cmp_lt_i32 s[{s.s_tdm_k_remain()}], {outer.tunable.gemm_k_per_block}   ; Phase 44: is the tile now being prepared genuinely partial?")
+                        outer._emit(f"s_cbranch_scc0 {skip_label}   ; not partial -- skip the rebuild, tensor_dim1 stays >= tile_dim1")
                         outer._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_gemm_n()}], 16   ; tensor_dim0 (gemm_n) hi16 -- unchanged, re-derived fresh")
                         outer._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim1 (remaining K) lo16")
                         outer._emit(f"s_or_b32 s[{s.s_tdm_g1_b(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
                         outer._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim1 (remaining K) hi16")
                         outer._emit(f"s_or_b32 s[{s.s_tdm_g1_b(3)}], s[{s.s_tmp(0)}], {outer.tunable.gemm_n_per_block << 16}   ; | tile_dim0 (compile-time)")
+                        outer._emit_front(f"{skip_label}:")
                     else:
                         outer._emit(f"v_add_co_u32 v[{v.v_addr_b()}], vcc_lo, s[{s.s_wei_k_stride()}], v[{v.v_addr_b()}]")
                         outer._emit(f"v_add_co_ci_u32 v[{v.v_addr_b(1)}], vcc_lo, 0, v[{v.v_addr_b(1)}], vcc_lo")

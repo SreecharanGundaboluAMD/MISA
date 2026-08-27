@@ -126,41 +126,28 @@ section for the record).
       tensor_dim rebuild's fixed cost outweighs the one-time gather savings once K is
       deep enough. Added to the master config search (not a blanket replacement) so the
       driver picks whichever is actually faster per shape.
-- [ ] **Skip the per-iteration TDM tensor_dim rebuild when not needed** — design refined
-      2026-08-27, **implementation deliberately deferred (see below), not attempted**.
-      `wmma_main_loop.py`'s loop structure (`label_body`/`label_body_last`) means
-      `move_slice_window_a/b_functor` (the rebuild's call site) only ever runs to prepare
-      the *next* tile, and is skipped entirely once the *current* tile is already the
-      last one (`s_kitr <= 0` branches straight to `label_body_last`, which computes WMMA
-      on the already-loaded final tile and never calls `move_slice_window` again). So the
-      rebuild's job on any given call is "does the tile I'm about to prepare turn out to
-      be a genuinely partial one" — true for at most ONE call per K-loop (whichever one
-      prepares the actual tail tile), false for every other call. Concrete design: guard
-      the existing 4-instruction rebuild with
-      `s_cmp_lt_i32 s[tdm_k_remain], {tile_dim0}` / `s_cbranch_scc0 {skip_label}` — when
-      NOT less-than (this upcoming tile is fully valid), skip the rebuild entirely and
-      leave `tensor_dim0`/`tensor_dim1` holding `tile_dim0` (already true from either the
-      prologue's initial setup or the previous "no rebuild needed" pass, since nothing
-      overwrites it in that branch). This is logically sound as a *consequence* of
-      Phase 31's own hardware-confirmed OOB semantics (`lane_index < tensor_dim`,
-      relative to this call's `global_addr`) — setting `tensor_dim0 = tile_dim0` exactly
-      makes that comparison true for every lane in a full tile by construction, so no
-      zero-fill triggers either way. **This is NOT the same configuration Phase 31 tested
-      and found broken** (Phase 31 found a *never-updated, always-`gemm_k`* tensor_dim0
-      reads real OOB memory on the tail -- this design instead uses the per-iteration
-      compile-time `tile_dim0` constant for every non-tail call, and only the genuine
-      tail call gets the full runtime rebuild), so it is a materially different, untested
-      hardware configuration, not a repeat of an already-answered question.
-      **Deliberately not implemented this pass**: this is a real edit to the
-      already-hardware-validated `move_slice_window_a/b` functors in BOTH
-      `igemm_fwd_gtc_wmma_nhwc.py` (Phases 28-31/37, multiple precisions) and
-      `igemm_bwd_gtc_wmma_nhwc.py` (Phase 42, just landed) -- a regression here would
-      silently affect every existing TDM config in both directions. Implemented under an
-      explicit no-GPU-execution constraint this session (shared GPU running another
-      benchmark); a subtle correctness gap in this reasoning could only be caught by the
-      same kind of direct hardware OOB probe Phase 31 itself used, which isn't possible
-      right now. Left as a fully-specified, ready-to-implement design rather than
-      guessed-and-shipped code.
+- [x] **Skip the per-iteration TDM tensor_dim rebuild when not needed** — implemented
+      and hardware-validated 2026-08-27, Phase 44 (`docs/gfx1250_wmma_layout.md`). Guards
+      the existing rebuild with `s_cmp_lt_i32 s[tdm_k_remain], {tile_dim0}` /
+      `s_cbranch_scc0 {skip_label}` in both fwd's and bwd's `move_slice_window_a/b` --
+      correct by construction (a materially different, previously-untested configuration
+      from what Phase 31 found broken: only non-tail calls skip the update, the genuine
+      tail call still gets the full rebuild). Hardware-validated: exact-multiple K, a
+      full K-tail battery (K=1/31/33/63/65/100), large-K (32 iterations), group>1, all
+      3 precisions tested directly (fp16/bf16/fp32), and composition with M/N-tail-via-TDM
+      -- every case `valid:y`. Zero regression (every non-TDM kernel byte-identical, every
+      TDM kernel shows only the expected additive guard). **Honest result: no measurable
+      timing improvement** at either shallow (K=128) or deep (K=1024) GEMM_K -- kept as
+      the new default anyway (correctness-neutral, no downside found), but this means
+      Phase 42's large-K slowdown is **still unexplained** -- something other than this
+      rebuild's SALU cost dominates at deep K. New open item below.
+- [ ] **Root-cause Phase 42's still-unexplained bwd TDM large-K slowdown** — Phase 44
+      ruled out the per-iteration tensor_dim rebuild as the cause (removing it produced
+      no measurable timing change at K=1024 vs K=128). The ~5-8% slowdown at deep K
+      relative to the non-TDM path (first measured in Phase 42) needs a fresh
+      hypothesis and profiling pass (e.g. rocprof instruction-mix/cycle breakdown on the
+      TDM vs non-TDM K=1024 dispatches specifically, mirroring Finding 5's methodology)
+      -- not yet attempted.
 - [ ] **Extend TDM to wrw and/or multi-tap (y/x>1) convolutions** — assessed 2026-08-27,
       **not attempted**. TDM support is now fwd+bwd, still 1x1/unit-stride-only.
       Structural analysis: wrw's GEMM_K (spatial, `n*ho*wo`) is the ROW axis for **BOTH**

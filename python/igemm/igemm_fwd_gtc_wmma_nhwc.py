@@ -1583,10 +1583,33 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                         # out-of-bounds check is relative to THIS call's global_addr, not an
                         # absolute tensor origin (confirmed on real hardware: a constant
                         # tensor_dim0 across advancing iterations reads real OOB memory
-                        # instead of zero-filling the true tail), so this must be rebuilt
-                        # every iteration, not just set once in the prologue. g1(2)'s upper
-                        # 16 bits (tensor_dim1 lo16, unchanged across the K loop) are simply
-                        # re-derived fresh here too, alongside tensor_dim0's hi16.
+                        # instead of zero-filling the true tail).
+                        #
+                        # Phase 44: this call only ever prepares the tile for the NEXT
+                        # iteration (wmma_main_loop.py's label_body/label_body_last split
+                        # means move_slice_window is never called to describe the CURRENT,
+                        # already-loaded tile) -- so at most ONE call per K-loop is actually
+                        # preparing a genuinely partial (tail) tile; every other call is
+                        # preparing a tile that's fully valid regardless of the exact
+                        # tensor_dim0 value used, AS LONG AS that value is >= tile_dim0 (the
+                        # OOB check `lane_index < tensor_dim0`, relative to this call's own
+                        # global_addr, is trivially true for every lane_index in [0,
+                        # tile_dim0) once tensor_dim0 >= tile_dim0 -- this is a direct,
+                        # structural consequence of Phase 31's own hardware-confirmed
+                        # semantics, not a new assumption about the OOB mechanism itself).
+                        # s_tdm_k_remain's value going into a "skip" call is therefore
+                        # irrelevant -- tensor_dim0 simply stays at whatever the LAST rebuild
+                        # (or the prologue's initial gemm_k) left it at, which is always
+                        # >= tile_dim0 until the one call that's genuinely preparing the
+                        # tail (that call takes the branch below and does the real rebuild,
+                        # same instructions as before Phase 44). This is a DIFFERENT,
+                        # previously-untested configuration from what Phase 31 found broken
+                        # (a NEVER-updated constant, used for every tile including the real
+                        # tail) -- here only non-tail calls skip the update; the genuine tail
+                        # call still gets the full runtime-derived rebuild.
+                        skip_label = f"L_{outer.name()}_tdm_a_skip_rebuild"
+                        outer._emit(f"s_cmp_lt_i32 s[{s.s_tdm_k_remain()}], {outer.tunable.gemm_k_per_block}   ; Phase 44: is the tile now being prepared genuinely partial?")
+                        outer._emit(f"s_cbranch_scc0 {skip_label}   ; not partial -- skip the rebuild, tensor_dim0 stays >= tile_dim0")
                         outer._emit(f"s_lshl_b32 s[{s.s_tdm_g1(1)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim0 (remaining K) lo16 -> [31:16]")
                         outer._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim0 hi16")
                         # M-tail via TDM (new): re-derive from s_tdm_m_remain (kernel-lifetime
@@ -1596,6 +1619,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                         m_operand = s.s_tdm_m_remain() if outer.tunable.wmma_m_tail else s.s_gemm_m()
                         outer._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{m_operand}], 16   ; tensor_dim1 (gemm_m, or remaining-from-block if M-tail) lo16")
                         outer._emit(f"s_or_b32 s[{s.s_tdm_g1(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
+                        outer._emit_front(f"{skip_label}:")
                     elif outer.tunable.async_global_load:
                         # Phase 13: v_off_a is a plain 32-bit byte OFFSET (no base pointer
                         # folded in), so advancing it is a single add, no carry chain needed.
@@ -1624,16 +1648,20 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                         # safe.
                         outer._emit(f"s_add_u32 s[{s.s_tdm_g0_b(2)}], s[{s.s_tdm_g0_b(2)}], {outer.bytes_per_row}")
                         outer._emit(f"s_addc_u32 s[{s.s_tdm_g0_b(3)}], s[{s.s_tdm_g0_b(3)}], 0")
-                        # Phase 31: mirrors move_slice_window_a_functor's tensor_dim0 rebuild
-                        # -- see there for why this is needed every iteration. Reads the SAME
-                        # s_tdm_k_remain (shared K-tile schedule between A and B), rebuilt
-                        # against B's own tensor_dim1 (gemm_n, not gemm_m).
+                        # Phase 44: mirrors move_slice_window_a_functor's rebuild-skip -- see
+                        # there for the full reasoning. Reads the SAME s_tdm_k_remain
+                        # (shared K-tile schedule between A and B), rebuilt against B's own
+                        # tensor_dim1 (gemm_n, not gemm_m) only when genuinely partial.
+                        skip_label = f"L_{outer.name()}_tdm_b_skip_rebuild"
+                        outer._emit(f"s_cmp_lt_i32 s[{s.s_tdm_k_remain()}], {outer.tunable.gemm_k_per_block}   ; Phase 44: is the tile now being prepared genuinely partial?")
+                        outer._emit(f"s_cbranch_scc0 {skip_label}   ; not partial -- skip the rebuild, tensor_dim0 stays >= tile_dim0")
                         outer._emit(f"s_lshl_b32 s[{s.s_tdm_g1_b(1)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim0 (remaining K) lo16 -> [31:16]")
                         outer._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim0 hi16")
                         # N-tail via TDM (new): mirrors A's M-tail treatment above.
                         n_operand = s.s_tdm_n_remain() if outer.tunable.wmma_n_tail else s.s_gemm_n()
                         outer._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{n_operand}], 16   ; tensor_dim1 (gemm_n, or remaining-from-block if N-tail) lo16")
                         outer._emit(f"s_or_b32 s[{s.s_tdm_g1_b(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
+                        outer._emit_front(f"{skip_label}:")
                     elif outer.tunable.async_global_load:
                         outer._emit(f"v_add_u32 v[{v.v_off_b()}], {outer.bytes_per_row}, v[{v.v_off_b()}]")
                     else:
