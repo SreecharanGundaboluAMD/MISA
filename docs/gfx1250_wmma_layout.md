@@ -4154,3 +4154,117 @@ before it earns a permanent home in the master search space.
 `driver/igemm_gtc_base.h` (struct field, config parsing, kernel-name fold mirror),
 `python/igemm/igemm_wrw_gtc_wmma_nhwc.py` (emission site),
 `config/igemm_wrw_gtc_gfx1250_nhwc_bf16_gsplit_stagger.config` (new).
+
+## Phase 42 (2026-08-27): TDM extended to bwd (both operands, 1x1/unit-stride)
+
+Motivated directly by `docs/gfx1250_rocprof_profiling.md`'s Finding 5 (instruction-mix
+decomposition): non-WMMA VALU is ~50% of all instructions in both fwd and wrw, and
+extending TDM beyond fwd was the highest-leverage identified next step, since TDM moves
+address generation from software VALU into hardware rather than trimming instruction
+counts at the margins. bwd was the natural next target: both its operands' *global
+memory layout properties* for the 1x1/unit-stride case turn out to be direct structural
+matches for TDM's existing descriptor abstraction, even though bwd's code looks very
+different from fwd's on the surface.
+
+### Design
+
+**A (grad_output)**: an NHWC tensor, so a fixed (n, ho, wo) pixel's K_out channels are
+contiguous in memory -- the exact same property fwd's A relies on. `_emit_tdm_descriptor_setup_a`
+is a near-literal port of fwd's identical method (`tensor_dim0=gemm_k` contiguous,
+`tensor_dim1=gemm_m` row axis, `tensor_dim0_stride=a_k_total`), just using bwd's own SGPR
+names. bwd's *general* per-tap gather (`_emit_tap_gather`) is genuinely harder than fwd's
+for multi-tap (division-based, not a plain multiply -- see the class docstring's "stride
+gap" explanation) -- but for `y=x=1` with `pad=0/stride=1/dilation=1` (TDM's existing
+1x1-only restriction, unchanged) it collapses to the trivial identity `ho=hi, wo=wi,
+valid always`, exactly what TDM's flat, gather-free load already assumes.
+
+**B (weight)**: read in the SAME physical `[K_out][Y][X][C_in]` layout fwd's B reads --
+but bwd's GEMM_K is K_out (weight's ROW axis), while fwd's GEMM_K is C_in (weight's
+CONTIGUOUS axis). This means `tensor_dim0`/`tensor_dim1` are SWAPPED relative to fwd's B
+descriptor: `tensor_dim0=gemm_n` (C_in, contiguous, `tile_dim0=gemm_n_per_block`),
+`tensor_dim1=gemm_k` (K_out, row axis, `tile_dim1=gemm_k_per_block`,
+`tensor_dim0_stride=wei_row_c`). This is not a novel/risky invention -- it's the
+necessary consequence of bwd and fwd using the same physical weight tensor for different
+GEMM roles, and it's directly confirmed by bwd's own EXISTING (already-validated)
+non-TDM code: `move_slice_window_b_functor` already advances `v_addr_b` by
+`s_wei_k_stride` (`= wei_row_c*databyte*gemm_k_per_block`) once per K-tile -- i.e. by
+`gemm_k_per_block` ROWS, not contiguous elements -- exactly the structure this
+descriptor encodes. Because GEMM_K is `tensor_dim1` here (not `tensor_dim0` as in fwd's
+B), the K-tail-via-hardware-OOB rebuild targets `tensor_dim1` every iteration -- the one
+genuine structural difference from fwd's B-TDM code, forced by the axis swap.
+
+**A real optimization found and applied, not just a port**: fwd's own TDM implementation
+unconditionally still emits `_emit_tap_gather()` even when `tdm_global_load` is set --
+its output (`v_addr_a`/`v_flag`) is provably unused by `global_load_a_functor`'s TDM
+branch, but fwd's per-tap gather is cheap (a few multiplies) so this waste was never
+worth fixing. bwd's per-tap gather is NOT cheap (two integer-division macro calls), so
+carrying the same "leave it in, it's dead code" pattern would have silently defeated
+much of the point of this extension. `emit_kernel_tap_loop` explicitly skips
+`_emit_tap_gather()` under `tdm_global_load` for bwd.
+
+### Driver changes
+
+`driver/igemm_bwd_gtc_driver.h`'s `tunable_is_valid()` gets the same two fixes fwd's
+Phase 31/39 already has: (1) `gemm_k % gemm_k_per_block == 0` is no longer required when
+`tdm_global_load` is set (TDM's hardware OOB handles a genuinely partial last K-block);
+(2) a runtime `unit_conv` check rejects non-1x1/strided/padded/dilated shapes explicitly
+-- `tdm_global_load`'s "1x1-only" restriction was previously enforced only at
+config-authoring time (`nxe==0` in `igemm_base.py`), never against the actual
+runtime-requested shape.
+
+### Verification
+
+**Zero regression**: every pre-existing bwd config (fp16/bf16/fp32/int8, all mechanism
+variants -- async/dbuf/k2x/ktail/mtail/ntail/combined) diffed byte-identical
+before/after across all 45 config files in `config/igemm_bwd_gtc_gfx1250_nhwc_*.config`.
+Master config regeneration (`script/build_gfx1250_master_configs.py --write`) is purely
+additive -- the new `_tdm` sections appended, zero existing sections changed.
+
+**Hardware correctness** (`conv_driver.exe`, against `naive_conv_bwd_nhwc`): all four
+precisions (fp16/bf16/fp32/int8) on `n=2,c=256,H=32,W=32,k=128,1x1`; group>1
+(`n=2,c=256,H=32,W=32,k=256,g=2`); large-K (`n=4,c=128,H=16,W=16,k=384`, 12 K-loop
+iterations, exercising `move_slice_window` repeatedly); and a full K-tail-via-hardware-OOB
+battery mirroring Phase 31's original rigor (`k=100,33,31,1,63,65` against
+`gemm_k_per_block=32` -- extreme tail, one-short, one-over, both directions) -- every
+applicable case reports `valid:y`.
+
+**Timing -- a real, honest trade-off, not a uniform win.** Controlled A/B
+(`c=128,H=16,W=16` fp16, `-V 0`, `IGEMM_WARMUP=2 IGEMM_REPEAT=10`, 3 repeats per point):
+
+| GEMM_K depth | Non-TDM | TDM | Delta |
+|---|---|---|---|
+| K=128 (4 iterations) | 0.028/0.027/0.027ms | 0.025/0.026/0.024ms | **~5-11% faster, consistent** |
+| K=1024 (32 iterations) | 0.094/0.088/0.088ms | 0.099/0.095/0.095ms | **~5-8% slower, consistent** |
+
+Consistent, repeatable pattern in both directions, not noise. Root cause: TDM removes a
+*one-time* cost (the division-heavy tap gather, paid once regardless of K depth) but the
+K-tail-via-OOB rebuild adds a small *per-iteration* cost (~6 extra SALU ops/iteration
+across A+B, unconditional every iteration even when this shape needs no tail at all,
+mirroring fwd's own existing design). For shallow K, the one-time savings dominate; for
+deep K, the per-iteration cost accumulates past where the savings pay for it. This
+crossover is a genuinely new finding -- no prior profiling in this project isolated it,
+since Finding 2/4's fwd-TDM measurements happened to use a shallow-K shape. **Not
+folded as a blanket replacement**: added to the master config search space instead (see
+below) so `driver_mode_normal` picks whichever kernel is actually faster per shape,
+rather than picking a fixed winner ahead of time.
+
+**Follow-up identified, not implemented here** (added to
+`docs/gfx1250_optimization_backlog.md`): the per-iteration tensor_dim rebuild could
+likely be skipped for all but the last iteration when the loop's total iteration count
+is known in advance not to need K-tail (i.e. gemm_k is an exact multiple) -- this would
+remove the per-iteration cost that causes the large-K regression, for both fwd's
+existing TDM and this new bwd TDM. Requires either a compile-time-provable exact-multiple
+path or a cheap runtime branch; not attempted here to keep this phase's scope to the
+port itself.
+
+### New files
+
+`config/igemm_bwd_gtc_gfx1250_nhwc_{fp16,bf16,fp32,int8}_tdm.config` (new, one 128x128
+tile each); `config/igemm_bwd_gtc_gfx1250_nhwc_{fp16,bf16,fp32,int8}_all.config`
+(regenerated, additive-only) fold the new TDM section into the comprehensive search.
+
+**Critical files**: `python/igemm/igemm_bwd_gtc_wmma_nhwc.py` (new
+`_emit_tdm_descriptor_setup_a/b`, `_emit_wave0_only`, prologue/tap-loop/
+global-load/move-slice-window wiring), `python/igemm/igemm_base.py` (direction-gate
+widening + mutual-exclusion assert), `driver/igemm_bwd_gtc_driver.h`
+(`tunable_is_valid()` K-relax + `unit_conv` runtime check).

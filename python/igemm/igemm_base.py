@@ -230,7 +230,13 @@ class igemm_gtc_tunable_parameter_t(object):
             if self.tdm_global_load:
                 # NOTE: self.direction/self.nxe aren't set yet at this point in __init__ (this
                 # fma_type-specific branch runs before them) -- read the raw dict instead.
-                assert tunable_dict['direction'] == 'fwd', "tdm_global_load is only implemented for fwd so far, see docs/gfx1250_wmma_layout.md's Phase 28"
+                # Phase 42: bwd added -- grad_output (A) is NHWC-contiguous per pixel exactly
+                # like fwd's A for the 1x1/unit-stride case (bwd's "harder per-tap gather"
+                # only matters for multi-tap; y=x=1 collapses it to a trivial identity), and
+                # weight (B) is read in the SAME physical layout fwd's B reads, just with
+                # tensor_dim0/tensor_dim1's roles swapped (bwd's GEMM_K is weight's ROW axis,
+                # not its contiguous axis) -- see docs/gfx1250_wmma_layout.md's Phase 42.
+                assert tunable_dict['direction'] in ('fwd', 'bwd'), "tdm_global_load is only implemented for fwd/bwd so far, see docs/gfx1250_wmma_layout.md's Phase 28/42"
                 assert tunable_dict['nxe'] == 0, "tdm_global_load is only implemented for 1x1/unit-stride convs (nxe=0) so far, see docs/gfx1250_wmma_layout.md's Phase 28"
                 assert not self.async_global_load, "tdm_global_load and async_global_load are mutually exclusive -- they're two different load mechanisms for the same operand"
                 assert not utility_dict_with_default_t(tunable_dict)('main_loop_interleave', 0), \
@@ -666,6 +672,10 @@ class igemm_gtc_tunable_parameter_t(object):
                 if self.direction == 'bwd':
                     assert not self.gemm_k_global_split, \
                         "wmma_k_tail is not implemented together with gemm_k_global_split for bwd -- bwd doesn't use split-K at all today"
+                    # Phase 42: mirrors fwd's identical mutual-exclusion -- TDM already
+                    # handles K-tail via hardware OOB for the 1x1-only case.
+                    assert not self.tdm_global_load, \
+                        "wmma_k_tail (new, non-TDM) and tdm_global_load are mutually exclusive -- TDM already has its own K-tail mechanism"
                 if self.direction == 'fwd':
                     # fwd (new): this is a genuinely DIFFERENT mechanism from TDM's K-tail
                     # (Phase 31/37) -- TDM already handles K-tail via hardware OOB for the

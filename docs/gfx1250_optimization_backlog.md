@@ -93,10 +93,30 @@ section for the record).
       tile_m as low as 16/32/48/96. Needs new VGPR/LDS-budget derivation per tile size,
       not a flag flip. Partially done via the existing `_k4x` (128x128x128) config —
       the smaller-tile-larger-K direction (64x64 with K=96/128/256) is still open.
-- [ ] **Extend TDM beyond fwd/1x1** — to bwd/wrw and/or multi-tap (y/x>1) convolutions.
-      Current TDM support is fwd-only, 1x1/unit-stride-only (`docs/gfx1250_wmma_layout.md`
-      Phase 28-31). Would need the same hardware-OOB-zero-fill trick re-derived for
-      bwd/wrw's different operand-addressing patterns.
+- [x] **Extend TDM to bwd** (both operands, 1x1/unit-stride) — done 2026-08-27, Phase 42
+      (`docs/gfx1250_wmma_layout.md`). Zero regression (45 configs byte-identical),
+      hardware-validated correct across all 4 precisions, group>1, large-K, and a full
+      K-tail-via-hardware-OOB battery. Also found and fixed a real waste in the port:
+      bwd's expensive per-tap division gather is now explicitly skipped under TDM
+      (fwd's own TDM never bothered, since fwd's equivalent waste is cheap). **Timing is
+      a genuine trade-off, not a uniform win**: ~5-11% faster for shallow GEMM_K
+      (K=128), ~5-8% *slower* for deep GEMM_K (K=1024) — the per-iteration hardware-OOB
+      tensor_dim rebuild's fixed cost outweighs the one-time gather savings once K is
+      deep enough. Added to the master config search (not a blanket replacement) so the
+      driver picks whichever is actually faster per shape.
+- [ ] **Skip the per-iteration TDM tensor_dim rebuild when not needed** — found while
+      measuring Phase 42's bwd timing trade-off above: the rebuild (K-tail-via-hardware-OOB)
+      runs unconditionally every K-loop iteration in BOTH fwd's original TDM and bwd's new
+      port, even for shapes where gemm_k is an exact multiple and no tail-masking is ever
+      needed. This is very likely the direct cause of the large-K slowdown. Skipping it for
+      all but the last iteration (or the exact-multiple case entirely) would likely close
+      most of that gap — needs either a compile-time-provable exact-multiple fast path or a
+      cheap runtime branch; not yet attempted for either fwd or bwd.
+- [ ] **Extend TDM to wrw and/or multi-tap (y/x>1) convolutions** — TDM support is now
+      fwd+bwd, still 1x1/unit-stride-only. wrw's split-K/atomic-accumulate structure is a
+      bigger design departure than bwd turned out to be (bwd's operands were direct
+      structural matches for the existing descriptor abstraction once worked through);
+      multi-tap would need TDM's per-tap gather-free assumption re-examined entirely.
 - [ ] **Fix `script/classify_gfx1250_coverage.py`'s `gemm_n % 4 == 0` blind spot** — the
       static-analysis classifier doesn't model fwd/bwd's non-atomic epilogue's
       `gemm_n % 4 == 0` sub-constraint (needed when `wmma_n_tail` is active, from the

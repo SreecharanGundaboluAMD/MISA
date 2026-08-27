@@ -532,10 +532,21 @@ public:
             // restriction (coalescing_store_wmma.py's shared epilogue, vector_write_out=4;
             // see igemm_fwd_gtc_driver.h's comment for the full derivation), independent of
             // bwd's B-operand load-side masking being a different (new) mechanism from fwd's.
+            // Phase 42: tdm_global_load relaxes the gemm_k exact-multiple requirement the
+            // same way fwd's Phase 31/39 does -- TDM's hardware OOB (tensor_dim0 for A,
+            // tensor_dim1 for B, see igemm_bwd_gtc_wmma_nhwc.py's Phase 42 descriptor
+            // setup) zero-fills a genuinely partial last K-block with no software masking.
+            // Also mirrors fwd's Phase 39 runtime-shape check: tdm_global_load's "1x1/
+            // unit-stride only" restriction is only enforced at config-authoring time
+            // (igemm_base.py asserts nxe==0), so a multi-tap/strided/padded/dilated
+            // runtime shape must be rejected here too, or it would silently dispatch to a
+            // TDM kernel that doesn't handle it and produce wrong results.
+            if(tunable->tdm_global_load && !unit_conv)
+                return false;
             if((!tunable->wmma_m_tail && gemm_m % gemm_m_per_block != 0) ||
                (!tunable->wmma_n_tail && gemm_n % gemm_n_per_block != 0) ||
                (tunable->wmma_n_tail && gemm_n % 4 != 0) ||
-               (!tunable->wmma_k_tail && gemm_k % gemm_k_per_block != 0))
+               (!tunable->tdm_global_load && !tunable->wmma_k_tail && gemm_k % gemm_k_per_block != 0))
                 return false;
             return true;
         }
