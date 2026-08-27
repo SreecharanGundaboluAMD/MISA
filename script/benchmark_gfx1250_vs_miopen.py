@@ -40,17 +40,30 @@ FORW_FLAG = {'fwd': 1, 'bwd': 2, 'wrw': 4}
 # match the Config column in docs/gfx1250_vendor_benchmark_vs_miopen.md's 38-shape
 # tables: base = combined 128x128+64x64 exact-fit, mtail/ntail/mntail = M/N/both
 # tail-relief (128x128-only for fwd, 64x64-only for bwd), tdm = TDM-based GEMM_K
-# tail (128x128-only, 1x1 conv only), gsplit = wrw's K-split (both tiles).
+# tail (128x128-only, 1x1 conv only), gsplit = K-split (128x128+64x64 both tiles,
+# all three directions as of Phase 49 -- wrw always had it, bwd/fwd got it in
+# Phase 48/49). Every shape's hardcoded per-row config (below) is tried alongside
+# 'gsplit' automatically for bwd/fwd (see GSPLIT_CANDIDATE in main()) -- split-K
+# wasn't available when most of these rows were first characterized, so it's
+# always worth trying as a second candidate, not just when a row explicitly says so.
 CONFIG_FILES = {
     ('fwd', 'base'):   'config/igemm_fwd_gtc_gfx1250_nhwc_bf16.config',
     ('fwd', 'mtail'):  'config/igemm_fwd_gtc_gfx1250_nhwc_bf16_mtail.config',
     ('fwd', 'ntail'):  'config/igemm_fwd_gtc_gfx1250_nhwc_bf16_ntail.config',
     ('fwd', 'mntail'): 'config/igemm_fwd_gtc_gfx1250_nhwc_bf16_mntail.config',
     ('fwd', 'tdm'):    'config/igemm_fwd_gtc_gfx1250_nhwc_bf16_tdm.config',
+    ('fwd', 'gsplit'): 'config/igemm_fwd_gtc_gfx1250_nhwc_bf16_gsplit.config',
     ('bwd', 'base'):   'config/igemm_bwd_gtc_gfx1250_nhwc_bf16.config',
     ('bwd', 'mtail'):  'config/igemm_bwd_gtc_gfx1250_nhwc_bf16_mtail.config',
+    ('bwd', 'gsplit'): 'config/igemm_bwd_gtc_gfx1250_nhwc_bf16_gsplit.config',
     ('wrw', 'gsplit'): 'config/igemm_wrw_gtc_gfx1250_nhwc_bf16_gsplit.config',
 }
+
+# gsplit wasn't available (or, for wrw, wasn't necessarily the best choice) when most
+# SHAPES rows below were characterized -- always try it as a second candidate for
+# bwd/fwd (wrw rows already use gsplit as their primary config) and report whichever
+# is faster, rather than only running the row's originally-hardcoded config.
+GSPLIT_CANDIDATE = {'fwd': 'gsplit', 'bwd': 'gsplit'}
 
 # The 38 shapes from docs/gfx1250_vendor_benchmark_vs_miopen.md's "full re-triage"
 # and "vs. MIOpen running natively on gfx1250" tables (2026-08-27 updates), batch=42
@@ -168,7 +181,17 @@ def main():
     check_gpu_contention()
 
     shapes = [s for s in SHAPES if args.direction == 'all' or s[0] == args.direction]
-    needed_configs = sorted(set((s[0], s[8]) for s in shapes))
+    # candidate configs per shape = its own hardcoded config, plus 'gsplit' for
+    # bwd/fwd (see GSPLIT_CANDIDATE) if not already the same and if a gsplit config
+    # exists for that direction -- report whichever candidate is fastest.
+    def candidates_for(direction, config):
+        cands = [config]
+        gsplit = GSPLIT_CANDIDATE.get(direction)
+        if gsplit and gsplit != config and (direction, gsplit) in CONFIG_FILES:
+            cands.append(gsplit)
+        return cands
+
+    needed_configs = sorted(set((s[0], cfg) for s in shapes for cfg in candidates_for(s[0], s[8])))
     built_dirs = {}
     for direction, config in needed_configs:
         built_dirs[(direction, config)] = build_config(direction, config, args.build_dir, args.rebuild)
@@ -181,9 +204,16 @@ def main():
     per_dir_ratios_1250 = {}
 
     for (direction, c, H, W, k, y, x, p, config, ref950, ref1250, solver1250) in shapes:
-        out_dir = built_dirs[(direction, config)]
-        misa_ms, err = run_shape(out_dir, direction, c, H, W, k, y, x, p,
-                                  args.warmup, args.repeat, args.verify)
+        best_ms, best_config, best_err = None, config, None
+        for cand_config in candidates_for(direction, config):
+            out_dir = built_dirs[(direction, cand_config)]
+            cand_ms, cand_err = run_shape(out_dir, direction, c, H, W, k, y, x, p,
+                                           args.warmup, args.repeat, args.verify)
+            if cand_ms is not None and (best_ms is None or cand_ms < best_ms):
+                best_ms, best_config, best_err = cand_ms, cand_config, None
+            elif best_ms is None:
+                best_err = cand_err
+        misa_ms, config, err = best_ms, best_config, best_err
         shape_str = f"{c},{H},{W},{k},{y}x{x}"
         if misa_ms is None:
             rows.append(f"| {direction} | {shape_str} | {config} | FAILED | {ref950} | {ref1250} | - | - | {solver1250} |")
