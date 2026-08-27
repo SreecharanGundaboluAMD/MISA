@@ -438,3 +438,205 @@ different run (possibly a different day, different GPU contention state, differe
 version). Directionally consistent with everything else measured this session (fwd wins,
 wrw still behind but no longer catastrophically), but treat the exact multiples as
 approximate, same as every other number in this doc.
+
+## Update (2026-08-27): full re-triage against `tracelens_shapes_gfx950.json` after Phases 23-31
+
+Re-ran the whole "what's applicable" triage from scratch against
+`/home/sgundabo/rocm-libraries/tracelens_shapes_gfx950.json` (the same MI350X/gfx950 trace
+cited in the update above), this time accounting for every capability landed since the
+original 20-shape triage at the top of this doc: `wmma_m_tail`/`wmma_n_tail` (Phases 25/26,
+fwd; `wmma_m_tail` only for bwd), `gemm_k_global_split` (Phase 17, wrw), and TDM-based
+GEMM_K tail (Phase 31, fwd/1x1 only). wrw still has no tail relief of any kind, gk/gn/gm
+must all be exact tile multiples.
+
+**Triage methodology**: 112 total entries, 26 batch norm (skipped, not a MISA op), 86 conv,
+14 depthwise (`g==c`, skipped, architecturally out of scope). Of the remaining 72
+non-depthwise conv entries, computed GEMM_M/N/K per direction (fwd: `gm=n·ho·wo,
+gn=k/g, gk=c/g`; bwd: `gm=n·hi·wi, gn=c/g, gk=k/g`; wrw: `gm=k/g, gn=c/g, gk=n·ho·wo` --
+matching each direction's own WMMA driver-check formula exactly, read directly from
+`igemm_{fwd,bwd,wrw}_gtc_driver.h`) and checked which of MISA's actually-buildable configs
+(not just "is there theoretically a relief mechanism") would accept it: `fwd_base`/
+`bwd_base` (both 128x128 and 64x64 tiles, exact-multiple only), `fwd_mtail`/`fwd_ntail`/
+`fwd_mntail`/`fwd_tdm` (each a SINGLE 128x128-only build -- no 64x64 alternative),
+`bwd_mtail` (a single 64x64-only build), `wrw_gsplit` (both 128x128 and 64x64, always used
+for wrw per this doc's own established "MISA's fastest option today" precedent).
+
+**One false positive caught and corrected**: the naive check "gm or gn lands on a multiple
+of 64 or 128" isn't sufficient for the tail/tdm-specialized configs, since (unlike the base
+combined configs) each only has ONE tile size built. `c=48,H=120,W=160,k=192,1x1` looked
+`fwd_tdm`-eligible by dimension count (`gn=192` is a multiple of 64) but the `_tdm` config
+only has a 128x128 build and 192 isn't a multiple of 128 -- confirmed by the actual driver
+returning `not applicable` when tried. Manually re-verified every other classified shape
+against the correct *paired*-tile constraint (a single tile choice must satisfy gm AND gn
+together, not each independently against "any" tile) with no further errors found. Final
+count: **38 applicable shapes** (17 fwd, 11 bwd, 10 wrw) out of 72 non-depthwise conv
+entries -- up from the original triage's 20, entirely due to the tail/tdm/gsplit capability
+growth across Phases 17 and 25-31 (all of which happened after that original count was
+taken).
+
+### Benchmark
+
+Same methodology as this doc's established reproduce steps: `IGEMM_WARMUP=5
+IGEMM_REPEAT=20`, `driver_mode_normal` (searches every tunable in the built module,
+reports the fastest), `-V 0` (skip verification, matching the existing gfx950-comparison
+methodology above), batch=42 bf16/NHWC throughout. MIOpen's numbers are read directly from
+the trace file (gfx950/MI350X), not re-run. GPU contention check before starting:
+`rocm-smi --showuse --showpids` read `GPU use (%): 100` with **no visible KFD PIDs** on two
+checks a few seconds apart -- the same "different tenant/namespace this session can't see"
+pattern documented earlier in this file on a shared/multi-tenant box. Same caveat applies:
+treat exact multiples as approximate.
+
+| Direction | Shape (c,H,W,k,y×x) | Config | MISA/gfx1250 (ms) | MIOpen/gfx950 (ms) | Ratio |
+|---|---|---|---|---|---|
+| fwd | 256,1,1,16,1x1 | mntail | 0.02500 | 0.00621 | 4.03x slower |
+| fwd | 512,1,1,32,1x1 | mntail | 0.02900 | 0.00800 | 3.63x slower |
+| fwd | 32,1,1,512,1x1 | mtail | 0.02200 | 0.00629 | 3.50x slower |
+| fwd | 96,120,160,48,1x1 | ntail | 0.06300 | 0.03997 | 1.58x slower |
+| fwd | 128,30,40,512,1x1 | mtail | 0.03000 | 0.02189 | 1.37x slower |
+| fwd | 256,30,40,128,1x1 | mtail | 0.01800 | 0.01366 | 1.32x slower |
+| fwd | 192,60,80,64,1x1 | base | 0.03000 | 0.02282 | 1.31x slower |
+| fwd | 64,60,80,128,1x1 | base | 0.02300 | 0.01824 | 1.26x slower |
+| fwd | 512,30,40,128,1x1 | mtail | 0.02400 | 0.01953 | 1.23x slower |
+| fwd | 24,240,320,128,1x1 | tdm | 0.22000 | 0.17973 | 1.22x slower |
+| fwd | 256,60,80,64,1x1 | base | 0.03300 | 0.02730 | 1.21x slower |
+| fwd | 128,30,40,128,1x1 | mtail | 0.01300 | 0.01112 | 1.17x slower |
+| fwd | 64,60,80,256,1x1 | base | 0.03700 | 0.03168 | 1.17x slower |
+| fwd | 192,120,160,48,1x1 | ntail | 0.09400 | 0.08065 | 1.17x slower |
+| fwd | 128,30,40,128,3x3 | mtail | 0.03900 | 0.03575 | 1.09x slower |
+| fwd | 128,120,160,128,3x3 | base | 0.36900 | 0.36303 | 1.02x slower |
+| fwd | 48,120,160,128,1x1 | tdm | 0.06400 | 0.06297 | 1.02x slower |
+| bwd | 512,1,1,32,1x1 | mtail | 0.01800 | 0.00939 | 1.92x slower |
+| bwd | 128,30,40,512,1x1 | mtail | 0.04300 | 0.02783 | 1.54x slower |
+| bwd | 128,30,40,128,3x3 | mtail | 0.08500 | 0.05621 | 1.51x slower |
+| bwd | 64,60,80,256,1x1 | base | 0.04400 | 0.03461 | 1.27x slower |
+| bwd | 512,30,40,128,1x1 | mtail | 0.04200 | 0.03528 | 1.19x slower |
+| bwd | 128,120,160,128,3x3 | base | 0.60100 | 0.50721 | 1.18x slower |
+| bwd | 256,30,40,128,1x1 | mtail | 0.02800 | 0.02428 | 1.15x slower |
+| bwd | 64,60,80,128,1x1 | base | 0.02900 | 0.02647 | 1.10x slower |
+| bwd | 192,60,80,64,1x1 | base | 0.03900 | 0.03852 | 1.01x slower |
+| bwd | 128,30,40,128,1x1 | mtail | 0.01600 | 0.01779 | **1.11x faster** |
+| bwd | 256,60,80,64,1x1 | base | 0.04100 | 0.04617 | **1.13x faster** |
+| wrw | 128,30,40,128,3x3 | gsplit | 0.42700 | 0.08654 | 4.93x slower |
+| wrw | 128,120,160,128,3x3 | gsplit | 2.04800 | 0.66439 | 3.08x slower |
+| wrw | 192,60,80,64,1x1 | gsplit | 0.14800 | 0.05720 | 2.59x slower |
+| wrw | 256,30,40,128,1x1 | gsplit | 0.08600 | 0.03579 | 2.40x slower |
+| wrw | 512,30,40,128,1x1 | gsplit | 0.09500 | 0.04728 | 2.01x slower |
+| wrw | 128,30,40,512,1x1 | gsplit | 0.09800 | 0.05202 | 1.88x slower |
+| wrw | 128,30,40,128,1x1 | gsplit | 0.03500 | 0.02684 | 1.30x slower |
+| wrw | 64,60,80,128,1x1 | gsplit | 0.06300 | 0.05149 | 1.22x slower |
+| wrw | 64,60,80,256,1x1 | gsplit | 0.06800 | 0.05810 | 1.17x slower |
+| wrw | 256,60,80,64,1x1 | gsplit | 0.06500 | 0.05890 | 1.10x slower |
+
+**Summary**: fwd 17 shapes, 1.02x-4.03x slower (avg 1.66x, 0 faster); bwd 11 shapes,
+0.89x-1.92x (avg 1.24x, **2 actually faster**); wrw 10 shapes, 1.10x-4.93x slower (avg
+2.17x, 0 faster).
+
+**The 20 shapes already tested in the Phase-22-era gfx950 comparison above show no
+regression** -- re-isolating just those (all `_base`/`_gsplit`, no tail/tdm involved) gives
+fwd avg 1.19x (was 1.19x), bwd avg 1.09x (was 1.08x), wrw avg 2.17x (was 2.01x, well within
+this doc's own documented run-to-run noise band). **The 18 newly-applicable shapes --
+unlocked entirely by Phases 25-31's tail/tdm/gsplit work -- are measurably worse on
+average**: fwd's 12 new shapes average 1.86x vs. the original set's 1.19x; bwd's 6 new
+shapes average 1.37x vs. 1.09x. This is an honest, expected finding, not a regression: the
+tail/tdm code paths (EXEC-mask guards, per-wave TDM issue overhead, small-grid occupancy
+for `H=1,W=1`-style degenerate spatial shapes) were built correctness-first throughout this
+whole initiative and have never been performance-tuned the way the exact-fit base path
+has. The worst offenders are exactly where that's expected: the three worst fwd ratios
+(3.5x-4.0x) are all `H=1,W=1` (`gemm_m=42`, batch-only, no spatial extent at all --
+essentially a tiny GEMM with no way to fill 256 CUs regardless of tile choice) matched
+against MIOpen baselines under 0.01ms, the regime this doc has repeatedly flagged as most
+exposed to fixed per-dispatch overhead; wrw's two worst ratios (3.3x3.3, 128x128x128) are
+its smallest 3x3 shapes, the same "smallest absolute time, most overhead-exposed" pattern
+noted for wrw earlier in this doc.
+
+**Net picture**: on the original, well-fitting shape population, MISA/gfx1250 remains
+essentially at parity-to-modestly-behind MIOpen/gfx950 across all three directions (as
+found before Phase 23). The newly-unlocked tail/edge-case shapes are usable (correct,
+`valid` results) but meaningfully slower in relative terms -- a real, quantified list of
+where future performance work on the tail-handling paths specifically (not the main loop
+or epilogue, both already tuned for the exact-fit case) would have the most leverage.
+
+## Update (2026-08-27): same 38 shapes vs. MIOpen running natively on gfx1250
+
+Same MISA numbers as the gfx950 comparison above, matched instead against
+`~/rocm-libraries/tracelense_gfx1250_b01_2.json` (the real MIOpen/gfx1250 trace with
+solver names, already used once in this doc's "re-checked against a real MIOpen/gfx1250
+trace" update). All 38 applicable shapes matched by exact MIOpenDriver argument string.
+
+| Direction | Shape (c,H,W,k,y×x) | Config | MISA (ms) | MIOpen/gfx1250 (ms) | Solver | Ratio |
+|---|---|---|---|---|---|---|
+| fwd | 512,1,1,32,1x1 | mntail | 0.02900 | 0.00971 | ImplicitGemmGroupFwdXdlops | 2.99x slower |
+| fwd | 256,1,1,16,1x1 | mntail | 0.02500 | 0.00862 | ImplicitGemmGroupFwdXdlops | 2.90x slower |
+| fwd | 32,1,1,512,1x1 | mtail | 0.02200 | 0.00847 | ImplicitGemmGroupFwdXdlops | 2.60x slower |
+| fwd | 128,30,40,512,1x1 | mtail | 0.03000 | 0.02047 | ConvHipConv | 1.47x slower |
+| fwd | 24,240,320,128,1x1 | tdm | 0.22000 | 0.16886 | ImplicitGemmGroupFwdXdlops | 1.30x slower |
+| fwd | 192,120,160,48,1x1 | ntail | 0.09400 | 0.07747 | ImplicitGemmGroupFwdXdlops | 1.21x slower |
+| fwd | 96,120,160,48,1x1 | ntail | 0.06300 | 0.05205 | ImplicitGemmGroupFwdXdlops | 1.21x slower |
+| fwd | 256,30,40,128,1x1 | mtail | 0.01800 | 0.01492 | ConvHipConv | 1.21x slower |
+| fwd | 512,30,40,128,1x1 | mtail | 0.02400 | 0.01995 | ImplicitGemmGroupFwdXdlops | 1.20x slower |
+| fwd | 64,60,80,128,1x1 | base | 0.02300 | 0.02039 | ImplicitGemmGroupFwdXdlops | 1.13x slower |
+| fwd | 128,120,160,128,3x3 | base | 0.36900 | 0.32842 | ConvHipConv | 1.12x slower |
+| fwd | 128,30,40,128,3x3 | mtail | 0.03900 | 0.03641 | ConvHipConv | 1.07x slower |
+| fwd | 48,120,160,128,1x1 | tdm | 0.06400 | 0.05992 | ImplicitGemmGroupFwdXdlops | 1.07x slower |
+| fwd | 64,60,80,256,1x1 | base | 0.03700 | 0.03714 | ConvHipConv | **1.00x faster** |
+| fwd | 128,30,40,128,1x1 | mtail | 0.01300 | 0.01307 | ConvHipConv | **1.01x faster** |
+| fwd | 256,60,80,64,1x1 | base | 0.03300 | 0.03960 | ImplicitGemmGroupFwdXdlops | **1.20x faster** |
+| fwd | 192,60,80,64,1x1 | base | 0.03000 | 0.03615 | ImplicitGemmGroupFwdXdlops | **1.21x faster** |
+| bwd | 128,30,40,128,3x3 | mtail | 0.08500 | 0.02388 | ConvHipConv | 3.56x slower |
+| bwd | 128,30,40,512,1x1 | mtail | 0.04300 | 0.01857 | ConvHipConv | 2.32x slower |
+| bwd | 256,30,40,128,1x1 | mtail | 0.02800 | 0.01395 | ConvHipConv | 2.01x slower |
+| bwd | 512,30,40,128,1x1 | mtail | 0.04200 | 0.02179 | ConvHipConv | 1.93x slower |
+| bwd | 512,1,1,32,1x1 | mtail | 0.01800 | 0.00945 | ConvHipConv | 1.90x slower |
+| bwd | 128,120,160,128,3x3 | base | 0.60100 | 0.31830 | ConvHipConv | 1.89x slower |
+| bwd | 128,30,40,128,1x1 | mtail | 0.01600 | 0.01274 | ConvHipConv | 1.26x slower |
+| bwd | 192,60,80,64,1x1 | base | 0.03900 | 0.03283 | ConvHipConv | 1.19x slower |
+| bwd | 256,60,80,64,1x1 | base | 0.04100 | 0.03716 | ConvHipConv | 1.10x slower |
+| bwd | 64,60,80,128,1x1 | base | 0.02900 | 0.02664 | ImplicitGemmGroupBwdXdlops | 1.09x slower |
+| bwd | 64,60,80,256,1x1 | base | 0.04400 | 0.04199 | ConvHipConv | 1.05x slower |
+| wrw | 192,60,80,64,1x1 | gsplit | 0.14800 | 0.00561 | ImplicitGemmGroupWrwXdlops | 26.39x slower |
+| wrw | 128,30,40,128,3x3 | gsplit | 0.42700 | 0.06740 | ImplicitGemmGroupWrwXdlops | 6.34x slower |
+| wrw | 128,120,160,128,3x3 | gsplit | 2.04800 | 0.41365 | ImplicitGemmGroupWrwXdlops | 4.95x slower |
+| wrw | 256,30,40,128,1x1 | gsplit | 0.08600 | 0.02838 | ImplicitGemmGroupWrwXdlops | 3.03x slower |
+| wrw | 512,30,40,128,1x1 | gsplit | 0.09500 | 0.04997 | ImplicitGemmGroupWrwXdlops | 1.90x slower |
+| wrw | 128,30,40,512,1x1 | gsplit | 0.09800 | 0.05295 | ImplicitGemmGroupWrwXdlops | 1.85x slower |
+| wrw | 128,30,40,128,1x1 | gsplit | 0.03500 | 0.02198 | ImplicitGemmGroupWrwXdlops | 1.59x slower |
+| wrw | 64,60,80,128,1x1 | gsplit | 0.06300 | 0.04026 | ImplicitGemmGroupWrwXdlops | 1.56x slower |
+| wrw | 64,60,80,256,1x1 | gsplit | 0.06800 | 0.05214 | ImplicitGemmGroupWrwXdlops | 1.30x slower |
+| wrw | 256,60,80,64,1x1 | gsplit | 0.06500 | 0.05217 | ImplicitGemmGroupWrwXdlops | 1.25x slower |
+
+**Summary**: fwd 17 shapes, 0.83x-2.99x (avg 1.42x, **4 faster**); bwd 11 shapes, 1.05x-3.56x
+slower (avg 1.75x, 0 faster); wrw 10 shapes, 1.25x-26.39x slower (avg 5.02x, 0 faster).
+
+**Isolating the original 20 (pre-Phase-23) shapes**: fwd avg **0.98x** (min 0.83x, max
+1.13x -- essentially a dead heat, matching this doc's earlier "re-checked... with solver
+names" update's 0.98x almost exactly); bwd avg 1.26x (matching that update's 1.25x almost
+exactly). **No regression on fwd/bwd for the shapes already characterized.** The 18
+newly-applicable shapes are worse on this trace too (fwd 1.60x avg, bwd 2.16x avg),
+mirroring the same tail/edge-case-overhead pattern found against gfx950 above.
+
+**wrw is the outlier, and it needed a real investigation, not just a report**: all 10 wrw
+shapes are already in the "original 20" (wrw has no tail relief, so no new wrw shapes were
+unlocked -- every wrw shape tested here was already tested in the earlier "re-checked...
+with solver names" update). That update reported wrw at 1.23x-11.41x (avg ~3.5x); this run
+shows 1.25x-26.39x (avg 5.02x) for the *same* 10 shapes, using the *same* `_gsplit` config
+and the *same* automatic ternary split-count search (confirmed still present and correct
+in `igemm_wrw_gtc_driver.h`). Investigated directly rather than just flagging the
+discrepancy: re-ran the worst outlier (`c=192,H=60,W=80,k=64,1x1`) three times (0.148,
+0.149, 0.148ms -- tightly reproducible, not run-to-run noise), then swept `IGEMM_GSPLIT_SWEEP`
+across 13 candidate split counts by hand. The full sweep confirms the ternary search
+*is* finding the true minimum today (split 225-252 at ~0.149ms genuinely beats split 315,
+the split this doc's Phase 20 update reported as best, which now measures 0.156ms) -- so
+this is not a search-algorithm regression. The true minimum itself has simply gotten much
+slower since Phase 20 (0.065ms then vs. ~0.148ms now for the identical shape/config/search).
+**Given `rocm-smi --showuse --showpids` showed `GPU use (%): 100` with no visible KFD PIDs
+throughout this entire session** (the same "different tenant on a shared box" signal
+flagged repeatedly elsewhere in this doc), the most likely explanation is GPU contention --
+and wrw's `_gsplit` kernels, which launch many small workgroups per candidate split and are
+occupancy/dispatch-latency-sensitive by design (that sensitivity is the whole reason
+`gemm_k_global_split` exists), are plausibly far more exposed to a noisy neighbor's
+scheduling interference than fwd/bwd's much larger, compute-bound single-dispatch kernels
+-- consistent with fwd/bwd showing *no* measurable change from earlier sessions while wrw
+shows a large one. This is a plausible, evidence-backed explanation, not a confirmed root
+cause: the exact multiples for wrw specifically should be treated as more provisional than
+this doc's other numbers, and re-measured on an exclusively-held GPU before being used to
+make any wrw-specific optimization decision.

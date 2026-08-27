@@ -122,9 +122,21 @@ not to cover the main-loop's chunked-load pattern cleanly.
 - `s_barrier_signal(-1)` issued early (right after TDM loads), `s_barrier_wait(-1)` issued
   only when the data is actually needed (FlyDSL: 7 WMMAs later) -- overlaps barrier
   propagation latency with compute. Directly encodable in MISA's hand-written assembly.
-- `disable_xdl_arb_stall()` -- a `S_SETREG_B32` write to `SCHED_MODE` bit 4 -- lets WMMAs
-  issue back-to-back without a multicycle arbitration stall. FlyDSL's hgemm calls this
-  once at kernel entry. Untested by MISA; worth a quick llvm-mc + hardware check.
+- `disable_xdl_arb_stall()` -- a `S_SETREG_B32` write to `SCHED_MODE` **bit[2]**
+  (`DISABLE_XDL_ARB_STALL`/`DISABLE_VALU_ARB_STALL` -- corrected from an earlier "bit 4"
+  note in this file; confirmed against the CDNA5 ISA doc's 5.7.2.1) -- lets a wave issue
+  multiple WMMA ops back-to-back instead of stalling for each one's full multi-cycle
+  latency before issuing its next instruction. FlyDSL's hgemm calls this once at kernel
+  entry. **Important caveat directly from the ISA doc, not previously noted**: this
+  trades away CO-EXECUTION -- normally the stall lets OTHER waves on the same SIMD issue
+  VALU work while one wave's WMMA is still running; disabling it "can block co-execution
+  opportunities so it is likely beneficial primarily when a single wave is running on a
+  SIMD." This means it's a plausible win for MISA's wrw kernels specifically (many small,
+  low-occupancy-per-SIMD split-K workgroups -- see `docs/gfx1250_rocprof_profiling.md`'s
+  finding that wrw's WMMA-busy-cycle-fraction is roughly half of fwd's) but could easily
+  REGRESS fwd/bwd's higher-occupancy, multi-wave-per-SIMD kernels. Untested by MISA;
+  worth an isolated llvm-mc + hardware A/B test on a wrw shape specifically before
+  considering it for fwd/bwd.
 
 ## hipconv findings
 
