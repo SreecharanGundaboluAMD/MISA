@@ -342,6 +342,9 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 # tdm_global_load is set (every existing config byte-identical).
                 self.s_tdm_g0  = sym_t('s_tdm_g0'      , sseq(4, 4))
                 self.s_tdm_g1  = sym_t('s_tdm_g1'      , sseq(8, 4))
+                # Phase 30: mirrors s_tdm_g0/g1 above, for the B operand.
+                self.s_tdm_g0_b = sym_t('s_tdm_g0_b'   , sseq(4, 4))
+                self.s_tdm_g1_b = sym_t('s_tdm_g1_b'   , sseq(8, 4))
                 # Phase 29: this wave's index within the workgroup (0, 1, 2, ...), used to
                 # gate TDM issue to a single wave -- TDM instructions ignore EXEC entirely
                 # (not per-lane), so a scalar branch on this is the only way to suppress
@@ -595,10 +598,10 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
 
         tile_dim0 (gemm_k_per_block) and tile_dim1 (gemm_m_per_block) are compile-time
         constants (baked in as immediates); tensor_dim0 (gemm_k), tensor_dim1 (gemm_m), and
-        tensor_dim0_stride (in_c_total) are runtime SGPR values (real conv shape). Every
-        wave in the workgroup issues an identical, redundant TDM load (TDM ignores EXEC and
-        isn't per-lane) -- correctness-first for this pilot; only-wave-0 issuing is a
-        follow-up optimization, not attempted here.
+        tensor_dim0_stride (in_c_total) are runtime SGPR values (real conv shape). This
+        descriptor SETUP stays unconditional (cheap, per-wave-independent SALU, run on every
+        wave) -- only the actual `tensor_load_to_lds` issue is gated to wave 0 (see
+        `_emit_wave0_only`, Phase 29), since TDM ignores EXEC and isn't per-lane.
         '''
         s = self.sgpr
         data_size_code = utility_log2(self.data_byte)
@@ -629,6 +632,58 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_mov_b32 s[{s.s_tdm_g1(5)}], s[{s.s_in_c_total()}]   ; tensor_dim0_stride lo32 (elements)")
         self._emit(f"s_mov_b32 s[{s.s_tdm_g1(6)}], 0   ; tensor_dim0_stride hi16 (assume < 2^32 elements)")
         self._emit(f"s_mov_b32 s[{s.s_tdm_g1(7)}], 0   ; tensor_dim1_stride unused (2D tensor)")
+        self._emit_empty_line()
+
+    def _emit_tdm_descriptor_setup_b(self):
+        '''
+        Phase 30: mirrors `_emit_tdm_descriptor_setup_a` for the B (weight) operand.
+        Called after `s_p_wei`'s group-offset add and `s_wei_k_stride` are both computed
+        (unlike A, B's group offset is folded straight into `s_p_wei` earlier in the
+        prologue, since a group's weight sub-tensor is fully self-contained -- see the
+        "group>1" prologue comments above this call site). B's per-thread block offset
+        (`s_block_n_off`), unlike A's, is NOT folded into `s_p_wei` anywhere else in this
+        kernel (the non-TDM path adds it per-lane, at the VGPR level, in
+        `v_addr_b_base`'s setup) -- so this descriptor's global_addr computation adds it
+        explicitly, the same way `_emit_tdm_descriptor_setup_a` adds `s_block_m_off`.
+
+        B's weight layout is [K_out][Y][X][C_in] (see class docstring), so for the 1x1
+        case its rows (fixed K_out/gemm_n index) are `gemm_k`-wide -- the SAME row width as
+        A -- spaced `wei_k_stride` (=Y*X*gemm_k) elements apart, mirroring A's
+        gemm_k-wide/in_c_total-spaced rows exactly: tensor_dim0=gemm_k (shared with A),
+        tensor_dim1=gemm_n (A's analogue: gemm_m), tensor_dim0_stride=wei_k_stride (A's
+        analogue: in_c_total), tile_dim0=gemm_k_per_block (shared with A),
+        tile_dim1=gemm_n_per_block (A's analogue: gemm_m_per_block). B's LDS region starts
+        at `lds_a_size` (A's region occupies byte 0..lds_a_size-1).
+        '''
+        s = self.sgpr
+        data_size_code = utility_log2(self.data_byte)
+        tile_dim0 = self.tunable.gemm_k_per_block
+        tile_dim1 = self.tunable.gemm_n_per_block
+        assert tile_dim0 < 65536 and tile_dim1 < 65536, "TDM tile_dim0/1 are 16-bit fields"
+
+        self._emit(f"; --- Phase 30: TDM descriptor for B operand ---")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g0_b(0)}], 1   ; group0: pred=1 (valid tensor)")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g0_b(1)}], {self.lds_a_size}   ; group0: lds_addr (B's LDS region starts after A's)")
+        self._emit(f"; group0: global_addr = p_wei + block_n_off * wei_k_stride * data_byte")
+        self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_block_n_off()}], s[{s.s_wei_k_stride()}]")
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {data_size_code}")
+        self._emit(f"s_add_u32 s[{s.s_tdm_g0_b(2)}], s[{s.s_p_wei()}], s[{s.s_tmp(0)}]")
+        self._emit(f"s_addc_u32 s[{s.s_tmp(1)}], s[{s.s_p_wei(1)}], 0")
+        self._emit(f"s_or_b32 s[{s.s_tdm_g0_b(3)}], s[{s.s_tmp(1)}], 0x80000000   ; | type=2 (image) in bits[31:30]")
+        self._emit_empty_line()
+
+        self._emit(f"; group1: data_size={data_size_code}, workgroup_mask=0 (not clustered)")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1_b(0)}], {data_size_code << 16}")
+        self._emit(f"s_lshl_b32 s[{s.s_tdm_g1_b(1)}], s[{s.s_gemm_k()}], 16   ; tensor_dim0 (gemm_k) lo16 -> [31:16]")
+        self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_gemm_k()}], 16   ; tensor_dim0 hi16")
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_gemm_n()}], 16   ; tensor_dim1 (gemm_n) lo16")
+        self._emit(f"s_or_b32 s[{s.s_tdm_g1_b(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
+        self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_gemm_n()}], 16   ; tensor_dim1 hi16")
+        self._emit(f"s_or_b32 s[{s.s_tdm_g1_b(3)}], s[{s.s_tmp(0)}], {tile_dim0 << 16}   ; | tile_dim0 (compile-time)")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1_b(4)}], {tile_dim1}   ; tile_dim1 (compile-time), tile_dim2 unused")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1_b(5)}], s[{s.s_wei_k_stride()}]   ; tensor_dim0_stride lo32 (elements)")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1_b(6)}], 0   ; tensor_dim0_stride hi16 (assume < 2^32 elements)")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1_b(7)}], 0   ; tensor_dim1_stride unused (2D tensor)")
         self._emit_empty_line()
 
     def _emit_wave0_only(self, body_fn):
@@ -800,6 +855,9 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_add_u32 s[{s.s_p_wei()}], s[{s.s_p_wei()}], s[{s.s_tmp(0)}]")
         self._emit(f"s_addc_u32 s[{s.s_p_wei(1)}], s[{s.s_p_wei(1)}], 0")
         self._emit_empty_line()
+
+        if self.tunable.tdm_global_load:
+            self._emit_tdm_descriptor_setup_b()
 
         # ---- B's fixed per-thread row base (this tap's column offset is added fresh every
         # tap in _emit_tap_gather -- see class docstring) ----
@@ -1191,8 +1249,13 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
+                s = outer.sgpr
                 with outer._deferred_context():
-                    if outer.tunable.async_global_load:
+                    if outer.tunable.tdm_global_load:
+                        # Phase 30: mirrors global_load_a_functor's TDM branch -- see there
+                        # for the wave0-gating rationale.
+                        outer._emit_wave0_only(lambda: outer._emit(f"tensor_load_to_lds s[{s.s_tdm_g0_b()}:{s.s_tdm_g0_b(3)}], s[{s.s_tdm_g1_b()}:{s.s_tdm_g1_b(7)}]"))
+                    elif outer.tunable.async_global_load:
                         outer._emit_gld_async_all_chunks(v.v_off_b, v.v_sst_os, outer.lds_a_size, outer.sgpr.s_p_wei, v_flag=None)
                     else:
                         outer._emit_gld_chunk_load(v.v_gld_b, v.v_addr_b, 0, v_flag=(v.v_flag_b if outer.tunable.wmma_n_tail else None))
@@ -1392,8 +1455,15 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
+                s = outer.sgpr
                 with outer._deferred_context():
-                    if outer.tunable.async_global_load:
+                    if outer.tunable.tdm_global_load:
+                        # Phase 30: mirrors move_slice_window_a_functor's TDM branch -- see
+                        # there for why addc-ing directly into s_tdm_g0_b(3)'s type field is
+                        # safe.
+                        outer._emit(f"s_add_u32 s[{s.s_tdm_g0_b(2)}], s[{s.s_tdm_g0_b(2)}], {outer.bytes_per_row}")
+                        outer._emit(f"s_addc_u32 s[{s.s_tdm_g0_b(3)}], s[{s.s_tdm_g0_b(3)}], 0")
+                    elif outer.tunable.async_global_load:
                         outer._emit(f"v_add_u32 v[{v.v_off_b()}], {outer.bytes_per_row}, v[{v.v_off_b()}]")
                     else:
                         for i in range(outer.row_repeat_b):
@@ -1413,7 +1483,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.async_global_to_lds_a = self.tunable.async_global_load
         ctrl.async_global_to_lds_b = self.tunable.async_global_load
         ctrl.tdm_global_to_lds_a = self.tunable.tdm_global_load
-        ctrl.tdm_global_to_lds_b = False   # Phase 28 pilot: A operand only
+        ctrl.tdm_global_to_lds_b = self.tunable.tdm_global_load   # Phase 30: B operand too
         ctrl.interleave = self.tunable.main_loop_interleave
         ctrl.local_prefetch_num = self.tunable.local_prefetch_num
         # Phase 1 (k-sub-loop): both A and B are untransposed here (K contiguous within

@@ -3056,3 +3056,47 @@ investigated further this phase (single-issuer-wave was the specific, scoped ask
 `s_wave_id` SGPR allocation, prologue derivation, `_emit_wave0_only` helper,
 `_tdm_label_counter`, `global_load_a_functor`'s TDM branch now wrapped in
 `_emit_wave0_only`.
+
+## Phase 30 (2026-08-27): TDM for the B operand (fwd, 1x1)
+
+Straight port of Phase 28/29's A-operand pattern to B, closing the prerequisite the
+GEMM_K-tail investigation surfaced: B's non-TDM load path has zero K-axis masking, so
+enabling K-tail (Phase 31) needs both operands on TDM, not just A.
+
+**Design**: new `s_tdm_g0_b`/`s_tdm_g1_b` descriptor SGPRs (same 4/8-SGPR, 4-aligned
+groups as A's), built by `_emit_tdm_descriptor_setup_b` -- called once, right after
+`s_p_wei`'s group-offset add and `s_wei_k_stride` are computed in the prologue. B's
+weight layout ([K_out][Y][X][C_in]) makes its 1x1-case row width `gemm_k` (shared with
+A) and row stride `wei_k_stride` (A's analogue: `in_c_total`), so the descriptor mirrors
+A's field-for-field: `tensor_dim0=gemm_k`, `tensor_dim1=gemm_n` (A: `gemm_m`),
+`tile_dim0=gemm_k_per_block` (shared), `tile_dim1=gemm_n_per_block` (A:
+`gemm_m_per_block`), `lds_addr=lds_a_size` (B's region starts right after A's). One
+real difference from A: B's per-workgroup offset (`s_block_n_off`) is NOT folded into
+`s_p_wei` anywhere else in this kernel (the non-TDM path adds it per-lane, at the VGPR
+level) -- so, unlike A's descriptor (which reuses an already-group-corrected `s_p_in`
+plus its own `block_m_off` add), B's `global_addr` computation adds `block_n_off *
+wei_k_stride * data_byte` explicitly, the same shape as A's `block_m_off * in_c_total *
+data_byte` add.
+
+`global_load_b_functor` and `move_slice_window_b_functor` got the same TDM branches as
+their A counterparts (issue wrapped in `_emit_wave0_only` from the start -- no
+un-gated intermediate step this time, since Phase 29 already shipped);
+`ctrl.tdm_global_to_lds_b` flips from Phase 28/29's hardcoded `False` to
+`self.tunable.tdm_global_load`.
+
+**Byte-identical regression sweep**: all 98 non-TDM gfx1250 configs regenerate
+identically to the pre-phase baseline (commit `35dd4ab`); the 3 `_tdm` configs show
+exactly the expected diff -- B's descriptor build, B's `tensor_load_to_lds`/advance
+replacing the old `global_load_dwordx4`/`ds_write_b128`/advance sequence, both wave0-gated
+with their own labels.
+
+**Hardware validation**: bf16/fp16/fp32 all `valid:y` across the same battery as Phase
+29 (exact-multiple large shape, multi-K-block, group>1) -- now genuinely exercising B's
+TDM path end-to-end (these shapes read real, non-degenerate weight tensors, so a wrong
+`wei_k_stride`/`block_n_off`/`lds_addr` placement would have surfaced as a correctness
+failure, not just a masking gap).
+
+**Critical files (Phase 30)**: `python/igemm/igemm_fwd_gtc_wmma_nhwc.py` --
+`s_tdm_g0_b`/`s_tdm_g1_b` SGPR allocation, `_emit_tdm_descriptor_setup_b`,
+`global_load_b_functor`/`move_slice_window_b_functor` TDM branches,
+`ctrl.tdm_global_to_lds_b` wiring.
