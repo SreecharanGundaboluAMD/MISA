@@ -219,19 +219,43 @@ section for the record).
       a follow-up item (below) to make the heuristic `gemm_k_per_block`-aware.
       Not combined with `wmma_k_tail` or `tdm_global_load` in this pass (both
       explicitly asserted against) — see `docs/gfx1250_wmma_layout.md`'s Phase 48.
-- [ ] **bwd split-K driver heuristic over-splits for fp32** — opened 2026-08-27 (Phase
-      48). The `~512-total-workgroups` heuristic in `driver/igemm_bwd_gtc_driver.h`
+- [ ] **bwd/fwd split-K driver heuristic over-splits for fp32** — opened 2026-08-27
+      (Phase 48), confirmed to also affect fwd (Phase 49). The `~512-total-workgroups`
+      heuristic in `driver/igemm_bwd_gtc_driver.h` and `driver/igemm_fwd_gtc_driver.h`
       doesn't account for `gemm_k_per_block` varying by precision (fp32's WMMA K=4 vs.
-      bf16/fp16's K=32) — on the Phase 46 target shape it picks a 64-way split
+      bf16/fp16's K=32) — on bwd's Phase 46 target shape it picks a 64-way split
       (3.3 TFLOPS) when a 16-way split (found via `IGEMM_GSPLIT_SWEEP`) gives 7.2
-      TFLOPS. Fix: scale the target total-workgroups heuristic (or switch to wrw's
-      fuller ternary-search-over-divisors approach, which would also benefit wrw/fwd)
-      by `gemm_k_per_block`. Low-to-moderate effort (Tier 1/2), driver-only change.
+      TFLOPS; fwd shows the identical pattern. Fix: scale the target total-workgroups
+      heuristic (or switch to wrw's fuller ternary-search-over-divisors approach, which
+      would also benefit wrw) by `gemm_k_per_block`. Low-to-moderate effort (Tier 1/2),
+      driver-only change, same fix would apply to all three directions at once.
 - [x] **bwd `group>1` returns `valid:n`** — fixed 2026-08-27 (Phase 47). Root cause: a
       copy-paste-from-fwd bug in the weight operand's group-offset computation (used
       `gemm_n` instead of bwd's own `gemm_k` — see `docs/gfx1250_wmma_layout.md`'s Phase
       47). One-line fix, hardware-validated across group=1/2/4, all precisions, every
       tile.
+- [x] **fwd has no `gemm_k_global_split` (split-K) support at all** — done 2026-08-27
+      (Phase 49), hardware-validated. Simpler port than bwd's: fwd's A and B BOTH have
+      GEMM_K as their own contiguous axis, so both shard offsets are flat adds folded
+      once into the existing group-offset computation — no per-tap address change
+      needed. bf16/fp16 both `valid:y` at `gkgs[16]`, 0.017-0.018ms/~11-12 TFLOPS — a
+      ~3x speedup over the non-split 128x128 baseline on the session's target shape.
+      Not combined with `wmma_k_tail`, `tdm_global_load`, `async_global_load`, or
+      `main_loop_interleave` in this pass (all asserted against) — see
+      `docs/gfx1250_wmma_layout.md`'s Phase 49.
+- [ ] **int8/int4 `gemm_k_global_split` atomic epilogue is unimplemented and now
+      explicitly blocked** — found and closed-as-a-hard-error 2026-08-27 (Phase 49).
+      `coalescing_store_wmma.py`'s atomic path always emits `global_atomic_add_f32`,
+      but int8/int4's WMMA accumulator is a genuine int32 value — adding two such
+      bit-patterns via real float addition is only bit-exact for non-negative sums under
+      ~8.39M (an IEEE754 subnormal-arithmetic coincidence, not a real integer add), and
+      silently corrupts negative or larger-magnitude accumulations, which realistic int8
+      conv workloads routinely produce. No direction (fwd/bwd/wrw) ever shipped an
+      int8/int4 split-K config — a real, unguarded gap. Added a shared assert in
+      `igemm_base.py` so it hard-errors instead of silently miscompiling/misrunning.
+      Real fix: wire a genuine integer atomic add (`global_atomic_add_i32`/`u32`) into
+      `coalescing_store_wmma.py`'s atomic path, gated on precision. Moderate effort
+      (Tier 2), one shared file benefits all three directions at once.
 
 ## Tier 3 — bigger bets (largest structural change, longest-term)
 

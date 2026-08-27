@@ -365,6 +365,25 @@ class igemm_gtc_tunable_parameter_t(object):
         self.gemm_k_unmerge_cluster             = utility_dict_with_default_t(tunable_dict)('gemm_k_unmerge_cluster', 0)     # maybe no need support for 1
         self.vector_store                       = utility_dict_with_default_t(tunable_dict)('vector_store', 0)
         self.gemm_k_global_split                = utility_dict_with_default_t(tunable_dict)('gemm_k_global_split', 0)
+        # gfx1250 WMMA's gemm_k_global_split atomic epilogue is ALWAYS global_atomic_add_f32
+        # (coalescing_store_wmma.py) -- for int8/int4, v_c holds a genuine int32 accumulate,
+        # not a float, so this atomic add is a bit-pattern-reinterpreted float addition, not
+        # an integer one. This is EXACT (bit-for-bit correct) only when every partial-sum
+        # element is non-negative and stays within the ~8.39M subnormal-float range (IEEE754
+        # subnormal addition of small non-negative integers, stored as raw int32 bit
+        # patterns, happens to be bit-exact integer addition with no rounding) -- confirmed
+        # empirically while porting fwd's Phase 49 split-K: a small (~512-magnitude, all-
+        # positive) int8 test shape passed nrms:0.000000 even with a real 8-way cross-shard
+        # split, which initially looked like proof of correctness but is actually a subnormal-
+        # arithmetic coincidence specific to small non-negative sums. Realistic int8 conv
+        # accumulators are commonly NEGATIVE (signed activations/weights) or larger than 8.39M
+        # in magnitude, where this reinterpretation silently corrupts the result. No direction
+        # (fwd/bwd/wrw) has ever shipped an int8/int4 gemm_k_global_split config -- this assert
+        # makes that gap explicit instead of leaving it as an untested trap. A real fix needs a
+        # genuine integer atomic add (e.g. global_atomic_add_i32/u32) wired into
+        # coalescing_store_wmma.py's atomic path, not attempted here.
+        assert not (self.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA and self.gemm_k_global_split and self.precision in ('int8', 'int4')), \
+            "gemm_k_global_split is not supported for int8/int4 WMMA kernels -- the atomic epilogue's global_atomic_add_f32 silently corrupts genuine int32 accumulator bit patterns for negative or large-magnitude sums (see this assert's full comment)"
         self.merge_e                            = utility_dict_with_default_t(tunable_dict)('merge_e', 0)   # indicate if merge c*y*x for gemm_k (fwd), useful in nhwc fwd
         #  x -(unmerge)-> x0*x1, if set to 1, means cluster first iterate all x1
         # hence stride of x0 should not be x1, but be total number of x divide by x0

@@ -4678,3 +4678,94 @@ occupancy win at small problem sizes) -- see `docs/gfx1250_optimization_backlog.
 prologue offset injection, epilogue flag, mutual-exclusion asserts),
 `driver/igemm_bwd_gtc_driver.h` (karg field, split-count heuristic, grid.z, zero-init
 prolog), `config/igemm_bwd_gtc_gfx1250_nhwc_{fp16,bf16,fp32}_gsplit.config` (new).
+
+## Phase 49 (2026-08-27): ported `gemm_k_global_split` (split-K) to fwd
+
+fwd was the last of the three directions with zero split-K support (wrw always had it;
+bwd got it in Phase 48). fwd's GEMM_K = `c` (input channels per tap, with `y*x` taps
+handled as a separate runtime outer loop -- see the class docstring), so this shards the
+channel-reduction dimension across `grid.z`, same idea as wrw/bwd.
+
+**Simpler than bwd's port**: fwd's A (input, NHWC layout `[N,H,W,C]`) and B (weight,
+layout `[K_out,Y,X,C_in]`) **both** have GEMM_K (`c`) as their own contiguous innermost
+axis -- confirmed directly from the existing `wmma_k_tail` comment in this file, which
+already notes both operands are the "hard case" (per-lane contiguous multi-element load)
+for K-tail masking, unlike bwd/wrw where one operand is contiguous and the other is a
+transposed row axis. This means **both** operands' split-K shard offset is a flat
+element/byte add (no stride-multiply case at all), and -- since B's existing per-tap
+address is always `v_addr_b_base + tap_idx*gemm_k*data_byte`, and addition is
+associative -- the shard offset can be folded into `s_p_in`/`s_p_wei` exactly ONCE in
+the prologue (right alongside the existing group-offset addition), automatically
+covering every tap for free. No `_emit_tap_gather` change was needed at all.
+
+**Ported pieces** (mirrors bwd's Phase 48 structure): always-declared `s_bz`/
+`s_gemm_k_per_wg`/`s_gemm_k_wg_off` SGPRs and 92-byte kernarg (up from 88); `ttmp7`
+bit-split into `s_by`(low16)/`s_bz`(high16) under split; `s_knum` becomes
+`s_gemm_k_per_wg`; `ctrl_coalescing_store_wmma.gemm_k_global_split` wiring (no changes
+needed in the shared `coalescing_store_wmma.py` itself, confirming it's genuinely
+direction-agnostic). Not combined with `tdm_global_load` (TDM's `tensor_dim0` setup reads
+the un-sharded `s_gemm_k` directly), `wmma_k_tail` (no last-shard clamp yet),
+`async_global_load`, or `main_loop_interleave` (neither audited against the new
+base-pointer shard offset) -- all four asserted against, narrowest correctness-first
+slice matching this file's existing discipline for every other new mechanism.
+
+**Driver** (`driver/igemm_fwd_gtc_driver.h`): identical heuristic to bwd's Phase 48
+(`largest_divisor_leq` targeting ~512 total workgroups, `IGEMM_GSPLIT_SWEEP` override);
+new `gemm_k_per_wg` karg field; grid.z set to the split count; a `fwd_gsplit_prolog`
+lambda zero-initing `p_out` (the atomic-add target) before every launch.
+
+**A genuine correctness landmine found and closed, not just avoided**: while validating
+int8, an 8-way split-K run on a small (~512-magnitude, all-positive) shape reported
+`nrms:0.000000` -- a byte-exact pass that looked like proof int8 split-K works. It
+doesn't, in general: `coalescing_store_wmma.py`'s atomic epilogue always emits
+`global_atomic_add_f32`, but int8's accumulator (`v_c`) holds a genuine int32 value, not
+a float. Adding two such bit-patterns via real IEEE754 float addition is only bit-exact
+when every value is non-negative and small enough to stay in the ~8.39M subnormal-float
+range (subnormal addition of small non-negative integers, stored as raw int32 bits,
+happens to equal integer addition with zero rounding -- a mathematical coincidence, not
+a design property) -- which is exactly what the ~512-magnitude all-positive test data
+hit. Realistic int8 conv accumulators are routinely negative (signed weights/activations)
+or larger than 8.39M, where this silently corrupts the result. No direction has ever
+shipped an int8/int4 `gemm_k_global_split` config (confirmed: wrw and bwd both lack one
+too) -- this was an existing, unguarded gap project-wide, not something Phase 49
+introduced. Closed by adding a shared assert in `igemm_base.py`
+(`fma_type==WMMA and gemm_k_global_split and precision in ('int8','int4')` -> hard
+error) so the gap can no longer be silently shipped or accidentally validated by
+unrepresentative test data the way it almost was here. A real fix needs a genuine
+integer atomic add (e.g. `global_atomic_add_i32`/`u32`) wired into
+`coalescing_store_wmma.py`'s atomic path -- not attempted in this phase, and now tracked
+in the backlog.
+
+**Hardware validation** (bf16/fp16/fp32, the target shape used throughout this session:
+`n=4,c=512,H=8,W=8,k=256,y=1,x=3`): bf16/fp16 both `valid:y` at `gkgs[16]`, 0.017-0.018ms
+/ ~11-12 TFLOPS on both the 128x128 and 64x64 tiles -- a ~3x speedup over the non-split
+128x128 baseline (0.053ms) on this shape. fp32 `valid:y` at the driver's default
+(over-aggressive, same known gap as bwd's Phase 48) 128-way split on 128x128
+(0.071ms/2.85 TFLOPS) vs. a hand-tuned 32-way split on 64x64
+(`IGEMM_GSPLIT_SWEEP`-free, driver already picked 32-way there: 0.026ms/7.86 TFLOPS) --
+consistent with bwd's already-documented fp32 heuristic gap. `group=2`: `valid:y`
+(0.021ms). `group=4`: `valid:y` on the 64x64 tile (the 128x128 tile is independently
+"not applicable" at this group/shape combo due to `gemm_n` being smaller than
+`gemm_n_per_block`, unrelated to split-K -- same tile-size constraint the non-split
+baseline already has). Non-evenly-divisible `gemm_k` (`c=257`, no useful divisor):
+correctly falls back / reports "not applicable" consistently with the non-split
+baseline's own pre-existing K-tail-less constraint. A genuinely awkward prime
+`num_k_blocks` case (`c=224`, `num_k_blocks=7`) confirmed the heuristic gracefully
+degrades to `gkgs[7]` (the only non-trivial divisor) rather than failing, and still
+`valid:y`.
+
+**Regression**: full `igemm_fwd_gtc_gfx1250_nhwc_{bf16,fp16,fp32,int8}_all.config`
+sweeps (every existing tile/variant: 128x128, 64x64, 128x64, 64x128, async, dbuf,
+dbuf_interleave, k2x, ktail, ldspad, mtail/ntail/mtail_ntail/mtail_ntail_ktail,
+setprio) plus a dedicated TDM config check: every candidate still `valid:y` across
+representative shapes (exact-multiple K, K-tail, group=2, generic ResNet-ish, TDM's
+1x1-only case) -- confirms the unconditional SGPR-layout/kernarg-size change has zero
+functional impact on non-split kernels, and that the new shared `igemm_base.py` assert
+doesn't affect bwd/wrw's existing (non-int8-split) configs either.
+
+**Critical files**: `python/igemm/igemm_fwd_gtc_wmma_nhwc.py` (SGPR fields, kernarg,
+prologue offset injection folded into the existing group-offset adds, epilogue flag,
+mutual-exclusion asserts), `python/igemm/igemm_base.py` (new int8/int4 +
+`gemm_k_global_split` shared assert), `driver/igemm_fwd_gtc_driver.h` (karg field,
+split-count heuristic, grid.z, zero-init prolog),
+`config/igemm_fwd_gtc_gfx1250_nhwc_{fp16,bf16,fp32}_gsplit.config` (new).

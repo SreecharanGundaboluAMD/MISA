@@ -146,6 +146,7 @@ typedef struct {
     int   dilation_h;
     int   dilation_w;
     int   group;
+    int   gemm_k_per_wg;    // Phase 49 (gemm_k_global_split): this workgroup's K-slice length
 } __attribute__((packed)) igemm_fwd_gtc_wmma_nhwc_karg_t;
 
 typedef struct {
@@ -672,7 +673,6 @@ public:
             karg.dilation_h = dilation_h;
             karg.dilation_w = dilation_w;
             karg.group      = group;
-            size_t karg_size = sizeof(karg);
 
             hipFunction_t kernel_func;
             std::string kernel_name = get_kernel_name(tunable);
@@ -691,6 +691,32 @@ public:
             // working workgroup_id_z delivery mechanism for these kernels, see
             // docs/gfx1250_wmma_layout.md); the kernel decodes group_idx back out on-device.
             size_t grid_y = static_cast<size_t>(group) * utility_integer_divide_ceil(gemm_n, tunable->gemm_n_per_block);
+
+            // Phase 49 (gemm_k_global_split): mirrors bwd's Phase 48 heuristic exactly (see
+            // that file's identical comment) -- a single heuristic split count (plus an
+            // IGEMM_GSPLIT_SWEEP override for measurement), not wrw's full ternary search.
+            // No wmma_k_tail-style last-shard remainder clamp exists yet (see the matching
+            // assert in igemm_fwd_gtc_wmma_nhwc.py), so every shard must get an EXACT, equal
+            // share of gemm_k -- gemm_k_global_splits is always chosen to evenly divide
+            // num_k_blocks.
+            int gemm_k_global_splits = 1;
+            if (tunable->gemm_k_global_split) {
+                auto largest_divisor_leq = [](int num_blocks, int target) -> int {
+                    for (int s = std::min(std::max(target, 1), num_blocks); s >= 1; s--) {
+                        if (num_blocks % s == 0) return s;
+                    }
+                    return 1;
+                };
+                int num_k_blocks = gemm_k / tunable->gemm_k_per_block;
+                int sweep_target = env_get_int("IGEMM_GSPLIT_SWEEP", 0);
+                int target_splits = sweep_target > 0 ? sweep_target :
+                    std::max(1, static_cast<int>((512 + grid_x * grid_y - 1) / (grid_x * grid_y)));
+                gemm_k_global_splits = largest_divisor_leq(num_k_blocks, target_splits);
+                karg.gemm_k_per_wg = (num_k_blocks / gemm_k_global_splits) * tunable->gemm_k_per_block;
+            } else {
+                karg.gemm_k_per_wg = gemm_k;   // unused by the kernel when not split, filled for a uniform karg
+            }
+            size_t karg_size = sizeof(karg);
 
             result_t result;
             result.kernel_name = kernel_name;
@@ -718,14 +744,24 @@ public:
             result.dumpheader.conv.dtype = dtype(tunable->precision);
 
             std::vector<igemm_launch_kernel_t> kernel_launchers;
-            kernel_launchers.push_back({kernel_func, &karg, karg_size, {grid_x * block_size, grid_y, 1}, {block_size, 1, 1}});
+            kernel_launchers.push_back({kernel_func, &karg, karg_size, {grid_x * block_size, grid_y, static_cast<size_t>(gemm_k_global_splits)}, {block_size, 1, 1}});
             result.dumpheader.n_dispatches = kernel_launchers.size();
-            result.dumpheader.gks = 0;
+            result.dumpheader.gks = gemm_k_global_splits;
             result.dumpdata.push_back(kernel_launchers.back());
             result.dumpdata.back().ktype = kargtype_t::igemm_fwd_gtc_wmma_nhwc_karg_t;
 
+            // Phase 49: the atomic epilogue accumulates INTO p_out across every one of its
+            // gemm_k_global_splits shards, so it must be re-zeroed before EVERY individual
+            // launch (not just once outside the warmup/repeat loop) -- see bwd's identical
+            // Phase 48 comment. Always fp32-wide regardless of tunable->precision (WMMA's
+            // D-operand/atomic add is always fp32).
             auto noop = std::function<float()>{[&]() -> float { return .0; }};
-            float duration = igemm_launch_kernels(kernel_launchers, noop, noop, this->warmup, this->repeat);
+            auto fwd_gsplit_prolog = tunable->gemm_k_global_split ?
+                std::function<float()>{[&]() -> float {
+                    HIP_CALL(hipMemset(p_out, 0x0, static_cast<size_t>(n) * k * ho * wo * sizeof(float)));
+                    return .0;
+                }} : noop;
+            float duration = igemm_launch_kernels(kernel_launchers, fwd_gsplit_prolog, noop, this->warmup, this->repeat);
 
             std::string dump_dir = env_get_str("IGEMM_DUMPDIR_ALL", "");
             if (dump_dir.size())
@@ -733,7 +769,7 @@ public:
 
             result.return_code = 0;
             result.duration_ms = duration;
-            result.gks = 0;
+            result.gks = gemm_k_global_splits;
 #ifdef IGEMM_SPLIT_KERNEL
             HIP_CALL(hipModuleUnload(cur_kernel_module));
 #endif
