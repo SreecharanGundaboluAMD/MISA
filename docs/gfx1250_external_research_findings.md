@@ -158,6 +158,21 @@ handles the rest. MISA's Phase 28 pilot already sets `tensor_dim0` correctly (to
 `s_gemm_k`) but doesn't yet test or rely on the OOB path for K -- confirmed by an
 independent, shipped kernel that this is exactly the right lever to pull next.
 
+**Correction/refinement, found while implementing Phase 31**: hipconv's depthwise
+kernel's `tdm_chan_ext = C - wg_ch_base` is a SINGLE-SHOT computation (depthwise has no
+K-reduction loop -- each output channel depends only on its own input channel, so there's
+no advancing `global_addr` across multiple calls to the same descriptor). MISA's fwd
+kernel DOES loop over K with an advancing `global_addr`, and a standalone hardware probe
+(see `docs/gfx1250_wmma_layout.md`'s Phase 31) confirmed `tensor_dim0`'s OOB check is
+relative to *that call's* `global_addr`, not a fixed tensor origin -- so holding
+`tensor_dim0` constant at the original `s_gemm_k` across iterations (which is what "sets
+`tensor_dim0` correctly" above was describing, and what Phase 28-30 actually shipped) is
+only correct for iteration 0; it must be DECREMENTED by the tile width every iteration
+(mirroring `wg_ch_base`'s role) for a real K-tail to zero-fill correctly instead of
+reading past-the-end memory. Phase 31 implements this; the depthwise formula's shape
+(`remaining = total - current_base`) is exactly right, just needs re-deriving every loop
+iteration for a looped consumer rather than computing it once.
+
 ### GEMM_M/spatial tail: three-dimension technique, no EXEC masking anywhere
 
 The depthwise kernel handles ALL of its boundaries (channel, right spatial edge,

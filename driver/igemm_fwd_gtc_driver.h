@@ -461,11 +461,14 @@ public:
             // gemm_n%4 != 0, valid:y otherwise). So wmma_n_tail additionally requires the
             // real (unpadded) gemm_n itself to be a multiple of 4 -- not just relaxed to
             // "any" non-exact-multiple-of-gemm_n_per_block value. gemm_k still requires an
-            // exact multiple of gemm_k_per_block (no K-loop tail handling exists yet).
+            // exact multiple of gemm_k_per_block UNLESS tdm_global_load is set: TDM's
+            // hardware OOB (tensor_dim0 < tile_dim0 zero-fills the tail row, on both A and
+            // B since Phase 30) handles a genuinely partial last K-block with no software
+            // masking at all -- see Phase 31 in docs/gfx1250_wmma_layout.md.
             if((!tunable->wmma_m_tail && gemm_m % gemm_m_per_block != 0) ||
                (!tunable->wmma_n_tail && gemm_n % gemm_n_per_block != 0) ||
                (tunable->wmma_n_tail && gemm_n % 4 != 0) ||
-               gemm_k % gemm_k_per_block != 0)
+               (!tunable->tdm_global_load && gemm_k % gemm_k_per_block != 0))
                 return false;
             return true;
         }

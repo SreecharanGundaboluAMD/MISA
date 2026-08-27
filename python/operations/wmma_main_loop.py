@@ -83,6 +83,12 @@ class ctrl_wmma_main_loop_t(object):
         # False = today's exact byte-identical behavior.
         self.tdm_global_to_lds_a         = False
         self.tdm_global_to_lds_b         = False
+        # Phase 31: persistent SGPR tracking "remaining valid K elements from the tile
+        # about to be issued" -- decremented by unroll_k once per loop iteration (shared
+        # between A and B, since both use the same K tile size), and consumed by
+        # move_slice_window_a/b_functor to rebuild each descriptor's tensor_dim0 before
+        # every re-issue. None unless tdm_global_load is set.
+        self.s_tdm_k_remain              = None
 
         # Phase 1 (k-sub-loop): byte offset between consecutive inst_wmma.k-wide K-slices
         # within one already-in-LDS tile, one value per operand since transposed vs
@@ -375,6 +381,12 @@ class wmma_main_loop_t(mc_base_t):
         self._emit(f"s_cbranch_scc0 {label_body}_last")
         self._emit_empty_line()
 
+        if any_tdm:
+            # Phase 31: decremented exactly ONCE per iteration here (not inside
+            # move_slice_window_a/b_functor themselves, which both run every iteration --
+            # decrementing in either of those would double-count) -- both A's and B's
+            # descriptor rebuild below read this same post-decrement value.
+            self._emit(f"s_sub_i32 s[{ctrl.s_tdm_k_remain()}], s[{ctrl.s_tdm_k_remain()}], {ctrl.unroll_k}   ; Phase 31: remaining valid K for the tile about to be issued")
         self._emit(f_move_slice_window_a())
         self._emit(f_move_slice_window_b())
         if ctrl.interleave:

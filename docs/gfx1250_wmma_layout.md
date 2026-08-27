@@ -3100,3 +3100,91 @@ failure, not just a masking gap).
 `s_tdm_g0_b`/`s_tdm_g1_b` SGPR allocation, `_emit_tdm_descriptor_setup_b`,
 `global_load_b_functor`/`move_slice_window_b_functor` TDM branches,
 `ctrl.tdm_global_to_lds_b` wiring.
+
+## Phase 31 (2026-08-27): GEMM_K tail via TDM's hardware OOB
+
+Enables a genuinely partial last K-block for `tdm_global_load` configs, using TDM's
+hardware zero-fill instead of any software masking -- the capability this whole TDM
+investigation was ultimately aimed at (GEMM_K tail has no other plan in this codebase).
+
+**A real semantics bug caught before it shipped**: the approved plan for this phase said
+"`tensor_dim0` stays untouched -- TDM's own OOB logic handles the tail," on the
+assumption that `tensor_dim0` is compared against an absolute, fixed tensor origin. Before
+implementing that, a standalone hardware probe (`__builtin_amdgcn_tensor_load_to_lds`, two
+back-to-back calls with an ADVANCING `global_addr`, one variant holding `tensor_dim0`
+constant across both calls, the other decrementing it by the tile width between calls,
+LDS marked `volatile` to stop the compiler from dead-code-eliminating the reads-back since
+it doesn't model the intrinsic as writing to `__shared__`) showed conclusively: **holding
+`tensor_dim0` constant across advancing calls reads real, out-of-bounds memory for the
+tail elements instead of zero-filling them.** `tensor_dim0`'s OOB check is relative to
+*that call's* `global_addr` ("start of the tile within the tensor, not the start of the
+tensor" -- ISA doc 10.11.2) -- i.e. "how many valid elements remain from here" -- not an
+absolute offset from a fixed origin. This matches the ISA doc's own hardware-native
+`iterate_enable` descriptor-reuse feature (10.11.3.1), which internally advances
+`global_addr` across passes and must therefore treat `tensor_dim0` the same
+relative way, and matches hipconv's own formula for its (non-looped, single-shot)
+depthwise channel tail: `tdm_chan_ext = max(0, min(WG_CH, C - wg_ch_base))` --
+literally "remaining from the current base," generalized here to a looped K-reduction.
+Decrementing `tensor_dim0` every iteration is therefore load-bearing, not optional.
+
+**Design**:
+1. **Driver**: `igemm_fwd_gtc_driver.h`'s WMMA applicability check now only rejects
+   `gemm_k % gemm_k_per_block != 0` `when !tunable->tdm_global_load` (mirrors Phases
+   25/26's `wmma_m_tail`/`wmma_n_tail` relax pattern).
+2. **Loop iteration count**: needed NO change. `s_knum` stays `s_mov_b32 s[s_knum],
+   s[s_gemm_k]` (the real, unrounded value) -- the main loop's existing `s_kitr -=
+   unroll_k; branch if > 0` structure already runs exactly `ceil(gemm_k /
+   gemm_k_per_block)` iterations for ANY `s_knum`, multiple or not (verified by hand-
+   tracing the iteration count for `gemm_k=100, gemm_k_per_block=32`: 4 iterations,
+   matching `ceil(100/32)`) -- this was already latent, general behavior, just never
+   exercised by a non-exact-multiple `gemm_k` before this phase.
+3. **New persistent SGPR `s_tdm_k_remain`**: initialized to `gemm_k` in the prologue
+   (matching what `_emit_tdm_descriptor_setup_a/b` already set `tensor_dim0` to for the
+   first tile), decremented by `gemm_k_per_block` exactly ONCE per main-loop iteration
+   (in `wmma_main_loop.py`, right before `move_slice_window_a/b_functor` -- shared
+   between A and B since both use the same K-tile schedule, so decrementing inside
+   either functor individually would double-count).
+4. `move_slice_window_a_functor`/`move_slice_window_b_functor`'s TDM branches now rebuild
+   `tensor_dim0`'s packed bits (`g1(1)`/`g1(2)` for A, `g1_b(1)`/`g1_b(2)` for B -- see
+   `_emit_tdm_descriptor_setup_a`'s docstring for the exact bit layout) from
+   `s_tdm_k_remain` after every address advance, re-deriving `tensor_dim1`'s lo16
+   (`gemm_m` for A, `gemm_n` for B -- unchanged across the K loop, just re-OR'd in fresh
+   since it shares a register with `tensor_dim0`'s hi16). 4 extra SALU instructions per
+   operand per iteration.
+5. No new tunable -- K-tail support falls straight out of `tdm_global_load` for any
+   config that also has both operands on TDM (Phase 30).
+
+**Byte-identical-shape regression sweep**: all 98 non-TDM gfx1250 configs regenerate
+identically to the pre-phase baseline (commit `68ffe89`); the 3 `_tdm` configs show
+exactly the expected diff -- one new `s_tdm_k_remain` SGPR, its prologue init, the
+per-iteration decrement, and the two tensor_dim0-rebuild sequences (8 new instructions
+total, 4 per operand) replacing nothing (the address-advance instructions are unchanged).
+
+**Hardware validation** (the actual point of this phase): existing exact-multiple/multi-
+K-block/group>1 battery re-run first to confirm no regression (`valid:y`, unchanged
+timing) -- the `tensor_dim0` rebuild never disagrees with the constant value in this
+case, since `remain >= tile_dim0` for every non-tail iteration regardless of which way
+it's computed. Then a genuinely non-exact-multiple K battery per precision (bf16/fp16
+`gemm_k_per_block=32`, fp32 `gemm_k_per_block=4`): remainder-4 (`c=100`), one-over-a-
+multiple (`c=2017`/`c=257`), one-short-of-a-multiple (`c=2015`/`c=255`), and a single
+wholly-partial tile (`c=31`/`c=3`, smaller than one whole tile) -- **all `valid:y`**
+across all three precisions. Also confirmed: a non-TDM config with the same non-exact
+`c=100` shape is still correctly rejected (`not applicable`), proving the driver relax
+is properly scoped to `tdm_global_load` only; and K-tail combined with `group>1`
+(`c=100,g=2`, giving a 50-element-per-group K dimension, not a multiple of 32) is also
+`valid:y`.
+
+**Net result**: GEMM_K tail -- previously unsolved anywhere in this codebase -- now works
+for fwd/1x1/`tdm_global_load` configs, with zero software masking in the compute path;
+the only cost is a few extra SALU instructions per K-loop iteration to keep
+`tensor_dim0` honest. This closes out the Phase 28-31 TDM arc: pilot correctness (28),
+single-issuer-wave efficiency (29), B-operand parity (30), and the K-tail capability
+unlock this investigation was aimed at (31). Not yet extended: bwd/wrw, multi-tap
+convs (`nxe!=0`), or GEMM_M tail via TDM's 3D-descriptor `tensor_dim2` trick (still on
+EXEC-mask guards, per Phases 25/26) -- all flagged as future follow-ons in
+`docs/gfx1250_external_research_findings.md`.
+
+**Critical files (Phase 31)**: `driver/igemm_fwd_gtc_driver.h` -- `gemm_k` tail relax;
+`python/operations/wmma_main_loop.py` -- `ctrl.s_tdm_k_remain`, per-iteration decrement;
+`python/igemm/igemm_fwd_gtc_wmma_nhwc.py` -- `s_tdm_k_remain` SGPR allocation + prologue
+init, `move_slice_window_a/b_functor`'s `tensor_dim0` rebuild.
