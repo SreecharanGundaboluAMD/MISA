@@ -369,12 +369,13 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 # garbage the division scratch left behind).
                 self.v_flag_b_ktail = sym_t('v_flag_b_ktail', vseq(1))
             if outer.tunable.atomic_pack_bf16:
-                # Phase 34: packed-bf16 atomic epilogue scratch -- v_pk_idx (partner-lane
-                # byte-index for ds_bpermute_b32, kernel-lifetime constant once computed),
-                # v_pk_partner (cross-lane-exchanged value, per-iteration scratch),
-                # v_pk_packed (packed bf16x2 result, per-iteration scratch). Only allocated
-                # when atomic_pack_bf16 is set (every existing config byte-identical).
-                self.v_pk_idx     = sym_t('v_pk_idx'     , vseq(1))
+                # Phase 34: packed-bf16 atomic epilogue scratch -- v_pk_partner (cross-lane-
+                # exchanged value, per-iteration scratch), v_pk_packed (packed bf16x2 result,
+                # per-iteration scratch). Only allocated when atomic_pack_bf16 is set (every
+                # existing config byte-identical). No dedicated partner-index register needed
+                # since the V_PERMLANE_XOR_B32 swap (docs/gfx1250_optimization_backlog.md) --
+                # it takes the XOR mask as an immediate, unlike ds_bpermute_b32's precomputed
+                # byte-index operand (formerly v_pk_idx, removed).
                 self.v_pk_partner = sym_t('v_pk_partner' , vseq(1))
                 self.v_pk_packed  = sym_t('v_pk_packed'  , vseq(1))
             self.v_end         = sym_t('v_end'         , vseq())
@@ -805,7 +806,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # the unreviewed partner-lane-out-of-range wrinkle a packed cross-lane exchange would
         # introduce for tail masking.
         if self.tunable.atomic_pack_bf16:
-            self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_pk_idx(), s.s_block_m_off(), s.s_block_n_off(), None, v.v_pk_partner(), None, v.v_pk_packed()))
+            self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), None, s.s_block_m_off(), s.s_block_n_off(), None, v.v_pk_partner(), None, v.v_pk_packed()))
         else:
             self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(),
                     s.s_block_m_off(), s.s_block_n_off(),

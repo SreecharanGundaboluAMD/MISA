@@ -4005,3 +4005,70 @@ igemm_gtc_base.h` -- `get_kernel_name()` mirror, new `local_prefetch_num`/`epilo
 `tunable_is_valid()`'s new `unit_conv` check for `tdm_global_load`; `script/
 build_gfx1250_master_configs.py` (new); `config/igemm_{fwd,bwd,wrw}_gtc_gfx1250_nhwc_
 {fp16,bf16,fp32,int8}_all.config` (new, 12 files).
+
+## Phase 40 (2026-08-27): `V_PERMLANE_XOR_B32` swap for Phase 34's cross-lane exchange
+
+Small-effort item from `docs/gfx1250_optimization_backlog.md` Tier 1. Phase 34's
+packed-bf16 atomic epilogue (`python/operations/coalescing_store_wmma.py`) exchanged each
+lane's fp32 accumulator value with its column-adjacent partner (lane XOR 1) via
+`ds_bpermute_b32` -- a DS-class (LDS-path) instruction, tracked by DSCNT, requiring a
+`s_wait_dscnt 0x0` before its result could be safely consumed (a real hardware race,
+found and fixed during Phase 34 itself). `V_PERMLANE_XOR_B32`, confirmed to assemble on
+gfx1250 via `llvm-mc -mcpu=gfx1250` earlier this session, is a plain VOP3 VALU
+instruction that performs the identical lane-XOR-mask exchange directly, with two
+concrete advantages over `ds_bpermute_b32` found while reading the CDNA5 ISA doc's
+cross-lane section (§7.2.7, §15.14) for this swap:
+
+1. **No wait needed.** As a VALU op (not DS-class/DSCNT-tracked), its result is
+   consumable by the very next instruction in program order -- eliminates the
+   per-iteration `s_wait_dscnt 0x0`.
+2. **No precomputed index register.** `V_PERMLANE_XOR_B32 D0, S0, S1, S2` takes the XOR
+   mask (`1`) and lane-group-width (`32`, the whole wave) as immediate operands directly
+   -- `ds_bpermute_b32`'s byte-index operand (`lane XOR 1`, then `<<2` for byte
+   addressing) needed a dedicated kernel-lifetime VGPR (`v_pk_idx` in
+   `igemm_wrw_gtc_wmma_nhwc.py`) computed once up front. Removed entirely, freeing 1
+   VGPR for every `atomic_pack_bf16` kernel.
+
+A third property, confirmed while re-reading the ISA doc's cross-lane section rather than
+assumed: `V_PERMLANE_XOR_B32` "ignores EXEC for reads (fetch-invalid: act as if EXEC is
+all ones)" -- unlike `ds_bpermute_b32`, whose read result for a disabled source lane is
+undefined/zeroed (the reason Phase 34's comment insisted "the exchange needs FULL EXEC").
+The new code needs no full-EXEC discipline around the exchange itself; EXEC is narrowed
+to even-lanes-only exactly as before, but only for the pack+atomic step.
+
+One documented hazard checked and confirmed not applicable: ISA doc §7.2.7, "V_PERMLANE*
+may not occur immediately after a V_CMPX." In this loop, `global_atomic_pk_add_bf16` and
+the EXEC-restore `s_mov_b32 exec_lo, -1` both sit between one iteration's
+`v_cmpx_eq_u32` and the next iteration's `V_PERMLANE_XOR_B32` -- never adjacent.
+
+### Changes
+
+- `python/operations/coalescing_store_wmma.py`: `atomic_pack_bf16` branch's exchange
+  sequence (`v_xor_b32`+`v_lshlrev_b32` precompute, `ds_bpermute_b32`, `s_wait_dscnt`)
+  replaced with one `v_permlane_xor_b32 v[v_tmp3], v[v_c+c_index], 1, 32`. `v_gather`
+  parameter no longer required for this branch (assert relaxed).
+- `python/igemm/igemm_wrw_gtc_wmma_nhwc.py`: removed the now-unused `v_pk_idx` VGPR
+  allocation; call site passes `None` for the `v_gather` slot.
+
+### Verification
+
+**Zero-regression**: every non-`atomic_pack_bf16` config path is untouched (the edited
+code is entirely inside the `ctrl.atomic_pack_bf16` branch); `atomic_pack_bf16` itself is
+only set by `config/igemm_wrw_gtc_gfx1250_nhwc_bf16_gsplit_pkatomic.config`.
+
+**Hardware correctness** (`conv_driver.exe`, `convbfp16`, both tile shapes, against the
+CPU reference): `n=42,c=192,H=60,W=80,k=64` (the 26x-slower-than-MIOpen worst-case shape
+from the benchmark doc), `n=42,c=128,H=30,W=40,k=128`, `n=42,c=256,H=30,W=40,k=128`,
+`n=8,c=64,H=16,W=16,k=64`, `n=1,c=32,H=4,W=4,k=32` -- every applicable kernel reports
+`valid:y`.
+
+**Timing** (best-of-repeat, GPU under contention -- see the standing caveat in
+`docs/gfx1250_rocprof_profiling.md` -- so treat as directional, not precise): consistently
+faster across every shape tried, roughly 4-9%: `c=192,k=64`: 0.094ms -> 0.090ms;
+`c=128,k=128`: 0.065ms -> 0.061ms (128x128 tile), 0.051ms -> 0.048ms (64x64 tile);
+`c=256,k=128`: 0.061ms -> 0.057ms (128x128 tile). Matches expectation: fewer instructions
+per (i_rm, j, i_rn) iteration (2 setup instructions removed kernel-lifetime, 1 wait
+removed per iteration, 1 DS-class op replaced by 1 cheaper VALU op).
+
+**Critical files**: `python/operations/coalescing_store_wmma.py`,
+`python/igemm/igemm_wrw_gtc_wmma_nhwc.py`.

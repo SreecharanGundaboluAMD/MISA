@@ -44,19 +44,20 @@ section for the record).
 ## Tier 1 — small effort (cross-validated or ISA-doc-motivated, cheap to try)
 
 - [ ] **`disable_xdl_arb_stall` (`SCHED_MODE` bit[2]) A/B test on a wrw split-K shape.**
-      Add a new tunable emitting `s_setreg_b32` at kernel entry; build both variants of
-      one wrw gsplit config; compare wall-clock on the worst-case shape from
-      `docs/gfx1250_vendor_benchmark_vs_miopen.md` (`c=192,H=60,W=80,k=64,1x1`, 26x
-      slower than MIOpen). See `docs/gfx1250_rocprof_profiling.md`'s "ISA-doc
-      cross-reference" section for the mechanism and Finding 3's occupancy caveat before
-      over-interpreting a positive result as wrw-specific.
-- [ ] **Swap `ds_bpermute_b32`+`s_wait_dscnt` for `V_PERMLANE_XOR_B32`** in
-      `python/operations/coalescing_store_wmma.py`'s Phase 34 packed-bf16 atomic
-      epilogue (the `lane XOR 1` partner exchange). `V_PERMLANE_XOR_B32` confirmed to
-      assemble cleanly on gfx1250 via `llvm-mc -mcpu=gfx1250`. Needs: semantic
-      equivalence check (VALU cross-lane vs. LDS-path cross-lane), implementation,
-      zero-regression sweep on existing bf16 wrw configs, hardware correctness
-      validation, timing comparison.
+      **Attempted 2026-08-27, blocked — not a guess we should make.** The CDNA5 ISA doc
+      (§5.7.2.1) documents this bit's *existence and semantics* but gives no `S_SETREG`
+      hardware-register ID/encoding for `SCHED_MODE`, and it is conspicuously absent
+      from the doc's own "Wave State Registers" table (§3.4, the complete list of
+      `S_GETREG`/`S_SETREG`-addressable registers, indices 1-28) — every other
+      documented writable register (`MODE`, `STATE_PRIV`, `EXCP_FLAG_USER`, etc.) is in
+      that table with an explicit index; `SCHED_MODE` is not. Confirmed via `llvm-mc
+      -mcpu=gfx1250`: `hwreg(HW_REG_SCHED_MODE, ...)` is not a recognized symbolic name
+      (LLVM has no built-in constant for it either). Writing an arbitrary/guessed
+      register ID via `s_setreg_b32` on real hardware is a correctness hazard, not a
+      performance experiment — it can corrupt unrelated wave state. **This item stays
+      open but is not actionable without the actual register ID/encoding** (from a more
+      complete internal register-ID reference than what's currently available, or a
+      vendor confirmation). Do not implement by guessing the hwreg ID.
 - [ ] **hipconv's staggered per-shard K-loop start phase** for wrw's
       `gemm_k_global_split` path — rotate each split-K workgroup's first K-tile index by
       a per-shard offset, reducing simultaneous-burst memory contention at kernel
@@ -131,3 +132,8 @@ section for the record).
   `driver/igemm_wrw_gtc_driver.h`.
 - **Occupancy measurement** and **rocprof extension to bwd/fwd-tail** — see Tier 0
   above, both closed 2026-08-27.
+- **`V_PERMLANE_XOR_B32` swap for Phase 34's cross-lane exchange** — Phase 40,
+  `python/operations/coalescing_store_wmma.py` /
+  `python/igemm/igemm_wrw_gtc_wmma_nhwc.py`, closed 2026-08-27. Removes the per-iteration
+  `s_wait_dscnt` and a kernel-lifetime VGPR; hardware-validated correct across 5 shapes,
+  ~4-9% faster on the shapes tried (contention-noisy, directional only).

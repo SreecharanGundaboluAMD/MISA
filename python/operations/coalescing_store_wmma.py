@@ -177,11 +177,11 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
             column value, compared fresh per i_rn).
             Phase 34 (ctrl.atomic_pack_bf16, atomic path only -- mutually exclusive with
             wmma_m_tail/wmma_n_tail at the igemm_base.py tunable level, so reusing these
-            same three params here is safe): v_gather holds the partner-lane byte-index
-            (computed once, kernel-lifetime constant), v_tmp3 holds the cross-lane-
-            exchanged partner value (per-iteration scratch), v_tmp4 holds the packed
-            bf16x2 result (per-iteration scratch). v_tid is required (used for both the
-            partner-index computation and the even/odd EXEC-mask guard).
+            same three params here is safe): v_tmp3 holds the cross-lane-exchanged partner
+            value (per-iteration scratch, produced directly by V_PERMLANE_XOR_B32 -- no
+            precomputed index register needed, see below), v_tmp4 holds the packed bf16x2
+            result (per-iteration scratch). v_tid is required (used for the even/odd
+            EXEC-mask guard only -- v_gather is unused by this branch).
 
         ctrl.gemm_k_global_split selects between two structurally different epilogues:
 
@@ -193,19 +193,26 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         register), instead of serializing all row addresses through one register. Column
         offset is folded into the atomic's immediate offset. When ctrl.atomic_pack_bf16 is
         set instead: every lane exchanges its fp32 value with its column-adjacent partner
-        (ds_bpermute_b32, lane XOR 1 -- valid since `lane % 16 -> column` in
+        (V_PERMLANE_XOR_B32, lane XOR 1 -- valid since `lane % 16 -> column` in
         wmma_mapping.py always makes adjacent lanes adjacent columns within a 16-lane
         half), packs (own, partner) into one bf16x2 with the lower column in the packed
         value's low 16 bits (matching row-major memory layout), then only EVEN lanes
         issue one global_atomic_pk_add_bf16 covering both columns -- halving the number
         of actual atomic ops hitting memory at the cost of bf16 (not fp32) intermediate
-        precision on the K-split reduction. The exchange needs FULL EXEC (both lanes of
-        every pair must be enabled for the gather to see real, not disabled-lane-zeroed,
-        values), so EXEC is narrowed to even-lanes-only only for the pack+atomic step and
-        restored before the next iteration's exchange -- this repeats every (i_rm, j,
-        i_rn) iteration, a real per-iteration cost this phase accepts as correctness-
-        first, not yet optimized (mirrors Phase 28's TDM pilot's own "known, deliberate
-        inefficiency" framing).
+        precision on the K-split reduction. V_PERMLANE_XOR_B32 "ignores EXEC for reads
+        (fetch-invalid: act as if EXEC is all ones)" per the CDNA5 ISA doc's cross-lane
+        section, so -- unlike the ds_bpermute_b32 this replaced (Phase 34's original
+        version; DS-class reads DO depend on the source lane's EXEC bit) -- the exchange
+        itself needs no full-EXEC widening at all; EXEC is narrowed to even-lanes-only
+        only for the pack+atomic step and restored before the next iteration's exchange,
+        same as before. Also a normal VALU op (VOP3), not a DS-class instruction tracked
+        by DSCNT, so its result is available to the very next instruction with no
+        `s_wait_dscnt` -- removes both the per-iteration wait and the one-time partner-
+        byte-index precompute (`v_gather`) the ds_bpermute_b32 version needed, since
+        V_PERMLANE_XOR_B32 takes the XOR mask directly as an immediate operand. (ISA doc
+        7.2.7: "V_PERMLANE* may not occur immediately after a V_CMPX" -- not applicable
+        here, since `global_atomic_pk_add_bf16` and the EXEC-restore `s_mov_b32` both sit
+        between this loop's `v_cmpx_eq_u32` and the next iteration's V_PERMLANE_XOR_B32.)
 
         Non-atomic path (gemm_k_global_split=False): LDS-reshuffle coalescing store, see
         docs/gfx1250_wmma_layout.md's LDS-reshuffle phase for the full derivation. A single
@@ -235,7 +242,10 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
             assert s_gemm_n is not None and v_tmp4 is not None
         if ctrl.atomic_pack_bf16:
             assert ctrl.gemm_k_global_split, "atomic_pack_bf16 only applies to the atomic epilogue branch"
-            assert v_tid is not None and v_gather is not None and v_tmp3 is not None and v_tmp4 is not None
+            # v_gather not required here: V_PERMLANE_XOR_B32 takes its XOR mask as an
+            # immediate, unlike ds_bpermute_b32's precomputed partner-byte-index operand
+            # (the original Phase 34 mechanism this replaced).
+            assert v_tid is not None and v_tmp3 is not None and v_tmp4 is not None
 
         with self._deferred_context():
             if ctrl.gemm_k_global_split and ctrl.atomic_pack_bf16:
@@ -243,10 +253,6 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                 self._emit(f"; wmma packed-bf16 atomic-add epilogue, {cxm.wave_repeat_m}x{cxm.wave_repeat_n} tiles, "
                            f"{inst_wmma.num_v_c} rows/tile")
                 self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], 1   ; row-to-row byte stride (bf16, 2 bytes/elem)")
-                # partner-lane byte-index for ds_bpermute_b32 (kernel-lifetime constant,
-                # computed once): partner = this lane XOR 1, index is in bytes (*4).
-                self._emit(f"v_xor_b32 v[{v_gather}], 1, v[{v_tid}]   ; partner lane = this lane XOR 1")
-                self._emit(f"v_lshlrev_b32 v[{v_gather}], 2, v[{v_gather}]   ; ds_bpermute_b32 index is in bytes")
                 self._emit_empty_line()
                 for i_rm in range(cxm.wave_repeat_m):
                     row_off = i_rm * cxm.wave_tile_m
@@ -262,20 +268,12 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                             c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
                             col_off = i_rn * cxm.wave_tile_n * 2
                             offset_str = f" offset:{col_off}" if col_off != 0 else ""
-                            # exchange needs FULL EXEC -- both lanes of every pair must be
-                            # enabled or the gather sees a disabled-lane zero, not the real
-                            # partner value (CDNA5 ISA doc 11.2.3).
-                            self._emit(f"ds_bpermute_b32 v[{v_tmp3}], v[{v_gather}], v[{v_c}+{c_index}]")
-                            # ds_bpermute_b32 is a DS-class instruction tracked by DSCNT (CDNA5
-                            # ISA doc: DS return-value ops "use DSCNT to determine when this
-                            # instruction has executed") -- its result is NOT safely readable
-                            # by the very next instruction the way a plain VALU-to-VALU
-                            # dependency is. Found by a real hardware miscompare (only the
-                            # FIRST couple of (i_rm,j,i_rn) iterations showed corrupted hi16
-                            # values; later iterations happened to have enough natural
-                            # instruction-issue delay to mask the race) before this wait was
-                            # added -- see docs/gfx1250_wmma_layout.md's Phase 34.
-                            self._emit(f"s_wait_dscnt 0x0")
+                            # V_PERMLANE_XOR_B32: partner = this lane XOR 1, mask/group-width
+                            # are immediates (no precomputed index register needed, unlike
+                            # ds_bpermute_b32's byte-index operand). Ignores EXEC for reads
+                            # (fetch-invalid), so no full-EXEC widening needed either. Plain
+                            # VALU op, not DSCNT-tracked -- result is immediately consumable.
+                            self._emit(f"v_permlane_xor_b32 v[{v_tmp3}], v[{v_c}+{c_index}], 1, 32   ; partner lane = this lane XOR 1")
                             self._emit(f"v_cvt_pk_bf16_f32 v[{v_tmp4}], v[{v_c}+{c_index}], v[{v_tmp3}]   ; lo16=this lane's col, hi16=partner's -- only correct if this lane is even")
                             # only even lanes issue the packed atomic (their own column is
                             # the pair's lower/base column); narrow EXEC, issue, restore.
