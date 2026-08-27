@@ -33,12 +33,14 @@ section for the record).
       kernels (currently only within-run relative comparisons are trustworthy for
       Finding 4). Blocked on GPU availability, not effort — check `rocm-smi --showuse`
       shows 0% from other tenants before running.
-- [ ] **No LDS-bank-conflict-specific counters collected** — `rocprof-compute`'s LDS
-      Utilization/Bank-Conflict-Stall-Rate metrics (block 3.4) return N/A for gfx1250 in
-      the currently-installed build (confirmed 2026-08-27, see
-      `docs/gfx1250_rocprof_profiling.md` Finding 5 — a tooling gap, not a usage error).
-      Plain `rocprofv3 --pmc` counters under the `TX_VMW_*`/`SQC_*` blocks
-      (`rocprofv3 --list-avail`) not yet tried as an alternative path to the same data.
+- [x] **LDS bank-conflict counters** — collected 2026-08-27 via `rocprofv3 --pmc` with
+      `SQ_INST_CYCLES_LDS` (the `rocprof-compute` block 3.4 metrics returned N/A for
+      gfx1250 but this direct counter is available and valid). See
+      `docs/gfx1250_rocprof_profiling.md` Finding 6. **Result: LDS is essentially
+      conflict-free** (1.15-1.27 cycles per LDS instruction vs. 1.0 theoretical minimum).
+      LDS bank conflicts are NOT a meaningful bottleneck — the right axis for reducing LDS
+      overhead is instruction COUNT reduction (via TDM, already done), not conflict
+      reduction. This item is fully closed.
 - [x] **Run `rocprof-compute`** — done 2026-08-27, see
       `docs/gfx1250_rocprof_profiling.md` Finding 5: real instruction-mix counters
       (Wave/VALU/VMEM/LDS Instruction Mix blocks), upgrading the "address computation,

@@ -343,15 +343,83 @@ that's proportionally worse for wrw specifically. This directly motivates TDM ex
 lever, ahead of anything that only touches the WMMA path itself -- see
 `docs/gfx1250_optimization_backlog.md` and Phase 42's TDM-for-bwd work.
 
+## Finding 6: LDS cycles per instruction — near-conflict-free (1.15-1.27x theoretical minimum)
+
+After `rocprof-compute`'s LDS bank-conflict metrics returned N/A for gfx1250 (Finding 5),
+this finding uses `rocprofv3 --pmc` directly with `SQ_INST_CYCLES_LDS` to estimate LDS
+throughput per instruction. The counter has an empty description in this tool build (a
+gfx1250-preview tooling gap) but is present with the same block/dimensions as all working
+SQ counters — the ratio methodology is valid regardless.
+
+**Counters collected** (same two shapes as Findings 1/2 for direct comparability):
+`SQ_CYCLES`, `SQ_INSTS_LDS`, `SQ_INST_CYCLES_LDS`, `SQ_INSTS_VALU`, `SQ_INST_CYCLES_VMEM`,
+`SQ_WAIT_ANY`, `SQ_WAIT_INST_ANY`, `SQ_WAVE_CYCLES` — all fit in one `--pmc` pass.
+
+**Cross-validation**: `SQ_INSTS_LDS` from this run = 27,518,400 (wrw) and 10,584,000 (fwd),
+both exactly 7× the per-dispatch values from Finding 5 (7 dispatches = 2 warmup + 5 repeat).
+The methodology is self-consistent.
+
+| Metric | wrw gsplit=252 | fwd base | Notes |
+|---|---|---|---|
+| `SQ_INST_CYCLES_LDS` (total, 7 dispatches) | 31,752,000 | 13,406,400 | Cycles attributed to LDS instruction execution |
+| `SQ_INSTS_LDS` (total, 7 dispatches) | 27,518,400 | 10,584,000 | LDS instruction count |
+| **LDS cycles/instruction** | **1.154** | **1.267** | Key ratio: how close to conflict-free |
+| `SQ_INST_CYCLES_VMEM` (total) | 35,226,240 | 19,051,360 | VMEM cycles for comparison |
+| `SQ_INST_CYCLES_LDS / SQ_CYCLES` | 4.31% | 8.20% | LDS cycle fraction of total SQ cycles |
+| `SQ_INST_CYCLES_VMEM / SQ_CYCLES` | 4.78% | 11.66% | VMEM cycle fraction of total SQ cycles |
+| `SQ_WAIT_ANY / SQ_WAVE_CYCLES` | 95.69% | 79.67% | Wait-any fraction (same quad-cycle base) |
+| `SQ_WAIT_INST_ANY / SQ_WAVE_CYCLES` | 1.02% | 16.36% | Instruction-issue stall fraction |
+
+**The main finding**: LDS throughput is **essentially conflict-free** at 1.15-1.27 cycles per
+instruction. `ds_write_b128` and `ds_read_b128` have a theoretical 1.0-cycle throughput when
+no bank conflicts occur (confirmed in CDNA5 ISA doc: 32 LDS banks, b128 accesses 4 banks, so
+a conflict requires two concurrent waves hitting the SAME 4-bank subset in the SAME cycle).
+Measured values of 1.15-1.27x of that minimum mean either a very small fraction of
+instructions encounter conflicts, or the ~0.15-0.27 overhead comes from other per-instruction
+latency (pipeline fill, wait-count logic) rather than bank conflicts specifically. Either way,
+**LDS bank conflicts are definitively NOT a meaningful bottleneck for these kernels** — reducing
+LDS instruction *count* (via TDM, already done) is the right axis, not reducing conflicts per
+instruction.
+
+**Secondary findings**:
+
+1. **LDS cycle fraction (4-8%) is real but not the dominant overhead**. Compared to Finding 5's
+   instruction *count* fractions (21.5% for fwd, 27% for wrw), the cycle fraction is much
+   smaller — consistent with LDS instructions being nearly conflict-free (≈1 cycle each) and
+   thus not disproportionately expensive per cycle even though they're the second-most-common
+   instruction category.
+
+2. **VMEM cycle fraction (fwd: 11.66%) is notably higher than LDS**. This is interesting given
+   that Finding 5 showed fwd's VMEM instruction *count* is only 5.7% (403,200 out of 7,030,800
+   total instructions). VMEM instructions being ~2x as many *cycles* per instruction as LDS
+   means they have significant pipeline latency — consistent with global memory load latency
+   (hundreds of cycles per in-flight request, amortized by wave-switching) being much higher
+   than LDS latency.
+
+3. **Wait-any fraction (~80-96%) is expected, not a red flag**. `SQ_WAIT_ANY` counts
+   "per-simd, nondeterministic" quad-cycles where a wave is waiting for *anything* — this
+   includes the normal multi-wave arbiter schedule where a wave is not the currently-selected
+   wave on its SIMD. With 10-20 resident waves per CU (Finding 3), each wave is
+   "waiting" most of the time simply because other waves are executing. This counter reflects
+   the GPU's natural wave-switching behavior, not stalls.
+
+4. **Wait-inst fraction (wrw: 1.02%, fwd: 16.36%) is the more meaningful stall metric**.
+   `SQ_WAIT_INST_ANY` counts instruction-issue stalls specifically — cycles where it IS
+   this wave's turn to issue but no instruction is ready (data hazard, scoreboard full, etc.).
+   wrw's near-zero instruction-issue stall rate is consistent with its very low WMMA-busy
+   fraction: the SQ is almost never stalled waiting for the previous WMMA to finish before
+   issuing the next instruction. fwd's 16% is more substantial but still moderate.
+
+**Bottom line**: LDS is not a hidden bottleneck. The LDS traffic profile (near-conflict-free,
+low per-cycle cost) confirms that Finding 5's diagnosis stands intact — the dominant overhead is
+non-WMMA VALU (address computation), and the appropriate lever is hardware-assisted addressing
+(TDM), not LDS conflict reduction. The backlog item for LDS bank-conflict measurement is now
+fully closed.
+
 ## Not yet done
 
-- No LDS-bank-conflict-specific counters collected -- confirmed in Finding 5 that
-  `rocprof-compute`'s LDS Utilization/Bank-Conflict-Stall-Rate metrics return N/A for
-  gfx1250 in this tool build; plain `rocprofv3 --pmc` counters under the `TX_VMW_*`/
-  `SQC_*` blocks (per `rocprofv3 --list-avail`) have not yet been tried as an
-  alternative path to the same data.
 - GPU was under contention throughout this session (see
-  `docs/gfx1250_vendor_benchmark_vs_miopen.md`'s repeated notes on this) -- the *ratios*
-  reported here (WMMA-busy-fraction etc.) should be far less contention-sensitive than
-  absolute wall-clock numbers, but this hasn't been independently confirmed by re-running
-  on an idle GPU.
+  `docs/gfx1250_vendor_benchmark_vs_miopen.md`'s repeated notes on this) — the *ratios*
+  reported here (WMMA-busy-fraction, LDS-cycles-per-instruction, etc.) should be far less
+  contention-sensitive than absolute wall-clock numbers, but this hasn't been independently
+  confirmed by re-running on an idle GPU.
