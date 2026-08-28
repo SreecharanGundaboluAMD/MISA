@@ -10,10 +10,9 @@ repo across machines, independent of any one assistant's local memory directory.
 - **conv_driver.exe mode string** — always use `convfp16`/`convbfp16`/`convint8`, not
   plain `conv`, for non-fp32 kernels, or every result silently reports `valid:n`.
 - **gfx1250 VGPR-MSB** — 128x128 WMMA tile ceiling is a codegen limit, not
-  hardware/toolchain; VGPR-MSB works on real hardware. Phase 54's crash-causing bug
-  (dst=1 never reset) is fixed and hardware-verified. Remaining `valid:n` RESOLVED to an
-  ordinary address-formula bug in `coalescing_store_wmma.py` — `v_c` itself proven
-  correct via raw dump + standalone repro, so it's NOT hardware/VGPR-MSB at all.
+  hardware/toolchain. Phase 54 is DONE for 128x128: both the dst=1-never-reset bug and
+  a `coalescing_store_wmma.py` row-advance MSB-bank bug are found, fixed, and
+  hardware-verified `valid:y` across fwd bf16/fp16/int8/fp32 + bwd bf16, both epilogues.
 - **GPU hardware debug technique** — use `rocgdb` to find the faulting PC on
   real-hardware crashes before writing synthetic repro kernels.
 - **gfx1250 WMMA hang risk** — back-to-back same-register WMMA with zero interleaving
@@ -154,14 +153,29 @@ fails through the real epilogue. Repeated bank-toggling and a full LDS round-tri
 flat addressing also both came back 100% correct.
 
 **Conclusion**: `v_c` is unconditionally correct after the main loop; VGPR-MSB, multi-group
-accumulation, multi-wave sync, and even a full LDS round-trip all work fine standalone. The bug
-is real but narrow: `coalescing_store_wmma.py`'s actual per-`(i_rm,j,i_rn)` tile-transpose
-address computation has an ordinary addressing bug (most likely an LDS slot collision) -- nothing
-to do with hardware or VGPR-MSB at all. Hand-deriving the row formula didn't find the collision
-(looks non-colliding algebraically); needs a live LDS dump right after the real scatter loop to
-catch directly -- see `docs/gfx1250_wmma_vgpr_msb_wip_status.md`'s "RESOLVED" section for the
-exact recommended next step. This turns what looked like an open hardware question into a
-tractable, ordinary software debugging task.
+accumulation, multi-wave sync, and even a full LDS round-trip all work fine standalone.
+
+**FOUND AND FIXED the actual bug, same session, immediately after the above.** Hand-tracing the
+generated `.inc` (not just the Python source) found it directly: in `coalescing_store_wmma.py`'s
+inner `for j in range(inst_wmma.num_v_c):` scatter loop (both the unchunked path and the chunked
+path's identical twin), the per-`j` row-advance `v_add_u32 v[v_tmp1], <stride>, v[v_tmp1]` is
+VOP2 -- the immediate lands in SRC0, but `v_tmp1` (meant to be an ordinary bank-0 address) lands
+in the VSRC1 slot, which is the SAME slot the surrounding `ds_write_b32`'s `v_c` DATA operand
+uses via `src1=1` (set once before the whole `j` loop, not reset until it ends). So the address
+advance silently reads its own current value from BANK 1 (garbage) instead of bank 0, for every
+`j>=1` -- while `j=0` (no advance needed yet) is unaffected. Exactly matches every symptom: first
+row/group always correct, everything after it corrupted, identically regardless of precision or
+epilogue implementation (both have the bug independently). Fixed by bracketing the row-advance
+with `ensure(src1=0)`/`ensure(src1=1)`, matching the discipline the OUTER `i_rm` loop already
+used for its own address computation.
+
+**Hardware-verified fixed**: `valid:y` for fwd bf16/fp16/int8/fp32 (both unchunked and
+`wmma_epilogue_chunked=1`) and bwd bf16. bf16/fp16's earlier "separate small M=0 noise" was NOT a
+separate bug -- same root cause, just looked like rounding noise at bf16's smaller magnitudes.
+Zero regression confirmed. Phase 54's VGPR-MSB mechanism is now genuinely done and correct for
+the 128x128 test across every precision and both epilogues -- see
+`docs/gfx1250_wmma_vgpr_msb_wip_status.md` for the full writeup and the real next step (Phase
+53's parked 256x256/256x128 tile configs, which may exercise untested code paths).
 
 ---
 

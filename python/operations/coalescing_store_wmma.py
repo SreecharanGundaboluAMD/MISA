@@ -322,7 +322,20 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                     self._emit(msb_line)
             for j in range(inst_wmma.num_v_c):
                 if j != 0:
+                    # Bugfix (Phase 54, 2026-08-28): same class of bug as the unchunked
+                    # path's identical row-advance (see its comment) -- v_tmp2 lands in
+                    # v_add_u32's VOP2 VSRC1 slot, still gated by src1=1 (left active for
+                    # the previous j's ds_write DATA operand), so it's silently read from
+                    # bank 1 (garbage) instead of bank 0. Bracket at src1=0.
+                    if ctrl.vgpr_msb_tracker is not None:
+                        msb_line = ctrl.vgpr_msb_tracker.ensure(src1=0)
+                        if msb_line:
+                            self._emit(msb_line)
                     self._emit(f"v_add_u32 v[{v_tmp2}], {padded_stride * elem_bytes * row_step}, v[{v_tmp2}]   ; advance to compact row j={j}")
+                    if ctrl.vgpr_msb_tracker is not None:
+                        msb_line = ctrl.vgpr_msb_tracker.ensure(src1=1)
+                        if msb_line:
+                            self._emit(msb_line)
                 for i_rn in range(cxm.wave_repeat_n):
                     c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
                     col_off = i_rn * cxm.wave_tile_n * elem_bytes
@@ -726,7 +739,28 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                         row_step = 2 if ctrl.wmma_acc_f16 else 1
                         for j in range(inst_wmma.num_v_c):
                             if j != 0:
+                                # Bugfix (Phase 54, 2026-08-28): this add's second operand
+                                # (v_tmp1, the running address) lands in v_add_u32's VOP2
+                                # VSRC1 slot -- which is STILL gated by src1's MSB, left at
+                                # 1 (bank 1) by the PREVIOUS j's ds_write below. Reading
+                                # v_tmp1 at src1=1 silently reads it from bank 1 (garbage)
+                                # instead of its real bank-0 value, corrupting the running
+                                # address for every j>=1 (and everything chained after it)
+                                # -- while j=0 (no advance needed yet) stays correct. This
+                                # exactly explains the "row 0 always right, every other row
+                                # wrong" signature root-caused this session (see
+                                # docs/gfx1250_wmma_vgpr_msb_wip_status.md). Bracket the
+                                # advance at src1=0, same discipline as the outer i_rm
+                                # loop's own address computation just above.
+                                if ctrl.vgpr_msb_tracker is not None:
+                                    msb_line = ctrl.vgpr_msb_tracker.ensure(src1=0)
+                                    if msb_line:
+                                        self._emit(msb_line)
                                 self._emit(f"v_add_u32 v[{v_tmp1}], {padded_stride * elem_bytes * row_step}, v[{v_tmp1}]   ; advance to row {row_off + j * row_step}")
+                                if ctrl.vgpr_msb_tracker is not None:
+                                    msb_line = ctrl.vgpr_msb_tracker.ensure(src1=1)
+                                    if msb_line:
+                                        self._emit(msb_line)
                             for i_rn in range(cxm.wave_repeat_n):
                                 c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
                                 col_off = i_rn * cxm.wave_tile_n * elem_bytes

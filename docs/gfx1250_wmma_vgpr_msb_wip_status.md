@@ -357,76 +357,73 @@ collision in the time available (it looks non-colliding on paper: `wave_m_idx∈
 i_rm∈{0..3}*16 + (lane/16)∈{0,1}*8 + j∈{0..7}` covers 0..127 without overlap) -- the bug is
 subtle enough that it needs a live dump, not more hand algebra.
 
-**Recommended next step**: add a raw LDS-content dump immediately after `coalescing_store_wmma.py`'s
-real scatter loop completes (right after its `s_barrier_wait -1`, before the gather begins) --
-every lane reads back its own scatter-target LDS bytes via `ds_read` and stores them straight to
-`s_p_out` (mirroring the `MSB_RAW_DUMP_LDS_ROUNDTRIP` diagnostic's second half, but reading from
-the REAL scatter's LDS layout/addresses instead of a trivial flat one). Comparing that dump
-against hand-computed expected LDS contents will show directly whether a later group's write is
-landing in another group's already-read (or not-yet-read) LDS slot. This is now a software
-debugging problem, not a hardware-uncertainty one -- much more tractable than what this doc
-described before this session.
+### FIXED (same session, immediately after RESOLVED above): the actual bug, found by hand-tracing the generated `.inc`
 
-**bf16/fp16's separate `M=0` noise issue remains unexplained** (~0.02%-9% relative error, not
-present in int8/fp32's bit-exact `M=0`) -- lower priority than the dominant, now-narrowed
-row>=1 bug; possibly a real, pre-existing bf16/fp16-specific rounding issue unrelated to Phase 54
-at all (worth checking whether it reproduces with `wmma_acc_high_bank=0`).
+Rather than adding another live dump, hand-tracing the ACTUAL generated assembly for the failing
+int8 config (not just the Python source) found it directly. In the unchunked scatter's inner
+`for j in range(inst_wmma.num_v_c):` loop (`coalescing_store_wmma.py` ~line 727-729, and the
+chunked path's structurally identical twin ~line 323-325), the per-`j` row-advance is:
+
+```python
+self._emit(f"v_add_u32 v[{v_tmp1}], {stride}, v[{v_tmp1}]   ; advance to row ...")
+```
+
+`v_add_u32` is a VOP2 instruction: `vdst, src0, vsrc1` -- the immediate (`stride`) lands in the
+**SRC0** slot, and `v_tmp1` (the running LDS address, meant to be an ordinary bank-0 value) lands
+in the **VSRC1** slot. VSRC1's bank is controlled by the SAME `src1` MSB bit that's holding
+`src1=1` for the surrounding `ds_write_b32`'s `v_c` DATA operand (set once, before the whole
+`j` loop, via `ensure(src1=1)`, and not reset until the loop ends). So this "add 512 to the
+address" instruction **silently reads its own current value from bank 1 (garbage) instead of
+bank 0**, corrupting the running address for every `j>=1` -- while `j=0` (no advance needed yet)
+uses the address computed *before* entering the `src1=1` window, so it's unaffected. This
+exactly matches every observed symptom: the first row/group is always correct, everything after
+it is corrupted, identically regardless of precision or which of the two epilogue
+implementations runs (both have the same bug, independently). The OUTER `i_rm` loop's own
+address computation already correctly brackets itself with `ensure(src1=0)`/`ensure(src1=1)` --
+this exact same discipline was just missing from the INNER `j` loop's row-advance.
+
+**Fix**: bracket the row-advance with `ensure(src1=0)` before / `ensure(src1=1)` after, in both
+the unchunked (`coalescing_store_wmma.py`'s `else:` branch, ~line 727) and chunked
+(`_emit_chunked_non_atomic_store`, ~line 323) paths.
+
+**Hardware-verified fixed**: `valid:y` for fwd bf16/fp16/int8/fp32 (both unchunked and
+`wmma_epilogue_chunked=1`) and bwd bf16, all on the same 128x128 single-workgroup shape that
+previously failed. bf16/fp16's earlier-reported "separate small `M=0` noise issue" was NOT a
+separate bug -- it was the same root cause (the tiny errors happened to look like rounding noise
+for bf16/fp16's smaller accumulated magnitudes, while int8's larger integer values made the
+corruption obviously nonsensical); it's gone now too. Zero regression confirmed: existing
+non-`wmma_acc_high_bank` configs (`igemm_bwd_gtc_gfx1250_nhwc_bf16_32x32`,
+`igemm_fwd_gtc_gfx1250_nhwc_bf16`) produce byte-identical `.s` output before/after (the fix is
+fully gated behind `ctrl.vgpr_msb_tracker is not None`).
+
+**Phase 54's VGPR-MSB mechanism is now genuinely working end-to-end** for the 128x128
+mechanism-only test across every precision and both epilogue implementations. Next real step is
+resuming the originally-parked 256x256/256x128 tile work (Phase 53's configs already exist --
+`config/igemm_fwd_gtc_gfx1250_nhwc_bf16_256x256.config`,
+`config/igemm_bwd_gtc_gfx1250_nhwc_bf16_256x128.config`) now that the mechanism is provably
+correct, not just mechanism-proven-in-isolation.
 
 ## How to resume on a different machine
 
-1. Clone/pull this branch (`users/SreecharanGundaboluAMD/gfx1250_bringup`) — this
-   WIP commit has everything above.
-2. Confirm the new machine has: a gfx1250 GPU (`rocminfo | grep gfx1250`), ROCm
-   toolchain with `llvm-mc`/`clang++`/`llvm-objdump` targeting gfx1250 (this session
-   used `/home/sgundabo/rocm-10.1/llvm/bin/` — path will differ), `rocgdb`, and
-   `hipcc` (for any standalone repro kernels, if rebuilding them).
-3. **First action**: read the ISA doc section on WMMA data hazards (search
-   `amd-instinct-cdna5-instruction-set-architecture.md` for "WMMA data hazard" or
-   similar — referenced in section 5.7 but not located/read this session).
-4. Reproduce the current `valid:n` state: build
-   `config/igemm_fwd_gtc_gfx1250_nhwc_bf16_128x128` — wait, there is no such
-   pre-made config for the mechanism-only test; recreate it inline (this exact
-   config was used throughout this session, not saved to a file):
-   ```
-   [codegen]
-   arch = 'gfx1250'
-   code_object = 'cov3'
-   mode = 'flat'
+Phase 54's 128x128 mechanism-only test is DONE and hardware-verified (`valid:y` across fwd
+bf16/fp16/int8/fp32, both epilogue implementations, and bwd bf16) — no need to re-litigate any
+of the above. The remaining work is genuinely new:
 
-   [igemm_fwd_gtc]
-   gemm_m_per_block         = 128
-   gemm_n_per_block         = 128
-   gemm_k_per_block         = 32
-   wmma_tile_m              = 16
-   wmma_repeat_m            = 4
-   wmma_tile_n              = 16
-   wmma_repeat_n            = 4
-   tensor_a_thread_lengths  = [1, 32, 1, 1]
-   tensor_a_cluster_lengths = [1, 1, 1, 128]
-   tensor_b_thread_lengths  = [1, 32, 1, 1]
-   tensor_b_cluster_lengths = [1, 1, 1, 128]
-   direction                = "fwd"
-   precision                = "bf16"
-   tensor_layout            = 'nhwc'
-   nxb                      = 0
-   nxe                      = 0
-   wavefront_size           = 32
-   cumode                   = 0
-   wmma_acc_high_bank       = 1
-   ```
-   ```
-   python3 igemm_codegen.py -d /tmp/p54_resume <path-to-above-config>
-   cd /tmp/p54_resume
-   IGEMM_WARMUP=2 IGEMM_REPEAT=2 ./conv_driver.exe convbfp16 -n 1 -c 128 -H 16 -W 8 \
-     -k 128 -y 1 -x 1 -p 0 -q 0 -u 1 -v 1 -l 1 -j 1 -g 1 -F 1 -t 1 \
-     --in_layout NHWC --fil_layout NHWC --out_layout NHWC -V 1
-   ```
-   Expect `valid:n`, no crash, matching this session's end state.
-5. Use `rocgdb` (see the technique above) on this exact repro *first*, before
-   writing any new synthetic tests — it found the real bug in minutes once used,
-   after hours of guessing didn't.
-6. Once `valid:y` is achieved on this plain 128x128 mechanism-only test: re-run the
-   **zero-regression check** (every existing config, `wmma_acc_high_bank` defaults
-   off, confirm byte-identical `.inc` output) before touching anything else, then
-   resume Phase 53's parked 256x256/256x128 tile work (configs already exist, see
-   above) now that the mechanism should actually be provably correct.
+1. Clone/pull this branch (`users/SreecharanGundaboluAMD/gfx1250_bringup`).
+2. Confirm the new machine has a gfx1250 GPU (`rocminfo | grep gfx1250`) and the ROCm toolchain
+   (`clang++`/`llvm-objdump` targeting gfx1250; path was `/opt/rocm/llvm/bin/` this session).
+3. Resume Phase 53's parked 256x256/256x128 tile work -- configs already exist:
+   `config/igemm_fwd_gtc_gfx1250_nhwc_bf16_256x256.config`,
+   `config/igemm_bwd_gtc_gfx1250_nhwc_bf16_256x128.config`. These need `wmma_acc_high_bank=1`
+   (now provably correct at 128x128) PLUS a bigger macro-tile, which will exercise more
+   `(i_rm,i_rn)` groups and possibly a different `wave_repeat_m/n`/`wave_tile_m/n` combination
+   than the 4x4 grid tested this session -- re-verify `valid:y` on real hardware for these
+   specific shapes before assuming the fix generalizes, since the row-advance bug this session
+   fixed was specific to the exact loop structure in `coalescing_store_wmma.py`, and a bigger
+   tile may exercise code paths (e.g. `wmma_epilogue_chunked`'s multi-pass-per-group logic, or
+   `wmma_acc_f16`/`wmma_acc_bf16` packed accumulation, both excluded from this session's testing)
+   not covered by the 128x128 mechanism-only test.
+4. `MSB_RAW_DUMP=1` (env var, wired into `igemm_fwd_gtc_wmma_nhwc.py`'s `emit_kernel_epilogue()`)
+   is still in the tree as a reusable diagnostic -- bypasses the epilogue entirely and dumps
+   `v_c` raw. Useful again if a NEW correctness issue appears at the bigger tile size, to quickly
+   rule accumulation in/out before suspecting the epilogue.
