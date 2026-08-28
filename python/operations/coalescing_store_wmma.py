@@ -642,7 +642,19 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                                 self._emit(f"global_store_dword v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str}")
                             else:
                                 th_str = f" th:{ctrl.atomic_th}" if ctrl.atomic_cascade else ""
-                                self._emit(f"global_atomic_add_f32 v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str} scope:{ctrl.atomic_scope}{th_str}")
+                                # Phase 57: int8/int4's WMMA accumulator is a genuine int32
+                                # value, not a float -- global_atomic_add_f32 would silently
+                                # bit-reinterpret it as float and only coincidentally add
+                                # correctly for small non-negative subnormal-range sums (see
+                                # the assert this replaces in igemm_base.py for the full
+                                # derivation). global_atomic_add_u32 is a plain 32-bit integer
+                                # add, correct for BOTH signed and unsigned int32 bit patterns
+                                # (two's-complement addition doesn't care how the result is
+                                # later interpreted) -- no separate signed variant exists or is
+                                # needed (confirmed: no GLOBAL_ATOMIC_ADD_I32 in the ISA doc's
+                                # opcode table, only U32/F32/F64/U64).
+                                atomic_add_inst = 'global_atomic_add_u32' if ctrl.precision in ('int8', 'int4') else 'global_atomic_add_f32'
+                                self._emit(f"{atomic_add_inst} v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str} scope:{ctrl.atomic_scope}{th_str}")
                             if masked:
                                 self._emit(f"s_mov_b32 exec_lo, -1")
                         cur, nxt = nxt, cur
