@@ -360,14 +360,26 @@ section for the record).
       correctness on every prior scenario (still all `valid:y`). Full numbers, both fixes,
       and the reasoning for why grid.z alone wasn't enough are in
       `docs/gfx1250_streamk_design.md`'s "Performance fix" section.
-      **Still open**: re-measure on a confirmed-idle GPU (both the regression and the fix
-      were measured under contention from another tenant, though the qualitative shape of
-      the improvement is large enough to trust directionally); the new `4`/`256` sizing
-      constants are hand-picked, not tuned; only bf16 at 128x128 tested (fp16/fp32/int8
-      and other tile shapes untested); not combined with M/N-tail masking; the
-      Reduction-strategy/Approach-C alternative not attempted. Given the strong result,
-      extending to more precisions/shapes and considering the master config union is now
-      reasonable once idle-GPU re-measurement confirms this holds.
+      **Still open, prioritized** (full detail in `docs/gfx1250_streamk_design.md`'s
+      "Resuming on another machine" section):
+      1. **The actual motivating question is unmeasured**: is `wrw_streamk` more
+         *contention-resilient* than `_gsplit` (lower variance across repeated runs under
+         real contention), not just similarly fast on one clean-ish run? This is the
+         entire reason Stream-K was worth building (`_gsplit` showed >2x session-to-
+         session variance under contention in `docs/gfx1250_vendor_benchmark_vs_miopen.md`)
+         — cheapest next step and the one everything else depends on.
+      2. **No tuning/search at all** — `_gsplit` finds its split count via a real ternary
+         search over dozens of candidates; `time_streamk()` makes exactly ONE fixed
+         heuristic choice (`blocks_per_cu=1`, `claims_per_worker_target=4`,
+         `max_total_shards=256`, hardcoded C++ constants, no env-var sweep like
+         `IGEMM_GSPLIT_SWEEP`). These got two shapes from ~4x slower to near-parity but are
+         unvalidated guesses, not a tuned optimum.
+      3. Re-measure on a confirmed-idle GPU (both the regression and the fix were measured
+         under contention).
+      4. Only one config exists (128x128x32, bf16); need 64x64x32 + fp16/fp32/int8 to reach
+         this via the normal driver search, and a decision on the master config union.
+      5. Not combined with M/N-tail masking (blocks real shapes); Reduction-strategy/
+         Approach-C not attempted.
 - [ ] **hipconv's block-diagonal channel packing across conv groups** — fills small WMMA
       tiles when the group count is high, a structurally different way to solve
       "GEMM_M/N too small to fill a tile" than tail-masking.

@@ -38,8 +38,17 @@ repo across machines, independent of any one assistant's local memory directory.
   uninitialized (masked every B-operand load to zero via the OOB flag, since this new code
   path bypasses `emit_kernel_tap_loop()`, which normally zeroes it). Hardware-validated
   single-shard, degenerate 1:1, genuine multi-claim (exact multiple and with a tail) —
-  all correct, zero regression. Performance vs. the existing `_gsplit` design not yet
-  measured (needs an idle GPU) — this proves the mechanism works, not that it's faster.
+  all correct, zero regression. **Performance measured same day**: initially ~4-4.4x
+  slower than `_gsplit` (persistent grid.z sizing reused the wrong heuristic, launching
+  MORE workgroups than the design it was replacing); root-caused and fixed by making
+  shard granularity coarser (the real cost is per-shard atomic-claim/broadcast overhead,
+  not worker count) — closed the gap to ~1.05x/~1.3x (near parity). **Still open, in
+  priority order** (see `docs/gfx1250_streamk_design.md`'s "Resuming on another machine"):
+  (1) the actual motivating question — is `wrw_streamk` more CONTENTION-RESILIENT than
+  `_gsplit`, not just similarly fast once — is unmeasured; (2) no tuning/search at all
+  (the new sizing constants are hand-picked, not swept, unlike `_gsplit`'s real ternary
+  search); (3) re-measure on an idle GPU (both results measured under contention); (4)
+  only one config exists (128x128x32 bf16); (5) no M/N-tail, no Approach C.
 - **GPU hardware debug technique** — use `rocgdb` to find the faulting PC on
   real-hardware crashes before writing synthetic repro kernels.
 - **gfx1250 WMMA hang risk** — back-to-back same-register WMMA with zero interleaving

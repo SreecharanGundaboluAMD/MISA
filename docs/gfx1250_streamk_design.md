@@ -465,18 +465,49 @@ to trust directionally.
 
 ### What's NOT done (real scope gaps, not swept under the rug)
 
+- **No tuning/search over the sizing constants at all** — this is the biggest gap. The
+  existing `_gsplit` design finds its split count via a real ternary search over dozens of
+  real-timed candidates per shape (see `time_split`'s search loop above `time_streamk` in
+  `igemm_wrw_gtc_driver.h`). `time_streamk()` makes exactly ONE fixed heuristic choice
+  (`blocks_per_cu=1`, `claims_per_worker_target=4`, `max_total_shards=256`, all hardcoded
+  C++ constants, not config-file tunables or env-var-sweepable like
+  `IGEMM_GSPLIT_SWEEP`) and never searches. These constants got the two measured shapes
+  from ~4x slower to near-parity, but they are unvalidated guesses, not a tuned optimum —
+  a real per-shape sweep would very likely do better in some regimes and worse in others.
+- **The actual motivating question hasn't been measured**: is `wrw_streamk` more
+  *contention-resilient* than `_gsplit`, not just similarly fast on one clean-ish run?
+  `docs/gfx1250_vendor_benchmark_vs_miopen.md` documents `_gsplit` showing >2x
+  session-to-session variance under contention specifically because it launches
+  hundreds-to-thousands of simultaneously-dispatched workgroups — that's the entire reason
+  Stream-K was worth building. Repeating the same shape many times (both designs) under
+  real contention and comparing variance, not just mean, is the real test and hasn't been
+  done.
+- **Only one config exists**: `config/igemm_wrw_gtc_gfx1250_nhwc_bf16_streamk.config`,
+  128x128x32, bf16 only, not in the master config union. To reach this via the normal
+  driver search/benchmark flow, need at least a 64x64x32 variant (matching `_gsplit`'s
+  existing tile-shape coverage) and fp16/fp32/int8 mirrors, then a decision on whether/when
+  to fold into the master union (deliberately deferred pending the two items above).
 - **Re-measure on a confirmed-idle GPU** — both the original 4x-slower finding and the
   fixed near-parity result were measured under contention from another tenant.
-- **`claims_per_worker_target=4` and `max_total_shards=256` are hand-picked, not tuned** —
-  a real parameter sweep (varying both) on an idle GPU would likely find a better point;
-  not attempted.
 - **fp16/fp32/int8 untested** — only bf16 built and validated.
 - **Only the 128x128 tile shape tested** — 64x64 and other existing wrw tile shapes not
   attempted.
 - **Not combined with `wmma_m_tail`/`wmma_n_tail`** (M/N-tail masking) — only exact-multiple
-  gemm_m/gemm_n tested.
+  gemm_m/gemm_n tested. Blocks a real chunk of real shapes (anything whose gemm_m/gemm_n
+  isn't an exact tile multiple).
 - **`wsred`-equivalent (Approach C) not attempted** — this implements Approach A's atomic
   strategy only.
-- **Shard granularity is fixed at exactly one `gemm_k_per_block`** — not exposed as a
-  tunable; a coarser granularity (fewer, bigger claims) might reduce atomic/barrier
-  overhead and is worth trying once performance work starts.
+
+### Resuming on another machine — prioritized next steps
+
+1. **Contention-stability measurement** (cheapest, and the load-bearing question this
+   whole effort rests on) — repeat the same shape N times each for `_gsplit` and
+   `wrw_streamk` under real contention, compare variance not just mean. If `wrw_streamk`
+   isn't more stable, the rest of this list matters much less.
+2. **Expose the sizing constants for tuning** — turn `blocks_per_cu`/
+   `claims_per_worker_target`/`max_total_shards` into an env-var sweep (mirroring
+   `IGEMM_GSPLIT_SWEEP`) at minimum, ideally a real per-shape search like `_gsplit`'s own
+   ternary search.
+3. **Re-measure on an idle GPU** to get a trustworthy absolute baseline.
+4. **More configs** (64x64x32, fp16/fp32/int8) once 1-3 suggest it's worth the coverage.
+5. **M/N-tail support**, then Approach C, roughly in that order of expected value.
