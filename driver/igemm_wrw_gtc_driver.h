@@ -1029,13 +1029,52 @@ public:
             // docs/gfx1250_streamk_design.md.
             int streamk_persistent_grid_z = 1;
             auto time_streamk = [&]() -> float {
-                int total_shards = num_k_blocks;
-                int potential_occupancy = 1;
-                HIP_CALL(hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(&potential_occupancy, kernel_func, static_cast<int>(block_size), 0));
-                streamk_persistent_grid_z = std::max(1, std::min(compute_gemmk_global_splits(static_cast<int>(grid_x * grid_y), potential_occupancy), total_shards));
+                // Phase 58 perf fix, take 2: shrinking grid.z alone (take 1) barely moved
+                // the needle, because the total number of atomic-claim + LDS-broadcast +
+                // double-barrier round trips is driven by the SHARD COUNT, not the worker
+                // count -- with one gemm_k_per_block per shard, 1575 total_shards meant
+                // ~1575 claims across the whole dispatch regardless of how many workers
+                // shared them, and concentrating them into fewer workers (grid.z 1024->512)
+                // just doubled max_iters, leaving the aggregate overhead unchanged (measured
+                // no real improvement -- see docs/gfx1250_streamk_design.md). The actual
+                // fix: make each CLAIMED UNIT cover multiple gemm_k_per_block blocks
+                // (coarser granularity), cutting the total claim count proportionally while
+                // keeping enough units for the persistent workers to still load-balance
+                // across (aim for a handful of claims per worker, not one, and not
+                // thousands).
+                //
+                // Grid.z target: ~one resident workgroup per CU total (each one already
+                // self-refills via the atomic counter -- no need to oversubscribe),
+                // spread across however many output tiles exist -- matches rocKE's own
+                // compute_streamk_grid_size (min(num_macro_tiles, num_cus*blocks_per_cu)).
+                // Uses the RAW device CU count, not this->num_cu -- the base class doubles
+                // that for gfx10+ for the (unrelated) splits-heuristic's own purposes,
+                // which just re-inflates the same worker count this fix is trying to shrink.
+                hipDeviceProp_t dev_prop;
+                hipDevice_t dev;
+                HIP_CALL(hipGetDevice(&dev));
+                HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
+                const int blocks_per_cu = 1;
+                int grid_size = static_cast<int>(grid_x * grid_y);
+                int target_total_workers = dev_prop.multiProcessorCount * blocks_per_cu;
+                int per_tile_workers = std::max(1, (target_total_workers + grid_size - 1) / grid_size);
+
+                // Shard-count target: a handful of claims per worker (enough to load-balance
+                // the tail without every worker's very first claim already being its last),
+                // but ALSO capped in absolute terms -- every claim costs a real atomic +
+                // LDS-broadcast + double-barrier round trip, so even spread evenly across
+                // many workers, thousands of total shards means thousands of synchronization
+                // events. Snapped down to the largest divisor of num_k_blocks (every shard
+                // must be an exact multiple of gemm_k_per_block -- no K-tail relief here).
+                const int claims_per_worker_target = 4;
+                const int max_total_shards = 256;
+                int shard_count_target = std::min(per_tile_workers * claims_per_worker_target, max_total_shards);
+                int total_shards = largest_divisor_leq(num_k_blocks, shard_count_target);
+
+                streamk_persistent_grid_z = std::max(1, std::min(per_tile_workers, total_shards));
                 int max_iters = (total_shards + streamk_persistent_grid_z - 1) / streamk_persistent_grid_z;
 
-                karg.gemm_k_per_wg = tunable->gemm_k_per_block;   // one exact block per claimed shard
+                karg.gemm_k_per_wg = (num_k_blocks / total_shards) * tunable->gemm_k_per_block;
                 karg.gemm_k_tail = 0;                              // asserted not wmma_k_tail
                 karg.gemm_k_num_splits = total_shards;
                 karg.p_streamk_counter = p_streamk_counter;

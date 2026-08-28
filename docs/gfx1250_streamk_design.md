@@ -407,23 +407,69 @@ atomic-claim + LDS-broadcast + double-barrier overhead on top of a workgroup cou
 *similar in magnitude* to `_gsplit`'s own chosen split count, with none of Stream-K's
 intended "small constant grid" benefit actually realized.
 
-**Fix identified but not yet implemented** (a natural next step, not attempted this
-session): cap `streamk_persistent_grid_z` independent of `grid_x*grid_y` — e.g. a fixed
-multiple of `num_cu` (queried via `hipDeviceProp_t::multiProcessorCount`, already used
-elsewhere in this driver) times a small `blocks_per_cu` target, matching rocKE's own
-`compute_streamk_grid_size` (`min(num_macro_tiles, num_cus * blocks_per_cu)`) rather than
-reusing the existing splits-heuristic formula. Worth re-measuring once that's in.
+### Performance fix (same day, implemented immediately after the finding above)
 
-**Caveat**: `rocm-smi` showed `GPU use (%): 100` from another tenant throughout this
-comparison — absolute numbers aren't final, but the *qualitative* finding (streamk
-launching a similar-or-larger workgroup count than gsplit, not a small constant one) is a
-structural/logic issue independent of contention, confirmed via `STREAMK_DEBUG`'s direct
-grid_z readout, not just the timing.
+Two changes to `time_streamk()` in `igemm_wrw_gtc_driver.h`, host-side only (zero
+device-code changes needed):
+
+1. **Grid.z sizing**: replaced `compute_gemmk_global_splits` (the splits-heuristic
+   formula, which scales *up* as `grid_x*grid_y` shrinks) with a direct target: `num_cu *
+   blocks_per_cu` (`blocks_per_cu=1`) total persistent workers, divided across
+   `grid_x*grid_y` independent per-tile counters — matching rocKE's own
+   `compute_streamk_grid_size` shape. Uses the *raw* `hipDeviceProp_t::multiProcessorCount`
+   queried fresh in this closure, not `this->num_cu` (the base class doubles that for
+   gfx10+, for the unrelated splits-heuristic's own purposes — reusing it would have
+   re-inflated the exact worker count this fix is trying to shrink).
+2. **Shard granularity** (the actual dominant cost, confirmed by testing grid.z-only
+   shrinkage first and finding it barely moved the needle — see below): shards are no
+   longer fixed at exactly one `gemm_k_per_block`. `time_streamk` now targets a total
+   shard count of `min(per_tile_workers * 4, 256)` — a handful of claims per worker,
+   capped in absolute terms since every claim costs a real atomic + LDS-broadcast +
+   double-barrier round trip regardless of how many workers share the work — snapped down
+   to the largest divisor of `num_k_blocks` (still required to be exact, no K-tail relief
+   in this mode) via the same `largest_divisor_leq` helper the old ternary search already
+   used. `karg.gemm_k_per_wg` is set to that shard's real size
+   (`num_k_blocks/total_shards * gemm_k_per_block`) instead of a hardcoded single block.
+
+**Why grid.z alone wasn't enough**: re-tested with only fix 1 applied (shard count still
+`num_k_blocks`) — grid.z dropped from 1024 to 512 for the 128,30,40,128 shape, but cost
+barely changed (0.297ms → 0.319ms, actually slightly worse). The total number of
+atomic-claim/broadcast round trips across the whole dispatch is driven by *shard count*
+(still ~1575 either way), not worker count — concentrating the same total claims into
+fewer workers just doubles `max_iters` per worker, leaving the aggregate overhead
+unchanged. Fix 2 (coarser shards) is what actually mattered.
+
+**Result after both fixes** (same shapes, same methodology):
+
+| Shape (c,H,W,k) | `_gsplit` (best-of-search) | `wrw_streamk` (fixed) | Ratio |
+|---|---|---|---|
+| 128,30,40,128 | 0.073ms (split=315) | 0.077ms (total_shards=225, grid.z=225) | **~1.05x — near parity** |
+| 256,30,40,128 | 0.129ms (split=175) | 0.169ms (total_shards=128, grid.z=128) | **~1.3x slower** |
+
+Down from ~4.1x/~4.4x slower before the fix. Note this comparison only measures the
+*chosen candidate's* kernel time for `_gsplit` — it doesn't count the cost of the ternary
+search itself (multiple real timed launches to find split=315/175), which `wrw_streamk`
+doesn't need at all (one shot, no search). In a real deployment where the split count
+isn't pre-cached, `wrw_streamk`'s total wall-clock cost could already be lower even at
+~1.3x slower per-dispatch — not measured here, a natural follow-up.
+
+Re-validated correctness after the fix on every scenario from the table above (all still
+`valid:y`, including the tail case, which now lands at `total_shards=50, grid.z=16,
+max_iters=4` instead of `400/64/7` — same qualitative shape, much cheaper).
+
+**Caveat**: `rocm-smi` showed `GPU use (%): 100` from another tenant throughout both the
+original comparison and the re-measurement — absolute numbers aren't final on an idle GPU,
+but the *qualitative* improvement (near-parity instead of 4x slower) is large enough, and
+confirmed via `STREAMK_DEBUG`'s direct shard/grid.z readout (not just wall-clock timing),
+to trust directionally.
 
 ### What's NOT done (real scope gaps, not swept under the rug)
 
-- **Persistent grid sizing needs the fix above** before this can be a real performance
-  candidate — see the comparison immediately above.
+- **Re-measure on a confirmed-idle GPU** — both the original 4x-slower finding and the
+  fixed near-parity result were measured under contention from another tenant.
+- **`claims_per_worker_target=4` and `max_total_shards=256` are hand-picked, not tuned** —
+  a real parameter sweep (varying both) on an idle GPU would likely find a better point;
+  not attempted.
 - **fp16/fp32/int8 untested** — only bf16 built and validated.
 - **Only the 128x128 tile shape tested** — 64x64 and other existing wrw tile shapes not
   attempted.
