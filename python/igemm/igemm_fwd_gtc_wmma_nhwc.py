@@ -24,6 +24,7 @@
 #
 ################################################################################
 # pylint: disable=maybe-no-member
+import os
 from ..codegen import *
 from ..operations import *
 from .igemm_base import *
@@ -1867,6 +1868,74 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
     def emit_kernel_epilogue(self):
         v = self.vgpr
         s = self.sgpr
+        if os.environ.get('MSB_RAW_DUMP') and self.vgpr_msb_tracker is not None:
+            # DIAGNOSTIC (Phase 54 investigation, 2026-08-28 -- see
+            # docs/gfx1250_wmma_vgpr_msb_wip_status.md): bypasses the coalescing-store
+            # epilogue entirely and dumps v_c (bank 1) straight to s_p_out, raw, one
+            # dword per register per thread. Used to prove `v_c` is already fully
+            # correct right after the main loop ends -- the corruption is in
+            # coalescing_store_wmma.py's real per-lane tile-transpose address
+            # formula, not in accumulation, not in VGPR-MSB itself, and not in any
+            # of the simplified LDS-round-trip/repeated-toggle variants below (all
+            # of which also come out correct). Kept as a reusable hook for future
+            # Phase 54 debugging -- off by default (env-gated), zero cost otherwise.
+            # num_vgpr_accumulate_c (128) * block_size (128) * 4 bytes == the real
+            # output tensor's byte size for the 128x128 test shape this was
+            # developed against, so it fits without resizing anything.
+            self._emit(f"; MSB_RAW_DUMP: raw v_c bank-1 dump, bypassing coalescing_store entirely")
+            self._emit(f"v_lshlrev_b32 v[{v.v_addr_out()}], {utility_log2(self.tunable.num_vgpr_accumulate_c * 4)}, v[{v.v_tid()}]")
+            # MSB_RAW_DUMP_REPEATED_TOGGLE: mimic the real (unchunked) epilogue's
+            # per-i_rm src1 0->1->0->1... re-toggle pattern instead of one clean
+            # toggle, to isolate whether REPEATED same-slot re-toggling (not the LDS
+            # addressing itself) is what corrupts groups beyond the first.
+            lds_roundtrip = os.environ.get('MSB_RAW_DUMP_LDS_ROUNDTRIP')
+            repeated = os.environ.get('MSB_RAW_DUMP_REPEATED_TOGGLE')
+            group_size = 32  # matches wave_repeat_m's 32-register (4 c-groups) chunking in the real epilogue
+            if lds_roundtrip:
+                # Route through LDS exactly like the real unchunked epilogue's scatter+
+                # gather (ds_write from bank-1 v_c -> barrier -> ds_read from bank-0 LDS
+                # copy -> global_store), but with trivial flat per-thread addressing (no
+                # tile-transpose) -- isolates whether ds_write FROM bank-1 specifically
+                # (a VDS-class instruction, unlike the raw dump's VFLAT global_store) is
+                # what corrupts groups beyond the first.
+                self._emit(f"v_lshlrev_b32 v[{v.v_addr_out(1)}], {utility_log2(self.tunable.num_vgpr_accumulate_c * 4)}, v[{v.v_tid()}]   ; this thread's LDS base")
+                msb_line = self.vgpr_msb_tracker.force(dst=0, src0=0, src1=1, src2=0)
+                if msb_line:
+                    self._emit(msb_line)
+                for i in range(self.tunable.num_vgpr_accumulate_c):
+                    self._emit(f"ds_write_b32 v[{v.v_addr_out(1)}], v[{v.v_c(i)}] offset:{i*4}")
+                msb_line = self.vgpr_msb_tracker.force(dst=0, src0=0, src1=0, src2=0)
+                if msb_line:
+                    self._emit(msb_line)
+                self._emit(f"s_wait_dscnt 0x0")
+                self._emit(f"s_barrier_signal -1")
+                self._emit(f"s_barrier_wait -1")
+                for i in range(self.tunable.num_vgpr_accumulate_c):
+                    self._emit(f"ds_read_b32 v[{v.v_addr_out()}], v[{v.v_addr_out(1)}] offset:{i*4}")
+                    self._emit(f"s_wait_dscnt 0x0")
+                    self._emit(f"global_store_dword v[{v.v_addr_out(1)}], v[{v.v_addr_out()}], s[{s.s_p_out()}:{s.s_p_out(1)}] offset:{i*4}")
+            elif repeated:
+                for base in range(0, self.tunable.num_vgpr_accumulate_c, group_size):
+                    msb_line = self.vgpr_msb_tracker.force(dst=0, src0=0, src1=0, src2=0)
+                    if msb_line:
+                        self._emit(msb_line)
+                    self._emit(f"v_mov_b32 v[{v.v_addr_out(1)}], v[{v.v_addr_out()}]   ; dummy bank-0 op, matches real epilogue doing address work at src1=0")
+                    msb_line = self.vgpr_msb_tracker.force(dst=0, src0=0, src1=1, src2=0)
+                    if msb_line:
+                        self._emit(msb_line)
+                    for i in range(base, min(base + group_size, self.tunable.num_vgpr_accumulate_c)):
+                        self._emit(f"global_store_dword v[{v.v_addr_out()}], v[{v.v_c(i)}], s[{s.s_p_out()}:{s.s_p_out(1)}] offset:{i*4}")
+            else:
+                msb_line = self.vgpr_msb_tracker.force(dst=0, src0=0, src1=1, src2=0)
+                if msb_line:
+                    self._emit(msb_line)
+                for i in range(self.tunable.num_vgpr_accumulate_c):
+                    self._emit(f"global_store_dword v[{v.v_addr_out()}], v[{v.v_c(i)}], s[{s.s_p_out()}:{s.s_p_out(1)}] offset:{i*4}")
+            msb_line = self.vgpr_msb_tracker.force(dst=0, src0=0, src1=0, src2=0)
+            if msb_line:
+                self._emit(msb_line)
+            self._emit(f"s_wait_storecnt 0x0")
+            return
         # s_out_k_total (=gemm_n*group) is the output tensor's TOTAL row stride (see class
         # docstring's group>1 note) -- s_gemm_n alone (per-group) is only correct for group=1.
         self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_k_total.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off(),

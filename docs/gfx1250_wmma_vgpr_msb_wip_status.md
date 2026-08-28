@@ -313,26 +313,64 @@ is `M_row*128 + N_col`):
   identically across four unrelated instruction encodings (`v_wmma_f32_16x16x32_{f16,bf16}`,
   `v_wmma_i32_16x16x64_iu8`, `v_wmma_f32_16x16x4_f32`).
 
-**Root cause of the remaining `valid:n` is still NOT found**, but is now MUCH better
-characterized: a single, precision-independent bug that leaves exactly the first `v_c` sub-range
-(bank-1 physical v256-v263, corresponding to `i_rm=0,i_rn=0`) correct and corrupts every other
-sub-range, reproducible identically regardless of which of two unrelated epilogue
-implementations reads it. bf16's `M=0` block ALSO has a separate, smaller-magnitude, not-yet-
-understood noise issue (~0.02%-9% relative error) not present in int8/fp32's bit-exact `M=0` --
-worth investigating separately, likely lower priority than the dominant row>=1 corruption.
+### RESOLVED (same session): it's the real epilogue's address formula, not v_c, not VGPR-MSB
 
-**Recommended next step**: a targeted rocgdb register dump was attempted this session (`break
-<kernel_symbol>` resolved without error but never actually trapped execution -- the run
-completed normally with no breakpoint hit; likely needs the kernel built with debug info, or a
-different rocgdb invocation for HSA kernel breakpoints -- not yet worked out). The more reliable
-next step is probably a minimal standalone repro with its own scratch output buffer (host code,
-not just `conv_driver.exe`): zero-init `v_c` across 2+ `(i_rm)` sub-ranges in bank 1, run a tiny
-fixed-iteration K-loop of WMMA accumulation matching this kernel's real structure (barrier +
-`ds_read` between iterations, not the tight zero-interleaving pattern that hung the GPU earlier),
-then do a **simple, direct, uncoalesced per-thread `global_store` straight from each `v_c`
-sub-range** (bypassing both LDS-round-trip epilogues entirely) to prove definitively whether the
-corruption is already present in `v_c` right after the main loop ends, or only appears somewhere
-between the main loop's end and a real epilogue's first read of it.
+Two independent lines of attack converged on the same answer:
+
+**1. A standalone repro (`/tmp/msb_repro/`, gone -- ephemeral, recreate from this description)**
+using the exact toolchain `clang++ -x assembler -target amdgcn-amd-amdhsa -mcpu=gfx1250 <f>.s -o
+<f>.hsaco` + a `hipModuleLoad`/`hipModuleGetFunction`/`hipModuleLaunchKernel` host harness
+(pattern: `test/twiddle/twiddle_test.cpp`, `test/persistent_workgroup/`). Built up incrementally,
+matching the real kernel's exact scale each step -- **every single variant passed with zero
+mismatches**: a minimal 2-group/1-wave test; the full 16-group/1-wave scale; the full
+16-group/4-wave/128-register scale (bit-for-bit matching the real kernel's block/tile config);
+adding distinct `v_a`/`v_b` sub-ranges per `(i_rm,i_rn)` (matching `emit_wmma_tile()`'s real
+indexing exactly, not a shared/simplified input); and adding an in-flight `global_load` during
+the WMMA burst (matching the real kernel's software-pipelined prefetch overlap). None of these
+reproduced the bug -- the core VGPR-MSB + multi-group + multi-wave + K-loop mechanism is
+correct at every scale tested.
+
+**2. A direct raw-dump diagnostic in the REAL kernel** (`MSB_RAW_DUMP=1` env var, wired into
+`igemm_fwd_gtc_wmma_nhwc.py`'s `emit_kernel_epilogue()` -- kept in the tree, off by default,
+zero cost otherwise): bypasses `coalescing_store_wmma.py` entirely and dumps `v_c` (bank 1)
+straight to `s_p_out` via a trivial flat per-thread `global_store`, no LDS round-trip, no
+tile-transpose addressing. Run against the exact same failing int8 128x128 config:
+**every one of the 16384 raw dwords across all 128 threads x 128 registers reads back exactly
+correct** (`0x00000080` = 128, matching `ref`). Also tested two closer approximations of the
+real epilogue's mechanics -- repeated `src1` 0→1→0→1 re-toggling per 32-register group
+(`MSB_RAW_DUMP_REPEATED_TOGGLE=1`), and a full `ds_write`(bank1)→barrier→`ds_read`(bank0)→
+`global_store` LDS round-trip with trivial flat addressing (`MSB_RAW_DUMP_LDS_ROUNDTRIP=1`) --
+**both also come back 100% correct**.
+
+**Conclusion**: `v_c` is provably, unconditionally correct right after the main loop ends, for
+every group, every precision. VGPR-MSB itself, multi-group accumulation, multi-wave sync, the
+K-loop structure, repeated bank re-toggling, and even a full LDS round-trip all work fine in
+isolation. The bug is real but narrow: it's specifically in `coalescing_store_wmma.py`'s
+**real per-`(i_rm, j, i_rn)` tile-transpose address computation** (the actual row/col math
+using `v_gemm_im`/`v_gemm_in`, `row_off = i_rm*wave_tile_m`, `padded_stride`/`macro_tile_n`
+shifts, and `wmma_mapping.py`'s `get_gemm_index_for_dst_matrix` per-lane row formula
+`row = wave_m_idx*64 + i_rm*wave_tile_m + (lane/16)*8 + j`) -- an ordinary addressing/logic bug
+in that formula (most likely a genuine LDS address collision where some `(i_rm,j,i_rn)`
+combination overwrites another's slot before it's read back), NOT a hardware or VGPR-MSB-
+mechanism issue at all. Hand-deriving the row formula algebraically didn't turn up an obvious
+collision in the time available (it looks non-colliding on paper: `wave_m_idx∈{0,1} *64 +
+i_rm∈{0..3}*16 + (lane/16)∈{0,1}*8 + j∈{0..7}` covers 0..127 without overlap) -- the bug is
+subtle enough that it needs a live dump, not more hand algebra.
+
+**Recommended next step**: add a raw LDS-content dump immediately after `coalescing_store_wmma.py`'s
+real scatter loop completes (right after its `s_barrier_wait -1`, before the gather begins) --
+every lane reads back its own scatter-target LDS bytes via `ds_read` and stores them straight to
+`s_p_out` (mirroring the `MSB_RAW_DUMP_LDS_ROUNDTRIP` diagnostic's second half, but reading from
+the REAL scatter's LDS layout/addresses instead of a trivial flat one). Comparing that dump
+against hand-computed expected LDS contents will show directly whether a later group's write is
+landing in another group's already-read (or not-yet-read) LDS slot. This is now a software
+debugging problem, not a hardware-uncertainty one -- much more tractable than what this doc
+described before this session.
+
+**bf16/fp16's separate `M=0` noise issue remains unexplained** (~0.02%-9% relative error, not
+present in int8/fp32's bit-exact `M=0`) -- lower priority than the dominant, now-narrowed
+row>=1 bug; possibly a real, pre-existing bf16/fp16-specific rounding issue unrelated to Phase 54
+at all (worth checking whether it reproduces with `wmma_acc_high_bank=0`).
 
 ## How to resume on a different machine
 

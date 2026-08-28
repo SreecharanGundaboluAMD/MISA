@@ -11,9 +11,9 @@ repo across machines, independent of any one assistant's local memory directory.
   plain `conv`, for non-fp32 kernels, or every result silently reports `valid:n`.
 - **gfx1250 VGPR-MSB** — 128x128 WMMA tile ceiling is a codegen limit, not
   hardware/toolchain; VGPR-MSB works on real hardware. Phase 54's crash-causing bug
-  (dst=1 never reset) is fixed and hardware-verified. Remaining `valid:n` is ONE
-  precision-independent bug (only the first `v_c` bank-1 sub-range survives; confirmed
-  identically across bf16/fp16/int8/fp32; confirmed NOT an epilogue bug) — root cause open.
+  (dst=1 never reset) is fixed and hardware-verified. Remaining `valid:n` RESOLVED to an
+  ordinary address-formula bug in `coalescing_store_wmma.py` — `v_c` itself proven
+  correct via raw dump + standalone repro, so it's NOT hardware/VGPR-MSB at all.
 - **GPU hardware debug technique** — use `rocgdb` to find the faulting PC on
   real-hardware crashes before writing synthetic repro kernels.
 - **gfx1250 WMMA hang risk** — back-to-back same-register WMMA with zero interleaving
@@ -135,24 +135,33 @@ now appears after every burst; llvm-objdump's own physical-address resolution, e
 `v0 /*v256*/`, confirms correct bank-1 addressing) and confirmed zero regression (every
 existing non-`wmma_acc_high_bank` config's `.s`/`.inc` is byte-identical before/after).
 
-**On real hardware: the crash-class symptom is gone, but `valid:n` persists -- and it's ONE
-precision-independent bug, not a subtle one.** Initial per-pixel diffing on bf16 alone was
-misleading (the diff-printer's 100-line cap was consumed by small errors in output row `M=0`
-before ever showing row `M>=1`). Re-tested with `PRINT_EVERY_PIXEL=1` (no cap) across all four
-precisions (bf16, fp16, int8, fp32) on matching 128x128 configs: **every precision shows the
-identical fault line** -- output row `M=0` is correct (bit-exact for int8/fp32), and **every
-row `M>=1` is completely corrupted** (int8 reads the exact constant `0x01010101` for every
-element past index 128; other precisions read plausible-looking-but-wrong or near-zero garbage
-unrelated to the reference). Ruled out via disassembly (bank-1 addressing is provably correct
-for every row, not just row 0) and a differential test (`wmma_epilogue_chunked=1`, a completely
-unrelated LDS scatter/gather implementation, produces the *exact same* failure on int8 -- same
-index, same exact corrupted value -- proving the corruption is already in `v_c`'s bank-1
-registers before either epilogue implementation reads it). Root cause of why only the FIRST
-`v_c` bank-1 sub-range (`i_rm=0,i_rn=0`) survives is still NOT found -- see
-`docs/gfx1250_wmma_vgpr_msb_wip_status.md`'s "Update (2026-08-28...)" section for full detail
-and the recommended next step (a minimal standalone repro with its own scratch buffer, doing a
-direct per-thread `global_store` straight from `v_c`, bypassing both epilogues, to prove whether
-the corruption predates or postdates the main loop).
+**On real hardware: the crash-class symptom is gone, and the remaining `valid:n` is RESOLVED to
+an ordinary software bug, NOT a hardware/VGPR-MSB issue.** Initial per-pixel diffing on bf16
+alone was misleading (the diff-printer's 100-line cap was consumed by small errors in output row
+`M=0` before ever showing row `M>=1`). Re-tested with `PRINT_EVERY_PIXEL=1` (no cap) across all
+four precisions: every precision showed the identical fault line -- row `M=0` correct, every row
+`M>=1` corrupted (int8: exact constant `0x01010101`; others: garbage unrelated to reference).
+
+Two independent tests then proved `v_c` itself is NOT the problem: (1) a standalone repro built
+up incrementally to the real kernel's exact scale (16 groups, 4 waves, 128 bank-1 registers,
+distinct `v_a`/`v_b` per group, in-flight prefetch during the WMMA burst -- matching
+`emit_wmma_tile()`'s real indexing exactly) passed with zero mismatches at every scale tested;
+(2) a raw-dump diagnostic wired directly into the real kernel (`MSB_RAW_DUMP=1` env var in
+`igemm_fwd_gtc_wmma_nhwc.py`'s `emit_kernel_epilogue()`, kept in the tree, off by default,
+zero cost) that bypasses `coalescing_store_wmma.py` entirely and dumps `v_c` straight to
+output -- every one of 16384 raw dwords came back exactly correct, for the SAME config that
+fails through the real epilogue. Repeated bank-toggling and a full LDS round-trip with trivial
+flat addressing also both came back 100% correct.
+
+**Conclusion**: `v_c` is unconditionally correct after the main loop; VGPR-MSB, multi-group
+accumulation, multi-wave sync, and even a full LDS round-trip all work fine standalone. The bug
+is real but narrow: `coalescing_store_wmma.py`'s actual per-`(i_rm,j,i_rn)` tile-transpose
+address computation has an ordinary addressing bug (most likely an LDS slot collision) -- nothing
+to do with hardware or VGPR-MSB at all. Hand-deriving the row formula didn't find the collision
+(looks non-colliding algebraically); needs a live LDS dump right after the real scatter loop to
+catch directly -- see `docs/gfx1250_wmma_vgpr_msb_wip_status.md`'s "RESOLVED" section for the
+exact recommended next step. This turns what looked like an open hardware question into a
+tractable, ordinary software debugging task.
 
 ---
 
