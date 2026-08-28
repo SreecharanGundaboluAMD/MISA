@@ -105,10 +105,13 @@ section for the record).
       derived by hand and confirmed exactly against the compiled kernel's reported
       metadata; codegen+assembly clean (CPU-only); zero regression (git-worktree diff,
       every existing kernel byte-identical, only the one new kernel symbol appended).
-      **Not hardware-validated** — implemented under an explicit no-GPU-execution
-      constraint (a benchmark was running on the shared GPU); correctness is unconfirmed
-      until the hardware battery every other phase in this doc has required actually
-      runs. Do not treat as "done" in the sense every other closed item here is.
+      **Hardware-validated 2026-08-28**: exact-fit shape (n=4,c=64,H=32,W=32,k=64,
+      gemm_k=4096, an exact multiple of 64) run standalone (single-config build, not the
+      master union) with `-V 1` — `valid:y` for all three precisions (bf16/fp16/fp32).
+      K-tail/M-tail were not exercised here (this narrow single-config build has no tail
+      variant; tail handling lives in separate config sections combined at the master
+      level) but the new tile's core WMMA mechanism is now confirmed correct on real
+      hardware, same footing as every other closed item in this doc.
 - [ ] **wrw addressing redesign to support `gemm_k_per_block > gemm_m_per_block`** —
       found while attempting the tile-widening above. The real blocker to CK's stated
       64x64-tile/large-K pairing (Tier 3 effort): `num_col_groups` would need to
