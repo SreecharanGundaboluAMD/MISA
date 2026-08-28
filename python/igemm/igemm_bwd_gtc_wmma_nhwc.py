@@ -98,6 +98,9 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         assert tunable.block_size == waves_per_m * waves_per_n * 32
         self.tunable = tunable
         self.data_byte = amdgpu_precision_data_byte(tunable.precision)
+        # Phase 54 (VGPR-MSB): see igemm_fwd_gtc_wmma_nhwc.py's identical comment --
+        # one tracker shared by the prologue's v_c zero-init, main loop, and epilogue.
+        self.vgpr_msb_tracker = vgpr_msb_tracker_t() if tunable.wmma_acc_high_bank else None
 
         # Asymmetric tile shapes (2026-08-25): row_repeat_a generalizes A (grad_output,
         # untransposed) the same way igemm_fwd_gtc_wmma_nhwc_t's row_repeat_a does -- thread
@@ -172,6 +175,9 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         # Phase 48: switches the shared epilogue from its direct (LDS-reshuffle) store path
         # to an atomic-add path -- direction-agnostic, mirrors wrw's identical wiring.
         ctrl_coalescing_store_wmma.gemm_k_global_split = tunable.gemm_k_global_split
+        # Phase 53: see igemm_fwd_gtc_wmma_nhwc.py's identical comment.
+        ctrl_coalescing_store_wmma.wmma_epilogue_chunked = tunable.wmma_epilogue_chunked
+        ctrl_coalescing_store_wmma.vgpr_msb_tracker = self.vgpr_msb_tracker
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
         # K/N-tail (bwd-specific): bwd's B (weight) operand is TRANSPOSED (see class
         # docstring) -- unlike fwd's B, where each lane owns one fixed N-column and reads
@@ -313,7 +319,10 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         def __init__(self, mc, outer):
             mc_base_t.__init__(self, mc)
             vseq = gpr_sequencer_t()
-            self.v_c           = sym_t('v_c'           , vseq(outer.tunable.num_vgpr_accumulate_c))     # 128
+            # Phase 54 (VGPR-MSB): see igemm_fwd_gtc_wmma_nhwc.py's identical comment --
+            # v_c gets its own bank-1 sequencer instead of sharing bank 0's vseq.
+            v_c_vseq = gpr_sequencer_t() if outer.tunable.wmma_acc_high_bank else vseq
+            self.v_c           = sym_t('v_c'           , v_c_vseq(outer.tunable.num_vgpr_accumulate_c))     # 128
             self.v_a           = sym_t('v_a'           , vseq(outer.tunable.num_vgpr_accumulate_a))     # 32
             self.v_b           = sym_t('v_b'           , vseq(outer.tunable.num_vgpr_accumulate_b))     # 32
             # Phase 1 (k-sub-loop): sized to outer.num_dwords (=bytes_per_row//4), NOT a
@@ -353,6 +362,11 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             # every tap (then move_slice_window_b bumps v_addr_b across K-iterations within a tap).
             self.v_addr_b_base = sym_t('v_addr_b_base' , vseq(2, 2))
             self.v_addr_out    = sym_t('v_addr_out'    , vseq(2))    # scratch used by coalescing_store_wmma (ping-pong pair)
+            if outer.tunable.wmma_epilogue_chunked:
+                # Phase 53 bugfix: see igemm_fwd_gtc_wmma_nhwc.py's identical comment --
+                # persistent per-lane global column, needed across every pass of the
+                # chunked epilogue's per-group gather.
+                self.v_chunked_col = sym_t('v_chunked_col' , vseq(1))
             if outer.tunable.wmma_m_tail:
                 # Phase 26a: extra scratch for coalescing_store_wmma's per-pass absolute-row
                 # EXEC-mask guard -- only allocated when wmma_m_tail is set (every existing
@@ -455,9 +469,13 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         epilogue_elem_bytes = 2 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16) else 4
         # Phase 48: the atomic (gemm_k_global_split) epilogue never touches LDS at all
         # (no reshuffle needed for a scalar atomic-add-per-element store) -- mirrors wrw's
-        # identical gating.
+        # identical gating. Phase 53: see igemm_fwd_gtc_wmma_nhwc.py's identical comment --
+        # the chunked epilogue only ever needs (wmma_tile_m*waves_per_m) rows resident at
+        # once, not the full gemm_m_per_block.
+        epilogue_m_rows = (self.wmma_mapping.ctrl.wave_tile_m * self.wmma_mapping.ctrl.waves_per_m()) \
+            if self.tunable.wmma_epilogue_chunked else self.tunable.gemm_m_per_block
         epilogue_lds_bytes = 0 if self.tunable.gemm_k_global_split else \
-            self.tunable.gemm_m_per_block * (self.tunable.gemm_n_per_block + epilogue_pad) * epilogue_elem_bytes
+            epilogue_m_rows * (self.tunable.gemm_n_per_block + epilogue_pad) * epilogue_elem_bytes
         # Phase 23: the 128x128 tile is already exactly at the 64KB/workgroup hardware limit
         # with ZERO headroom (Phase 21) -- padding pushes it over (128*132*4 = 67584 > 65536).
         # Fail loudly at codegen time, not silently at kernel-load time on real hardware.
@@ -472,7 +490,11 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             'workgroup_group_segment_byte_size':   max(self.lds_single_size * self.lds_buffer_num, epilogue_lds_bytes),
             'kernarg_segment_byte_size'         :   92,
             'wavefront_sgpr_count'              :   self.sgpr.s_end.value + 2 * 3,
-            'workitem_vgpr_count'               :   self.vgpr.v_end.value,
+            # Phase 54 (VGPR-MSB): see igemm_fwd_gtc_wmma_nhwc.py's identical comment --
+            # bank 1 always starts at physical VGPR 256, so the wave must be granted
+            # that whole span regardless of bank 0's (v_end's) actual usage.
+            'workitem_vgpr_count'               :   (256 + self.tunable.num_vgpr_accumulate_c) \
+                if self.tunable.wmma_acc_high_bank else self.vgpr.v_end.value,
             'wavefront_size'                    :   32,
             'cumode'                            :   0,
         }
@@ -659,6 +681,12 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
     def emit_kernel_prologue(self):
         s = self.sgpr
         v = self.vgpr
+        if self.vgpr_msb_tracker is not None:
+            # Phase 54: see igemm_fwd_gtc_wmma_nhwc.py's identical comment -- establish
+            # a known VGPR-MSB state before the first VGPR-writing instruction.
+            msb_line = self.vgpr_msb_tracker.ensure(dst=0, src0=0, src1=0, src2=0)
+            if msb_line:
+                self._emit(msb_line)
         self._emit(f"s_load_dwordx4 s[{s.s_p_in()}:{s.s_p_in(3)}], s[{s.s_ka()}:{s.s_ka(1)}], 0")
         self._emit(f"s_load_dwordx4 s[{s.s_p_out()}:{s.s_p_out(3)}], s[{s.s_ka()}:{s.s_ka(1)}], 16")
         self._emit(f"s_load_dword s[{s.s_gemm_k()}], s[{s.s_ka()}:{s.s_ka(1)}], 32")
@@ -748,8 +776,19 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
 
         # zero the accumulator -- v_wmma_* does D = A@B + C, and v_c is used as both C and D.
         self._emit(f"; clear accumulator")
+        if self.vgpr_msb_tracker is not None:
+            msb_line = self.vgpr_msb_tracker.ensure(dst=1)
+            if msb_line:
+                self._emit(msb_line)
         for i in range(self.tunable.num_vgpr_accumulate_c):
             self._emit(f"v_mov_b32 v[{v.v_c(i)}], 0")
+        if self.vgpr_msb_tracker is not None:
+            # Phase 54 bugfix: see igemm_fwd_gtc_wmma_nhwc.py's identical comment --
+            # reset dst back to bank 0 immediately, before the rest of the prologue's
+            # ordinary bank-0 VGPR writes.
+            msb_line = self.vgpr_msb_tracker.ensure(dst=0, src0=0, src1=0, src2=0)
+            if msb_line:
+                self._emit(msb_line)
         self._emit_empty_line()
 
         if self.tunable.async_global_load:
@@ -1526,6 +1565,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.tdm_global_to_lds_b = self.tunable.tdm_global_load
         ctrl.local_prefetch_num = self.tunable.local_prefetch_num
         ctrl.wmma_setprio = self.tunable.wmma_setprio
+        ctrl.vgpr_msb_tracker = self.vgpr_msb_tracker
         # Phase 1 (k-sub-loop): A (grad_output/input, untransposed) advances K-contiguous
         # bytes; B (weight, TRANSPOSED -- [K rows][N cols] in LDS) advances whole K-rows,
         # i.e. inst_wmma.k * row_pitch (row_pitch = gemm_n_per_block*data_byte), matching
@@ -1565,7 +1605,8 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_c_total.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off(),
                     s.s_gemm_m.label if self.tunable.wmma_m_tail else None, v.v_m_tail_row() if self.tunable.wmma_m_tail else None,
                     s.s_gemm_n.label if self.tunable.wmma_n_tail else None, v.v_n_tail_col() if self.tunable.wmma_n_tail else None,
-                    s.s_tmp(1) if self.tunable.wmma_n_tail else None))
+                    s.s_tmp(1) if self.tunable.wmma_n_tail else None,
+                    v_chunked_col=v.v_chunked_col() if self.tunable.wmma_epilogue_chunked else None))
         self._emit(f"s_wait_storecnt 0x0")
 
     def emit_kernel_body(self):

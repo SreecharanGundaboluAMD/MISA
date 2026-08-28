@@ -152,6 +152,11 @@ class ctrl_wmma_main_loop_t(object):
         # rewrite the same k-substep drain loop, and composing them isn't validated yet.
         self.local_prefetch_num          = 1
 
+        # Phase 54 (VGPR-MSB): shared vgpr_msb_tracker_t instance (None = mechanism off,
+        # today's byte-identical behavior). When set, v_c lives in a separate 256-VGPR
+        # bank from v_a/v_b -- see igemm_base.py's wmma_acc_high_bank docstring.
+        self.vgpr_msb_tracker             = None
+
         # symbol type
         self.v_a                         = None
         self.v_b                         = None
@@ -226,6 +231,23 @@ class wmma_main_loop_t(mc_base_t):
                 # doc's own caveat (5.7.2.1) about when this helps vs. hurts, cited in
                 # igemm_base.py's wmma_setprio docstring.
                 self._emit(f"s_setprio 1")
+            if ctrl.vgpr_msb_tracker is not None:
+                # Phase 54: v_wmma_* is VOP3P -- D(dst)/A(src0)/B(src1)/C(src2) map to
+                # independent MSB slots (confirmed via llvm-mc). v_c is always D and C
+                # (bank 1); v_a/v_b are always A and B (bank 0). One consistent pattern
+                # for the whole loop body. Uses force() (always emits), NOT ensure()
+                # (memoized skip-if-unchanged) -- emit_wmma_tile() is called from
+                # several different places (early issue, loop body, drain/tail) tied
+                # together by REAL runtime branches, not straight-line code, so
+                # ensure()'s "already set, skip" assumption is unsafe here: a branch
+                # can reach this point without ever having executed whichever earlier
+                # textual call site last updated the tracker's remembered state. Found
+                # via hardware validation (HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION)
+                # after every straight-line-only micro-test passed -- see
+                # docs/gfx1250_wmma_layout.md's Phase 54.
+                msb_line = ctrl.vgpr_msb_tracker.force(dst=1, src0=0, src1=0, src2=1)
+                if msb_line:
+                    self._emit(msb_line)
             a_slot_off = slot * num_v_a_total
             b_slot_off = slot * num_v_b_total
             for i_rm in range(wmma_m.wave_repeat_m):

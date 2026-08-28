@@ -691,6 +691,64 @@ class igemm_gtc_tunable_parameter_t(object):
                     # guard, not a real regression.
                     assert not (self.wmma_acc_f16 or self.wmma_acc_bf16), \
                         "wmma_n_tail's per-element epilogue masking is not yet implemented for wmma_acc_f16/bf16acc's packed 2-elements-per-register layout, see docs/gfx1250_wmma_layout.md's Phase 51"
+            # Phase 53 (chunked epilogue): non-atomic path only. 0 (default) = today's
+            # one-shot design (stage the whole macro-tile in LDS at once), byte-identical
+            # for every existing config -- this is what hard-caps the macro-tile at 128x128
+            # (see docs/gfx1250_wmma_layout.md's Phase 52). 1 = reuse a small,
+            # tile-size-invariant LDS region across wave_repeat_m groups instead, unlocking
+            # bigger macro-tiles (e.g. the new 256x256/256x128 wmma_mapping.py entries)
+            # within the same 64KB/workgroup LDS limit. This alone only solves the LDS
+            # ceiling -- gfx1250's real, hardware-verified 256-VGPR/wave budget (NOT the
+            # 1024 figure Phase 52 originally cited from external research, which turned
+            # out to describe a capability this project's plain v[N]-addressed assembly
+            # doesn't use -- see Phase 53's correction) independently caps how big a tile's
+            # ACCUMULATOR can be, regardless of LDS. wmma_acc_f16/bf16acc (halves the
+            # accumulator width) is therefore a load-bearing combination for any tile
+            # bigger than 128x128, not an optional extra -- supported here. Narrowest
+            # correctness-first slice: not yet combined with wmma_m_tail/wmma_n_tail
+            # (masking interaction with per-group chunking not audited) or
+            # gemm_k_global_split (this flag only touches the non-atomic branch -- the
+            # atomic path has no LDS staging or tile-size ceiling to begin with). See
+            # docs/gfx1250_wmma_layout.md's Phase 53.
+            self.wmma_epilogue_chunked = utility_dict_with_default_t(tunable_dict)('wmma_epilogue_chunked', 0)
+            if self.wmma_epilogue_chunked:
+                assert self.direction in ('fwd', 'bwd'), \
+                    "wmma_epilogue_chunked is only implemented for fwd/bwd so far, see docs/gfx1250_wmma_layout.md's Phase 53"
+                assert not self.wmma_m_tail and not self.wmma_n_tail, \
+                    "wmma_epilogue_chunked is not yet combined with wmma_m_tail/wmma_n_tail, see docs/gfx1250_wmma_layout.md's Phase 53"
+                assert not self.gemm_k_global_split, \
+                    "wmma_epilogue_chunked only applies to the non-atomic epilogue -- gemm_k_global_split's atomic path has no LDS staging to chunk"
+            # Phase 54 (VGPR-MSB): moves ONLY the accumulator (v_c) into a second,
+            # independently-addressed 256-VGPR bank (S_SET_VGPR_MSB, doc Sec 3.3.2.3),
+            # freeing its entire footprint out of the plain 0-255 address space every
+            # other register (v_a/v_b/global-load buffers/addresses/temps) still lives
+            # in. Confirmed via a direct llvm-mc assemble+objdump disassemble round-trip
+            # that this project's toolchain fully supports the mechanism -- an earlier
+            # investigation tested it wrong (tried literal v256+ operand syntax, which
+            # was never real) and wrongly concluded it was unusable; see
+            # docs/gfx1250_wmma_layout.md's Phase 53 correction and Phase 54. This is
+            # the actual fix for the VGPR wall Phase 53 hit trying to grow past 128x128
+            # by fitting everything in one bank. Scope of this phase: v_c ITSELF must
+            # still fit inside a single 256-register bank (asserted below once
+            # num_vgpr_accumulate_c is known) -- v_c spanning multiple banks (needing
+            # per-c_index-range MSB switching inside the main loop's WMMA-issue inner
+            # loop) is a natural follow-on, not implemented here. Default 0 = today's
+            # exact byte-identical behavior (v_c allocated from the same flat 0-255
+            # sequencer as everything else).
+            self.wmma_acc_high_bank = utility_dict_with_default_t(tunable_dict)('wmma_acc_high_bank', 0)
+            if self.wmma_acc_high_bank:
+                # coalescing_store_wmma.py's chunked non-atomic path
+                # (_emit_chunked_non_atomic_store) AND its plain (unchunked) non-atomic
+                # path are both wired for v_c living in a separate bank. The plain atomic
+                # (gemm_k_global_split) path and atomic_pack_bf16 are not -- both still
+                # read v_c directly (global_atomic_add_f32/global_atomic_pk_add_bf16,
+                # v_permlane_xor_b32) with no tracker awareness. wmma_m_tail/wmma_n_tail's
+                # masked slow-path store (indexing v_gather+i directly, bypassing
+                # v_gather_range) also isn't audited for this yet.
+                assert not self.gemm_k_global_split, \
+                    "wmma_acc_high_bank's atomic epilogue path (gemm_k_global_split) is not yet wired for v_c living in a separate VGPR bank"
+                assert not self.wmma_m_tail and not self.wmma_n_tail, \
+                    "wmma_acc_high_bank is not yet combined with wmma_m_tail/wmma_n_tail's masked slow-path store"
             # Phase 35 (GEMM_K tail, wrw): no precedent anywhere else in this codebase --
             # unlike the TDM-hardware-OOB K-tail fwd/1x1 uses (Phase 31), this is a genuine
             # software EXEC-mask mechanism, since wrw doesn't use TDM. Composes with
@@ -752,6 +810,11 @@ class igemm_gtc_tunable_parameter_t(object):
             self.num_vgpr_accumulate_c          = wmma_mapping.total_acc_c()
             self.num_vgpr_accumulate_a          = self.wmma_repeat_m * wmma_mapping.inst_wmma.num_v_a * self.local_prefetch_num
             self.num_vgpr_accumulate_b          = self.wmma_repeat_n * wmma_mapping.inst_wmma.num_v_b * self.local_prefetch_num
+            if self.wmma_acc_high_bank:
+                assert self.num_vgpr_accumulate_c <= 256, \
+                    f"wmma_acc_high_bank (Phase 54) only moves v_c into a SINGLE extra bank -- " \
+                    f"num_vgpr_accumulate_c:{self.num_vgpr_accumulate_c} must fit within one 256-register " \
+                    f"bank; a bigger accumulator needs multi-bank MSB switching inside the main loop, not implemented"
 
         self.global_prefetch_a_num              = 2 if self.tensor_a_pass_through and not self.tensor_a_pass_through_interleave_gld else 1
         self.global_prefetch_b_num              = 2 if self.tensor_b_pass_through and not self.tensor_b_pass_through_interleave_gld else 1

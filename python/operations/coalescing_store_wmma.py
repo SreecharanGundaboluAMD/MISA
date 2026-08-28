@@ -146,6 +146,27 @@ class ctrl_coalescing_store_wmma_t(object):
         # docs/gfx1250_wmma_layout.md's Phase 35 and igemm_wrw_gtc_driver.h's WMMA run().
         self.wrw_reduction_kernel = 0
 
+        # Phase 53 (chunked epilogue, non-atomic path only): 0 (default) = today's
+        # one-shot design, staging the WHOLE macro-tile in LDS before any store --
+        # byte-identical codegen, this is what hard-caps the macro-tile at 128x128 (see
+        # docs/gfx1250_wmma_layout.md's Phase 52/53). 1 = reuse a small,
+        # tile-size-INVARIANT LDS region across `wave_repeat_m` sequential groups
+        # instead -- the same principle XDLOPS's coalescing_store.py already uses
+        # (`coalescing_groups`), adapted to WMMA's simpler addressing. Mutually
+        # exclusive with wmma_m_tail/wmma_n_tail/wmma_acc_f16/bf16acc (masking/packed-
+        # layout interaction not audited this pass, see igemm_base.py) and with
+        # gemm_k_global_split (this flag only touches the non-atomic branch).
+        self.wmma_epilogue_chunked = 0
+
+        # Phase 54 (VGPR-MSB): shared vgpr_msb_tracker_t instance (None = mechanism
+        # off, today's byte-identical behavior). When set, v_c lives in a separate
+        # 256-VGPR bank -- every v_c read-out below (ds_write DATA/global-store-or-
+        # atomic VSRC -> src1 slot; the bf16 cross-lane permlane/cvt_pk path's first
+        # source -> src0 slot) asks the tracker to emit `s_set_vgpr_msb` only when the
+        # required bank combination actually changes. See igemm_base.py's
+        # wmma_acc_high_bank docstring.
+        self.vgpr_msb_tracker = None
+
 
 class igemm_coalescing_store_wmma_t(mc_base_t):
     def __init__(self, mc, ctrl):
@@ -159,7 +180,221 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         # sharing the same small counter values).
         self._label_counter = 0
 
-    def __call__(self, v_c, v_gemm_im, v_gemm_in, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1, v_tid=None, v_gather=None, s_block_m_off=None, s_block_n_off=None, s_gemm_m=None, v_tmp3=None, s_gemm_n=None, v_tmp4=None, s_tmp2=None):
+    def _emit_chunked_non_atomic_store(self, ctrl, cxm, inst_wmma, v_c, v_gemm_im, v_gemm_in,
+            v_tid, v_gather, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1,
+            s_block_m_off, s_block_n_off, vwo, macro_tile_n, elem_bytes, elem_byte_shift,
+            ds_read_inst, gst_inst, v_gather_range, pad, padded_stride, log2_n, v_chunked_col):
+        '''
+        Phase 53: chunked epilogue. Reuses one small, tile-size-INVARIANT LDS region
+        across `wave_repeat_m` sequential groups instead of staging the whole macro-tile
+        at once (the pre-Phase-53 design above, which is exactly what hard-caps the
+        macro-tile at 128x128 -- see docs/gfx1250_wmma_layout.md's Phase 52/53). Same
+        principle as XDLOPS's coalescing_store.py `coalescing_groups`, adapted to WMMA's
+        much simpler (no thread-cluster sub-tiling) addressing.
+
+        Chunks by `i_rm` (wave_repeat_m) only, not `i_rn` -- one group's scatter already
+        covers the FULL macro_tile_n width (the `i_rn`/`j` loops are unconditionally
+        nested inside `i_rm`), so the per-group LDS footprint is
+        `(wave_tile_m*waves_per_m) x macro_tile_n` elements, independent of
+        `wave_repeat_m`/`wave_repeat_n` -- i.e. independent of how big the macro-tile
+        grows. No `i_rn` chunking is needed to keep this bounded.
+
+        Key subtlety: `wmma_mapping.py`'s `get_gemm_index_for_dst_matrix` encodes
+        `v_gemm_im = (wave_m_idx << log2(wave_tile_m*wave_repeat_m)) | (lane/16)*8` --
+        note the wave index is shifted by the FULL `wave_tile_m*wave_repeat_m`, not just
+        `wave_tile_m`. So for a FIXED `i_rm`, the absolute rows touched across all waves
+        are scattered across the full macro-tile (stride `wave_tile_m*wave_repeat_m`
+        apart), not contiguous -- reusing one small LDS region across groups requires a
+        **compact** (group-local) address, not the tile-local one the unchunked path
+        above uses. The compact row drops the `wave_repeat_m` factor: extract
+        `wave_idx = v_gemm_im >> log2(wave_tile_m*wave_repeat_m)` and re-pack it at
+        `log2(wave_tile_m)` instead of its native (higher) bit position. This is the
+        SAME transform in both directions: SCATTER computes compact-from-native (once,
+        group-invariant, since v_gemm_im itself never changes); GATHER needs the inverse
+        (native-from-compact, since the compact row it derives from `tid` must be
+        expanded back to a real tile-local row before adding `s_block_m_off` for the
+        global store address) -- this direction ALSO needs `+ i_rm*wave_tile_m` folded
+        in, since that's exactly the offset compact addressing dropped.
+
+        Bugfix (found via hardware validation, -V 1, after this method's first real
+        build+run -- it had never been hardware-tested before): the gather's per-pass
+        loop originally advanced the GLOBAL store address by a single fixed stride
+        per pass, assuming "compact row advances linearly" implies "true (uncompacted)
+        row advances linearly". False: the compact->true mapping
+        (`wave_idx = compact_row >> log2(wave_tile_m)`, re-inserted at
+        `log2(wave_tile_m*wave_repeat_m)`) has a discontinuity every `wave_tile_m`
+        compact rows -- crossing it jumps the true row by
+        `wave_tile_m*wave_repeat_m - wave_tile_m`, not by the assumed per-pass step.
+        Confirmed on hardware: roughly half of every group's stored elements landed at
+        the wrong row (`valid:n`). Fixed by recomputing the true row (hence the global
+        address) fully from scratch every pass, using `v_tid` (never clobbered) instead
+        of trying to preserve a running value through the pass loop's own register
+        reuse.
+
+        One persistent register beyond the unchunked path's v_tmp1/v_tmp2/v_gather is
+        genuinely needed for this: `v_chunked_col` holds this thread's GLOBAL column
+        (invariant across every pass and every group, computed once below before the
+        group loop) -- everything else the recomputation needs (compact row, wave_idx,
+        lane_sub) is rederived fresh each pass from `v_tid`, so no other new register is
+        required; `v_tmp1`/`v_tmp2`/`v_gather` keep their existing per-group/per-pass
+        scratch roles.
+        '''
+        wave_tile_m = cxm.wave_tile_m
+        wave_repeat_m = cxm.wave_repeat_m
+        waves_per_m = cxm.waves_per_m()
+        virtual_tile_m = wave_tile_m * waves_per_m   # per-group compact M range -- constant across groups
+        log2_wave_tile_m = utility_log2(wave_tile_m)
+        log2_true_tile_m = utility_log2(wave_tile_m * wave_repeat_m)   # bit position to re-insert wave_idx at (native/uncompacted)
+        total_elements_g = virtual_tile_m * macro_tile_n
+        elements_per_thread_g = total_elements_g // ctrl.block_size
+        assert elements_per_thread_g % vwo == 0, f"elements_per_thread_g:{elements_per_thread_g} not divisible by vector_write_out:{vwo}"
+        num_passes_g = elements_per_thread_g // vwo
+        elems_per_pass_g = ctrl.block_size * vwo
+        assert elems_per_pass_g % macro_tile_n == 0, f"elems_per_pass_g:{elems_per_pass_g} not divisible by macro_tile_n:{macro_tile_n}"
+        row_step_per_pass_g = elems_per_pass_g // macro_tile_n
+
+        if ctrl.vgpr_msb_tracker is not None:
+            # Phase 54: every VALU instruction in this whole epilogue writes to a
+            # bank-0 scratch register (v_tmp1/v_tmp2/v_gather/v_gather_range) -- v_c is
+            # ONLY ever read here, never written -- so dst=0 holds for the entire
+            # method; only src0/src1 change, at the specific points below where v_c is
+            # actually read. src2 must ALSO be reset here (not just dst): the gather's
+            # per-pass address recomputation uses `v_lshl_or_b32 vdst, src0, shift_imm,
+            # src2` (confirmed VOP3 via llvm-mc -- the OR operand is a real, MSB-
+            # sensitive SRC2 slot, not folded into src0/src1) with `v_gather` as BOTH
+            # dst and src2 -- left at its main-loop value (src2=1, for v_c's WMMA C
+            # operand), this silently read v_gather from the wrong bank (a real bug
+            # found via hardware validation: HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION,
+            # not merely wrong results, since the corrupted value feeds directly into
+            # the global store address).
+            msb_line = ctrl.vgpr_msb_tracker.ensure(dst=0, src2=0)
+            if msb_line:
+                self._emit(msb_line)
+        self._emit(f"; wmma CHUNKED LDS-reshuffle coalescing store, tile {cxm.macro_tile_m}x{macro_tile_n}, "
+                   f"{wave_repeat_m} groups of {virtual_tile_m}x{macro_tile_n}, vector_write_out={vwo}, {num_passes_g} passes/group")
+        # this thread's GLOBAL column: invariant across every pass and every group (only
+        # the row varies), so computed once, here, into a register that survives the
+        # whole method -- v_tmp1/v_gather both get reused as scratch below and can't
+        # hold it themselves. Uses v_tmp1 as scratch first (its real per-group job,
+        # the LDS address, is (re)computed fresh inside the group loop below anyway).
+        self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {utility_log2(vwo)}, v[{v_tid}]   ; tid*{vwo}")
+        self._emit(f"v_and_b32 v[{v_chunked_col}], {macro_tile_n - 1}, v[{v_tmp1}]   ; col (tile-local)")
+        self._emit(f"v_add_u32 v[{v_chunked_col}], s[{s_block_n_off}], v[{v_chunked_col}]   ; + block_n_off -> global col (persistent for the whole method)")
+        self._emit(f"s_wait_dscnt 0x0")
+        self._emit(f"s_barrier_signal -1")
+        self._emit(f"s_barrier_wait -1   ; main loop's own LDS traffic must retire before group 0 reuses this LDS region")
+        self._emit_empty_line()
+
+        for i_rm in range(wave_repeat_m):
+            self._emit(f"; --- chunked epilogue group {i_rm}/{wave_repeat_m} ---")
+            if i_rm != 0:
+                self._emit(f"s_wait_dscnt 0x0")
+                self._emit(f"s_barrier_signal -1")
+                self._emit(f"s_barrier_wait -1   ; group {i_rm-1}'s gather-reads must retire before this group's scatter reuses the same LDS bytes")
+
+            # ---- scatter: this group's own wave_repeat_n*num_v_c accumulator slice, at the
+            # COMPACT row (v_gemm_im's wave_idx re-packed at log2(wave_tile_m), no i_rm offset --
+            # dropped by compaction, recovered on the gather side instead) ----
+            self._emit(f"v_lshrrev_b32 v[{v_tmp1}], {log2_true_tile_m}, v[{v_gemm_im}]   ; wave_idx (native position)")
+            self._emit(f"v_and_b32 v[{v_tmp2}], {wave_tile_m - 1}, v[{v_gemm_im}]   ; lane_sub = (lane/16)*8")
+            self._emit(f"v_lshl_or_b32 v[{v_tmp2}], v[{v_tmp1}], {log2_wave_tile_m}, v[{v_tmp2}]   ; compact_row = (wave_idx<<log2(wave_tile_m)) | lane_sub")
+            self._emit(f"v_and_b32 v[{v_tmp1}], {macro_tile_n - 1}, v[{v_gemm_in}]   ; col (unchanged -- N is never chunked)")
+            if pad:
+                self._emit(f"v_mul_lo_u32 v[{v_tmp2}], {padded_stride}, v[{v_tmp2}]   ; compact_row * padded_stride")
+            else:
+                self._emit(f"v_lshlrev_b32 v[{v_tmp2}], {log2_n}, v[{v_tmp2}]   ; compact_row << log2(macro_tile_n)")
+            self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_tmp1}], v[{v_tmp2}]   ; + col -> compact tile-linear index")
+            self._emit(f"v_lshlrev_b32 v[{v_tmp2}], {elem_byte_shift}, v[{v_tmp2}]   ; byte address (compact, this group)")
+            # Phase 53: for wmma_acc_f16/bf16acc, VGPR j packs TWO logical rows (2j lo-half,
+            # 2j+1 hi-half) -- mirrors the unchunked path's identical Phase 24 handling
+            # exactly (wave_tile_m/waves_per_m/log2_wave_tile_m above are unaffected by
+            # accumulate width, since a WMMA instruction always covers wave_tile_m=16 rows
+            # regardless of how densely they're packed into registers).
+            row_step = 2 if ctrl.wmma_acc_f16 else 1
+            if ctrl.vgpr_msb_tracker is not None:
+                # Phase 54: v_c is always the DATA operand of ds_write_b16/b16_d16_hi/
+                # b32 below (VDS -> src1 slot, confirmed via llvm-mc) -- one setting
+                # covers this whole group's scatter, reset before the gather's global
+                # store below (which reads v_gather_range, a bank-0 register, off the
+                # SAME src1 slot).
+                msb_line = ctrl.vgpr_msb_tracker.ensure(src1=1)
+                if msb_line:
+                    self._emit(msb_line)
+            for j in range(inst_wmma.num_v_c):
+                if j != 0:
+                    self._emit(f"v_add_u32 v[{v_tmp2}], {padded_stride * elem_bytes * row_step}, v[{v_tmp2}]   ; advance to compact row j={j}")
+                for i_rn in range(cxm.wave_repeat_n):
+                    c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
+                    col_off = i_rn * cxm.wave_tile_n * elem_bytes
+                    offset_str = f" offset:{col_off}" if col_off != 0 else ""
+                    if ctrl.wmma_acc_f16:
+                        hi_off = col_off + padded_stride * elem_bytes
+                        self._emit(f"ds_write_b16 v[{v_tmp2}], v[{v_c}+{c_index}]{offset_str}   ; row j*2 (lo 16 bits)")
+                        self._emit(f"ds_write_b16_d16_hi v[{v_tmp2}], v[{v_c}+{c_index}] offset:{hi_off}   ; row j*2+1 (hi 16 bits)")
+                    else:
+                        self._emit(f"ds_write_b32 v[{v_tmp2}], v[{v_c}+{c_index}]{offset_str}")
+            self._emit_empty_line()
+
+            self._emit(f"s_wait_dscnt 0x0")
+            self._emit(f"s_barrier_signal -1")
+            self._emit(f"s_barrier_wait -1   ; group {i_rm}'s scatter writes must be visible before this group's gather reads")
+
+            if ctrl.vgpr_msb_tracker is not None:
+                # Phase 54: the ENTIRE gather phase below (address computation AND the
+                # final store loop) only ever reads/writes bank-0 scratch registers
+                # (v_tid/v_tmp1/v_tmp2/v_gather/v_gather_range) -- reset src1 back to
+                # bank 0 here, before the FIRST gather instruction, not just before the
+                # store loop, since e.g. v_tid/v_tmp1 appear as src1 in the address
+                # computation too.
+                msb_line = ctrl.vgpr_msb_tracker.ensure(src1=0)
+                if msb_line:
+                    self._emit(msb_line)
+
+            # ---- gather: same tid-based scheme as the unchunked path, but over the
+            # SMALLER virtual (compact) tile. LDS address (compact-linear, invariant
+            # across this group's passes, exactly like the unchunked path) is computed
+            # once, here. The GLOBAL store address is NOT invariant in the same way --
+            # it must be recomputed fresh every pass (see this method's docstring
+            # bugfix note) -- that happens inside the per-pass loop below instead. ----
+            self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {utility_log2(vwo)}, v[{v_tid}]   ; tid*{vwo}, compact tile-linear index for pass 0")
+            self._emit(f"v_and_b32 v[{v_gather}], {macro_tile_n - 1}, v[{v_tmp1}]   ; col0 (tile-local, scratch only)")
+            self._emit(f"v_lshrrev_b32 v[{v_tmp2}], {log2_n}, v[{v_tmp1}]   ; compact_row0 (0..{virtual_tile_m - 1}, scratch only)")
+            if pad:
+                self._emit(f"v_mul_lo_u32 v[{v_tmp1}], {padded_stride}, v[{v_tmp2}]   ; compact_row0 * padded_stride")
+                self._emit(f"v_add_u32 v[{v_tmp1}], v[{v_gather}], v[{v_tmp1}]   ; + col0 -> padded compact tile-linear index")
+                self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {elem_byte_shift}, v[{v_tmp1}]   ; padded LDS byte address (invariant across this group's passes)")
+            else:
+                self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {elem_byte_shift}, v[{v_tmp1}]   ; LDS byte address (invariant across this group's passes)")
+            self._emit_empty_line()
+
+            for it in range(num_passes_g):
+                # recompute this pass's TRUE global row fresh from v_tid every time --
+                # the compact->true mapping is discontinuous every wave_tile_m compact
+                # rows, so it cannot be advanced by a single fixed per-pass stride (see
+                # this method's docstring bugfix note). v_gather is pure scratch here:
+                # safe, because its underlying register (v_gather_range/v_c) isn't
+                # touched by the ds_read below until AFTER this address is fully
+                # computed and stored in v_tmp2.
+                self._emit(f"v_lshlrev_b32 v[{v_gather}], {utility_log2(vwo)}, v[{v_tid}]   ; tid*{vwo}")
+                self._emit(f"v_lshrrev_b32 v[{v_gather}], {log2_n}, v[{v_gather}]   ; compact_row0")
+                if it != 0:
+                    self._emit(f"v_add_u32 v[{v_gather}], {it * row_step_per_pass_g}, v[{v_gather}]   ; + pass advance -> compact_row (pass {it})")
+                self._emit(f"v_lshrrev_b32 v[{v_tmp2}], {log2_wave_tile_m}, v[{v_gather}]   ; wave_idx = compact_row >> log2(wave_tile_m)")
+                self._emit(f"v_and_b32 v[{v_gather}], {wave_tile_m - 1}, v[{v_gather}]   ; lane_sub = compact_row & (wave_tile_m-1)")
+                self._emit(f"v_lshl_or_b32 v[{v_gather}], v[{v_tmp2}], {log2_true_tile_m}, v[{v_gather}]   ; (wave_idx<<log2(wave_tile_m*wave_repeat_m)) | lane_sub")
+                if i_rm != 0:
+                    self._emit(f"v_or_b32 v[{v_gather}], {i_rm * wave_tile_m}, v[{v_gather}]   ; | (i_rm<<log2(wave_tile_m)) -- true row (tile-local, full macro_tile_m range)")
+                self._emit(f"v_add_u32 v[{v_gather}], s[{s_block_m_off}], v[{v_gather}]   ; + block_m_off -> global row")
+                self._emit(f"v_mul_lo_u32 v[{v_gather}], s[{s_gemm_m_stride}], v[{v_gather}]")
+                self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_chunked_col}], v[{v_gather}]   ; + global col")
+                self._emit(f"v_lshlrev_b32 v[{v_tmp2}], {elem_byte_shift}, v[{v_tmp2}]   ; global memory byte address, pass {it}")
+
+                self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * row_step_per_pass_g * padded_stride * elem_bytes}")
+                self._emit(f"s_wait_dscnt 0x0")
+                self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
+            self._emit_empty_line()
+
+    def __call__(self, v_c, v_gemm_im, v_gemm_in, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1, v_tid=None, v_gather=None, s_block_m_off=None, s_block_n_off=None, s_gemm_m=None, v_tmp3=None, s_gemm_n=None, v_tmp4=None, s_tmp2=None, v_chunked_col=None):
         '''
         v_gemm_im/v_gemm_in: this thread's base (row, col) within the macro tile, from
             igemm_wmma_mapping_t.get_gemm_index_for_dst_matrix (row/col of wave_repeat
@@ -361,13 +596,22 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                     # Phase 51: dedicated scratch for the per-pass fast/slow store branch --
                     # see the pass loop below.
                     assert s_tmp2 is not None, "wmma_n_tail with vector_write_out>1 (the non-narrow-accumulate case) requires s_tmp2, see Phase 51"
-                total_elements = macro_tile_m * macro_tile_n
-                elements_per_thread = total_elements // ctrl.block_size
-                assert elements_per_thread % vwo == 0, f"elements_per_thread:{elements_per_thread} not divisible by vector_write_out:{vwo}"
-                num_passes = elements_per_thread // vwo
-                elems_per_pass = ctrl.block_size * vwo
-                assert elems_per_pass % macro_tile_n == 0, f"elems_per_pass:{elems_per_pass} not divisible by macro_tile_n:{macro_tile_n}"
-                row_step_per_pass = elems_per_pass // macro_tile_n
+                if ctrl.wmma_epilogue_chunked:
+                    # Phase 53: wmma_acc_f16/bf16acc IS supported (needed to make a bigger
+                    # tile's accumulator fit gfx1250's real 256-VGPR/wave ceiling at all --
+                    # see docs/gfx1250_wmma_layout.md's Phase 53 correction) -- only
+                    # wmma_m_tail/wmma_n_tail remain excluded (masking interaction with
+                    # per-group chunking not audited this pass).
+                    assert not ctrl.wmma_m_tail and not ctrl.wmma_n_tail, \
+                        "wmma_epilogue_chunked is not yet combined with wmma_m_tail/wmma_n_tail, see docs/gfx1250_wmma_layout.md's Phase 53"
+                else:
+                    total_elements = macro_tile_m * macro_tile_n
+                    elements_per_thread = total_elements // ctrl.block_size
+                    assert elements_per_thread % vwo == 0, f"elements_per_thread:{elements_per_thread} not divisible by vector_write_out:{vwo}"
+                    num_passes = elements_per_thread // vwo
+                    elems_per_pass = ctrl.block_size * vwo
+                    assert elems_per_pass % macro_tile_n == 0, f"elems_per_pass:{elems_per_pass} not divisible by macro_tile_n:{macro_tile_n}"
+                    row_step_per_pass = elems_per_pass // macro_tile_n
                 log2_n = utility_log2(macro_tile_n)
                 # Phase 23: pad the LDS row stride by one dwordx4 (4 elements) to break a
                 # bank-conflict periodicity -- macro_tile_n is always a multiple of 64 (LDS
@@ -406,188 +650,235 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                 v_gather_num_regs = max(1, (vwo * elem_bytes) // 4)
                 v_gather_range = f"{v_gather}:{v_gather}+{v_gather_num_regs - 1}" if v_gather_num_regs > 1 else v_gather
 
-                self._emit(f"; wmma LDS-reshuffle coalescing store, tile {macro_tile_m}x{macro_tile_n}, "
-                           f"vector_write_out={vwo}, {num_passes} passes")
-                # barrier: the main loop's own LDS traffic must be fully retired before we reuse
-                # this same physical LDS region for the reshuffle -- otherwise a fast wave could
-                # start overwriting it while a slow wave in this workgroup is still reading it.
-                self._emit(f"s_wait_dscnt 0x0")
-                self._emit(f"s_barrier_signal -1")
-                self._emit(f"s_barrier_wait -1")
-
-                # ---- scatter: same (i_rm,i_rn,j) addressing as the atomic path above, retargeted
-                # to a tile-linear LDS address via shifts (macro_tile_n is a compile-time power of
-                # 2) instead of a runtime-stride multiply -- cheaper than the global-memory case.
-                # v_gemm_im/v_gemm_in are GLOBAL (gemm-space) positions -- the caller adds
-                # s_block_m_off/s_block_n_off once, persistently, right after computing them (see
-                # e.g. igemm_fwd_gtc_wmma_nhwc.py's emit_kernel_prologue) -- so they must be masked
-                # back down to tile-local (0..macro_tile_m/n-1) before use as an LDS address: since
-                # block_m_off/n_off are always exact multiples of macro_tile_m/n, `& (macro_tile-1)`
-                # strips exactly that high part and leaves the tile-local component unchanged. ----
-                self._emit(f"v_and_b32 v[{v_tmp2}], {macro_tile_n - 1}, v[{v_gemm_in}]   ; tile-local col (persistent)")
-                for i_rm in range(cxm.wave_repeat_m):
-                    row_off = i_rm * cxm.wave_tile_m
-                    self._emit(f"v_add_u32 v[{v_tmp1}], {row_off}, v[{v_gemm_im}]" if row_off != 0 else f"v_mov_b32 v[{v_tmp1}], v[{v_gemm_im}]")
-                    self._emit(f"v_and_b32 v[{v_tmp1}], {macro_tile_m - 1}, v[{v_tmp1}]   ; tile-local row")
-                    if pad:
-                        self._emit(f"v_mul_lo_u32 v[{v_tmp1}], {padded_stride}, v[{v_tmp1}]   ; row * padded_stride")
-                    else:
-                        self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {log2_n}, v[{v_tmp1}]   ; row << log2(macro_tile_n)")
-                    self._emit(f"v_add_u32 v[{v_tmp1}], v[{v_tmp2}], v[{v_tmp1}]   ; + col -> tile-linear index, row {row_off}")
-                    self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {elem_byte_shift}, v[{v_tmp1}]   ; byte address")
-                    # Phase 24: for f16acc, VGPR j packs TWO logical rows (2j lo-half, 2j+1
-                    # hi-half, per the ISA doc's 16-bit C/D-matrix table) -- v_tmp1 tracks the
-                    # LO row's address, stepping 2 rows (not 1) per j; the HI row's write
-                    # reuses the SAME v_tmp1 base with one extra row's stride folded into its
-                    # offset immediate (no extra address-compute instruction needed).
-                    row_step = 2 if ctrl.wmma_acc_f16 else 1
-                    for j in range(inst_wmma.num_v_c):
-                        if j != 0:
-                            self._emit(f"v_add_u32 v[{v_tmp1}], {padded_stride * elem_bytes * row_step}, v[{v_tmp1}]   ; advance to row {row_off + j * row_step}")
-                        for i_rn in range(cxm.wave_repeat_n):
-                            c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
-                            col_off = i_rn * cxm.wave_tile_n * elem_bytes
-                            offset_str = f" offset:{col_off}" if col_off != 0 else ""
-                            if ctrl.wmma_acc_f16:
-                                hi_off = col_off + padded_stride * elem_bytes
-                                self._emit(f"ds_write_b16 v[{v_tmp1}], v[{v_c}+{c_index}]{offset_str}   ; row {row_off + j*2} (lo 16 bits)")
-                                self._emit(f"ds_write_b16_d16_hi v[{v_tmp1}], v[{v_c}+{c_index}] offset:{hi_off}   ; row {row_off + j*2 + 1} (hi 16 bits)")
-                            else:
-                                self._emit(f"ds_write_b32 v[{v_tmp1}], v[{v_c}+{c_index}]{offset_str}")
-                self._emit_empty_line()
-
-                # ---- barrier: all scatter writes must be visible to every lane before any gather read ----
-                self._emit(f"s_wait_dscnt 0x0")
-                self._emit(f"s_barrier_signal -1")
-                self._emit(f"s_barrier_wait -1")
-
-                # ---- gather: lane `tid` owns `vwo` contiguous elements per pass, starting at
-                # tile-linear index tid*vwo (+ a compile-time pass offset folded into the ds_read's
-                # immediate). row0/col0 (this lane's position for pass 0) are derived from that same
-                # index via shift/mask (macro_tile_n is a power of 2) -- col never changes across
-                # passes since elems_per_pass is a multiple of macro_tile_n by construction, so only
-                # the row (and therefore the global memory address) advances, by one scalar add of a
-                # precomputed per-pass stride. ----
-                self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {utility_log2(vwo)}, v[{v_tid}]   ; tid*{vwo}, tile-linear index for pass 0")
-                self._emit(f"v_and_b32 v[{v_gather}], {macro_tile_n - 1}, v[{v_tmp1}]   ; col0 (tile-local)")
-                self._emit(f"v_lshrrev_b32 v[{v_tmp2}], {log2_n}, v[{v_tmp1}]   ; row0 (tile-local)")
-                # Phase 23: compute the LDS byte address (padded or not) from row0/col0 while
-                # they're still tile-local -- must happen BEFORE the block-offset adds below
-                # overwrite v_gather/v_tmp2 with global col/row. v_tmp1's original tid*vwo
-                # value is dead after this (unpadded case reuses it directly; padded case
-                # recomputes from row0*padded_stride+col0, since padding breaks the direct
-                # shift relationship between the packed index and the LDS offset).
-                if pad:
-                    self._emit(f"v_mul_lo_u32 v[{v_tmp1}], {padded_stride}, v[{v_tmp2}]   ; row0 * padded_stride")
-                    self._emit(f"v_add_u32 v[{v_tmp1}], v[{v_gather}], v[{v_tmp1}]   ; + col0 -> padded tile-linear index")
-                    self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {elem_byte_shift}, v[{v_tmp1}]   ; padded LDS byte address (invariant across passes)")
+                if ctrl.wmma_epilogue_chunked:
+                    assert v_chunked_col is not None, "wmma_epilogue_chunked requires v_chunked_col (see kernel_vgpr_t)"
+                    self._emit_chunked_non_atomic_store(ctrl, cxm, inst_wmma, v_c, v_gemm_im, v_gemm_in,
+                        v_tid, v_gather, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1,
+                        s_block_m_off, s_block_n_off, vwo, macro_tile_n, elem_bytes, elem_byte_shift,
+                        ds_read_inst, gst_inst, v_gather_range, pad, padded_stride, log2_n, v_chunked_col)
                 else:
-                    self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {elem_byte_shift}, v[{v_tmp1}]   ; LDS byte address (invariant across passes)")
-                self._emit(f"v_add_u32 v[{v_gather}], s[{s_block_n_off}], v[{v_gather}]   ; + block_n_off -> global col")
-                self._emit(f"v_add_u32 v[{v_tmp2}], s[{s_block_m_off}], v[{v_tmp2}]   ; + block_m_off -> global row")
-                if ctrl.wmma_n_tail:
-                    # Phase 26b/51: this lane's column-in-range state, captured NOW -- v_gather
-                    # itself is about to be reused as the gather's LDS-read destination
-                    # register (v_gather_range aliases v_gather, see below), so its "global
-                    # column" value would otherwise be gone before pass 0's guard needs it.
-                    # Pass-invariant (column never changes across passes), so this is computed
-                    # once here, not per-pass. Phase 51: holds "remaining = gemm_n - col0"
-                    # (SIGNED), not a plain 0/1 flag -- "remaining > i" for i=0..vwo-1 is what
-                    # the per-element masking below needs (a per-GROUP flag, "remaining > 0",
-                    # is just the i=0 case of the same check, so this subsumes the old Phase
-                    # 26b behavior exactly for vwo==1 / non-straddling groups). Signed
-                    # subtraction/compare also correctly masks off every element when
-                    # gemm_n < vwo (remaining goes negative).
-                    self._emit(f"v_sub_i32 v[{v_tmp4}], s[{s_gemm_n}], v[{v_gather}]   ; wmma_n_tail: remaining = gemm_n - col0")
-                    if vwo > 1 and not ctrl.wmma_acc_f16:
-                        # Phase 51: gemm_n % vwo, computed ONCE (pass-invariant) into its own
-                        # dedicated scratch SGPR -- lets each pass cheaply branch straight to
-                        # the pre-Phase-51 fast (single vectorized store) path whenever the
-                        # real gemm_n happens to be an exact multiple of vwo, instead of always
-                        # paying the slower per-element decomposition (see the pass loop
-                        # below). vwo is a compile-time power of 2, so a plain AND suffices.
-                        self._emit(f"s_and_b32 s[{s_tmp2}], s[{s_gemm_n}], {vwo - 1}   ; wmma_n_tail: gemm_n % {vwo}")
-                if ctrl.wmma_m_tail:
-                    # Phase 25: this lane's absolute row for pass 0, preserved across passes --
-                    # v_tmp2 itself gets folded into a byte address on the next line, so it can't
-                    # double as the running row counter the way it does in the unmasked case.
-                    self._emit(f"v_mov_b32 v[{v_tmp3}], v[{v_tmp2}]   ; wmma_m_tail: absolute row, pass 0")
-                self._emit(f"v_mul_lo_u32 v[{v_tmp2}], s[{s_gemm_m_stride}], v[{v_tmp2}]")
-                self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_gather}], v[{v_tmp2}]")
-                self._emit(f"v_lshlrev_b32 v[{v_tmp2}], {elem_byte_shift}, v[{v_tmp2}]   ; global memory byte address for pass 0")
-                self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], {utility_log2(row_step_per_pass) + elem_byte_shift}   ; per-pass memory stride")
-                self._emit_empty_line()
-                for it in range(num_passes):
-                    # row_step_per_pass*padded_stride*elem_bytes == elems_per_pass*elem_bytes
-                    # when pad=0 (since elems_per_pass is a multiple of macro_tile_n by
-                    # construction) -- one formula, byte-identical to the old literal in the
-                    # unpadded f32 case (elem_bytes=4).
-                    self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * row_step_per_pass * padded_stride * elem_bytes}")
+
+                    if ctrl.vgpr_msb_tracker is not None:
+                        # Phase 54: same reasoning as the chunked path's identical reset --
+                        # every scratch VALU instruction below writes to a bank-0 register,
+                        # v_c is only ever READ (never written) here, so dst=0/src2=0 holds
+                        # for this whole branch; only src1 toggles, once for the whole
+                        # scatter block and once for the whole gather block (unlike the
+                        # chunked path, this design does all scatter THEN all gather, not
+                        # per-group, so no per-i_rm toggling is needed).
+                        msb_line = ctrl.vgpr_msb_tracker.ensure(dst=0, src2=0)
+                        if msb_line:
+                            self._emit(msb_line)
+                    self._emit(f"; wmma LDS-reshuffle coalescing store, tile {macro_tile_m}x{macro_tile_n}, "
+                               f"vector_write_out={vwo}, {num_passes} passes")
+                    # barrier: the main loop's own LDS traffic must be fully retired before we reuse
+                    # this same physical LDS region for the reshuffle -- otherwise a fast wave could
+                    # start overwriting it while a slow wave in this workgroup is still reading it.
                     self._emit(f"s_wait_dscnt 0x0")
-                    if ctrl.wmma_n_tail and vwo > 1 and not ctrl.wmma_acc_f16:
-                        # Phase 51: gemm_n is no longer guaranteed to be a multiple of vwo here
-                        # (that restriction -- previously required by tunable_is_valid()
-                        # whenever wmma_n_tail was set -- is exactly what this mechanism
-                        # lifts), so a single EXEC mask covering the whole vwo-wide vectorized
-                        # store can't correctly handle gemm_n falling STRICTLY INSIDE one
-                        # lane's group (the old mask only checked the group's first column,
-                        # silently writing up to vwo-1 out-of-range trailing columns too).
-                        #
-                        # A runtime scalar branch picks between the pre-Phase-51 fast path
-                        # (single vectorized store, exact-multiple case -- byte-identical to
-                        # before this phase) and a slow path decomposed into vwo individual
-                        # masked scalar stores (only the specific straddling group's write
-                        # differs from the fast path; every other lane's data is unaffected
-                        # either way) -- measured on real hardware to matter: without this
-                        # branch (always taking the slow path), an existing exact-multiple-of-4
-                        # shape regressed ~24% (0.132ms -> 0.164ms). gemm_n % vwo is pass-
-                        # invariant, precomputed once into s_tmp2 above. m_tail's row check
-                        # (if any) is cheaply recomputed fresh for each slow-path element (1
-                        # extra VALU instruction) rather than saving/restoring a partially-
-                        # narrowed EXEC state across elements -- avoids needing yet another
-                        # scratch register. Not yet extended to wmma_acc_f16/bf16acc's packed-
-                        # 2-elements-per-register layout (no existing config combines the two,
-                        # asserted against in igemm_base.py -- see
-                        # docs/gfx1250_optimization_backlog.md).
-                        self._label_counter += 1
-                        label_slow = f"L_cstore_{id(self)}_{self._label_counter}_ntail_slow"
-                        label_done = f"L_cstore_{id(self)}_{self._label_counter}_ntail_done"
-                        self._emit(f"s_cmp_eq_u32 s[{s_tmp2}], 0")
-                        self._emit(f"s_cbranch_scc0 {label_slow}   ; Phase 51: gemm_n % {vwo} != 0 this pass -> per-element masking")
-                        if ctrl.wmma_m_tail:
-                            self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (fast path)")
-                        self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n (fast path)")
-                        self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
-                        self._emit(f"s_mov_b32 exec_lo, -1")
-                        self._emit(f"s_branch {label_done}")
-                        self._emit_front(f"{label_slow}:")
-                        for i in range(vwo):
-                            if ctrl.wmma_m_tail:
-                                self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (elem {i})")
-                            self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], {i}   ; wmma_n_tail: col0+{i} < real gemm_n")
-                            self._emit(f"global_store_dword v[{v_tmp2}], v[{v_gather}+{i}], s[{s_p_out}:{s_p_out}+1] offset:{i * elem_bytes}")
-                            self._emit(f"s_mov_b32 exec_lo, -1")
-                        self._emit_front(f"{label_done}:")
+                    self._emit(f"s_barrier_signal -1")
+                    self._emit(f"s_barrier_wait -1")
+
+                    # ---- scatter: same (i_rm,i_rn,j) addressing as the atomic path above, retargeted
+                    # to a tile-linear LDS address via shifts (macro_tile_n is a compile-time power of
+                    # 2) instead of a runtime-stride multiply -- cheaper than the global-memory case.
+                    # v_gemm_im/v_gemm_in are GLOBAL (gemm-space) positions -- the caller adds
+                    # s_block_m_off/s_block_n_off once, persistently, right after computing them (see
+                    # e.g. igemm_fwd_gtc_wmma_nhwc.py's emit_kernel_prologue) -- so they must be masked
+                    # back down to tile-local (0..macro_tile_m/n-1) before use as an LDS address: since
+                    # block_m_off/n_off are always exact multiples of macro_tile_m/n, `& (macro_tile-1)`
+                    # strips exactly that high part and leaves the tile-local component unchanged. ----
+                    self._emit(f"v_and_b32 v[{v_tmp2}], {macro_tile_n - 1}, v[{v_gemm_in}]   ; tile-local col (persistent)")
+                    for i_rm in range(cxm.wave_repeat_m):
+                        row_off = i_rm * cxm.wave_tile_m
+                        if ctrl.vgpr_msb_tracker is not None and i_rm != 0:
+                            # Phase 54: this iteration's address computation (below)
+                            # reads v_gemm_im as src1 -- reset back to bank 0 (the
+                            # previous i_rm's ds_write block above left it at src1=1).
+                            # i_rm==0 needs no reset: src1 is already 0 here, carried
+                            # over from the main loop's own state.
+                            msb_line = ctrl.vgpr_msb_tracker.ensure(src1=0)
+                            if msb_line:
+                                self._emit(msb_line)
+                        self._emit(f"v_add_u32 v[{v_tmp1}], {row_off}, v[{v_gemm_im}]" if row_off != 0 else f"v_mov_b32 v[{v_tmp1}], v[{v_gemm_im}]")
+                        self._emit(f"v_and_b32 v[{v_tmp1}], {macro_tile_m - 1}, v[{v_tmp1}]   ; tile-local row")
+                        if pad:
+                            self._emit(f"v_mul_lo_u32 v[{v_tmp1}], {padded_stride}, v[{v_tmp1}]   ; row * padded_stride")
+                        else:
+                            self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {log2_n}, v[{v_tmp1}]   ; row << log2(macro_tile_n)")
+                        self._emit(f"v_add_u32 v[{v_tmp1}], v[{v_tmp2}], v[{v_tmp1}]   ; + col -> tile-linear index, row {row_off}")
+                        self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {elem_byte_shift}, v[{v_tmp1}]   ; byte address")
+                        if ctrl.vgpr_msb_tracker is not None:
+                            # Phase 54: the address computation just above reads
+                            # v_gemm_im/v_gemm_in (persistent bank-0 registers) as
+                            # src1 -- must run at src1=0 (established once, before this
+                            # loop, and restored at the end of every prior iteration's
+                            # ds_write block below). v_c is the DATA operand of
+                            # ds_write_b16/b16_d16_hi/b32 below (VDS -> src1 slot) --
+                            # switch to src1=1 only now, after that address is done.
+                            msb_line = ctrl.vgpr_msb_tracker.ensure(src1=1)
+                            if msb_line:
+                                self._emit(msb_line)
+                        # Phase 24: for f16acc, VGPR j packs TWO logical rows (2j lo-half, 2j+1
+                        # hi-half, per the ISA doc's 16-bit C/D-matrix table) -- v_tmp1 tracks the
+                        # LO row's address, stepping 2 rows (not 1) per j; the HI row's write
+                        # reuses the SAME v_tmp1 base with one extra row's stride folded into its
+                        # offset immediate (no extra address-compute instruction needed).
+                        row_step = 2 if ctrl.wmma_acc_f16 else 1
+                        for j in range(inst_wmma.num_v_c):
+                            if j != 0:
+                                self._emit(f"v_add_u32 v[{v_tmp1}], {padded_stride * elem_bytes * row_step}, v[{v_tmp1}]   ; advance to row {row_off + j * row_step}")
+                            for i_rn in range(cxm.wave_repeat_n):
+                                c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
+                                col_off = i_rn * cxm.wave_tile_n * elem_bytes
+                                offset_str = f" offset:{col_off}" if col_off != 0 else ""
+                                if ctrl.wmma_acc_f16:
+                                    hi_off = col_off + padded_stride * elem_bytes
+                                    self._emit(f"ds_write_b16 v[{v_tmp1}], v[{v_c}+{c_index}]{offset_str}   ; row {row_off + j*2} (lo 16 bits)")
+                                    self._emit(f"ds_write_b16_d16_hi v[{v_tmp1}], v[{v_c}+{c_index}] offset:{hi_off}   ; row {row_off + j*2 + 1} (hi 16 bits)")
+                                else:
+                                    self._emit(f"ds_write_b32 v[{v_tmp1}], v[{v_c}+{c_index}]{offset_str}")
+                    self._emit_empty_line()
+
+                    # ---- barrier: all scatter writes must be visible to every lane before any gather read ----
+                    self._emit(f"s_wait_dscnt 0x0")
+                    self._emit(f"s_barrier_signal -1")
+                    self._emit(f"s_barrier_wait -1")
+
+                    if ctrl.vgpr_msb_tracker is not None:
+                        # Phase 54: the whole gather section below (address computation AND
+                        # the per-pass store loop) only ever touches bank-0 registers
+                        # (v_tid/v_tmp1/v_tmp2/v_gather/v_gather_range as pure scratch) --
+                        # reset src1 back to bank 0 before the first gather instruction.
+                        msb_line = ctrl.vgpr_msb_tracker.ensure(src1=0)
+                        if msb_line:
+                            self._emit(msb_line)
+                    # ---- gather: lane `tid` owns `vwo` contiguous elements per pass, starting at
+                    # tile-linear index tid*vwo (+ a compile-time pass offset folded into the ds_read's
+                    # immediate). row0/col0 (this lane's position for pass 0) are derived from that same
+                    # index via shift/mask (macro_tile_n is a power of 2) -- col never changes across
+                    # passes since elems_per_pass is a multiple of macro_tile_n by construction, so only
+                    # the row (and therefore the global memory address) advances, by one scalar add of a
+                    # precomputed per-pass stride. ----
+                    self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {utility_log2(vwo)}, v[{v_tid}]   ; tid*{vwo}, tile-linear index for pass 0")
+                    self._emit(f"v_and_b32 v[{v_gather}], {macro_tile_n - 1}, v[{v_tmp1}]   ; col0 (tile-local)")
+                    self._emit(f"v_lshrrev_b32 v[{v_tmp2}], {log2_n}, v[{v_tmp1}]   ; row0 (tile-local)")
+                    # Phase 23: compute the LDS byte address (padded or not) from row0/col0 while
+                    # they're still tile-local -- must happen BEFORE the block-offset adds below
+                    # overwrite v_gather/v_tmp2 with global col/row. v_tmp1's original tid*vwo
+                    # value is dead after this (unpadded case reuses it directly; padded case
+                    # recomputes from row0*padded_stride+col0, since padding breaks the direct
+                    # shift relationship between the packed index and the LDS offset).
+                    if pad:
+                        self._emit(f"v_mul_lo_u32 v[{v_tmp1}], {padded_stride}, v[{v_tmp2}]   ; row0 * padded_stride")
+                        self._emit(f"v_add_u32 v[{v_tmp1}], v[{v_gather}], v[{v_tmp1}]   ; + col0 -> padded tile-linear index")
+                        self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {elem_byte_shift}, v[{v_tmp1}]   ; padded LDS byte address (invariant across passes)")
                     else:
-                        if ctrl.wmma_m_tail:
-                            # Phase 25: EXEC-mask off lanes whose absolute row for this pass is in
-                            # the tail block's out-of-range tail (>= real gemm_m). Wave32-only idiom
-                            # (v_cmpx narrows EXEC directly, exec_lo restore afterward) -- mirrors
-                            # _emit_gld_chunk_load's existing v_flag masking in
-                            # igemm_fwd_gtc_wmma_nhwc.py, not XDLOPS's 64-bit saveexec/or pattern.
-                            self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
-                        if ctrl.wmma_n_tail:
-                            # Phase 26b: chained right after the M-tail guard (if any) -- wave32
-                            # v_cmpx intersects with the current EXEC rather than overwriting it,
-                            # so this further narrows to lanes that are ALSO column-in-range.
-                            # Phase 51: "remaining > 0" is exactly the old "col0 < gemm_n" flag.
-                            self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n")
-                        self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
-                        if ctrl.wmma_m_tail or ctrl.wmma_n_tail:
+                        self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {elem_byte_shift}, v[{v_tmp1}]   ; LDS byte address (invariant across passes)")
+                    self._emit(f"v_add_u32 v[{v_gather}], s[{s_block_n_off}], v[{v_gather}]   ; + block_n_off -> global col")
+                    self._emit(f"v_add_u32 v[{v_tmp2}], s[{s_block_m_off}], v[{v_tmp2}]   ; + block_m_off -> global row")
+                    if ctrl.wmma_n_tail:
+                        # Phase 26b/51: this lane's column-in-range state, captured NOW -- v_gather
+                        # itself is about to be reused as the gather's LDS-read destination
+                        # register (v_gather_range aliases v_gather, see below), so its "global
+                        # column" value would otherwise be gone before pass 0's guard needs it.
+                        # Pass-invariant (column never changes across passes), so this is computed
+                        # once here, not per-pass. Phase 51: holds "remaining = gemm_n - col0"
+                        # (SIGNED), not a plain 0/1 flag -- "remaining > i" for i=0..vwo-1 is what
+                        # the per-element masking below needs (a per-GROUP flag, "remaining > 0",
+                        # is just the i=0 case of the same check, so this subsumes the old Phase
+                        # 26b behavior exactly for vwo==1 / non-straddling groups). Signed
+                        # subtraction/compare also correctly masks off every element when
+                        # gemm_n < vwo (remaining goes negative).
+                        self._emit(f"v_sub_i32 v[{v_tmp4}], s[{s_gemm_n}], v[{v_gather}]   ; wmma_n_tail: remaining = gemm_n - col0")
+                        if vwo > 1 and not ctrl.wmma_acc_f16:
+                            # Phase 51: gemm_n % vwo, computed ONCE (pass-invariant) into its own
+                            # dedicated scratch SGPR -- lets each pass cheaply branch straight to
+                            # the pre-Phase-51 fast (single vectorized store) path whenever the
+                            # real gemm_n happens to be an exact multiple of vwo, instead of always
+                            # paying the slower per-element decomposition (see the pass loop
+                            # below). vwo is a compile-time power of 2, so a plain AND suffices.
+                            self._emit(f"s_and_b32 s[{s_tmp2}], s[{s_gemm_n}], {vwo - 1}   ; wmma_n_tail: gemm_n % {vwo}")
+                    if ctrl.wmma_m_tail:
+                        # Phase 25: this lane's absolute row for pass 0, preserved across passes --
+                        # v_tmp2 itself gets folded into a byte address on the next line, so it can't
+                        # double as the running row counter the way it does in the unmasked case.
+                        self._emit(f"v_mov_b32 v[{v_tmp3}], v[{v_tmp2}]   ; wmma_m_tail: absolute row, pass 0")
+                    self._emit(f"v_mul_lo_u32 v[{v_tmp2}], s[{s_gemm_m_stride}], v[{v_tmp2}]")
+                    self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_gather}], v[{v_tmp2}]")
+                    self._emit(f"v_lshlrev_b32 v[{v_tmp2}], {elem_byte_shift}, v[{v_tmp2}]   ; global memory byte address for pass 0")
+                    self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], {utility_log2(row_step_per_pass) + elem_byte_shift}   ; per-pass memory stride")
+                    self._emit_empty_line()
+                    for it in range(num_passes):
+                        # row_step_per_pass*padded_stride*elem_bytes == elems_per_pass*elem_bytes
+                        # when pad=0 (since elems_per_pass is a multiple of macro_tile_n by
+                        # construction) -- one formula, byte-identical to the old literal in the
+                        # unpadded f32 case (elem_bytes=4).
+                        self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * row_step_per_pass * padded_stride * elem_bytes}")
+                        self._emit(f"s_wait_dscnt 0x0")
+                        if ctrl.wmma_n_tail and vwo > 1 and not ctrl.wmma_acc_f16:
+                            # Phase 51: gemm_n is no longer guaranteed to be a multiple of vwo here
+                            # (that restriction -- previously required by tunable_is_valid()
+                            # whenever wmma_n_tail was set -- is exactly what this mechanism
+                            # lifts), so a single EXEC mask covering the whole vwo-wide vectorized
+                            # store can't correctly handle gemm_n falling STRICTLY INSIDE one
+                            # lane's group (the old mask only checked the group's first column,
+                            # silently writing up to vwo-1 out-of-range trailing columns too).
+                            #
+                            # A runtime scalar branch picks between the pre-Phase-51 fast path
+                            # (single vectorized store, exact-multiple case -- byte-identical to
+                            # before this phase) and a slow path decomposed into vwo individual
+                            # masked scalar stores (only the specific straddling group's write
+                            # differs from the fast path; every other lane's data is unaffected
+                            # either way) -- measured on real hardware to matter: without this
+                            # branch (always taking the slow path), an existing exact-multiple-of-4
+                            # shape regressed ~24% (0.132ms -> 0.164ms). gemm_n % vwo is pass-
+                            # invariant, precomputed once into s_tmp2 above. m_tail's row check
+                            # (if any) is cheaply recomputed fresh for each slow-path element (1
+                            # extra VALU instruction) rather than saving/restoring a partially-
+                            # narrowed EXEC state across elements -- avoids needing yet another
+                            # scratch register. Not yet extended to wmma_acc_f16/bf16acc's packed-
+                            # 2-elements-per-register layout (no existing config combines the two,
+                            # asserted against in igemm_base.py -- see
+                            # docs/gfx1250_optimization_backlog.md).
+                            self._label_counter += 1
+                            label_slow = f"L_cstore_{id(self)}_{self._label_counter}_ntail_slow"
+                            label_done = f"L_cstore_{id(self)}_{self._label_counter}_ntail_done"
+                            self._emit(f"s_cmp_eq_u32 s[{s_tmp2}], 0")
+                            self._emit(f"s_cbranch_scc0 {label_slow}   ; Phase 51: gemm_n % {vwo} != 0 this pass -> per-element masking")
+                            if ctrl.wmma_m_tail:
+                                self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (fast path)")
+                            self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n (fast path)")
+                            self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
                             self._emit(f"s_mov_b32 exec_lo, -1")
-                    if it != num_passes - 1:
-                        self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_tmp2}], s[{s_tmp1}]   ; advance to pass {it + 1}")
-                        if ctrl.wmma_m_tail:
-                            self._emit(f"v_add_u32 v[{v_tmp3}], {row_step_per_pass}, v[{v_tmp3}]   ; wmma_m_tail: advance absolute row")
-                self._emit_empty_line()
+                            self._emit(f"s_branch {label_done}")
+                            self._emit_front(f"{label_slow}:")
+                            for i in range(vwo):
+                                if ctrl.wmma_m_tail:
+                                    self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (elem {i})")
+                                self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], {i}   ; wmma_n_tail: col0+{i} < real gemm_n")
+                                self._emit(f"global_store_dword v[{v_tmp2}], v[{v_gather}+{i}], s[{s_p_out}:{s_p_out}+1] offset:{i * elem_bytes}")
+                                self._emit(f"s_mov_b32 exec_lo, -1")
+                            self._emit_front(f"{label_done}:")
+                        else:
+                            if ctrl.wmma_m_tail:
+                                # Phase 25: EXEC-mask off lanes whose absolute row for this pass is in
+                                # the tail block's out-of-range tail (>= real gemm_m). Wave32-only idiom
+                                # (v_cmpx narrows EXEC directly, exec_lo restore afterward) -- mirrors
+                                # _emit_gld_chunk_load's existing v_flag masking in
+                                # igemm_fwd_gtc_wmma_nhwc.py, not XDLOPS's 64-bit saveexec/or pattern.
+                                self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
+                            if ctrl.wmma_n_tail:
+                                # Phase 26b: chained right after the M-tail guard (if any) -- wave32
+                                # v_cmpx intersects with the current EXEC rather than overwriting it,
+                                # so this further narrows to lanes that are ALSO column-in-range.
+                                # Phase 51: "remaining > 0" is exactly the old "col0 < gemm_n" flag.
+                                self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n")
+                            self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
+                            if ctrl.wmma_m_tail or ctrl.wmma_n_tail:
+                                self._emit(f"s_mov_b32 exec_lo, -1")
+                        if it != num_passes - 1:
+                            self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_tmp2}], s[{s_tmp1}]   ; advance to pass {it + 1}")
+                            if ctrl.wmma_m_tail:
+                                self._emit(f"v_add_u32 v[{v_tmp3}], {row_step_per_pass}, v[{v_tmp3}]   ; wmma_m_tail: advance absolute row")
+                    self._emit_empty_line()
         return self._get_deferred()

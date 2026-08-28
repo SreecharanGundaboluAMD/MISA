@@ -161,6 +161,12 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         assert tunable.block_size == waves_per_m * waves_per_n * 32
         self.tunable = tunable
         self.data_byte = amdgpu_precision_data_byte(tunable.precision)
+        # Phase 54 (VGPR-MSB): one tracker instance shared by the prologue's v_c
+        # zero-init, the main loop, and the epilogue -- all three run sequentially
+        # within this kernel's own emission, so a single mutable tracker correctly
+        # sees every v_c-touching instruction in program order. None when the tunable
+        # is off (today's exact byte-identical behavior).
+        self.vgpr_msb_tracker = vgpr_msb_tracker_t() if tunable.wmma_acc_high_bank else None
 
         # Asymmetric tile shapes (2026-08-25): the global-load thread mapping historically
         # required block_size == gemm_m_per_block == gemm_n_per_block (one row per thread,
@@ -286,6 +292,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # Phase 49: switches the shared epilogue from its direct (LDS-reshuffle) store path
         # to an atomic-add path -- direction-agnostic, mirrors wrw/bwd's identical wiring.
         ctrl_coalescing_store_wmma.gemm_k_global_split = tunable.gemm_k_global_split
+        # Phase 53: switches the non-atomic epilogue from staging the whole macro-tile in
+        # LDS at once to reusing a small, tile-size-invariant region across wave_repeat_m
+        # groups -- see docs/gfx1250_wmma_layout.md's Phase 52/53.
+        ctrl_coalescing_store_wmma.wmma_epilogue_chunked = tunable.wmma_epilogue_chunked
+        ctrl_coalescing_store_wmma.vgpr_msb_tracker = self.vgpr_msb_tracker
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
 
         # int8 added: the only two byte-width-dependent literals (the A/B global-address
@@ -431,7 +442,14 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         def __init__(self, mc, outer):
             mc_base_t.__init__(self, mc)
             vseq = gpr_sequencer_t()
-            self.v_c           = sym_t('v_c'           , vseq(outer.tunable.num_vgpr_accumulate_c))     # 128
+            # Phase 54 (VGPR-MSB): v_c gets its own independent 0-based sequencer (bank
+            # 1, physical 256-511) instead of sharing bank 0's vseq with everything
+            # else -- it never counts against v_end/workitem_vgpr_count's bank-0 total
+            # below. See get_kernel_code()'s workitem_vgpr_count computation for the
+            # other half of this (the wave must still be GRANTED enough physical VGPRs
+            # to cover bank 1, or bank-1 addresses read/write as out-of-range).
+            v_c_vseq = gpr_sequencer_t() if outer.tunable.wmma_acc_high_bank else vseq
+            self.v_c           = sym_t('v_c'           , v_c_vseq(outer.tunable.num_vgpr_accumulate_c))     # 128
             self.v_a           = sym_t('v_a'           , vseq(outer.tunable.num_vgpr_accumulate_a))     # 32
             self.v_b           = sym_t('v_b'           , vseq(outer.tunable.num_vgpr_accumulate_b))     # 32
             if outer.tunable.async_global_load:
@@ -479,6 +497,18 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 # is added) -- computed once from the *y*x*c* row stride, reused every tap.
                 self.v_addr_b_base = sym_t('v_addr_b_base' , vseq(2 * outer.row_repeat_b, 2))
             self.v_addr_out    = sym_t('v_addr_out'    , vseq(2))    # scratch used by coalescing_store_wmma (ping-pong pair)
+            if outer.tunable.wmma_epilogue_chunked:
+                # Phase 53 bugfix: the chunked epilogue's gather phase must recompute
+                # each pass's TRUE (uncompacted) global row fresh (the compact->true
+                # row mapping has a discontinuity every wave_tile_m rows, so a single
+                # fixed per-pass stride -- valid in the unchunked path -- silently
+                # produces wrong addresses roughly half the time here). That
+                # recomputation needs one value to persist across every pass in a
+                # group (this thread's global COLUMN, invariant across passes but
+                # computed using v_gather/v_tmp1/v_tmp2, all of which get reused as
+                # scratch or clobbered by the per-pass LDS read) -- see
+                # coalescing_store_wmma.py's _emit_chunked_non_atomic_store.
+                self.v_chunked_col = sym_t('v_chunked_col' , vseq(1))
             if outer.tunable.wmma_m_tail:
                 # Phase 25: extra scratch for coalescing_store_wmma's per-pass absolute-row
                 # EXEC-mask guard -- only allocated when wmma_m_tail is set (every existing
@@ -574,9 +604,14 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         epilogue_elem_bytes = 2 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16) else 4
         # Phase 49: the atomic (gemm_k_global_split) epilogue never touches LDS at all (no
         # reshuffle needed for a scalar atomic-add-per-element store) -- mirrors wrw/bwd's
-        # identical gating.
+        # identical gating. Phase 53: the chunked epilogue only ever needs
+        # (wmma_tile_m*waves_per_m) rows resident at once (constant across wave_repeat_m
+        # groups), not the full gemm_m_per_block -- see coalescing_store_wmma.py's
+        # _emit_chunked_non_atomic_store and docs/gfx1250_wmma_layout.md's Phase 53.
+        epilogue_m_rows = (self.wmma_mapping.ctrl.wave_tile_m * self.wmma_mapping.ctrl.waves_per_m()) \
+            if self.tunable.wmma_epilogue_chunked else self.tunable.gemm_m_per_block
         epilogue_lds_bytes = 0 if self.tunable.gemm_k_global_split else \
-            self.tunable.gemm_m_per_block * (self.tunable.gemm_n_per_block + epilogue_pad) * epilogue_elem_bytes
+            epilogue_m_rows * (self.tunable.gemm_n_per_block + epilogue_pad) * epilogue_elem_bytes
         # Phase 23: the 128x128 tile is already exactly at the 64KB/workgroup hardware limit
         # with ZERO headroom (Phase 21) -- padding pushes it over (128*132*4 = 67584 > 65536).
         # Fail loudly at codegen time, not silently at kernel-load time on real hardware.
@@ -591,7 +626,14 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             'workgroup_group_segment_byte_size':   max(self.lds_single_size * self.lds_buffer_num, epilogue_lds_bytes),
             'kernarg_segment_byte_size'         :   92,
             'wavefront_sgpr_count'              :   self.sgpr.s_end.value + 2 * 3,
-            'workitem_vgpr_count'               :   self.vgpr.v_end.value,
+            # Phase 54 (VGPR-MSB): when wmma_acc_high_bank is set, v_c physically lives
+            # in bank 1 (256-511), which the hardware always starts at physical VGPR
+            # 256 regardless of how much of bank 0 (v_end) is actually used -- the wave
+            # must be GRANTED registers covering that whole span, not just v_end's
+            # count, or bank-1 accesses read/write as out-of-range (silently wrong
+            # results, not a crash -- see the ISA doc's out-of-range behavior table).
+            'workitem_vgpr_count'               :   (256 + self.tunable.num_vgpr_accumulate_c) \
+                if self.tunable.wmma_acc_high_bank else self.vgpr.v_end.value,
             'wavefront_size'                    :   32,
             'cumode'                            :   0,
         }
@@ -797,6 +839,17 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
     def emit_kernel_prologue(self):
         s = self.sgpr
         v = self.vgpr
+        if self.vgpr_msb_tracker is not None:
+            # Phase 54: establish a KNOWN VGPR-MSB state (all banks 0) before the very
+            # first VGPR-writing instruction in the kernel (v_tid's v_mov_b32 below) --
+            # the ISA doc never states MODE's VGPR-MSB reset value at wave launch, so
+            # this must never be assumed. The tracker's own "first call always emits"
+            # rule only protects call sites that go THROUGH the tracker; every
+            # instruction emitted before this point in program order would otherwise
+            # run under an unknown, un-established bank state.
+            msb_line = self.vgpr_msb_tracker.ensure(dst=0, src0=0, src1=0, src2=0)
+            if msb_line:
+                self._emit(msb_line)
         self._emit(f"s_load_dwordx4 s[{s.s_p_in()}:{s.s_p_in(3)}], s[{s.s_ka()}:{s.s_ka(1)}], 0")
         self._emit(f"s_load_dwordx4 s[{s.s_p_out()}:{s.s_p_out(3)}], s[{s.s_ka()}:{s.s_ka(1)}], 16")
         self._emit(f"s_load_dword s[{s.s_gemm_k()}], s[{s.s_ka()}:{s.s_ka(1)}], 32")
@@ -905,8 +958,27 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # (see wmma_main_loop.py), so it must start at zero rather than whatever garbage was
         # left in these VGPRs at kernel entry.
         self._emit(f"; clear accumulator")
+        if self.vgpr_msb_tracker is not None:
+            # Phase 54: v_mov_b32 is VOP1 -- only dst matters (the immediate 0 isn't a
+            # VGPR, MSB is ignored for it).
+            msb_line = self.vgpr_msb_tracker.ensure(dst=1)
+            if msb_line:
+                self._emit(msb_line)
         for i in range(self.tunable.num_vgpr_accumulate_c):
             self._emit(f"v_mov_b32 v[{v.v_c(i)}], 0")
+        if self.vgpr_msb_tracker is not None:
+            # Phase 54 bugfix: reset dst back to bank 0 immediately -- everything
+            # after this point in the prologue (GEMM_M index decomposition, tap-loop
+            # address setup, etc.) writes ordinary bank-0 VGPRs, and dst was left at
+            # 1 (bank 1) by the zero-init above with nothing to reset it. Every VGPR
+            # write in the rest of the prologue was silently landing in bank 1 until
+            # this was added -- found via rocgdb (HSA_STATUS_ERROR_MEMORY_APERTURE_
+            # VIOLATION at a completely unrelated, ordinary global_load whose address
+            # register had never been correctly written). See
+            # docs/gfx1250_wmma_layout.md's Phase 54.
+            msb_line = self.vgpr_msb_tracker.ensure(dst=0, src0=0, src1=0, src2=0)
+            if msb_line:
+                self._emit(msb_line)
         self._emit_empty_line()
 
         if self.tunable.async_global_load:
@@ -1758,6 +1830,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.interleave = self.tunable.main_loop_interleave
         ctrl.wmma_setprio = self.tunable.wmma_setprio
         ctrl.local_prefetch_num = self.tunable.local_prefetch_num
+        ctrl.vgpr_msb_tracker = self.vgpr_msb_tracker
         # Phase 1 (k-sub-loop): both A and B are untransposed here (K contiguous within
         # an LDS row), so advancing inst_wmma.k K-elements is just inst_wmma.k*data_byte.
         ctrl.k_substep_stride_bytes_a    = self.wmma_mapping.ctrl.inst_wmma.k * self.data_byte
@@ -1799,7 +1872,8 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_k_total.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off(),
                     s.s_gemm_m.label if self.tunable.wmma_m_tail else None, v.v_m_tail_row() if self.tunable.wmma_m_tail else None,
                     s.s_gemm_n.label if self.tunable.wmma_n_tail else None, v.v_n_tail_col() if self.tunable.wmma_n_tail else None,
-                    s.s_tmp(1) if self.tunable.wmma_n_tail else None))
+                    s.s_tmp(1) if self.tunable.wmma_n_tail else None,
+                    v_chunked_col=v.v_chunked_col() if self.tunable.wmma_epilogue_chunked else None))
         self._emit(f"s_wait_storecnt 0x0")
 
     def emit_kernel_body(self):

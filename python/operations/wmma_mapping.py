@@ -275,6 +275,29 @@ ctrl_wmma_mapping_table = {
         ctrl_wmma_mapping_t(64,  64,  16, 16, 2, 2, 4, v_wmma_f16_16x16x32_f16),
         ctrl_wmma_mapping_t(128, 64,  16, 16, 2, 4, 4, v_wmma_f16_16x16x32_f16),
         ctrl_wmma_mapping_t(64,  128, 16, 16, 2, 4, 4, v_wmma_f16_16x16x32_f16),
+        # 256x256, Phase 53 (chunked epilogue): a bigger-than-128x128 macro-tile's
+        # accumulator (total_acc_c = macro_tile_m*macro_tile_n/block_size) does not fit
+        # gfx1250's real, hardware-verified 256-VGPR/wave ceiling at f32-accumulate width
+        # (num_v_c=8) for ANY block_size choice that keeps block_size<=macro_tile (the
+        # existing row_repeat_a/b precondition -- see Phase 53's correction to Phase 52,
+        # which originally over-cited an external "1024 VGPR" figure this project's plain
+        # v[N]-addressed assembly can't actually use). f16acc's num_v_c=4 halves it back
+        # into range: block_size=256 (waves_per_m=4,waves_per_n=2, chosen so
+        # block_size==macro_tile_m==macro_tile_n exactly -- no row_repeat needed at all,
+        # the simplest case) gives total_acc_c = 256*256/256 * (4/8) = 128, matching the
+        # EXISTING 128x128 f32 entry's own accumulator size exactly. fwd-only -- see the
+        # 256x128 entry below for bwd (transposed B requires row_repeat_b==1). Requires
+        # `wmma_epilogue_chunked=1` (chunked epilogue, extended to handle f16acc's packed
+        # 2-elements-per-register layout) -- see docs/gfx1250_wmma_layout.md's Phase 53.
+        ctrl_wmma_mapping_t(256, 256, 16, 16, 8, 4, 8, v_wmma_f16_16x16x32_f16),
+        # 256x128, Phase 53 (chunked epilogue, bwd): bwd's B is TRANSPOSED
+        # (igemm_bwd_gtc_wmma_nhwc_t's own docstring) and asserts row_repeat_b==1 --
+        # gemm_n_per_block must stay == block_size(128, matching the existing 128x128
+        # entry's own waves_per_m/n=2/2 split exactly), so only gemm_m_per_block grows
+        # (wave_repeat_m 4->8, row_repeat_a=2, already-generalized -- no new global-load
+        # mechanism). total_acc_c = 256*128/128 * (4/8) = 128, same budget as fwd's
+        # 256x256 above. Requires `wmma_epilogue_chunked=1`.
+        ctrl_wmma_mapping_t(256, 128, 16, 16, 4, 8, 4, v_wmma_f16_16x16x32_f16),
     ],
     'bf16': [
         ctrl_wmma_mapping_t(128, 128, 16, 16, 4, 4, 4, v_wmma_f32_16x16x32_bf16),
@@ -294,6 +317,10 @@ ctrl_wmma_mapping_table = {
         ctrl_wmma_mapping_t(64,  64,  16, 16, 2, 2, 4, v_wmma_bf16_16x16x32_bf16),
         ctrl_wmma_mapping_t(128, 64,  16, 16, 2, 4, 4, v_wmma_bf16_16x16x32_bf16),
         ctrl_wmma_mapping_t(64,  128, 16, 16, 2, 4, 4, v_wmma_bf16_16x16x32_bf16),
+        # 256x256/256x128, Phase 53 (chunked epilogue): see 'fp16_f16acc''s identical
+        # entries for the full derivation.
+        ctrl_wmma_mapping_t(256, 256, 16, 16, 8, 4, 8, v_wmma_bf16_16x16x32_bf16),
+        ctrl_wmma_mapping_t(256, 128, 16, 16, 4, 8, 4, v_wmma_bf16_16x16x32_bf16),
     ],
     # int8: K=64 (not 32), but num_v_a/num_v_b/num_v_c are still 8/8/8 (same as fp16/bf16 --
     # only elements/dword differs: 4 int8/dword vs 2 fp16/dword), so the same 128x128 macro

@@ -602,6 +602,68 @@ class gpr_sequencer_t(object):
     def get(self):
         return self.cnt
 
+class vgpr_msb_tracker_t(object):
+    '''
+    Phase 54 (gfx1250 VGPR-MSB, doc Sec 3.3.2.3): tracks the wave's currently-active
+    S_SET_VGPR_MSB state -- one 2-bit bank field per DST/SRC0/SRC1/SRC2 operand slot --
+    and returns a new `s_set_vgpr_msb` line only when the combination required by the
+    next instruction differs from what's already active. Mirrors ds_waitcnt_t's
+    (main_loop_graph.py) redundancy-suppression pattern: S_SET_VGPR_MSB sets all four
+    fields at once and the hardware MODE state persists until the next
+    S_SET_VGPR_MSB, so a slot not touched by the current instruction keeps whatever
+    bank was last programmed for it -- callers only pass the slots their instruction
+    actually uses; the tracker fills in the rest from its retained state.
+
+    Immediate bit layout confirmed via a direct llvm-mc assemble + llvm-objdump
+    disassemble round-trip against this project's actual toolchain (see
+    docs/gfx1250_wmma_layout.md's Phase 53/54): immediate[7:0] =
+    {dst[7:6], src2[5:4], src1[3:2], src0[1:0]}.
+
+    The very first `ensure()` call always emits, regardless of whether the requested
+    banks are all 0 -- the ISA doc doesn't state MODE's VGPR-MSB reset value at wave
+    launch, so this deliberately never assumes it.
+    '''
+    def __init__(self):
+        self.dst, self.src0, self.src1, self.src2 = 0, 0, 0, 0
+        self.initialized = False
+
+    def ensure(self, dst=None, src0=None, src1=None, src2=None):
+        new_dst  = self.dst  if dst  is None else dst
+        new_src0 = self.src0 if src0 is None else src0
+        new_src1 = self.src1 if src1 is None else src1
+        new_src2 = self.src2 if src2 is None else src2
+        if self.initialized and (new_dst, new_src0, new_src1, new_src2) == (self.dst, self.src0, self.src1, self.src2):
+            return None
+        self.dst, self.src0, self.src1, self.src2 = new_dst, new_src0, new_src1, new_src2
+        self.initialized = True
+        imm = (new_dst << 6) | (new_src2 << 4) | (new_src1 << 2) | new_src0
+        return f"s_set_vgpr_msb {imm}"
+
+    def force(self, dst=None, src0=None, src1=None, src2=None):
+        '''
+        Like ensure(), but ALWAYS emits, never skips based on remembered state, and
+        never assumes the caller's textual/program order matches runtime execution
+        order. Required at any call site that can be reached via more than one
+        control-flow path (a real runtime branch or loop, not a compile-time-unrolled
+        Python for-loop) -- e.g. wmma_main_loop.py's emit_wmma_tile(), called from
+        several different places (early issue, loop body, drain/tail) stitched
+        together by actual branches. ensure()'s cross-call memoization silently
+        assumes straight-line code: it can wrongly believe a bank is already set
+        because some OTHER textual call site set it earlier in the Python script,
+        when the runtime path that actually reached this point never executed that
+        prior call at all. Found via hardware validation (a real, reproducible
+        HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION) after every straight-line-only
+        micro-test passed -- see docs/gfx1250_wmma_layout.md's Phase 54.
+        '''
+        new_dst  = self.dst  if dst  is None else dst
+        new_src0 = self.src0 if src0 is None else src0
+        new_src1 = self.src1 if src1 is None else src1
+        new_src2 = self.src2 if src2 is None else src2
+        self.dst, self.src0, self.src1, self.src2 = new_dst, new_src0, new_src1, new_src2
+        self.initialized = True
+        imm = (new_dst << 6) | (new_src2 << 4) | (new_src1 << 2) | new_src0
+        return f"s_set_vgpr_msb {imm}"
+
 class macro_packlo_b32_t(macro_base_t):
     def __init__(self, mc):
         macro_base_t.__init__(self, mc, True)

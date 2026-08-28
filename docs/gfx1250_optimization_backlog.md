@@ -282,6 +282,29 @@ section for the record).
 
 ## Tier 3 — bigger bets (largest structural change, longest-term)
 
+- [ ] **VGPR-MSB register-allocator support** (`S_SET_VGPR_MSB`, up to 1024 VGPRs/wave)
+      — IN PROGRESS (Phase 54). Confirmed real and usable through this project's
+      existing toolchain: verified via a full `llvm-mc` assemble + `llvm-objdump`
+      disassemble round-trip (the disassembler resolves and annotates the true
+      hardware address). The instruction encoding never changes — only the *bank*
+      each register symbol is emitted against does — so this is purely a codegen
+      problem: teach the register allocator to track a bank per symbol beyond the
+      first 256, and teach instruction emission to (a) map each instruction format's
+      DST/SRC0/SRC1/SRC2 slots to its actual operands (VOP1/VOP2/VOP3/VOP3P/VOPD/VDS/
+      VFLAT/VBUFFER/VIMAGE all differ) and (b) emit `S_SET_VGPR_MSB` exactly when the
+      needed bank combination changes from the previous instruction. This is the
+      actual fix for the tile-size ceiling below, not tile-shape tuning. See Phase 53
+      (verification) and Phase 54 (implementation) in `docs/gfx1250_wmma_layout.md`.
+- [ ] **Bigger WMMA macro-tile via the chunked epilogue** (Phase 52/53) — the LDS side
+      of the gfx950-XDLOPS-vs-gfx1250-WMMA tile-size gap is fixed
+      (`wmma_epilogue_chunked` in `coalescing_store_wmma.py`, built and uncommitted),
+      but a 256x256 (or 256x128) tile needs a minimum 284 VGPRs at the best reachable
+      wave/block-size split even with `wmma_acc_bf16`/`wmma_acc_f16` — 28 over today's
+      256-register ceiling, with no tile-shape choice closing the gap (see Phase 53's
+      full derivation). This is exactly what the VGPR-MSB item above unblocks. The
+      chunked mechanism itself is otherwise ready to validate standalone on the
+      existing 128x128 tile (`wmma_epilogue_chunked=1`, should be a no-op on output,
+      different LDS/barrier pattern) whenever picked back up.
 - [ ] **Stream-K / persistent-kernel design** for wrw's split-K (rocKE has a working
       reference: `helpers/streamk.py`, `helpers/persistent.py`) — a small, constant-size
       grid with an atomic tile-counter dynamically pulling work, instead of a fixed
