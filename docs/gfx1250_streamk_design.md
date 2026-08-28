@@ -498,16 +498,54 @@ to trust directionally.
 - **`wsred`-equivalent (Approach C) not attempted** — this implements Approach A's atomic
   strategy only.
 
+### Idle-GPU re-measurement + real tuning (2026-08-28, same day, GPU confirmed idle)
+
+Re-measured the exact same two shapes on a confirmed-idle GPU (no KFD processes, tight
+repeat-to-repeat consistency): results matched the earlier contended measurement almost
+exactly (0.072→0.075ms and 0.128→0.168ms) — the original 4x-slower finding and its fix
+were NOT contention artifacts.
+
+**Found and fixed a real, additional sizing bug while testing a third, multi-output-tile
+shape** (`512,30,40,128`, `grid_x*grid_y=4`): it measured **~1.73x slower**, worse than the
+two single/near-single-tile shapes already fixed. `STREAMK_DEBUG` showed why: the
+persistent-worker target (`num_cu`) was being *divided* by `grid_x*grid_y` (matching
+rocKE's own `compute_streamk_grid_size` shape) — for 4 output tiles, each tile got only 64
+workers instead of 256, forcing `max_iters=4` instead of 1, and extra loop iterations show
+up directly as wall-clock latency even though total GPU-wide parallelism is similar.
+
+Exposed the sizing constants as env-var overrides (`STREAMK_BLOCKS_PER_CU`,
+`STREAMK_DIVIDE_BY_TILES`, `STREAMK_CLAIMS_PER_WORKER`, `STREAMK_MAX_SHARDS` — mirroring
+`IGEMM_GSPLIT_SWEEP`'s role for the old design) and swept `STREAMK_DIVIDE_BY_TILES=0`
+(every output tile independently targets the *full* `num_cu` worker count, no division):
+closed `512,30,40,128` from ~1.73x to ~1.09x, and *also* improved `256,30,40,128` (which
+turns out to have `grid_y=2`, not 1 — not actually single-tile as first assumed) from
+~1.31x to ~1.09x, with zero change on the genuinely single-tile shape (`grid_size=1` makes
+division a no-op there). **Made this the new default** — strictly better on every shape
+tested, no downside found. Re-validated correctness on every scenario (single shard,
+degenerate 1:1, multi-claim exact/tail, multi-tile) — all still `valid:y`.
+
+**Final comparison, idle GPU, both fixes applied**:
+
+| Shape (c,H,W,k) | `_gsplit` | `wrw_streamk` | Ratio |
+|---|---|---|---|
+| 128,30,40,128 | 0.074ms | 0.076ms | ~1.03x |
+| 256,30,40,128 | 0.128ms | 0.140ms | ~1.09x |
+| 512,30,40,128 | 0.169ms | 0.185ms | ~1.09x |
+
+Consistently ~1.03-1.09x slower now, down from the earlier 1.04x/1.31x/1.73x spread — a
+real, solid tuning improvement, not just a lucky shape.
+
 ### Resuming on another machine — prioritized next steps
 
-1. **Contention-stability measurement** (cheapest, and the load-bearing question this
-   whole effort rests on) — repeat the same shape N times each for `_gsplit` and
-   `wrw_streamk` under real contention, compare variance not just mean. If `wrw_streamk`
-   isn't more stable, the rest of this list matters much less.
-2. **Expose the sizing constants for tuning** — turn `blocks_per_cu`/
-   `claims_per_worker_target`/`max_total_shards` into an env-var sweep (mirroring
-   `IGEMM_GSPLIT_SWEEP`) at minimum, ideally a real per-shape search like `_gsplit`'s own
-   ternary search.
-3. **Re-measure on an idle GPU** to get a trustworthy absolute baseline.
-4. **More configs** (64x64x32, fp16/fp32/int8) once 1-3 suggest it's worth the coverage.
-5. **M/N-tail support**, then Approach C, roughly in that order of expected value.
+1. **Contention-stability measurement** — still the load-bearing question this whole
+   effort rests on (this update was all measured on an idle GPU). Repeat the same shape N
+   times each for `_gsplit` and `wrw_streamk` under *real* contention (or synthesized
+   competing GPU load), compare variance not just mean. If `wrw_streamk` isn't more
+   stable, the rest of this list matters much less.
+2. **Further tuning** — `STREAMK_CLAIMS_PER_WORKER`/`STREAMK_MAX_SHARDS` still hand-picked
+   (4 / 256), only `STREAMK_DIVIDE_BY_TILES` has been swept so far. A real per-shape sweep
+   of the remaining two (or a proper search like `_gsplit`'s own ternary search) would
+   likely close the remaining ~1.05-1.09x gap further.
+3. **More configs** (64x64x32, fp16/fp32/int8) once contention-resilience (item 1)
+   justifies the coverage.
+4. **M/N-tail support**, then Approach C, roughly in that order of expected value.

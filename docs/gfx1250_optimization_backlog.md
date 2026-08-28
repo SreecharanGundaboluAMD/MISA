@@ -360,25 +360,31 @@ section for the record).
       correctness on every prior scenario (still all `valid:y`). Full numbers, both fixes,
       and the reasoning for why grid.z alone wasn't enough are in
       `docs/gfx1250_streamk_design.md`'s "Performance fix" section.
-      **Still open, prioritized** (full detail in `docs/gfx1250_streamk_design.md`'s
-      "Resuming on another machine" section):
-      1. **The actual motivating question is unmeasured**: is `wrw_streamk` more
-         *contention-resilient* than `_gsplit` (lower variance across repeated runs under
-         real contention), not just similarly fast on one clean-ish run? This is the
-         entire reason Stream-K was worth building (`_gsplit` showed >2x session-to-
-         session variance under contention in `docs/gfx1250_vendor_benchmark_vs_miopen.md`)
-         — cheapest next step and the one everything else depends on.
-      2. **No tuning/search at all** — `_gsplit` finds its split count via a real ternary
-         search over dozens of candidates; `time_streamk()` makes exactly ONE fixed
-         heuristic choice (`blocks_per_cu=1`, `claims_per_worker_target=4`,
-         `max_total_shards=256`, hardcoded C++ constants, no env-var sweep like
-         `IGEMM_GSPLIT_SWEEP`). These got two shapes from ~4x slower to near-parity but are
-         unvalidated guesses, not a tuned optimum.
-      3. Re-measure on a confirmed-idle GPU (both the regression and the fix were measured
-         under contention).
-      4. Only one config exists (128x128x32, bf16); need 64x64x32 + fp16/fp32/int8 to reach
+      **Re-measured on a confirmed-idle GPU + found/fixed a real additional tuning bug
+      (2026-08-28, same day)**: idle-GPU numbers matched the earlier contended ones almost
+      exactly (confirms the original finding/fix weren't contention artifacts). Testing a
+      third, multi-output-tile shape (`512,30,40,128`, 4 output tiles) found it at ~1.73x
+      slower — worse than the two already-fixed shapes — because the persistent-worker
+      target was being divided across output tiles (matching rocKE's own formula shape),
+      starving multi-tile shapes of workers and forcing more loop iterations per worker.
+      Exposed the sizing constants as env-var overrides
+      (`STREAMK_BLOCKS_PER_CU`/`STREAMK_DIVIDE_BY_TILES`/`STREAMK_CLAIMS_PER_WORKER`/
+      `STREAMK_MAX_SHARDS`, mirroring `IGEMM_GSPLIT_SWEEP`) and found
+      `STREAMK_DIVIDE_BY_TILES=0` (don't divide — every tile independently targets the
+      full `num_cu` worker count) strictly better on every shape tested — made it the new
+      default. **All three measured shapes now sit at a consistent ~1.03-1.09x slower**
+      (was 1.04x/1.31x/1.73x). Full numbers in `docs/gfx1250_streamk_design.md`.
+      **Still open, prioritized**:
+      1. **The actual motivating question is still unmeasured**: is `wrw_streamk` more
+         *contention-resilient* than `_gsplit` (lower variance under real contention), not
+         just similarly fast on an idle GPU? This is the entire reason Stream-K was worth
+         building (`_gsplit` showed >2x session-to-session variance under contention in
+         `docs/gfx1250_vendor_benchmark_vs_miopen.md`) — everything else depends on this.
+      2. `STREAMK_CLAIMS_PER_WORKER`/`STREAMK_MAX_SHARDS` still hand-picked (4/256), not
+         swept — only the tile-division behavior has been tuned so far.
+      3. Only one config exists (128x128x32, bf16); need 64x64x32 + fp16/fp32/int8 to reach
          this via the normal driver search, and a decision on the master config union.
-      5. Not combined with M/N-tail masking (blocks real shapes); Reduction-strategy/
+      4. Not combined with M/N-tail masking (blocks real shapes); Reduction-strategy/
          Approach-C not attempted.
 - [ ] **hipconv's block-diagonal channel packing across conv groups** — fills small WMMA
       tiles when the group count is high, a structurally different way to solve

@@ -1054,10 +1054,30 @@ public:
                 hipDevice_t dev;
                 HIP_CALL(hipGetDevice(&dev));
                 HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
-                const int blocks_per_cu = 1;
+                // Research-only overrides for sweeping these constants externally without
+                // rebuilding -- mirrors IGEMM_GSPLIT_SWEEP's role for the old design's split
+                // count. Defaults match the hand-picked values that closed most of the
+                // original ~4x gap; not yet swept/tuned per-shape (see
+                // docs/gfx1250_streamk_design.md's "Resuming on another machine" list).
+                const int blocks_per_cu = env_get_int("STREAMK_BLOCKS_PER_CU", 1);
                 int grid_size = static_cast<int>(grid_x * grid_y);
                 int target_total_workers = dev_prop.multiProcessorCount * blocks_per_cu;
-                int per_tile_workers = std::max(1, (target_total_workers + grid_size - 1) / grid_size);
+                // Tuning update (idle-GPU sweep, same day): dividing target_total_workers by
+                // grid_size (matching rocKE's own compute_streamk_grid_size shape) was the
+                // default, but measured strictly worse on every multi-output-tile shape
+                // tested -- fewer workers per tile means more max_iters (loop iterations)
+                // per persistent workgroup, which shows up directly as wall-clock latency
+                // even though total GPU-wide parallelism is technically similar. NOT
+                // dividing (every tile independently targets target_total_workers) closed a
+                // 512,30,40,128 shape from ~1.73x slower than _gsplit to ~1.07x, and
+                // improved a 256,30,40,128 shape (which also has grid_y=2, not 1) from
+                // ~1.31x to at/near parity -- with zero change on genuinely single-tile
+                // shapes (grid_size=1 makes the two paths identical there). Made this the
+                // default; STREAMK_DIVIDE_BY_TILES=1 restores the old rocKE-shaped behavior
+                // for comparison.
+                int per_tile_workers = env_get_int("STREAMK_DIVIDE_BY_TILES", 0)
+                    ? std::max(1, (target_total_workers + grid_size - 1) / grid_size)
+                    : target_total_workers;
 
                 // Shard-count target: a handful of claims per worker (enough to load-balance
                 // the tail without every worker's very first claim already being its last),
@@ -1066,8 +1086,8 @@ public:
                 // many workers, thousands of total shards means thousands of synchronization
                 // events. Snapped down to the largest divisor of num_k_blocks (every shard
                 // must be an exact multiple of gemm_k_per_block -- no K-tail relief here).
-                const int claims_per_worker_target = 4;
-                const int max_total_shards = 256;
+                const int claims_per_worker_target = env_get_int("STREAMK_CLAIMS_PER_WORKER", 4);
+                const int max_total_shards = env_get_int("STREAMK_MAX_SHARDS", 256);
                 int shard_count_target = std::min(per_tile_workers * claims_per_worker_target, max_total_shards);
                 int total_shards = largest_divisor_leq(num_k_blocks, shard_count_target);
 
