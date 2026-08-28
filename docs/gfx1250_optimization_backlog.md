@@ -388,16 +388,24 @@ section for the record).
       cannot have (no search at all, one deterministic sizing decision). Small sample
       (n=8/shape, 2 shapes, synthetic contention) — real-world/larger-scale confirmation
       still needed. Full numbers in `docs/gfx1250_streamk_design.md`.
+      **Config coverage + M/N-tail masking done (2026-08-28, same day)**: added
+      64x64x32 to the bf16 config, plus new fp16/fp32 configs (both tile sizes, matching
+      `_gsplit`'s existing coverage; int8 skipped, not a current priority). M/N-tail
+      masking needed zero code changes (the tail flags are prologue-computed constants,
+      already wired into the epilogue call) — 128x128x32 doesn't fit (already at the
+      256-VGPR wall, tail flags push it over), but 64x64x32 has headroom and
+      hardware-validates cleanly (M-only, N-only, both, combined with multi-claim) — new
+      `config/igemm_wrw_gtc_gfx1250_nhwc_bf16_streamk_mntail.config`. All still opt-in,
+      not in the master config union.
       **Still open, prioritized**:
       1. Larger contention-resilience sample (more shapes/repeats, ideally real not
          synthesized contention) to firm up the mixed result above in either direction.
       2. `STREAMK_CLAIMS_PER_WORKER`/`STREAMK_MAX_SHARDS` still hand-picked (4/256) and
          only tuned on an idle GPU — a contention-aware retune may close the widened
          mean-ratio gap.
-      3. Only one config exists (128x128x32, bf16); need 64x64x32 + fp16/fp32/int8 to reach
-         this via the normal driver search, and a decision on the master config union.
-      4. Not combined with M/N-tail masking (blocks real shapes); Reduction-strategy/
-         Approach-C not attempted.
+      3. Master config union decision, once 1-2 give enough confidence.
+      4. Reduction-strategy/Approach-C not attempted (lowest priority — rocKE's own
+         reference is incomplete for this part too).
 - [ ] **hipconv's block-diagonal channel packing across conv groups** — fills small WMMA
       tiles when the group count is high, a structurally different way to solve
       "GEMM_M/N too small to fill a tile" than tail-masking.

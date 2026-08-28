@@ -463,40 +463,48 @@ but the *qualitative* improvement (near-parity instead of 4x slower) is large en
 confirmed via `STREAMK_DEBUG`'s direct shard/grid.z readout (not just wall-clock timing),
 to trust directionally.
 
-### What's NOT done (real scope gaps, not swept under the rug)
+### Config coverage + M/N-tail masking (2026-08-28, same day)
 
-- **No tuning/search over the sizing constants at all** — this is the biggest gap. The
-  existing `_gsplit` design finds its split count via a real ternary search over dozens of
-  real-timed candidates per shape (see `time_split`'s search loop above `time_streamk` in
-  `igemm_wrw_gtc_driver.h`). `time_streamk()` makes exactly ONE fixed heuristic choice
-  (`blocks_per_cu=1`, `claims_per_worker_target=4`, `max_total_shards=256`, all hardcoded
-  C++ constants, not config-file tunables or env-var-sweepable like
-  `IGEMM_GSPLIT_SWEEP`) and never searches. These constants got the two measured shapes
-  from ~4x slower to near-parity, but they are unvalidated guesses, not a tuned optimum —
-  a real per-shape sweep would very likely do better in some regimes and worse in others.
-- **The actual motivating question hasn't been measured**: is `wrw_streamk` more
-  *contention-resilient* than `_gsplit`, not just similarly fast on one clean-ish run?
-  `docs/gfx1250_vendor_benchmark_vs_miopen.md` documents `_gsplit` showing >2x
-  session-to-session variance under contention specifically because it launches
-  hundreds-to-thousands of simultaneously-dispatched workgroups — that's the entire reason
-  Stream-K was worth building. Repeating the same shape many times (both designs) under
-  real contention and comparing variance, not just mean, is the real test and hasn't been
-  done.
-- **Only one config exists**: `config/igemm_wrw_gtc_gfx1250_nhwc_bf16_streamk.config`,
-  128x128x32, bf16 only, not in the master config union. To reach this via the normal
-  driver search/benchmark flow, need at least a 64x64x32 variant (matching `_gsplit`'s
-  existing tile-shape coverage) and fp16/fp32/int8 mirrors, then a decision on whether/when
-  to fold into the master union (deliberately deferred pending the two items above).
-- **Re-measure on a confirmed-idle GPU** — both the original 4x-slower finding and the
-  fixed near-parity result were measured under contention from another tenant.
-- **fp16/fp32/int8 untested** — only bf16 built and validated.
-- **Only the 128x128 tile shape tested** — 64x64 and other existing wrw tile shapes not
-  attempted.
-- **Not combined with `wmma_m_tail`/`wmma_n_tail`** (M/N-tail masking) — only exact-multiple
-  gemm_m/gemm_n tested. Blocks a real chunk of real shapes (anything whose gemm_m/gemm_n
-  isn't an exact tile multiple).
+**M/N-tail masking**: turned out to need no code changes at all — `v_flag_a_mtail`/
+`v_flag_b_ntail` are computed once in the prologue as per-thread constants (M/N position
+doesn't depend on which K-shard is being processed), and the epilogue call in
+`emit_kernel_streamk_loop()` already conditionally wired them in from the start. This was
+simply untested, not actually blocked. Tried it directly (`wmma_m_tail=1`/`wmma_n_tail=1`
+alongside `wrw_streamk=1`): **128x128x32 doesn't fit** — already at gfx1250's 256-VGPR
+ceiling with `wrw_streamk`'s own claim/broadcast scratch alone, and the tail flags'
+2 extra registers push it to register index 258 (out of the 0-255 range), a hard
+codegen-time failure, not a runtime one. **64x64x32 has plenty of headroom** and
+hardware-validates cleanly: M-only tail, N-only tail, both together, and combined with
+genuine multi-claim (large K) all `valid:y`. New config:
+`config/igemm_wrw_gtc_gfx1250_nhwc_bf16_streamk_mntail.config` (64x64x32 only).
+
+**More configs**: added 64x64x32 sections to the existing bf16 config, plus new
+`fp16_streamk.config` and `fp32_streamk.config` (both 128x128x32 + 64x64x32, matching the
+existing `_gsplit` config family's precision/tile-shape coverage). int8 deliberately
+skipped — not a current priority per explicit earlier direction in this project. All four
+new/updated configs build cleanly and hardware-validate: exact-fit shapes, genuine
+multi-claim (large K), and (bf16 only, since that's the config with the tail variant)
+M/N-tail, across both tile sizes, all `valid:y`. Still opt-in only, not folded into the
+master config union.
+
+### What's still NOT done
+
+- **Not folded into the master config union** — deliberately deferred: the master union
+  benchmark script would need to reconcile `wrw_streamk`'s different launch-grid model
+  (constant-size persistent grid vs. one-shot search) with the existing
+  ternary-search-driven candidate list, and the contention-resilience question below is
+  still only partially answered.
+- **Contention-resilience is only partially measured** — see the section above: real
+  signal (lower variance in both shapes tried) but small sample (n=8/shape, 2 shapes, one
+  synthetic contention scenario). A bigger sample and/or real (not synthesized) contention
+  would make this much more solid in either direction.
+- **`STREAMK_CLAIMS_PER_WORKER`/`STREAMK_MAX_SHARDS` still hand-picked** (4/256) and only
+  tuned on an idle GPU — `STREAMK_DIVIDE_BY_TILES` is the only constant that's been swept
+  so far. A contention-aware retune may close the widened mean-ratio gap seen under load.
 - **`wsred`-equivalent (Approach C) not attempted** — this implements Approach A's atomic
-  strategy only.
+  strategy only; rocKE's own Reduction-strategy reference is itself incomplete (see §1a),
+  so this would be original engineering, not a port, and was already rated lowest priority
+  in the original design section above.
 
 ### Idle-GPU re-measurement + real tuning (2026-08-28, same day, GPU confirmed idle)
 
@@ -586,6 +594,11 @@ synthesized) contention would strengthen this either direction.
    GPU. A real per-shape sweep of the remaining two (or a proper search like `_gsplit`'s
    own ternary search) — ideally re-tuned *under contention*, not just idle, given the
    mean-ratio gap widened under load above — would likely close the remaining gap further.
-3. **More configs** (64x64x32, fp16/fp32/int8) once contention-resilience (item 1)
-   justifies the coverage.
-4. **M/N-tail support**, then Approach C, roughly in that order of expected value.
+3. **Master config union decision** — once 1-2 give enough confidence, decide whether/how
+   to fold `wrw_streamk` configs into the normal driver search flow.
+4. **Approach C** (Reduction-strategy) — lowest priority; rocKE's own reference is
+   incomplete for this part, so it would be original engineering, not a port.
+
+(Config coverage for bf16/fp16/fp32 at both tile sizes, and M/N-tail masking on 64x64x32,
+are done — see "Config coverage + M/N-tail masking" above. int8 deliberately skipped, not
+a current priority.)
