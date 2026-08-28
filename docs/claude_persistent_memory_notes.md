@@ -10,8 +10,10 @@ repo across machines, independent of any one assistant's local memory directory.
 - **conv_driver.exe mode string** — always use `convfp16`/`convbfp16`/`convint8`, not
   plain `conv`, for non-fp32 kernels, or every result silently reports `valid:n`.
 - **gfx1250 VGPR-MSB** — 128x128 WMMA tile ceiling is a codegen limit, not
-  hardware/toolchain; VGPR-MSB works on real hardware, but Phase 54's kernel
-  integration is WIP, paused for a machine migration + GPU reboot.
+  hardware/toolchain; VGPR-MSB works on real hardware. Phase 54's crash-causing bug
+  (dst=1 never reset) is fixed and hardware-verified. Remaining `valid:n` is ONE
+  precision-independent bug (only the first `v_c` bank-1 sub-range survives; confirmed
+  identically across bf16/fp16/int8/fp32; confirmed NOT an epilogue bug) — root cause open.
 - **GPU hardware debug technique** — use `rocgdb` to find the faulting PC on
   real-hardware crashes before writing synthetic repro kernels.
 - **gfx1250 WMMA hang risk** — back-to-back same-register WMMA with zero interleaving
@@ -118,6 +120,39 @@ convention below still stands for future sessions unless the user asks again).
 Full resume instructions, the exact repro config, and a hardware-safety warning are in
 `docs/gfx1250_wmma_vgpr_msb_wip_status.md` -- read that file first when picking this
 back up, not this memory alone.
+
+**Update (2026-08-28, new machine, post-migration): the dst=1-never-reset bug is fixed
+and hardware-verified, but it was necessary, not sufficient.** A different machine had
+independently RCA'd the exact bug described above (`emit_wmma_tile()` sets `dst=1` before
+every WMMA burst, nothing ever reset it back to 0, so every bank-0 VGPR write in between
+bursts -- `ds_read_b128` for `v_a`/`v_b`, `global_load_dwordx4` into `v_gld_a`/`v_gld_b`,
+`emit_buffer_switch()`'s `v_xor_b32` -- was silently landing in bank 1) but crashed before
+it could hardware-validate its own fix. Re-applied the fix on this machine (as the LAST
+thing `emit_wmma_tile()` does, right after the burst, rather than patching each individual
+consumer call site -- more robust, since there were three separate consumer classes, not
+just the one the other machine had noticed). Verified via disassembly (`s_set_vgpr_msb 0`
+now appears after every burst; llvm-objdump's own physical-address resolution, e.g.
+`v0 /*v256*/`, confirms correct bank-1 addressing) and confirmed zero regression (every
+existing non-`wmma_acc_high_bank` config's `.s`/`.inc` is byte-identical before/after).
+
+**On real hardware: the crash-class symptom is gone, but `valid:n` persists -- and it's ONE
+precision-independent bug, not a subtle one.** Initial per-pixel diffing on bf16 alone was
+misleading (the diff-printer's 100-line cap was consumed by small errors in output row `M=0`
+before ever showing row `M>=1`). Re-tested with `PRINT_EVERY_PIXEL=1` (no cap) across all four
+precisions (bf16, fp16, int8, fp32) on matching 128x128 configs: **every precision shows the
+identical fault line** -- output row `M=0` is correct (bit-exact for int8/fp32), and **every
+row `M>=1` is completely corrupted** (int8 reads the exact constant `0x01010101` for every
+element past index 128; other precisions read plausible-looking-but-wrong or near-zero garbage
+unrelated to the reference). Ruled out via disassembly (bank-1 addressing is provably correct
+for every row, not just row 0) and a differential test (`wmma_epilogue_chunked=1`, a completely
+unrelated LDS scatter/gather implementation, produces the *exact same* failure on int8 -- same
+index, same exact corrupted value -- proving the corruption is already in `v_c`'s bank-1
+registers before either epilogue implementation reads it). Root cause of why only the FIRST
+`v_c` bank-1 sub-range (`i_rm=0,i_rn=0`) survives is still NOT found -- see
+`docs/gfx1250_wmma_vgpr_msb_wip_status.md`'s "Update (2026-08-28...)" section for full detail
+and the recommended next step (a minimal standalone repro with its own scratch buffer, doing a
+direct per-thread `global_store` straight from `v_c`, bypassing both epilogues, to prove whether
+the corruption predates or postdates the main loop).
 
 ---
 

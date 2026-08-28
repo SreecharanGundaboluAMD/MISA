@@ -262,6 +262,28 @@ class wmma_main_loop_t(mc_base_t):
                         v_c((c_index, c_index + inst_wmma.num_v_c - 1))))
             if ctrl.wmma_setprio:
                 self._emit(f"s_setprio 0")
+            if ctrl.vgpr_msb_tracker is not None:
+                # Phase 54 bugfix: reset back to bank 0 immediately, same discipline as
+                # the prologue's accumulator zero-init (igemm_{fwd,bwd}_gtc_wmma_nhwc.py's
+                # emit_kernel_prologue). Nothing downstream of a WMMA burst in this main
+                # loop ever needs dst=1 again until the NEXT burst's own force(dst=1,...)
+                # -- but every consumer that runs in between (f_sld_a/b's ds_read_b128,
+                # f_gld_a/b's write into the persistent v_gld_a/b staging register,
+                # emit_buffer_switch()'s v_xor_b32 on v_sst_a_os/v_sld_a_os/v_sld_b_os)
+                # is an ordinary bank-0 VGPR write that silently lands in bank 1 if dst
+                # is left at 1 from the burst just emitted above. Resetting centrally
+                # here (once, right after the burst) rather than before each individual
+                # consumer call site is deliberate: there are multiple such consumers
+                # across multiple functions in this file, and patching them one at a
+                # time is exactly how the original bug happened (found via source
+                # inspection matching a real hardware `valid:n`-no-crash symptom: bank 1
+                # is still a valid VGPR address, so the corruption never faults).
+                # force() (not ensure()) for the same reason as the dst=1 call above --
+                # this point is reached via a real runtime loop-back branch as well as
+                # straight-line fallthrough, not just linear Python emission order.
+                msb_line = ctrl.vgpr_msb_tracker.force(dst=0, src0=0, src1=0, src2=0)
+                if msb_line:
+                    self._emit(msb_line)
 
         def emit_extra_substeps():
             # k-sub-step 0's shared_load+wmma is always emitted at its original position

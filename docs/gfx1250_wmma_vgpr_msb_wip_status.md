@@ -221,6 +221,119 @@ Summary of touched files:
   had a real reason behind it (size, licensing/NDA), reconsider before pushing this
   commit anywhere shared.
 
+## Update (2026-08-28, new machine, post-migration): RCA'd and fixed the dst=1 leak bug -- necessary but NOT sufficient
+
+A second machine (the one this session had been running on) crashed before hardware
+validation could finish, but its investigation correctly identified a real, previously-missed
+bug in `wmma_main_loop.py`: `emit_wmma_tile()` sets `dst=1` (bank 1, for `v_c`) via
+`vgpr_msb_tracker.force()` before every WMMA burst, but **nothing ever reset it back to 0
+afterward**. Every ordinary bank-0 VGPR write that runs between one burst and the next --
+`f_sld_a`/`f_sld_b`'s `ds_read_b128` (loads `v_a`/`v_b`), `f_gld_a`/`f_gld_b`'s
+`global_load_dwordx4` (writes the persistent `v_gld_a`/`v_gld_b` staging registers), and
+`emit_buffer_switch()`'s `v_xor_b32` (toggles `v_sst_a_os`/`v_sld_a_os`/`v_sld_b_os`) -- was
+silently landing in bank 1 instead. This matches the "valid:n, no crash" symptom exactly (bank
+1 is still a valid VGPR address, so the corruption never faults).
+
+**Fix applied** (`python/operations/wmma_main_loop.py`'s `emit_wmma_tile()`): rather than
+patching each individual consumer call site (which is exactly how the bug happened in the
+first place -- easy to miss one), the reset (`vgpr_msb_tracker.force(dst=0, src0=0, src1=0,
+src2=0)`) is now the LAST thing `emit_wmma_tile()` does, right after the burst, mirroring the
+already-fixed prologue pattern (set dst=1 for the write, reset immediately after). This
+guarantees every downstream consumer sees bank 0 by default regardless of which one runs next.
+Uses `force()` not `ensure()`, same reasoning as the dst=1 call above (this point is reached via
+a real loop-back branch, not just linear Python emission order).
+
+**Verified on real hardware this session** (2026-08-28, gfx1250, idle-ish GPU apart from ~100%
+utilization from two unrelated other-user `python3` processes -- proceeded carefully with
+`timeout`, no hang):
+1. Confirmed via generated `.inc`/disassembly: `s_set_vgpr_msb 0` now appears right after every
+   WMMA burst, before the next `ds_read`/`global_load`/buffer-switch. Disassembly's own
+   physical-address resolution (`v0 /*v256*/` etc.) confirms the bank-1 addressing for both the
+   WMMA burst AND the epilogue's `ds_store_b32` (which independently toggles `src1=1` itself,
+   already correct from the earlier bugs #3-#5 fixes) is being computed correctly by the
+   assembler/hardware.
+2. Zero regression: every existing (non-`wmma_acc_high_bank`) config produces byte-identical
+   `.s`/`.inc` output before and after this fix (diffed `igemm_bwd_gtc_gfx1250_nhwc_bf16_32x32`
+   directly) -- the fix is fully gated behind `ctrl.vgpr_msb_tracker is not None`.
+3. **The crash-class symptom this bug caused is gone, but `valid:n` PERSISTS** on the same
+   128x128 bf16 fwd mechanism-only test from this doc's resume config.
+4. **Tested and REFUTED one hazard hypothesis**: added 4 real `v_nop` instructions right after
+   the WMMA burst (testing whether reading a bank-1-addressed Matrix D needs more real-VALU-
+   instruction separation than the ISA doc's dense-WMMA hazard table implies for bank-0 reads --
+   doc section 7.12.1, table says 0 NOPs needed when XDL co-exec-stall isn't disabled, which this
+   codegen never disables). **No change at all.** (Throwaway diagnostic, reverted, not in the
+   working tree.)
+
+### The remaining bug is precision-independent, and always faults at the exact same boundary
+
+Initial per-pixel diffing on bf16 alone was misleading: `PER_PIXEL_CHECK_PRINT`'s diff-line
+output caps at 100 printed mismatches, and bf16's first ~100 output elements (all within output
+row/`gemm_m` index 0) already have small (~0.02%-9%) errors, consuming the whole cap before the
+real story -- everything from output index 128 onward -- was ever visible. Re-ran with
+`PRINT_EVERY_PIXEL=1` (prints every element unconditionally, no cap) across **all four
+precisions** (bf16, fp16, int8, fp32) on matching 128x128 single-workgroup configs
+(`gemm_m=n*ho*wo=128`, `gemm_n=k=128`, exactly one 128x128 output tile, so the flat output index
+is `M_row*128 + N_col`):
+
+- **Every precision shows the identical fault line**: output row `M=0` (flat indices 0-127) is
+  either bit-exact (int8, fp32) or has only the small pre-existing noise (bf16, fp16 -- see
+  "still open" note below); **every row `M>=1` (index 128 onward) is completely wrong** for
+  every precision, not just a few percent off. int8 is the most legible: every element from
+  index 128 on reads the exact constant `0x01010101` (a bit-pattern, not a plausible int32
+  GEMM accumulation result -- exceeds the max possible sum for `c=128`). fp16 reads near-zero
+  garbage (`0x0000003a`-ish tiny floats, unrelated to `ref`). fp32 reads plausible-looking but
+  wrong small positive floats. bf16's `M=0` block is small-noise-wrong (a separate, much
+  smaller-magnitude issue, still unexplained but clearly secondary) while its `M>=1` block is
+  exactly the same kind of unrelated-to-`ref` garbage as the other three.
+- **Confirmed this is NOT precision-specific and NOT an addressing bug**: disassembly for both
+  bf16 and int8 shows byte-identical, correctly-resolved bank-1 physical addressing (via
+  llvm-objdump's own `/*v256*/`-style annotations) for the accumulator zero-init (all 128
+  registers, v256-v383), every WMMA burst call (all 16 `(i_rm,i_rn)` combinations, correct
+  8-register strides), and the epilogue's `ds_store_b32` scatter (also correctly bank-resolved,
+  same stride pattern, for both int8 and bf16). The *addresses* the generated code computes are
+  provably correct at the instruction-encoding level for every row, not just row 0.
+- **Confirmed this is NOT an epilogue-implementation bug**: `wmma_epilogue_chunked=1` (a
+  completely different, independently-written LDS scatter/gather implementation from the default
+  unchunked path -- different addressing scheme, different loop structure, shares no code) was
+  tested against int8 and produces the **exact same failure**: same starting index (128), same
+  exact corrupted value (`0x01010101`). Two structurally-unrelated consumers of `v_c` reading the
+  *identical* wrong bit pattern at the *identical* index means the corruption is already present
+  in `v_c`'s bank-1 physical registers (for every `(i_rm,i_rn)` group except the very first)
+  before *either* epilogue implementation starts reading it -- ruling out both epilogue codepaths
+  as the cause and pointing back at the main K-loop's WMMA accumulation into bank 1, or a genuine
+  hardware behavior difference between the first bank-1 WMMA destination range used and every
+  subsequent one.
+- **Hazard-timing theories reconsidered and found wanting**: the ISA doc's accumulation-chain
+  hazard entries require A/B/Index to match a *previous* instruction's D -- doesn't apply within
+  one 16-call burst (every call in a burst targets a disjoint `v_c` sub-range, no intra-burst
+  chaining), and the *cross-K-iteration* accumulation chain (same `v_c` sub-range read as C by
+  the next outer K-block's WMMA) has a full barrier + several `ds_read`s of real separation
+  already, for every precision identically -- yet only `i_rm=0`/row 0 survives. No hazard theory
+  found so far explains why row 0 specifically would be exempt while every other row breaks
+  identically across four unrelated instruction encodings (`v_wmma_f32_16x16x32_{f16,bf16}`,
+  `v_wmma_i32_16x16x64_iu8`, `v_wmma_f32_16x16x4_f32`).
+
+**Root cause of the remaining `valid:n` is still NOT found**, but is now MUCH better
+characterized: a single, precision-independent bug that leaves exactly the first `v_c` sub-range
+(bank-1 physical v256-v263, corresponding to `i_rm=0,i_rn=0`) correct and corrupts every other
+sub-range, reproducible identically regardless of which of two unrelated epilogue
+implementations reads it. bf16's `M=0` block ALSO has a separate, smaller-magnitude, not-yet-
+understood noise issue (~0.02%-9% relative error) not present in int8/fp32's bit-exact `M=0` --
+worth investigating separately, likely lower priority than the dominant row>=1 corruption.
+
+**Recommended next step**: a targeted rocgdb register dump was attempted this session (`break
+<kernel_symbol>` resolved without error but never actually trapped execution -- the run
+completed normally with no breakpoint hit; likely needs the kernel built with debug info, or a
+different rocgdb invocation for HSA kernel breakpoints -- not yet worked out). The more reliable
+next step is probably a minimal standalone repro with its own scratch output buffer (host code,
+not just `conv_driver.exe`): zero-init `v_c` across 2+ `(i_rm)` sub-ranges in bank 1, run a tiny
+fixed-iteration K-loop of WMMA accumulation matching this kernel's real structure (barrier +
+`ds_read` between iterations, not the tight zero-interleaving pattern that hung the GPU earlier),
+then do a **simple, direct, uncoalesced per-thread `global_store` straight from each `v_c`
+sub-range** (bypassing both LDS-round-trip epilogues entirely) to prove definitively whether the
+corruption is already present in `v_c` right after the main loop ends, or only appears somewhere
+between the main loop's end and a real epilogue's first read of it.
+
 ## How to resume on a different machine
 
 1. Clone/pull this branch (`users/SreecharanGundaboluAMD/gfx1250_bringup`) — this
