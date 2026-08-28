@@ -574,6 +574,24 @@ either to help on typical conv shapes without further investigation. Given this,
 further bigger-tile work (extending to wrw, other precisions, etc.) over other backlog items
 is not recommended until the remaining gap is understood.
 
+## Phase 57 — int8/int4 `gemm_k_global_split` atomic epilogue (code-level fix, not hw-validated)
+
+`coalescing_store_wmma.py`'s atomic (split-K) epilogue always emitted `global_atomic_add_f32`,
+which bit-reinterprets int8/int4's genuine int32 WMMA accumulator as a float — only bit-exact
+for non-negative sums under ~8.39M (IEEE754 subnormal-arithmetic coincidence). This was
+previously hard-blocked by an assert in `igemm_base.py`. Fixed by emitting
+`global_atomic_add_u32` instead when `ctrl.precision in ('int8', 'int4')` — a plain
+two's-complement 32-bit add, correct for signed and unsigned bit patterns alike (confirmed via
+the ISA doc's opcode table: no separate `GLOBAL_ATOMIC_ADD_I32` exists or is needed). The
+blocking assert was removed accordingly; no other precision's atomic path changes.
+
+**Not done**: hardware end-to-end validation with genuinely signed / large-magnitude int8 test
+data (fwd's own default test-data generation in `conv_driver.cpp` is a weak constant-`1,1`
+pattern for int8/int4 — bwd's default `-5..5` random-signed generation would be the right one
+to test with, if this becomes a priority later). Deprioritized per explicit user direction —
+int8/int4 is not a current focus. Treat this as a real but unexercised capability, same caveat
+class as the 256x256 tile's untested precisions above.
+
 ## How to resume on a different machine
 
 Phase 54's 128x128 mechanism-only test is DONE (`valid:y` across fwd bf16/fp16/int8/fp32, both

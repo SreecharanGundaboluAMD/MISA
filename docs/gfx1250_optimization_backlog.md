@@ -266,19 +266,14 @@ section for the record).
       Not combined with `wmma_k_tail`, `tdm_global_load`, `async_global_load`, or
       `main_loop_interleave` in this pass (all asserted against) — see
       `docs/gfx1250_wmma_layout.md`'s Phase 49.
-- [ ] **int8/int4 `gemm_k_global_split` atomic epilogue is unimplemented and now
-      explicitly blocked** — found and closed-as-a-hard-error 2026-08-27 (Phase 49).
-      `coalescing_store_wmma.py`'s atomic path always emits `global_atomic_add_f32`,
-      but int8/int4's WMMA accumulator is a genuine int32 value — adding two such
-      bit-patterns via real float addition is only bit-exact for non-negative sums under
-      ~8.39M (an IEEE754 subnormal-arithmetic coincidence, not a real integer add), and
-      silently corrupts negative or larger-magnitude accumulations, which realistic int8
-      conv workloads routinely produce. No direction (fwd/bwd/wrw) ever shipped an
-      int8/int4 split-K config — a real, unguarded gap. Added a shared assert in
-      `igemm_base.py` so it hard-errors instead of silently miscompiling/misrunning.
-      Real fix: wire a genuine integer atomic add (`global_atomic_add_i32`/`u32`) into
-      `coalescing_store_wmma.py`'s atomic path, gated on precision. Moderate effort
-      (Tier 2), one shared file benefits all three directions at once.
+- [x] **int8/int4 `gemm_k_global_split` atomic epilogue** — code-level fix landed
+      2026-08-28 (Phase 57). `coalescing_store_wmma.py`'s atomic path now emits
+      `global_atomic_add_u32` for int8/int4 (was always `global_atomic_add_f32`, which
+      bit-reinterpreted the genuine int32 accumulator as float — only coincidentally
+      correct for small non-negative sums). The blocking assert in `igemm_base.py` was
+      removed accordingly. NOT hardware end-to-end validated with genuinely signed /
+      large-magnitude int8 data — deprioritized, int8/int4 is not a current focus. See
+      `docs/gfx1250_wmma_vgpr_msb_wip_status.md`'s Phase 57.
 
 ## Tier 3 — bigger bets (largest structural change, longest-term)
 
