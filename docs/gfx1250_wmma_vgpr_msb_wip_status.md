@@ -482,6 +482,98 @@ Two diagnostic hooks are kept in the tree (env-gated, off by default, zero cost)
 (raw LDS dump, less decisive) and `CHUNK_FINGERPRINT=1` (position fingerprinting, the one that
 actually found this bug) in `coalescing_store_wmma.py`'s `_emit_chunked_non_atomic_store`.
 
+## Phase 56 (2026-08-28, same day): 256x256 is correct but NOT a performance win yet -- occupancy
+
+After Phase 55 landed, ran `script/benchmark_gfx1250_vs_gfx950_diverse.py`'s 60-shape diverse
+sweep (GPU at 100% use from another tenant throughout -- absolute numbers not trustworthy, but
+same-run relative comparisons across candidates are). None of the 60 shapes actually exercise
+the new 256-size tiles (they need exact multiples of 256/128, since `wmma_m_tail`/`wmma_n_tail`
+aren't wired for `wmma_acc_high_bank` yet) -- regenerated the master `_all.config` files
+(`script/build_gfx1250_master_configs.py --write`) so the 256-size sections are at least in the
+searchable candidate set going forward.
+
+Built a shape by hand that fits exactly (`n=1,c=256,H=64,W=64,k=256`, 1x1, stride 1) to test the
+256x256 tile directly against the master config's other candidates in the same
+`conv_driver.exe` invocation (same contention, fair same-run comparison). **Result: 256x256 was
+the SLOWEST candidate** -- `0.060ms` vs. `0.015-0.021ms` for the existing 64x64/128x128 kernels,
+~3x worse. At a much larger problem (`H=W=256`) the gap narrows to ~15% slower, not gone.
+
+**Working theory**: occupancy. The 256x256 tile needs 512 VGPRs/wave (`wmma_acc_high_bank=1`,
+full F32 accumulate, confirmed via `.vgpr_count`) vs. ~250-ish for the existing 128x128 kernel
+-- likely roughly halving achievable waves/CU. The backlog's own Tier 0 profiling
+(`docs/gfx1250_optimization_backlog.md`) found non-WMMA VALU is ~50% of all instructions in
+these kernels, which benefits heavily from cross-wave latency hiding -- a tile that costs
+occupancy can lose more there than it gains from doing more compute per workgroup, especially
+on smaller problems with few workgroups to fill the GPU to begin with. Not yet confirmed via
+direct occupancy measurement (rocprof), only inferred from the shrinking gap at larger scale
+(more workgroups partially compensating) and the VGPR math.
+
+**Next**: try (1) `lds_double_buffer=1` on the 256x256/256x128 configs (Phase 52 noted gfx950's
+own tuned 256x256 XDLOPS sacrifices this for LDS budget; MISA's chunked epilogue's smaller
+footprint might not force the same trade), and (2) combining `wmma_acc_bf16=1` (packed
+accumulate, halves `v_c` to 128 registers) with `wmma_acc_high_bank=1`, dropping total wave VGPR
+need from 512 to 384 -- trading back some of the precision Phase 55 was trying to avoid giving
+up, in exchange for occupancy, if that's what's actually costing performance. See below for
+results.
+
+### Results: both tried, neither closes the gap -- 128x128 wins in every shape tested
+
+Built all four combinations (plain, `+dbuf`, `+bf16acc`, `+dbuf+bf16acc`) as sections of one
+config file alongside the existing 128x128 kernel, so every candidate runs in the same
+`conv_driver.exe` invocation (fair same-contention comparison). fwd, three problem sizes
+(`c=256,k=256`, spatial 64x64 / 128x128 / 256x256):
+
+| variant | 64x64 | 128x128 | 256x256 |
+|---|---|---|---|
+| 256x256 plain (512 VGPR) | 0.057ms | 0.041ms | 0.046ms |
+| 256x256 `+dbuf` (512 VGPR, 64KB LDS) | 0.053ms | 0.041ms | 0.047ms |
+| 256x256 `+bf16acc` (384 VGPR) | 0.050ms | 0.040ms | 0.045ms |
+| 256x256 `+dbuf+bf16acc` (384 VGPR, 64KB LDS) | 0.050ms | 0.040ms | 0.045ms |
+| **128x128 (existing, ~250 VGPR)** | **0.021ms** | **0.022ms** | **0.041ms** |
+
+(The `+bf16acc` variants report `valid:n` when run mixed with the plain/dbuf variants in the
+same invocation -- this is the SAME pre-existing, already-documented `conv_driver.cpp`
+limitation `build_gfx1250_master_configs.py` works around: output buffer width is computed once
+from the first kernel in a run, not per-candidate, so a packed-accumulate kernel's real, correct
+output gets miscompared when mixed with a full-F32 kernel's width assumption. Confirmed
+`valid:y` for every `+bf16acc` variant tested standalone, including multi-workgroup. Timing
+numbers are unaffected -- the kernel still does real work and gets timed correctly regardless of
+the comparison harness's format mismatch.)
+
+**Conclusions**:
+- `lds_double_buffer=1` gives no consistent benefit (sometimes marginally better, sometimes
+  marginally worse) while permanently costing the full 64KB LDS budget for zero measured
+  upside on any tested shape. Not adopted as a default.
+- `wmma_acc_bf16` (packed accumulate) is a consistent, if modest, ~10-12% win over the plain
+  256x256/256x128 entry at every scale tested, with no downside beyond the expected precision
+  loss. Added as a proper separate opt-in config file
+  (`igemm_{fwd,bwd}_gtc_gfx1250_nhwc_bf16_{256x256,256x128}_bf16acc.config`, matching this
+  project's existing convention for accumulate-width variants -- NOT folded into the plain
+  entry, since `wmma_acc_bf16` is one of `build_gfx1250_master_configs.py`'s
+  `ACCUMULATE_WIDTH_KEYS` and mixing it into the master-searched file would trigger the same
+  false-`valid:n` issue described above for every OTHER kernel in that file, not just itself.
+- **Neither change closes the gap to the existing 128x128 kernel, at ANY tested scale** -- even
+  the best 256-size variant remains roughly 2x slower at small/medium scale and still ~10%
+  slower even at the largest tested problem (256x256 spatial, 256 channels). The VGPR-driven-
+  occupancy theory explains PART of the gap (packed accumulate's 384-vs-512 VGPR reduction
+  does help, consistently, across all three sizes) but clearly isn't the whole story -- some
+  other cost (candidates, not yet investigated: the chunked epilogue's own per-group barrier
+  overhead absent from the 128x128 kernel's one-shot epilogue; fewer, bigger workgroups per
+  dispatch reducing wave-level parallelism independent of per-wave VGPR count; the 8-wave
+  workgroup structure itself vs. 128x128's 4-wave workgroups) is also at play. Not root-caused
+  further this session -- would need direct rocprof occupancy/instruction-mix measurement
+  (`docs/gfx1250_optimization_backlog.md`'s Tier 0 methodology) to separate these theories,
+  ideally on a confirmed-idle GPU.
+
+**Bottom line**: the 256x256/256x128 tiles are a correct, real engineering capability (Phase
+54/55) that simply isn't a performance win yet on the shapes tried. Kept in the master search
+set (plain entry) and as opt-in files (packed variant) in case they win on untried shapes (e.g.
+much larger problems, or shapes where 128x128's own occupancy is ALREADY constrained by
+something else, making the bigger tile's relative disadvantage smaller) -- but don't expect
+either to help on typical conv shapes without further investigation. Given this, prioritizing
+further bigger-tile work (extending to wrw, other precisions, etc.) over other backlog items
+is not recommended until the remaining gap is understood.
+
 ## How to resume on a different machine
 
 Phase 54's 128x128 mechanism-only test is DONE (`valid:y` across fwd bf16/fp16/int8/fp32, both

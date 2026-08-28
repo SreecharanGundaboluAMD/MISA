@@ -294,24 +294,42 @@ section for the record).
       instead of bank 0. `valid:y` across fwd bf16/fp16/int8/fp32 and bwd bf16, both
       epilogue implementations, at 128x128. See
       `docs/gfx1250_wmma_vgpr_msb_wip_status.md` for the full writeup.
-- [x] **Bigger WMMA macro-tile via the chunked epilogue** (Phase 52/53/55) — DONE. The
-      VGPR wall is closed (VGPR-MSB above): fwd 256x256 and bwd 256x128 build with full
-      F32 accumulate (`wmma_acc_high_bank=1`, replacing the precision-losing
-      `wmma_acc_bf16` workaround Phase 53 needed and which still didn't fit even with
-      packing). Also found and fixed a genuine, separate, pre-existing
-      `wmma_epilogue_chunked` bug along the way: the chunked scatter derived
-      `wave_idx`/`lane_sub` directly from `v_gemm_im` without masking out the
-      block-offset the prologue permanently folds into it, so every workgroup after the
-      first (`grid_x>1`) scattered into the wrong LDS bytes entirely (invisible for
-      `bx=0`, since `block_m_off=0` there). Found via a position-fingerprint diagnostic
-      (`CHUNK_FINGERPRINT=1`) and fixed by masking to tile-local range, matching the
-      unchunked path's existing discipline. **Hardware-validated `valid:y`** for both
-      directions, single- and multi-workgroup, multi-K-block, multi-N-block. See Phase
-      55 in `docs/gfx1250_wmma_vgpr_msb_wip_status.md` for the full investigation.
-      Untested: int8/fp16/fp32 at 256-size tiles (only bf16 verified), wrw direction,
-      and whether main-loop double-buffering is affordable on top (Phase 52 noted
-      gfx950's own tuned 256x256 sacrifices this for LDS budget — worth re-checking
-      given the chunked epilogue's smaller footprint).
+- [~] **Bigger WMMA macro-tile via the chunked epilogue** (Phase 52/53/55/56) —
+      CORRECTNESS DONE, PERFORMANCE NOT YET A WIN. The VGPR wall is closed (VGPR-MSB
+      above): fwd 256x256 and bwd 256x128 build with full F32 accumulate
+      (`wmma_acc_high_bank=1`, replacing the precision-losing `wmma_acc_bf16`
+      workaround Phase 53 needed and which still didn't fit even with packing). Also
+      found and fixed a genuine, separate, pre-existing `wmma_epilogue_chunked` bug
+      along the way: the chunked scatter derived `wave_idx`/`lane_sub` directly from
+      `v_gemm_im` without masking out the block-offset the prologue permanently folds
+      into it, so every workgroup after the first (`grid_x>1`) scattered into the
+      wrong LDS bytes entirely (invisible for `bx=0`, since `block_m_off=0` there).
+      Found via a position-fingerprint diagnostic (`CHUNK_FINGERPRINT=1`) and fixed by
+      masking to tile-local range, matching the unchunked path's existing discipline.
+      **Hardware-validated `valid:y`** for both directions, single- and
+      multi-workgroup, multi-K-block, multi-N-block. See Phase 55 in
+      `docs/gfx1250_wmma_vgpr_msb_wip_status.md`.
+
+      **Phase 56: tried to close the performance gap, couldn't yet.** Same-run
+      comparison (256x256 vs. existing 128x128, both in one `conv_driver.exe`
+      invocation) showed the new tile is the SLOWEST candidate at every scale tried —
+      ~2-3x slower at small/medium problem sizes, still ~10-15% slower even at the
+      largest tested (256x256 spatial, 256 channels). Tried `lds_double_buffer=1` (no
+      consistent benefit, costs the full 64KB LDS budget) and packed accumulate
+      (`wmma_acc_bf16`, drops VGPR/wave from 512 to 384 — consistent ~10-12%
+      improvement over the plain entry, added as a separate opt-in
+      `*_256x256_bf16acc.config`/`*_256x128_bf16acc.config` file per this project's
+      accumulate-width-variant convention) — **neither closes the gap**. VGPR-driven
+      occupancy explains part of it but not all; remaining candidates (chunked
+      epilogue's per-group barrier overhead vs. 128x128's one-shot epilogue, or
+      fewer/bigger workgroups reducing wave-level parallelism independent of per-wave
+      VGPR count) not yet investigated — would need direct rocprof occupancy/
+      instruction-mix measurement on a confirmed-idle GPU to separate. See Phase 56 in
+      `docs/gfx1250_wmma_vgpr_msb_wip_status.md` for full numbers.
+
+      Untested: int8/fp16/fp32 at 256-size tiles (only bf16 verified), wrw direction —
+      **do not extend to these until the performance gap above is understood**, since
+      that would just propagate a config that isn't winning yet.
 - [ ] **Stream-K / persistent-kernel design** for wrw's split-K (rocKE has a working
       reference: `helpers/streamk.py`, `helpers/persistent.py`) — a small, constant-size
       grid with an atomic tile-counter dynamically pulling work, instead of a fixed
