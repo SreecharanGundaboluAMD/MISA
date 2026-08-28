@@ -374,14 +374,26 @@ section for the record).
       full `num_cu` worker count) strictly better on every shape tested — made it the new
       default. **All three measured shapes now sit at a consistent ~1.03-1.09x slower**
       (was 1.04x/1.31x/1.73x). Full numbers in `docs/gfx1250_streamk_design.md`.
+      **Contention-resilience measured (2026-08-28, same day) — the actual motivating
+      question, honest mixed result**: no real external tenant available, so contention
+      was synthesized (a large background fwd conv, confirmed via `rocm-smi` to be
+      consuming the GPU). Ran both designs 8x each against 2 shapes, comparing variance
+      (coefficient of variation), not just mean. **`wrw_streamk` showed lower variance in
+      both shapes** (12.7% vs 14.5%, and 10.6% vs 20.5% — nearly half) — supports the core
+      hypothesis. **But its mean slowdown grew under load** (1.52x and 1.26x, vs. the
+      idle-GPU 1.03-1.09x) — the near-parity result doesn't fully hold under contention
+      with today's (idle-tuned) sizing. Separately: `_gsplit`'s own ternary search picked
+      **4 different split counts across 8 repeats** for one shape under contention — the
+      search itself is unstable under load, a distinct reliability gap `wrw_streamk`
+      cannot have (no search at all, one deterministic sizing decision). Small sample
+      (n=8/shape, 2 shapes, synthetic contention) — real-world/larger-scale confirmation
+      still needed. Full numbers in `docs/gfx1250_streamk_design.md`.
       **Still open, prioritized**:
-      1. **The actual motivating question is still unmeasured**: is `wrw_streamk` more
-         *contention-resilient* than `_gsplit` (lower variance under real contention), not
-         just similarly fast on an idle GPU? This is the entire reason Stream-K was worth
-         building (`_gsplit` showed >2x session-to-session variance under contention in
-         `docs/gfx1250_vendor_benchmark_vs_miopen.md`) — everything else depends on this.
-      2. `STREAMK_CLAIMS_PER_WORKER`/`STREAMK_MAX_SHARDS` still hand-picked (4/256), not
-         swept — only the tile-division behavior has been tuned so far.
+      1. Larger contention-resilience sample (more shapes/repeats, ideally real not
+         synthesized contention) to firm up the mixed result above in either direction.
+      2. `STREAMK_CLAIMS_PER_WORKER`/`STREAMK_MAX_SHARDS` still hand-picked (4/256) and
+         only tuned on an idle GPU — a contention-aware retune may close the widened
+         mean-ratio gap.
       3. Only one config exists (128x128x32, bf16); need 64x64x32 + fp16/fp32/int8 to reach
          this via the normal driver search, and a decision on the master config union.
       4. Not combined with M/N-tail masking (blocks real shapes); Reduction-strategy/

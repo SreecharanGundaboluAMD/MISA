@@ -42,13 +42,24 @@ repo across machines, independent of any one assistant's local memory directory.
   slower than `_gsplit` (persistent grid.z sizing reused the wrong heuristic, launching
   MORE workgroups than the design it was replacing); root-caused and fixed by making
   shard granularity coarser (the real cost is per-shard atomic-claim/broadcast overhead,
-  not worker count) — closed the gap to ~1.05x/~1.3x (near parity). **Still open, in
-  priority order** (see `docs/gfx1250_streamk_design.md`'s "Resuming on another machine"):
-  (1) the actual motivating question — is `wrw_streamk` more CONTENTION-RESILIENT than
-  `_gsplit`, not just similarly fast once — is unmeasured; (2) no tuning/search at all
-  (the new sizing constants are hand-picked, not swept, unlike `_gsplit`'s real ternary
-  search); (3) re-measure on an idle GPU (both results measured under contention); (4)
-  only one config exists (128x128x32 bf16); (5) no M/N-tail, no Approach C.
+  not worker count) — closed the gap to ~1.05x/~1.3x. **Re-measured on an idle GPU same
+  day**: matched the contended numbers almost exactly (confirms not a contention
+  artifact), then found a THIRD sizing bug on a multi-output-tile shape (persistent
+  worker count was divided across tiles, starving multi-tile shapes) — fixed by exposing
+  the sizing constants as env-var overrides and defaulting to not dividing; all 3 shapes
+  now sit at ~1.03-1.09x slower. **Then measured the actual motivating question**
+  (contention-resilience) via synthesized background GPU load: `wrw_streamk` showed LOWER
+  run-to-run variance in both shapes tested (12.7% vs 14.5%, and 10.6% vs 20.5%) —
+  supports the hypothesis — but its MEAN slowdown grew under load (1.26-1.52x vs idle's
+  1.03-1.09x), so it's an honest mixed result, not a clean win. Separately: `_gsplit`'s
+  own ternary search picked 4 different split counts across 8 repeats under contention —
+  a distinct instability `wrw_streamk` cannot have (no search at all). Small sample
+  (n=8/shape, synthetic contention) — needs more shapes/repeats and ideally real
+  contention to firm up either direction. See `docs/gfx1250_streamk_design.md`'s
+  "Resuming on another machine" for the current prioritized list: (1) bigger
+  contention-resilience sample; (2) further tuning, ideally contention-aware not just
+  idle-tuned; (3) only one config exists (128x128x32 bf16); (4) no M/N-tail, no
+  Approach C.
 - **GPU hardware debug technique** — use `rocgdb` to find the faulting PC on
   real-hardware crashes before writing synthetic repro kernels.
 - **gfx1250 WMMA hang risk** — back-to-back same-register WMMA with zero interleaving

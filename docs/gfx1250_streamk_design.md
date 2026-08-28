@@ -535,17 +535,57 @@ degenerate 1:1, multi-claim exact/tail, multi-tile) — all still `valid:y`.
 Consistently ~1.03-1.09x slower now, down from the earlier 1.04x/1.31x/1.73x spread — a
 real, solid tuning improvement, not just a lucky shape.
 
+### Contention-resilience measurement (2026-08-28, same day — the actual motivating question)
+
+No real external tenant was available at measurement time, so contention was synthesized:
+launched a large, long-running fwd conv (`n=64,c=512,H=56,W=56,k=512,3x3`,
+`IGEMM_REPEAT=100000` in the background, confirmed consuming the GPU via `rocm-smi`) to
+saturate the GPU, then ran both `_gsplit` and `wrw_streamk` 8 times each against the same
+two shapes from the comparison above, recording each run's cost individually (not just a
+mean) to measure variance.
+
+| Shape | `_gsplit` mean/stdev/CV | `wrw_streamk` mean/stdev/CV | Mean ratio |
+|---|---|---|---|
+| 128,30,40,128 | 0.211ms / 0.031 / **14.5%** | 0.320ms / 0.041 / **12.7%** | 1.52x |
+| 256,30,40,128 | 0.310ms / 0.064 / **20.5%** | 0.391ms / 0.042 / **10.6%** | 1.26x |
+
+**`wrw_streamk` shows lower run-to-run variance (coefficient of variation) than `_gsplit`
+in both shapes tested** — modestly (12.7% vs 14.5%) on the first, substantially (10.6% vs
+20.5%, essentially half) on the second. This supports the core hypothesis this whole
+effort was built on. **But it's not a clean win**: `wrw_streamk`'s *mean* slowdown relative
+to `_gsplit` grew under this contention (1.52x and 1.26x) compared to the idle-GPU
+baseline (1.03x-1.09x) — the near-parity result above doesn't fully hold once the GPU is
+under load, at least for this synthetic contention scenario and this small (n=8) sample
+size.
+
+**A separate, qualitatively important observation**: `_gsplit`'s own ternary search picked
+**four different split counts across the 8 repeats** for the `256,30,40,128` shape (315,
+315, 315, 175, 225, 315, 225, 525) — the search itself is unstable under contention, not
+just the resulting dispatch's timing. `wrw_streamk` has no search at all (one deterministic
+sizing decision per shape), so it cannot exhibit this failure mode by construction — a
+real reliability difference that raw cost variance doesn't fully capture (an unlucky
+search under contention could persist a suboptimal cached choice for real deployment use,
+which `_gsplit`'s architecture is inherently exposed to and `wrw_streamk`'s is not).
+
+**Honest summary**: the evidence leans toward `wrw_streamk` being more *stable*
+(lower variance, no search-instability failure mode) but not unambiguously faster under
+contention with today's tuning — the sizing constants were tuned on an idle GPU (previous
+section), not under load, so it's plausible a contention-aware retune would close the
+mean-ratio gap further. Small sample size (n=8/shape, one synthetic contention scenario,
+one background competitor shape) — a larger sweep across more shapes and real (not
+synthesized) contention would strengthen this either direction.
+
 ### Resuming on another machine — prioritized next steps
 
-1. **Contention-stability measurement** — still the load-bearing question this whole
-   effort rests on (this update was all measured on an idle GPU). Repeat the same shape N
-   times each for `_gsplit` and `wrw_streamk` under *real* contention (or synthesized
-   competing GPU load), compare variance not just mean. If `wrw_streamk` isn't more
-   stable, the rest of this list matters much less.
+1. **Larger contention-resilience sample** — the measurement above is real but small
+   (n=8/shape, 2 shapes, one synthetic competitor). More shapes, more repeats, and ideally
+   a real external tenant (not synthesized) would make this conclusion much more solid in
+   either direction.
 2. **Further tuning** — `STREAMK_CLAIMS_PER_WORKER`/`STREAMK_MAX_SHARDS` still hand-picked
-   (4 / 256), only `STREAMK_DIVIDE_BY_TILES` has been swept so far. A real per-shape sweep
-   of the remaining two (or a proper search like `_gsplit`'s own ternary search) would
-   likely close the remaining ~1.05-1.09x gap further.
+   (4 / 256), only `STREAMK_DIVIDE_BY_TILES` has been swept so far, and only on an idle
+   GPU. A real per-shape sweep of the remaining two (or a proper search like `_gsplit`'s
+   own ternary search) — ideally re-tuned *under contention*, not just idle, given the
+   mean-ratio gap widened under load above — would likely close the remaining gap further.
 3. **More configs** (64x64x32, fp16/fp32/int8) once contention-resilience (item 1)
    justifies the coverage.
 4. **M/N-tail support**, then Approach C, roughly in that order of expected value.
