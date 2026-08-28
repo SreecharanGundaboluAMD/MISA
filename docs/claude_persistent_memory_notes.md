@@ -1,4 +1,4 @@
-# Claude persistent memory notes (session snapshot, 2026-08-28)
+# Claude persistent memory notes (session snapshot, 2026-08-28, updated)
 
 This file is a plain-text export of the persistent, cross-session memory Claude Code
 built up while working on this repo (stored outside the repo, under
@@ -16,6 +16,11 @@ repo across machines, independent of any one assistant's local memory directory.
   Phase 55: resumed 256x256/256x128 tile configs (full F32 accumulate, no more packed
   workaround) — also found+fixed a separate `wmma_epilogue_chunked` masking bug that
   broke every `grid_x>1` workgroup. Both configs now `valid:y` single+multi-workgroup.
+  Phase 56: double-buffer + packed-accumulate tried for perf, neither closes the
+  2-3x gap vs 128x128 — don't extend to wrw/other precisions yet. Phase 57: int8/int4
+  split-K atomic epilogue fixed (code-level only, not hw-validated, deprioritized);
+  64x64_kmax wrw tile now hw-validated `valid:y`. Also: the old "wrw has no
+  gemm_k_global_split" claim in the vendor-benchmark memory is STALE, don't cite it.
 - **GPU hardware debug technique** — use `rocgdb` to find the faulting PC on
   real-hardware crashes before writing synthetic repro kernels.
 - **gfx1250 WMMA hang risk** — back-to-back same-register WMMA with zero interleaving
@@ -215,6 +220,32 @@ Both 256-size configs are DONE -- correct for single- and multi-workgroup proble
 directions -- see `docs/gfx1250_wmma_vgpr_msb_wip_status.md`'s Phase 55 for full detail. The
 `CHUNK_FINGERPRINT` technique (decodable per-position constant + real pipeline + decode output)
 is a good reusable pattern for future addressing-bug hunts in this codebase.
+
+**Phase 56** (same day): tried to make the 256x256/256x128 tile a performance win via
+`lds_double_buffer=1` and packed accumulate (`wmma_acc_bf16`). Neither closes the gap --
+still 2-3x slower than 128x128 at every scale tried. Packed accumulate alone gives a
+consistent ~10-12% improvement over plain (kept as opt-in `*_bf16acc.config` files) but
+doesn't get close to parity. Don't re-attempt either as a fix, and don't extend this tile
+to wrw/int8/fp16/fp32 until the remaining gap (chunked-epilogue barrier overhead vs.
+fewer/bigger-workgroup occupancy loss) is root-caused via rocprof on an idle GPU.
+
+**Phase 57** (2026-08-28, separate item, not VGPR-MSB): int8/int4's `gemm_k_global_split`
+atomic epilogue always emitted `global_atomic_add_f32`, silently bit-reinterpreting the
+genuine int32 WMMA accumulator as float (only bit-exact for small non-negative sums).
+Fixed to emit `global_atomic_add_u32` for int8/int4 (`coalescing_store_wmma.py`), removed
+the blocking assert in `igemm_base.py`. Code-level fix only -- not hardware end-to-end
+validated with genuinely signed/large-magnitude data, deprioritized per explicit user
+direction (int8/int4 isn't a current focus). Also hardware-validated (this session) the
+previously-untested 64x64_kmax wrw tile shape from an earlier, unrelated backlog item:
+`valid:y` for bf16/fp16/fp32 on an exact-fit shape.
+
+**Correction**: an earlier memory (`gfx1250-vendor-benchmark-vs-miopen`, 2026-08-25)
+claimed wrw had "no gemm_k_global_split support in the WMMA path at all" as the root cause
+of a 100-1660x slowdown vs MIOpen. This is STALE/wrong -- git history shows wrw split-K
+was ported well before that benchmark ran (Phase 33/34/41/45), with multiple
+`config/igemm_wrw_gtc_gfx1250_nhwc_bf16_gsplit*.config` variants already in the repo. Don't
+cite "wrw has no split-K" as current fact; if revisiting that benchmark, first check
+whether the gsplit configs were actually in the candidate set for the slow shapes.
 
 ---
 
