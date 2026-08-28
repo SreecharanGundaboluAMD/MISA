@@ -344,13 +344,24 @@ section for the record).
       multiple (512 shards / 64 persistent workers, 8 claims each), and multi-claim with a
       non-exact-multiple tail (400/64, 7 claims) all pass cleanly, repeated with fresh
       random data. Zero regression on every existing kernel.
-      **What's NOT done** (real gaps, see the design doc's own list): no performance
-      comparison yet against the existing `_gsplit` ternary-search design (needs an idle
-      GPU) — this proves the mechanism is *correct*, not that it's faster; only bf16 at
-      128x128 tested (fp16/fp32/int8 and other tile shapes untested); not combined with
-      M/N-tail masking; shard granularity is fixed at one block, not tunable; the
-      Reduction-strategy/Approach-C alternative not attempted. Not folded into the master
-      config union until the performance question is answered.
+      **Performance comparison done 2026-08-28 (same day): currently ~4-4.4x SLOWER than
+      `_gsplit`**, not a win yet — root cause identified via `STREAMK_DEBUG=1`, not a
+      mystery. The persistent grid.z isn't actually small: it reuses the existing
+      splits-heuristic formula (`num_cu*occupancy/grid_x*grid_y`), which scales *up* as
+      the output-tile count shrinks — for a single-tile shape it launched 1024
+      workgroups, MORE than `_gsplit`'s own chosen split count (315), while also paying
+      new atomic-claim/LDS-broadcast/double-barrier overhead per shard. Fix identified,
+      not implemented: cap persistent grid.z at a small multiple of `num_cu` directly
+      (matching rocKE's own `compute_streamk_grid_size`), independent of tile count. See
+      `docs/gfx1250_streamk_design.md`'s "Performance comparison" section for the full
+      numbers and diagnosis. **Do not extend this to more shapes/precisions or fold into
+      the master config until the grid-sizing fix lands and is re-measured** — it would
+      just propagate a currently-losing config, the exact mistake already flagged for the
+      256x256 tile above.
+      Other gaps (see the design doc's own list): only bf16 at 128x128 tested (fp16/fp32/
+      int8 and other tile shapes untested); not combined with M/N-tail masking; shard
+      granularity is fixed at one block, not tunable; the Reduction-strategy/Approach-C
+      alternative not attempted.
 - [ ] **hipconv's block-diagonal channel packing across conv groups** — fills small WMMA
       tiles when the group count is high, a structurally different way to solve
       "GEMM_M/N too small to fill a tile" than tail-masking.

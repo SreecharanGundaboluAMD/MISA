@@ -382,12 +382,48 @@ after the two fixes above. Zero regression confirmed: every existing (non-`wrw_s
 kernel in the full bf16 wrw master config is byte-identical before/after this change
 (`id()`-based label-name noise aside).
 
+### Performance comparison (2026-08-28, same day, GPU under contention -- see caveat)
+
+Spot-checked against the existing `_gsplit` design's best-of-search result, real shapes
+from `docs/gfx1250_vendor_benchmark_vs_miopen.md`'s wrw trace (n=42, 1x1, `bench_out/
+wrw_bf16_master` vs. the `_streamk` config, `-V 0`, `IGEMM_WARMUP=5 IGEMM_REPEAT=10`):
+
+| Shape (c,H,W,k) | `_gsplit` (best-of-search) | `wrw_streamk` | Ratio |
+|---|---|---|---|
+| 128,30,40,128 | 0.073ms (chosen split=315) | 0.297ms (grid.z=1024) | **~4.1x slower** |
+| 256,30,40,128 | 0.128ms (chosen split=175) | 0.565ms (grid.z=512) | **~4.4x slower** |
+
+**`wrw_streamk` is currently slower, not faster — and the reason is identifiable, not
+mysterious.** `STREAMK_DEBUG=1` shows the persistent grid is NOT actually small: for the
+128,30,40,128 shape it launched **1024 workgroups** (more than `_gsplit`'s own chosen 315),
+each doing up to 2 claims (`total_shards=1575`). The bug is in the occupancy-sizing formula
+reused from the existing heuristic (`compute_gemmk_global_splits` =
+`num_cu * potential_occupancy / grid_size`): that formula was designed to answer "how many
+splits should exist" and scales *up* as `grid_x*grid_y` (`grid_size`) shrinks — for these
+shapes `grid_x*grid_y=1` (a single output tile), so it returns a large number. That's
+backwards for a persistent grid, which should stay close to `num_cu` (~256) itself
+regardless of how many output tiles exist. The result: `wrw_streamk` pays real per-shard
+atomic-claim + LDS-broadcast + double-barrier overhead on top of a workgroup count that's
+*similar in magnitude* to `_gsplit`'s own chosen split count, with none of Stream-K's
+intended "small constant grid" benefit actually realized.
+
+**Fix identified but not yet implemented** (a natural next step, not attempted this
+session): cap `streamk_persistent_grid_z` independent of `grid_x*grid_y` — e.g. a fixed
+multiple of `num_cu` (queried via `hipDeviceProp_t::multiProcessorCount`, already used
+elsewhere in this driver) times a small `blocks_per_cu` target, matching rocKE's own
+`compute_streamk_grid_size` (`min(num_macro_tiles, num_cus * blocks_per_cu)`) rather than
+reusing the existing splits-heuristic formula. Worth re-measuring once that's in.
+
+**Caveat**: `rocm-smi` showed `GPU use (%): 100` from another tenant throughout this
+comparison — absolute numbers aren't final, but the *qualitative* finding (streamk
+launching a similar-or-larger workgroup count than gsplit, not a small constant one) is a
+structural/logic issue independent of contention, confirmed via `STREAMK_DEBUG`'s direct
+grid_z readout, not just the timing.
+
 ### What's NOT done (real scope gaps, not swept under the rug)
 
-- **No performance comparison against the existing `_gsplit` ternary-search design.**
-  This proves correctness of the mechanism, not that it's faster or more
-  contention-resilient in practice — that comparison needs a confirmed-idle GPU and is the
-  natural next step before considering this for the master config union.
+- **Persistent grid sizing needs the fix above** before this can be a real performance
+  candidate — see the comparison immediately above.
 - **fp16/fp32/int8 untested** — only bf16 built and validated.
 - **Only the 128x128 tile shape tested** — 64x64 and other existing wrw tile shapes not
   attempted.
