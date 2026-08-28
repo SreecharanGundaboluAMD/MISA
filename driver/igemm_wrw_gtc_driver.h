@@ -105,6 +105,23 @@ typedef struct {
                                 // gemm_k_global_split are both set -- see get_kernel_args().
     int   gemm_k_num_splits;   // Phase 35: the launched grid.z (== splits), so the device can
                                 // tell "am I the last shard" via bz == gemm_k_num_splits-1.
+                                // Phase 58 (wrw_streamk): reused as "total shard count" for
+                                // the persistent loop's in-range test (same meaning, offset
+                                // 96 either way -- see get_kernel_args()'s Phase 58 note).
+    int   _streamk_pad;        // Phase 58: this struct is `packed` (no compiler-inserted
+                                // padding) -- without an explicit 4-byte filler here,
+                                // p_streamk_counter would land at byte offset 100 (NOT
+                                // 8-aligned), but the device emits `s_load_dwordx2` for it
+                                // (get_kernel_args() declares it at offset 104). Only present
+                                // when wrw_streamk is set device-side; host always carries it
+                                // (same "always present" convention as every other field here).
+    void *p_streamk_counter;   // Phase 58: pointer to a host-zeroed grid_x*grid_y*4-byte
+                                // int32 workspace, one atomic-claim counter per output tile.
+                                // Only present/read when wrw_streamk is set.
+    int   streamk_max_iters;   // Phase 58: this persistent workgroup's bounded loop trip
+                                // count = ceil(total_shards / launched_grid_z).
+    int   streamk_grid_y;      // Phase 58: grid.y (N-block count), for this tile's counter
+                                // index = (bx*grid_y + by).
 } __attribute__((packed)) igemm_wrw_gtc_wmma_nhwc_karg_t;
 
 static void dump_wrw_karg(igemm_wrw_gtc_karg_t * karg){
@@ -922,6 +939,15 @@ public:
             // it already does for wmma_acc_f16/wmma_acc_bf16) -- zeroing at the fp32 element
             // count there would write past the actual (half-sized) allocation.
             size_t gsplit_zero_elem_byte = tunable->atomic_pack_bf16 ? 2 : sizeof(float);
+            // Phase 58 (wrw_streamk): one atomic-claim counter per (bx,by) output tile.
+            // Zeroed every dispatch below (same "must re-zero every dispatch" discipline as
+            // the atomic epilogue's own output buffer -- otherwise the 2nd+ warmup/repeat
+            // iteration would start claiming from a stale nonzero counter and every shard
+            // would read as already-exhausted). See docs/gfx1250_streamk_design.md.
+            void *p_streamk_counter = nullptr;
+            if (tunable->wrw_streamk) {
+                HIP_CALL(hipMalloc(&p_streamk_counter, grid_x * grid_y * sizeof(int)));
+            }
             auto wrw_gsplit_prolog = std::function<float()>{[&]() -> float {
                 // Phase 35: wrw_reduction_kernel's main kernel does plain (non-atomic)
                 // per-shard stores, not accumulation -- every partition slot gets fully
@@ -930,6 +956,8 @@ public:
                 // num_k_blocks*wsred_output_size).
                 if (tunable->gemm_k_global_split && !tunable->wrw_reduction_kernel)
                     HIP_CALL(hipMemset(p_wei, 0, static_cast<size_t>(group) * (k / group) * (c / group) * y * x * gsplit_zero_elem_byte));
+                if (tunable->wrw_streamk)
+                    HIP_CALL(hipMemset(p_streamk_counter, 0, grid_x * grid_y * sizeof(int)));
                 return .0;
             }};
 
@@ -991,13 +1019,63 @@ public:
                 return duration;
             };
 
+            // Phase 58 (wrw_streamk): total_shards = num_k_blocks (finest granularity -- one
+            // gemm_k_per_block-sized shard per claimable unit, matching rocKE's k_iter
+            // granularity). The persistent grid.z is sized via the SAME occupancy heuristic
+            // used for heuristic_candidate above (num_cu * max_occupancy_per_CU / grid_size),
+            // capped to [1, total_shards] -- deliberately NO per-split-count search: that
+            // search (and its real-timed-launch noise sensitivity) is exactly what a
+            // persistent, self-balancing grid is meant to make unnecessary. See
+            // docs/gfx1250_streamk_design.md.
+            int streamk_persistent_grid_z = 1;
+            auto time_streamk = [&]() -> float {
+                int total_shards = num_k_blocks;
+                int potential_occupancy = 1;
+                HIP_CALL(hipModuleOccupancyMaxActiveBlocksPerMultiprocessor(&potential_occupancy, kernel_func, static_cast<int>(block_size), 0));
+                streamk_persistent_grid_z = std::max(1, std::min(compute_gemmk_global_splits(static_cast<int>(grid_x * grid_y), potential_occupancy), total_shards));
+                int max_iters = (total_shards + streamk_persistent_grid_z - 1) / streamk_persistent_grid_z;
+
+                karg.gemm_k_per_wg = tunable->gemm_k_per_block;   // one exact block per claimed shard
+                karg.gemm_k_tail = 0;                              // asserted not wmma_k_tail
+                karg.gemm_k_num_splits = total_shards;
+                karg.p_streamk_counter = p_streamk_counter;
+                karg.streamk_max_iters = max_iters;
+                karg.streamk_grid_y = static_cast<int>(grid_y);
+                size_t grid_z = static_cast<size_t>(streamk_persistent_grid_z);
+                if (env_get_int("STREAMK_DEBUG", 0)) {
+                    std::cout << "STREAMK_DEBUG: total_shards=" << total_shards
+                              << " grid_z=" << streamk_persistent_grid_z
+                              << " max_iters=" << max_iters
+                              << " gemm_k_per_wg=" << karg.gemm_k_per_wg
+                              << " p_streamk_counter=" << karg.p_streamk_counter
+                              << " grid_x=" << grid_x << " grid_y=" << grid_y
+                              << std::endl;
+                }
+
+                result.dumpdata.clear();
+                std::vector<igemm_launch_kernel_t> kernel_launchers;
+                kernel_launchers.push_back({kernel_func, &karg, karg_size, {grid_x * block_size, grid_y, grid_z}, {block_size, 1, 1}});
+                result.dumpheader.n_dispatches = kernel_launchers.size();
+                result.dumpheader.gks = streamk_persistent_grid_z;
+                result.dumpdata.push_back(kernel_launchers.back());
+                result.dumpdata.back().ktype = kargtype_t::igemm_wrw_gtc_wmma_nhwc_karg_t;
+
+                float duration = igemm_launch_kernels(kernel_launchers, wrw_gsplit_prolog, noop, this->warmup, this->repeat);
+                if (dump_dir.size())
+                    dump_shader_args(dump_dir, result.dumpheader, result.dumpdata, result.kernel_name);
+                return duration;
+            };
+
             float min_duration = FLT_MAX;
             int selected_splits = 1;
             // Research-only override for sweeping the perf-vs-split-count curve externally
             // without rebuilding: IGEMM_GSPLIT_SWEEP=<target> forces a single candidate
             // snapped to the nearest valid divisor of that target, bypassing the search.
             int sweep_target = tunable->gemm_k_global_split ? env_get_int("IGEMM_GSPLIT_SWEEP", 0) : 0;
-            if (sweep_target > 0) {
+            if (tunable->wrw_streamk) {
+                min_duration = time_streamk();
+                selected_splits = streamk_persistent_grid_z;
+            } else if (sweep_target > 0) {
                 selected_splits = largest_divisor_leq(num_k_blocks, sweep_target);
                 min_duration = time_split(selected_splits);
             } else {
@@ -1031,6 +1109,8 @@ public:
             result.gks = selected_splits;
             if (p_wei_workspace_wsred != nullptr)
                 HIP_CALL(hipFree(p_wei_workspace_wsred));
+            if (p_streamk_counter != nullptr)
+                HIP_CALL(hipFree(p_streamk_counter));
 #ifdef IGEMM_SPLIT_KERNEL
             HIP_CALL(hipModuleUnload(cur_kernel_module));
 #endif

@@ -801,6 +801,39 @@ class igemm_gtc_tunable_parameter_t(object):
                     "wrw_reduction_kernel and atomic_pack_bf16 are mutually exclusive -- this mode has no atomics at all"
                 assert not self.wmma_acc_f16 and not self.wmma_acc_bf16, \
                     "wrw_reduction_kernel keeps the D-operand plain fp32 (matching the workspace's fixed fp32 layout) -- not combined with the packed-accumulator precision tricks for now"
+            # Phase 58 (wrw_streamk): a persistent-kernel / Stream-K proof of mechanism --
+            # see docs/gfx1250_streamk_design.md for the full design and rationale. Scoped
+            # deliberately narrow for a first pass: grid.x/grid.y (tile assignment) are
+            # completely unchanged -- only the K-split axis (grid.z) becomes dynamic. Instead
+            # of grid.z == the chosen split count (today's model, up to 4096 tiny
+            # simultaneously-launched workgroups -- the documented contention-sensitivity
+            # culprit in docs/gfx1250_vendor_benchmark_vs_miopen.md), the driver launches a
+            # small, constant-size grid.z; each of those persistent workgroups loops,
+            # atomically claiming the next not-yet-processed K-shard index from a per-tile
+            # global counter (one counter slot per (bx,by) output tile, zeroed before each
+            # dispatch) until the shard count is exhausted. Requires gemm_k_global_split=1
+            # (builds on top of its existing atomic epilogue, per-shard K-range derivation,
+            # and kernarg fields -- this tunable only changes WHERE the shard index comes
+            # from, not how a shard is processed once claimed). Requires nxe==0 (single-tap,
+            # y=x=1 -- same restriction every existing gsplit config already has): the
+            # persistent loop replaces the tap loop's single (iy=0,ix=0) body with N
+            # dynamically-claimed-shard iterations of that same body shape (zero v_c, reset
+            # addresses, run the main loop, atomic-epilogue-store) -- generalizing this to
+            # real multi-tap (y*x>1) filters is future work, not attempted here.
+            self.wrw_streamk = utility_dict_with_default_t(tunable_dict)('wrw_streamk', 0)
+            if self.wrw_streamk:
+                assert self.gemm_k_global_split, \
+                    "wrw_streamk builds on top of the atomic (gemm_k_global_split) epilogue -- set gemm_k_global_split=1 too"
+                assert self.nxe == 0, \
+                    "wrw_streamk's first pass only supports nxe==0 (single-tap, y=x=1) -- see docs/gfx1250_streamk_design.md"
+                assert not self.gsplit_stagger, \
+                    "gsplit_stagger staggers simultaneously-launched shards' first burst -- meaningless once shards are claimed at different real times by a persistent loop, and untested together"
+                assert not self.wmma_k_tail, \
+                    "wrw_streamk's first pass doesn't yet compose with wmma_k_tail's last-shard-remainder-extension logic -- untested, not attempted"
+                assert not self.tdm_global_load, \
+                    "wrw_streamk's first pass doesn't compose with tdm_global_load (both declare s_wave_id independently) -- untested, not attempted"
+                assert not self.wrw_reduction_kernel, \
+                    "wrw_streamk's first pass only supports the atomic epilogue -- wrw_reduction_kernel's workspace-slot addressing is computed once from the static bz in the prologue, which is wrong once the shard index is dynamically claimed per persistent-loop iteration instead"
             if self.wmma_acc_f16:
                 wmma_mapping_key = self.precision + '_f16acc'
             elif self.wmma_acc_bf16:
@@ -1320,6 +1353,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_wsred"
         if tunable.gsplit_stagger:
             kernel_name += "_stagger"
+        if tunable.wrw_streamk:
+            kernel_name += "_streamk"
         # Extends Phase 16's fold above to the M/N/K-tail EXEC-mask/fine-grained-mask
         # mechanisms (Phases 25/26b/35/36/38) -- these were pure masking additions with no
         # buffer-layout change, so folding them was skipped originally (every existing

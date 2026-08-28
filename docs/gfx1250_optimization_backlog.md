@@ -328,35 +328,29 @@ section for the record).
       Untested: int8/fp16/fp32 at 256-size tiles (only bf16 verified), wrw direction —
       **do not extend to these until the performance gap above is understood**, since
       that would just propagate a config that isn't winning yet.
-- [ ] **Stream-K / persistent-kernel design** for wrw's split-K — **design completed and
-      concretely scoped 2026-08-28 (not yet implemented in code)**. Motivation, current
-      mechanism, reference implementation, and three ranked implementation approaches are
-      documented in full at `docs/gfx1250_streamk_design.md` — read that before starting
-      implementation. One-paragraph summary: rocKE's reference
-      (`helpers/streamk.py`/`helpers/persistent.py`, found under
-      `~/rocm-libraries/dnn-providers/hip-kernel-provider/rocke/platform/python/rocke/`)
-      launches a small, CU-count-sized, constant grid whose workgroups pull
-      `(m_tile,n_tile,k_iter)` work-items from a global atomic counter in a bounded loop
-      until exhausted — this directly targets the real, evidence-backed problem found in
-      `docs/gfx1250_vendor_benchmark_vs_miopen.md` (wrw's current fixed-`grid.z`-equals-
-      split-count design launches hundreds-to-thousands of tiny simultaneously-dispatched
-      workgroups, making it unusually exposed to GPU scheduling noise from other tenants —
-      measured a >2x same-config regression session-to-session, attributed to contention).
-      **Recommended starting point: "Approach A"** (see the design doc) — reuses MISA's
-      existing atomic epilogue, div/rem macros, and (critically) wrw's own existing
-      tap-loop as a structural precedent for "re-enter the main loop with fully-refreshed
-      per-iteration addressing," adding only the persistent-loop control flow and the
-      atomic tile-claim/broadcast itself as genuinely new mechanism.
-      **Deliberately NOT attempted as code this session**: this is a materially new
-      class of codegen pattern for MISA (no persistent-loop/atomic-tile-claim primitive
-      exists anywhere in this hand-assembled-kernel generator today), requiring a new
-      multi-wave barrier-broadcast protocol and per-iteration address re-derivation that
-      would need careful, well-tested implementation — attempting it live, unvalidated,
-      on a shared GPU with nobody available to intervene if something goes wrong (this
-      project has already hit one unrecoverable WMMA-related hang requiring a physical
-      machine reboot, see `docs/claude_persistent_memory_notes.md`'s "gfx1250 WMMA hang
-      risk") was judged too risky for an unsupervised session. Implement Approach A with
-      real development time and hardware supervision available.
+- [~] **Stream-K / persistent-kernel design** for wrw's split-K — **Approach A implemented
+      and hardware-validated 2026-08-28** (with the user supervising, after an earlier
+      unsupervised pass deliberately stopped at the design stage — see
+      `docs/gfx1250_streamk_design.md` for the full history, design rationale, two real
+      bugs found and fixed, and the validation table). One-paragraph summary: instead of
+      wrw's `gemm_k_global_split` launching `grid.z == chosen split count` (up to
+      thousands of tiny simultaneously-dispatched workgroups — the documented
+      contention-sensitivity culprit in `docs/gfx1250_vendor_benchmark_vs_miopen.md`),
+      `wrw_streamk=1` (new tunable, `config/igemm_wrw_gtc_gfx1250_nhwc_bf16_streamk.config`)
+      launches a small, occupancy-sized persistent grid whose workgroups dynamically claim
+      K-shards (one `gemm_k_per_block` each) from a per-output-tile atomic counter in a
+      bounded loop — no per-split-count search needed at all. Hardware-validated: single
+      shard, degenerate 1:1 (small and large shard counts), genuine multi-claim at an exact
+      multiple (512 shards / 64 persistent workers, 8 claims each), and multi-claim with a
+      non-exact-multiple tail (400/64, 7 claims) all pass cleanly, repeated with fresh
+      random data. Zero regression on every existing kernel.
+      **What's NOT done** (real gaps, see the design doc's own list): no performance
+      comparison yet against the existing `_gsplit` ternary-search design (needs an idle
+      GPU) — this proves the mechanism is *correct*, not that it's faster; only bf16 at
+      128x128 tested (fp16/fp32/int8 and other tile shapes untested); not combined with
+      M/N-tail masking; shard granularity is fixed at one block, not tunable; the
+      Reduction-strategy/Approach-C alternative not attempted. Not folded into the master
+      config union until the performance question is answered.
 - [ ] **hipconv's block-diagonal channel packing across conv groups** — fills small WMMA
       tiles when the group count is high, a structurally different way to solve
       "GEMM_M/N too small to fill a tile" than tail-masking.

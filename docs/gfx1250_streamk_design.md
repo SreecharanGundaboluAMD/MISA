@@ -1,11 +1,17 @@
 # Stream-K / persistent-kernel design for wrw split-K (2026-08-28)
 
-**Status: design only, not yet implemented.** This doc is the output of a research pass
-(reading rocKE's reference implementation in full, plus MISA's current wrw split-K
-mechanism in full) intended to make a future implementation session fast and low-risk.
-See `docs/gfx1250_optimization_backlog.md`'s Stream-K item for the one-paragraph summary
-and why implementation was deliberately deferred this session (unsupervised GPU access,
-documented hang-risk precedent in this exact project).
+**Status: Approach A (K-only) implemented and hardware-validated the same day**, once the
+user returned and could supervise (the design below was written during an earlier,
+unsupervised part of the session, when actually writing this device-side code was
+deliberately deferred -- see the "why deferred" note preserved below for that reasoning).
+Implementation, bugs found, and validation results are in a new section at the end of this
+doc ("Implementation update"). The sections below are the original research/design output
+and remain accurate as background.
+
+This doc is the output of a research pass (reading rocKE's reference implementation in
+full, plus MISA's current wrw split-K mechanism in full) intended to make implementation
+fast and low-risk. See `docs/gfx1250_optimization_backlog.md`'s Stream-K item for the
+current one-paragraph summary.
 
 ## 1. Motivation (concrete, evidence-backed, not speculative)
 
@@ -296,3 +302,99 @@ deferred indefinitely unless A is measured and found insufficient.
   (1857+, 3257-3320), Phase 34 (3321-3417), Phase 35 (3419+), Phase 41 (4076-4157), Phase
   50 (~4773+); `docs/gfx1250_vendor_benchmark_vs_miopen.md:574-674`;
   `docs/claude_persistent_memory_notes.md` (WMMA hang risk, VGPR-MSB, wrw status summary).
+
+## Implementation update (2026-08-28, same day, user supervising)
+
+Implemented Approach A exactly as scoped above (K-only, single-tap, grid.x/grid.y
+unchanged), with one simplification: shard granularity is fixed at exactly one
+`gemm_k_per_block` per claimed unit (`total_shards = num_k_blocks`, the finest granularity
+rocKE's own `k_iter` uses) rather than a tunable coarser chunk size -- kept simple since
+proving the mechanism was the goal, not tuning granularity.
+
+### What changed
+
+- **New tunable `wrw_streamk`** (`igemm_base.py`) — requires `gemm_k_global_split=1`,
+  `nxe==0`, and asserts against `wmma_k_tail`/`tdm_global_load`/`wrw_reduction_kernel`
+  (none of those combinations were attempted).
+- **New kernarg fields** (`igemm_wrw_gtc_wmma_nhwc.py`'s `get_kernel_args()`,
+  `igemm_wrw_gtc_driver.h`'s karg struct): `p_streamk_counter` (pointer to a
+  host-zeroed `grid_x*grid_y*4`-byte int32 workspace, one atomic-claim counter per output
+  tile), `streamk_max_iters`, `streamk_grid_y`. `gemm_k_num_splits` is reused (same
+  meaning, "total shard count", now the persistent loop's in-range bound instead of the
+  wmma_k_tail last-shard check).
+- **New device method `emit_kernel_streamk_loop()`** — replaces
+  `emit_kernel_tap_loop()` for `wrw_streamk` builds. A bounded loop (compile/launch-time
+  `max_iters`, no data-dependent trip count): claim next shard index (flat-tid==0 issues
+  `global_atomic_add_u32` with the SADDR form + `th:TH_ATOMIC_RETURN`, EXEC-masked via
+  `v_cmpx_eq_u32`), broadcast via an LDS round-trip + a real `s_barrier_signal`/
+  `s_barrier_wait` pair (this kernel is always 4-wave/`block_size=128`), in-range check,
+  then the same per-shard body the static design already used (zero `v_c`, recompute
+  `v_addr_a` from a now-split-K-offset-free `v_addr_a_base`, `_emit_b_gather`, main loop,
+  atomic epilogue store).
+- **Host driver** (`igemm_wrw_gtc_driver.h`): new `time_streamk()` closure, used instead
+  of the ternary search entirely when `wrw_streamk` is set — sizes the persistent grid via
+  the existing occupancy heuristic (`compute_gemmk_global_splits`), capped to
+  `[1, total_shards]`, computes `max_iters`, allocates+zeros the counter workspace (zeroed
+  every dispatch, same discipline as the atomic epilogue's own output zero-init).
+- New config: `config/igemm_wrw_gtc_gfx1250_nhwc_bf16_streamk.config` (opt-in only, not in
+  the master config union yet).
+
+### Two real bugs found via hardware testing (both fixed)
+
+1. **Missing `s_wait_dscnt 0x0` before the first barrier.** Every existing
+   barrier-after-LDS-write in this codebase (`coalescing_store_wmma.py`) precedes
+   `s_barrier_signal` with `s_wait_dscnt 0x0` to ensure the write has actually retired
+   before the barrier releases other waves to read it — my first version omitted this.
+   Caused flaky, run-to-run-varying wrong results at higher shard counts. Fixed by adding
+   the wait (matching established convention exactly).
+2. **`s_ix` never initialized (the actual root cause of most observed failures).**
+   `emit_kernel_tap_loop()` normally zeroes `s_ix` at the top of its own loop; this new
+   method bypasses the tap loop entirely and never set it, leaving it as whatever garbage
+   occupied that SGPR at kernel entry. `_emit_b_gather` reads `s_ix` (dilation/pad offset
+   for B's gather) unconditionally, so a garbage value pushed `wi_idx` out of
+   `[0, wi)` for every thread, masking every B load to zero via the existing OOB-`v_flag`
+   mechanism — main loop ran, but on all-zero B data, so `v_c` (and the final output)
+   stayed exactly zero. This gave a *deterministic* zero output at small shard counts and
+   a garbage-dependent (hence apparently "flaky") wrong output at others, since the
+   specific garbage value in that SGPR slot varies with whatever prior kernel/context left
+   it. Found via a hardware raw-dump diagnostic (temporary, since removed) that isolated
+   each stage: claim mechanism confirmed correct first (every thread saw the right claimed
+   tile_idx and total_shards), then a dump of `v_gld_b` immediately after the initial
+   global loads showed it was unconditionally zero — pointing straight at the OOB mask.
+   Fixed with one `s_mov_b32 s[s_ix], 0` at the top of the new method (`nxe==0` guarantees
+   `y=x=1`, so this is valid for the entire kernel lifetime, not just per-tap).
+
+### Hardware validation
+
+All on `bf16`/wrw/NHWC, spot-checked shapes (not an exhaustive sweep — this is a proof of
+mechanism, not a finished feature):
+
+| Scenario | Shape | total_shards | persistent grid.z | max_iters | Result |
+|---|---|---|---|---|---|
+| Single shard (no contention at all) | n=1,c=128,H=4,W=8,k=128 | 1 | 1 | 1 | `valid:y`, nrms~0.0005 |
+| Degenerate 1:1 (small) | n=2,c=128,H=8,W=8,k=128 | 4 | 4 | 1 | `valid:y` |
+| Degenerate 1:1 (larger) | n=8,c=128,H=16,W=16,k=128 | 64 | 64 | 1 | `valid:y` |
+| **Genuine multi-claim, exact multiple** | n=64,c=512,H=16,W=16,k=512 | 512 | 64 | 8 | `valid:y`, nrms~0.0005 |
+| **Genuine multi-claim, non-exact (tail)** | n=50,c=512,H=16,W=16,k=512 | 400 | 64 | 7 | `valid:y`, nrms~0.0004 |
+
+Every scenario repeated 2-5 times with fresh random data each run — no flakiness observed
+after the two fixes above. Zero regression confirmed: every existing (non-`wrw_streamk`)
+kernel in the full bf16 wrw master config is byte-identical before/after this change
+(`id()`-based label-name noise aside).
+
+### What's NOT done (real scope gaps, not swept under the rug)
+
+- **No performance comparison against the existing `_gsplit` ternary-search design.**
+  This proves correctness of the mechanism, not that it's faster or more
+  contention-resilient in practice — that comparison needs a confirmed-idle GPU and is the
+  natural next step before considering this for the master config union.
+- **fp16/fp32/int8 untested** — only bf16 built and validated.
+- **Only the 128x128 tile shape tested** — 64x64 and other existing wrw tile shapes not
+  attempted.
+- **Not combined with `wmma_m_tail`/`wmma_n_tail`** (M/N-tail masking) — only exact-multiple
+  gemm_m/gemm_n tested.
+- **`wsred`-equivalent (Approach C) not attempted** — this implements Approach A's atomic
+  strategy only.
+- **Shard granularity is fixed at exactly one `gemm_k_per_block`** — not exposed as a
+  tunable; a coarser granularity (fewer, bigger claims) might reduce atomic/barrier
+  overhead and is worth trying once performance work starts.

@@ -23,16 +23,23 @@ repo across machines, independent of any one assistant's local memory directory.
   MIOpen" number is OBSOLETE (predates wrw split-K) — current numbers already tracked in
   `docs/gfx1250_vendor_benchmark_vs_miopen.md` (~2-5x slower average, updated 2026-08-27),
   spot-confirmed 2026-08-28.
-- **Stream-K / persistent-kernel design for wrw** — researched and documented in full
-  (`docs/gfx1250_streamk_design.md`, 2026-08-28), NOT implemented. Deliberately stopped at
-  the design stage: the device-side codegen (persistent loop, atomic tile-claim, new
-  multi-wave barrier broadcast, per-iteration address re-derivation) is a materially new
-  pattern for this hand-assembled-kernel generator, and this project has already hit one
-  unrecoverable WMMA-related GPU hang requiring a physical reboot (see "gfx1250 WMMA hang
-  risk" below) — attempting genuinely new, unvalidated looping/sync kernel code
-  unsupervised was judged too risky. Read that doc before implementing; it names a
-  recommended starting approach ("Approach A") with file:line pointers into both MISA's
-  current mechanism and the rocKE reference it's based on.
+- **Stream-K / persistent-kernel (wrw_streamk, Approach A)** — researched, designed, THEN
+  implemented and hardware-validated, all 2026-08-28 (`docs/gfx1250_streamk_design.md`).
+  First pass (unsupervised) deliberately stopped at the design stage only — genuinely new
+  persistent-loop/atomic-claim/multi-wave-barrier kernel code is a materially new pattern
+  for this hand-assembled generator, and this project already has one unrecoverable
+  WMMA-related GPU hang on record (see "gfx1250 WMMA hang risk" below) — too risky to
+  attempt unsupervised. User returned, asked for a smaller K-only proof-of-mechanism slice
+  with supervision available, and it was implemented the same session. New tunable
+  `wrw_streamk`: small occupancy-sized persistent grid, workgroups dynamically claim
+  K-shards from a per-tile atomic counter in a bounded loop, replacing the ternary
+  split-count search entirely. Two real bugs found via hardware testing: missing
+  `s_wait_dscnt` before a barrier (flaky results), and the real culprit — `s_ix` left
+  uninitialized (masked every B-operand load to zero via the OOB flag, since this new code
+  path bypasses `emit_kernel_tap_loop()`, which normally zeroes it). Hardware-validated
+  single-shard, degenerate 1:1, genuine multi-claim (exact multiple and with a tail) —
+  all correct, zero regression. Performance vs. the existing `_gsplit` design not yet
+  measured (needs an idle GPU) — this proves the mechanism works, not that it's faster.
 - **GPU hardware debug technique** — use `rocgdb` to find the faulting PC on
   real-hardware crashes before writing synthetic repro kernels.
 - **gfx1250 WMMA hang risk** — back-to-back same-register WMMA with zero interleaving

@@ -205,6 +205,12 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # wmma_main_loop.py addresses LDS correctly whenever a wrw _dbuf config is built.
         self.lds_single_size = igemm_next_pow2(self.lds_a_size + self.lds_b_size)
         self.lds_buffer_num  = 2 if tunable.lds_double_buffer else 1
+        # Phase 58 (wrw_streamk): a dedicated 4-byte LDS slot for the persistent loop's
+        # tile-claim broadcast (lane 0 writes the atomic result, s_barrier, every lane
+        # reads it back) -- placed right after the A/B staging LDS so it never collides
+        # with it. gemm_k_global_split's own epilogue uses zero LDS (see
+        # get_kernel_code's epilogue_lds_bytes), so this is the only extra LDS this mode needs.
+        self.streamk_lds_off = self.lds_single_size * self.lds_buffer_num
 
         # gemm_k_per_block*data_byte happens to equal 64 bytes for fp16/bf16/int8 (32*2, 32*2,
         # 64*1), but fp32 forces gemm_k_per_block=4 (matching inst_wmma.k), giving 4*4=16 --
@@ -302,6 +308,20 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 # last shard" is a simple s_bz == s_gemm_k_num_splits-1 compare.
                 self.s_gemm_k_tail       = sym_t('s_gemm_k_tail'       , sseq(1))
                 self.s_gemm_k_num_splits = sym_t('s_gemm_k_num_splits' , sseq(1))
+            if outer.tunable.wrw_streamk:
+                # Phase 58: gemm_k_num_splits here means "total shard count" (reused,
+                # mutually exclusive with the wmma_k_tail branch above -- see igemm_base.py's
+                # assert). p_streamk_counter/streamk_max_iters/streamk_grid_y are the new
+                # kernargs; s_streamk_tile_idx is the currently-claimed shard index (replaces
+                # s_bz's role for address derivation); s_streamk_iter is the persistent loop's
+                # own bounded counter.
+                self.s_gemm_k_num_splits   = sym_t('s_gemm_k_num_splits'   , sseq(1))
+                self.s_streamk_counter_ptr = sym_t('s_streamk_counter_ptr' , sseq(2, 2))
+                self.s_streamk_max_iters   = sym_t('s_streamk_max_iters'   , sseq(1))
+                self.s_streamk_grid_y      = sym_t('s_streamk_grid_y'      , sseq(1))
+                self.s_streamk_tile_idx    = sym_t('s_streamk_tile_idx'    , sseq(1))
+                self.s_streamk_iter        = sym_t('s_streamk_iter'        , sseq(1))
+                self.s_streamk_addr        = sym_t('s_streamk_addr'        , sseq(2, 2))
             if outer.tunable.tdm_global_load:
                 # Phase 45: TDM descriptors for A (grad_output) and B (input) -- both
                 # operands are "128-wide tiles" here (GEMM_K is the row axis for BOTH),
@@ -411,6 +431,25 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 # byte-index operand (formerly v_pk_idx, removed).
                 self.v_pk_partner = sym_t('v_pk_partner' , vseq(1))
                 self.v_pk_packed  = sym_t('v_pk_packed'  , vseq(1))
+            if outer.tunable.wrw_streamk:
+                # Phase 58: persistent-loop tile-claim scratch. The atomic uses the SADDR
+                # form (s_streamk_addr, an SGPR pair -- see emit_kernel_streamk_loop), not a
+                # VADDR pair, so no dedicated VGPR address register is needed here (VGPR
+                # budget for this tile shape is already tight -- an earlier VADDR-pair
+                # version overflowed past register 255). v_streamk_one is a constant 1 (the
+                # atomic's increment operand, also doubles as its required VOFFSET=0... no,
+                # see v_streamk_zero for that); v_streamk_claim holds the atomic's returned
+                # pre-increment value, then (after the LDS broadcast round-trip) every lane's
+                # copy of the SAME claimed shard index.
+                self.v_streamk_one   = sym_t('v_streamk_one'   , vseq(1))
+                self.v_streamk_claim = sym_t('v_streamk_claim' , vseq(1))
+                # Dedicated always-zero VGPR: doubles as (a) the atomic's required VOFFSET
+                # (must be 0 -- the real address is entirely in SADDR) and (b)
+                # ds_write_b32/ds_read_b32's per-lane address (every lane must target the
+                # SAME LDS word for the broadcast to work; the actual LDS byte position is
+                # the instruction's `offset:` immediate instead -- see
+                # emit_kernel_streamk_loop).
+                self.v_streamk_zero  = sym_t('v_streamk_zero'  , vseq(1))
             self.v_end         = sym_t('v_end'         , vseq())
 
         def emit(self):
@@ -457,6 +496,18 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         if self.tunable.wmma_k_tail and self.tunable.gemm_k_global_split:
             kas.append(amdgpu_kernel_arg_t('gemm_k_tail', 4, 92, 'by_value', 'i32'))
             kas.append(amdgpu_kernel_arg_t('gemm_k_num_splits', 4, 96, 'by_value', 'i32'))
+        if self.tunable.wrw_streamk:
+            # Phase 58: mutually exclusive with the wmma_k_tail branch above (asserted in
+            # igemm_base.py), so offset 92 (gemm_k_tail's slot there) is simply unused here --
+            # reuse gemm_k_num_splits at its EXISTING offset 96 (same host-side struct field,
+            # same meaning it already has: "how many shards exist" -- previously only used
+            # for the wmma_k_tail last-shard check, now the persistent loop's in-range test
+            # too) rather than colliding with it. New fields append after it, 8-byte-aligned
+            # for the pointer.
+            kas.append(amdgpu_kernel_arg_t('gemm_k_num_splits', 4, 96, 'by_value', 'i32'))
+            kas.append(amdgpu_kernel_arg_t('p_streamk_counter', 8, 104, 'global_buffer', 'u32', address_space='global', is_const='false'))
+            kas.append(amdgpu_kernel_arg_t('streamk_max_iters', 4, 112, 'by_value', 'i32'))
+            kas.append(amdgpu_kernel_arg_t('streamk_grid_y', 4, 116, 'by_value', 'i32'))
         return kas
 
     def get_kernel_code(self):
@@ -482,8 +533,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             'enable_sgpr_workgroup_id_x'       :   1,
             'enable_sgpr_workgroup_id_y'       :   1,
             'enable_vgpr_workitem_id'          :   0,
-            'workgroup_group_segment_byte_size':   max(self.lds_single_size * self.lds_buffer_num, epilogue_lds_bytes),
-            'kernarg_segment_byte_size'         :   100 if (self.tunable.wmma_k_tail and self.tunable.gemm_k_global_split) else 92,
+            'workgroup_group_segment_byte_size':   max(self.lds_single_size * self.lds_buffer_num, epilogue_lds_bytes) + (4 if self.tunable.wrw_streamk else 0),
+            'kernarg_segment_byte_size'         :   120 if self.tunable.wrw_streamk else
+                                                     100 if (self.tunable.wmma_k_tail and self.tunable.gemm_k_global_split) else 92,
             'wavefront_sgpr_count'              :   self.sgpr.s_end.value + 2 * 3,
             'workitem_vgpr_count'               :   self.vgpr.v_end.value,
             'wavefront_size'                    :   32,
@@ -679,6 +731,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         if self.tunable.wmma_k_tail and self.tunable.gemm_k_global_split:
             self._emit(f"s_load_dword s[{s.s_gemm_k_tail()}], s[{s.s_ka()}:{s.s_ka(1)}], 92")
             self._emit(f"s_load_dword s[{s.s_gemm_k_num_splits()}], s[{s.s_ka()}:{s.s_ka(1)}], 96")
+        if self.tunable.wrw_streamk:
+            self._emit(f"s_load_dword s[{s.s_gemm_k_num_splits()}], s[{s.s_ka()}:{s.s_ka(1)}], 96   ; Phase 58: total shard count")
+            self._emit(f"s_load_dwordx2 s[{s.s_streamk_counter_ptr()}:{s.s_streamk_counter_ptr(1)}], s[{s.s_ka()}:{s.s_ka(1)}], 104")
+            self._emit(f"s_load_dword s[{s.s_streamk_max_iters()}], s[{s.s_ka()}:{s.s_ka(1)}], 112")
+            self._emit(f"s_load_dword s[{s.s_streamk_grid_y()}], s[{s.s_ka()}:{s.s_ka(1)}], 116")
         self._emit(f"v_mov_b32 v[{v.v_tid()}], v0")
         if self.tunable.tdm_global_load:
             # Phase 45: mirrors fwd/bwd's identical Phase 29/42 computation -- this wave's
@@ -709,7 +766,21 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"s_and_b32 s[{s.s_tmp()}], s[{s.s_bz()}], 0x7f   ; gsplit_stagger: bz mod 128")
             self._emit(f"s_sleep_var s[{s.s_tmp()}]")
         self._emit(f"s_wait_kmcnt 0x0")
-        if self.tunable.gemm_k_global_split:
+        if self.tunable.wrw_streamk:
+            # Phase 58: s_gemm_k_wg_off is NOT computed here -- unlike the static-shard
+            # design, this workgroup's shard index isn't known until the persistent loop
+            # claims one (see emit_kernel_streamk_loop). s_bz is decoded above but otherwise
+            # unused in this mode (it's just "which of the small persistent pool", not a
+            # shard index). What CAN be computed once here (constant for the kernel's
+            # lifetime): this tile's counter address = counter_ptr + (bx*grid_y + by)*4.
+            self._emit(f"s_mul_i32 s[{s.s_tmp()}], s[{s.s_bx()}], s[{s.s_streamk_grid_y()}]")
+            self._emit(f"s_add_u32 s[{s.s_tmp()}], s[{s.s_tmp()}], s[{s.s_by()}]")
+            self._emit(f"s_lshl_b32 s[{s.s_tmp()}], s[{s.s_tmp()}], 2   ; *4 bytes")
+            self._emit(f"s_add_u32 s[{s.s_streamk_addr()}], s[{s.s_streamk_counter_ptr()}], s[{s.s_tmp()}]")
+            self._emit(f"s_addc_u32 s[{s.s_streamk_addr(1)}], s[{s.s_streamk_counter_ptr(1)}], 0")
+            self._emit(f"v_mov_b32 v[{v.v_streamk_one()}], 1")
+            self._emit(f"v_mov_b32 v[{v.v_streamk_zero()}], 0")
+        elif self.tunable.gemm_k_global_split:
             self._emit(f"s_mul_i32 s[{s.s_gemm_k_wg_off()}], s[{s.s_bz()}], s[{s.s_gemm_k_per_wg()}]   ; this workgroup's K-slice base")
         self._emit_empty_line()
 
@@ -857,9 +928,13 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"v_add_u32 v[{v.v_tmp(2)}], s[{s.s_block_m_off()}], v[{v.v_tmp(1)}]   ; wmma_m_tail: absolute GEMM_M index")
             self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_gemm_m()}], v[{v.v_tmp(2)}]")
             self._emit(f"v_cndmask_b32 v[{v.v_flag_a_mtail()}], 0, 1, vcc_lo")
-        if self.tunable.gemm_k_global_split:
+        if self.tunable.gemm_k_global_split and not self.tunable.wrw_streamk:
             self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_gemm_k_wg_off()}], s[{s.s_a_m_total()}]   ; this workgroup's K-slice base, in A row units")
             self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_tmp(2)}], v[{v.v_tmp()}]")
+        # Phase 58 (wrw_streamk): the K-slice offset is NOT folded in here -- unlike the
+        # static-shard design, it isn't known until the persistent loop claims a shard.
+        # v_addr_a_base stays shard-independent; emit_kernel_streamk_loop() adds the current
+        # iteration's offset directly onto v_addr_a (not v_addr_a_base) after each claim.
         self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.data_byte)}, v[{v.v_tmp()}]")
         self._emit(f"v_mov_b32 v[{v.v_addr_a_base(1)}], s[{s.s_p_in(1)}]")
         self._emit(f"v_add_co_u32 v[{v.v_addr_a_base()}], vcc_lo, s[{s.s_p_in()}], v[{v.v_tmp()}]")
@@ -1448,6 +1523,124 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # (see class docstring, Phase 5f)
         wmma_main_loop_t(self.mc, ctrl).emit()
 
+    def emit_kernel_streamk_loop(self):
+        '''
+        Phase 58: persistent-kernel proof of mechanism (docs/gfx1250_streamk_design.md,
+        "Approach A", scoped to K-only / single-tap). Replaces emit_kernel_tap_loop()'s
+        (nxe==0, single-iteration) per-shard body with a BOUNDED loop (max_iters is a
+        host-computed, launch-time-constant kernarg -- no data-dependent trip count, so no
+        hang risk from the loop bound itself) that dynamically claims K-shard indices from a
+        per-(bx,by) global atomic counter, instead of the static workgroup_id_z-derived
+        shard index every other gemm_k_global_split kernel uses. Only called when
+        wrw_streamk is set (nxe==0, wmma_k_tail=0, tdm_global_load=0 all asserted in
+        igemm_base.py, so this method never needs to handle those cases).
+        '''
+        s = self.sgpr
+        v = self.vgpr
+        # nxe==0 guarantees y=x=1 (asserted in igemm_base.py), so ix is always 0 -- normally
+        # zeroed inside emit_kernel_tap_loop()'s label_tap_y top (s_iy itself IS zeroed
+        # unconditionally in emit_kernel_prologue), but this method never calls the tap loop
+        # at all, so s_ix was otherwise left holding whatever garbage occupied that SGPR at
+        # kernel entry -- found via a hardware raw-dump diagnostic (v_gld_b consistently
+        # read back as exactly 0 for every thread/shard, tracing back to _emit_b_gather's
+        # OOB v_flag masking every single B load because wi_idx, derived from garbage s_ix,
+        # was always out of [0, wi)).
+        self._emit(f"s_mov_b32 s[{s.s_ix()}], 0")
+        label_loop = f"L_{self.name()}_streamk_loop"
+        label_skip = f"L_{self.name()}_streamk_skip"
+
+        self._emit(f"s_mov_b32 s[{s.s_streamk_iter()}], 0")
+        self._emit_front(f"{label_loop}:")
+
+        # ---- claim the next shard index. Only flat-tid==0 issues the atomic (EXEC-masked,
+        # not a per-wave check -- v_tid is the flat 0..127 thread id, so this is exactly one
+        # lane across the whole 4-wave workgroup); the result is broadcast to every lane via
+        # an LDS round-trip + a REAL cross-wave barrier (this kernel is always block_size
+        # 128 / 4-wave -- see docs/gfx1250_streamk_design.md's note on why rocKE's
+        # single-wave ds_bpermute broadcast doesn't apply here and an actual barrier is
+        # required and cannot be elided by a compiler that never exists in this hand-
+        # assembled pipeline in the first place). gfx1250's VOPC "x" form takes no explicit
+        # exec destination (implicit); the atomic uses the SADDR form (s_streamk_addr) with
+        # a VOFFSET of 0 (v_streamk_zero) and needs an explicit th:TH_ATOMIC_RETURN to get a
+        # return value at all -- both confirmed via llvm-mc against this exact ISA. gfx1250
+        # has no plain s_barrier -- it's always the split s_barrier_signal/s_barrier_wait
+        # form (see docs/claude_persistent_memory_notes.md's ISA quirks). ----
+        self._emit(f"; Phase 58: claim next K-shard index (only flat tid==0 issues the atomic)")
+        self._emit(f"v_cmpx_eq_u32 0, v[{v.v_tid()}]")
+        self._emit(f"global_atomic_add_u32 v[{v.v_streamk_claim()}], v[{v.v_streamk_zero()}], v[{v.v_streamk_one()}], s[{s.s_streamk_addr()}:{s.s_streamk_addr(1)}] scope:SCOPE_SYS th:TH_ATOMIC_RETURN")
+        self._emit(f"s_wait_loadcnt 0x0")
+        self._emit(f"ds_write_b32 v[{v.v_streamk_zero()}], v[{v.v_streamk_claim()}] offset:{self.streamk_lds_off}")
+        self._emit(f"s_mov_b32 exec_lo, -1")
+        self._emit(f"s_wait_dscnt 0x0   ; the ds_write must retire before the barrier releases other waves to read it")
+        self._emit(f"s_barrier_signal -1")
+        self._emit(f"s_barrier_wait -1")
+        self._emit(f"ds_read_b32 v[{v.v_streamk_claim()}], v[{v.v_streamk_zero()}] offset:{self.streamk_lds_off}")
+        self._emit(f"s_wait_dscnt 0x0")
+        self._emit(f"s_barrier_signal -1   ; ensure every lane has read before the next iteration can reuse this LDS slot")
+        self._emit(f"s_barrier_wait -1")
+        self._emit(f"v_readfirstlane_b32 s[{s.s_streamk_tile_idx()}], v[{v.v_streamk_claim()}]")
+        self._emit_empty_line()
+
+        self._emit(f"s_cmp_lt_u32 s[{s.s_streamk_tile_idx()}], s[{s.s_gemm_k_num_splits()}]   ; in_range: did we claim a real shard?")
+        self._emit(f"s_cbranch_scc0 {label_skip}")
+        self._emit_empty_line()
+
+        # ---- process the claimed shard: this workgroup's K-slice base, in gemm_k_per_wg
+        # units, is now (claimed tile_idx) instead of the static s_bz -- everything else
+        # downstream (s_gemm_k_wg_off feeds _emit_b_gather's per-iteration gather AND, via
+        # the fresh v_addr_a recompute below, A's address) is unchanged from the static
+        # design's per-shard body. ----
+        self._emit(f"s_mul_i32 s[{s.s_gemm_k_wg_off()}], s[{s.s_streamk_tile_idx()}], s[{s.s_gemm_k_per_wg()}]")
+        self._emit_empty_line()
+
+        self._emit(f"; clear accumulator (fresh per claimed shard)")
+        for i in range(self.tunable.num_vgpr_accumulate_c):
+            self._emit(f"v_mov_b32 v[{v.v_c(i)}], 0")
+        self._emit_empty_line()
+
+        if self.lds_buffer_num == 2:
+            self._emit_lds_offset_setup()
+
+        # ---- v_addr_a = v_addr_a_base + (gemm_k_wg_off * a_m_total) * databyte, recomputed
+        # fresh every claimed shard (v_addr_a_base itself has NO split-K offset folded in --
+        # see emit_kernel_prologue's Phase 58 note) ----
+        self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_gemm_k_wg_off()}], s[{s.s_a_m_total()}]")
+        self._emit(f"s_lshl_b32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], {utility_log2(self.data_byte)}")
+        self._emit(f"v_add_co_u32 v[{v.v_addr_a()}], vcc_lo, s[{s.s_tmp(2)}], v[{v.v_addr_a_base()}]")
+        self._emit(f"v_add_co_ci_u32 v[{v.v_addr_a(1)}], vcc_lo, 0, v[{v.v_addr_a_base(1)}], vcc_lo")
+        self._emit_empty_line()
+
+        # ---- B's initial gather (reads s_gemm_k_wg_off live, already updated above) ----
+        self._emit_b_gather(None)
+        self._emit_empty_line()
+
+        self._emit(self.global_load_a_functor()())
+        self._emit(self.global_load_b_functor()())
+        self._emit_empty_line()
+
+        self.emit_kernel_fma_main_loop()
+        self._emit_empty_line()
+
+        # ---- atomic-epilogue store this shard's partial sum (iy=ix=0 always -- nxe==0 --
+        # so the tap-offset s_p_out_tap machinery emit_kernel_tap_loop() needs is unnecessary
+        # here; s_p_out itself is already this shard's correct output base) ----
+        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(),
+                s.s_block_m_off(), s.s_block_n_off(),
+                s.s_gemm_m.label if self.tunable.wmma_m_tail else None, v.v_m_tail_row() if self.tunable.wmma_m_tail else None,
+                s.s_gemm_n.label if self.tunable.wmma_n_tail else None, v.v_n_tail_col() if self.tunable.wmma_n_tail else None,
+                s.s_tmp(1) if self.tunable.wmma_n_tail else None))
+        self._emit(f"s_wait_storecnt 0x0")
+        self._emit_empty_line()
+
+        self._emit_front(f"{label_skip}:")
+        self._emit(f"s_add_u32 s[{s.s_streamk_iter()}], s[{s.s_streamk_iter()}], 1")
+        self._emit(f"s_cmp_lt_u32 s[{s.s_streamk_iter()}], s[{s.s_streamk_max_iters()}]")
+        self._emit(f"s_cbranch_scc1 {label_loop}")
+        self._emit_empty_line()
+
     def emit_kernel_body(self):
         self.emit_kernel_prologue()
-        self.emit_kernel_tap_loop()
+        if self.tunable.wrw_streamk:
+            self.emit_kernel_streamk_loop()
+        else:
+            self.emit_kernel_tap_loop()
