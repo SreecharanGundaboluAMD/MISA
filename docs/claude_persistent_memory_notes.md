@@ -20,8 +20,9 @@ repo across machines, independent of any one assistant's local memory directory.
   2-3x gap vs 128x128 — don't extend to wrw/other precisions yet. Phase 57: int8/int4
   split-K atomic epilogue fixed (code-level only, not hw-validated, deprioritized);
   64x64_kmax wrw tile now hw-validated `valid:y`. Also: wrw's old "100-1660x slower than
-  MIOpen" finding is OBSOLETE (predates wrw split-K) — re-tested 2026-08-28, now ~1x/~2.3x
-  on the same two worst shapes; full re-benchmark across all shapes still worth doing.
+  MIOpen" number is OBSOLETE (predates wrw split-K) — current numbers already tracked in
+  `docs/gfx1250_vendor_benchmark_vs_miopen.md` (~2-5x slower average, updated 2026-08-27),
+  spot-confirmed 2026-08-28.
 - **GPU hardware debug technique** — use `rocgdb` to find the faulting PC on
   real-hardware crashes before writing synthetic repro kernels.
 - **gfx1250 WMMA hang risk** — back-to-back same-register WMMA with zero interleaving
@@ -240,19 +241,19 @@ direction (int8/int4 isn't a current focus). Also hardware-validated (this sessi
 previously-untested 64x64_kmax wrw tile shape from an earlier, unrelated backlog item:
 `valid:y` for bf16/fp16/fp32 on an exact-fit shape.
 
-**Correction + re-test**: an earlier memory (`gfx1250-vendor-benchmark-vs-miopen`,
-2026-08-25) found wrw 100-1660x slower than MIOpen, root-caused to "no `gemm_k_global_split`
-support in the WMMA path at all". That was CORRECT at the time (commit timestamps: the
-benchmark ran 2026-08-25T08:55Z, wrw's first split-K port landed 2026-08-25T20:58Z, ~12h
-later) but is now OBSOLETE. Re-tested 2026-08-28 on the exact same two worst shapes using
-the current master bf16 config: the "8.0ms vs MIOpen's 0.035ms (227x slower)" shape now
-gets 0.031ms via a `wsred_gkgs` split-K candidate (faster than MIOpen); the "1.18s vs
-0.71ms (1665x slower)" shape now gets 1.655ms (~2.3x slower, not 1665x). Non-split
-candidates were unchanged in the same run, confirming this is a real improvement, not
-noise. Don't cite the old 100-1660x number as current. A full re-benchmark of every wrw
-shape in the original trace file, ideally on an idle GPU, would be high-value future work
-to confirm parity across the whole shape set (only 2 of the original slow shapes were
-spot-checked here).
+**Correction**: an earlier memory (`gfx1250-vendor-benchmark-vs-miopen`, 2026-08-25) found
+wrw 100-1660x slower than MIOpen, root-caused to "no `gemm_k_global_split` support in the
+WMMA path at all". That was correct when written (wrw's first split-K port landed ~12h
+after that benchmark ran) but is now OBSOLETE. **This repo already has a much more
+thorough, current answer**: `docs/gfx1250_vendor_benchmark_vs_miopen.md` (updated through
+2026-08-27) re-benchmarked all 10 applicable wrw shapes multiple times with the gsplit fix
+in place — current average is ~2.17x-5.02x slower than MIOpen (the spread attributed to
+GPU contention, confirmed not a search-algorithm issue via manual sweep), not 100-1660x.
+fwd/bwd remain at parity-to-modest-slowdown (~1.2-1.75x avg, several shapes faster).
+Spot-checked 2 of the same shapes on 2026-08-28 (0.031ms vs. old 8.0ms/MIOpen's 0.035ms;
+1.655ms vs. old 1.18s/MIOpen's ~0.7ms) — consistent with that doc's numbers. **Read
+`docs/gfx1250_vendor_benchmark_vs_miopen.md` for current wrw-vs-MIOpen numbers, not the old
+100-1660x figure.**
 
 ---
 

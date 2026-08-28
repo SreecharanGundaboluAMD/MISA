@@ -658,3 +658,17 @@ shows a large one. This is a plausible, evidence-backed explanation, not a confi
 cause: the exact multiples for wrw specifically should be treated as more provisional than
 this doc's other numbers, and re-measured on an exclusively-held GPU before being used to
 make any wrw-specific optimization decision.
+
+## Update (2026-08-28): re-confirmed the original two catastrophic-outlier shapes from the very first pass
+
+The very first pass at the top of this doc (before wrw split-K existed) flagged two shapes
+as the worst: `c=128,H=30,W=40,k=128,1x1` (8.0ms MISA vs 0.035ms MIOpen, 227x slower) and
+`c=128,H=120,W=160,k=128,3x3,pad=1` (1.18s MISA vs 0.71ms MIOpen, 1665x slower). Spot-checked
+both again directly (`bench_out/wrw_bf16_master`'s master config, `-V 0`, `IGEMM_WARMUP`/
+`IGEMM_REPEAT` 3-5): non-split candidates for both shapes are unchanged (~8-10ms and
+~1.15-1.45s respectively, confirming those old numbers weren't measurement error), but the
+best `_gsplit`-family candidate now gives **0.031ms** (`wsred_gkgs[525]`, faster than the
+recorded MIOpen number) and **1.655ms** (`wsred_gkgs[1008]`, ~2.3-2.5x slower) respectively —
+consistent with this doc's own ~2-5x average finding above, not the pre-split-K 227x/1665x
+figures. `wsred` (weighted split reduction) variants won both spot-checks over plain
+`gkgs`/`ktail_gkgs`/`scopedev_gkgs`/etc.
