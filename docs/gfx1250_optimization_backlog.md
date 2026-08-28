@@ -328,11 +328,35 @@ section for the record).
       Untested: int8/fp16/fp32 at 256-size tiles (only bf16 verified), wrw direction —
       **do not extend to these until the performance gap above is understood**, since
       that would just propagate a config that isn't winning yet.
-- [ ] **Stream-K / persistent-kernel design** for wrw's split-K (rocKE has a working
-      reference: `helpers/streamk.py`, `helpers/persistent.py`) — a small, constant-size
-      grid with an atomic tile-counter dynamically pulling work, instead of a fixed
-      `grid.z` split decided before launch. Architecturally the most different, highest-
-      ceiling alternative to MISA's current design; also the largest engineering lift.
+- [ ] **Stream-K / persistent-kernel design** for wrw's split-K — **design completed and
+      concretely scoped 2026-08-28 (not yet implemented in code)**. Motivation, current
+      mechanism, reference implementation, and three ranked implementation approaches are
+      documented in full at `docs/gfx1250_streamk_design.md` — read that before starting
+      implementation. One-paragraph summary: rocKE's reference
+      (`helpers/streamk.py`/`helpers/persistent.py`, found under
+      `~/rocm-libraries/dnn-providers/hip-kernel-provider/rocke/platform/python/rocke/`)
+      launches a small, CU-count-sized, constant grid whose workgroups pull
+      `(m_tile,n_tile,k_iter)` work-items from a global atomic counter in a bounded loop
+      until exhausted — this directly targets the real, evidence-backed problem found in
+      `docs/gfx1250_vendor_benchmark_vs_miopen.md` (wrw's current fixed-`grid.z`-equals-
+      split-count design launches hundreds-to-thousands of tiny simultaneously-dispatched
+      workgroups, making it unusually exposed to GPU scheduling noise from other tenants —
+      measured a >2x same-config regression session-to-session, attributed to contention).
+      **Recommended starting point: "Approach A"** (see the design doc) — reuses MISA's
+      existing atomic epilogue, div/rem macros, and (critically) wrw's own existing
+      tap-loop as a structural precedent for "re-enter the main loop with fully-refreshed
+      per-iteration addressing," adding only the persistent-loop control flow and the
+      atomic tile-claim/broadcast itself as genuinely new mechanism.
+      **Deliberately NOT attempted as code this session**: this is a materially new
+      class of codegen pattern for MISA (no persistent-loop/atomic-tile-claim primitive
+      exists anywhere in this hand-assembled-kernel generator today), requiring a new
+      multi-wave barrier-broadcast protocol and per-iteration address re-derivation that
+      would need careful, well-tested implementation — attempting it live, unvalidated,
+      on a shared GPU with nobody available to intervene if something goes wrong (this
+      project has already hit one unrecoverable WMMA-related hang requiring a physical
+      machine reboot, see `docs/claude_persistent_memory_notes.md`'s "gfx1250 WMMA hang
+      risk") was judged too risky for an unsupervised session. Implement Approach A with
+      real development time and hardware supervision available.
 - [ ] **hipconv's block-diagonal channel packing across conv groups** — fills small WMMA
       tiles when the group count is high, a structurally different way to solve
       "GEMM_M/N too small to fill a tile" than tail-masking.

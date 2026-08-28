@@ -1,0 +1,298 @@
+# Stream-K / persistent-kernel design for wrw split-K (2026-08-28)
+
+**Status: design only, not yet implemented.** This doc is the output of a research pass
+(reading rocKE's reference implementation in full, plus MISA's current wrw split-K
+mechanism in full) intended to make a future implementation session fast and low-risk.
+See `docs/gfx1250_optimization_backlog.md`'s Stream-K item for the one-paragraph summary
+and why implementation was deliberately deferred this session (unsupervised GPU access,
+documented hang-risk precedent in this exact project).
+
+## 1. Motivation (concrete, evidence-backed, not speculative)
+
+`docs/gfx1250_vendor_benchmark_vs_miopen.md`'s last ~100 lines document that wrw's
+`_gsplit` (split-K) numbers are the most volatile of anything benchmarked in this project:
+the *same* shape, config, and search reported 0.065ms in one session and ~0.148ms in a
+later session — a >2x regression with zero code change. The most likely explanation
+(confirmed not a search-algorithm bug via a manual `IGEMM_GSPLIT_SWEEP` sweep): wrw's
+split-K kernels launch **many small workgroups per candidate split** (grid.z equals the
+chosen split count, which can reach into the hundreds-to-thousands, capped at 4096) and
+are therefore unusually exposed to scheduling interference from other tenants on a shared
+GPU — fwd/bwd's much larger, single-dispatch kernels show no such session-to-session
+variance.
+
+Stream-K / persistent-kernel design (as used by CK Tile, FlashAttention-3, etc.) fixes
+this at the architectural level: launch a **small, constant-size grid** (order of magnitude
+= number of CUs), and have those workgroups dynamically self-balance via a global atomic
+counter, rather than pre-deciding "how many workgroups" via an expensive, noise-sensitive
+pre-launch timing search.
+
+## 2. Reference implementation (rocKE)
+
+Found at `~/rocm-libraries/dnn-providers/hip-kernel-provider/rocke/platform/python/rocke/helpers/streamk.py`
+and `.../helpers/persistent.py` (read in full; also mirrored under `~/rocm-libs/...`).
+This is CK-Tile-parity Python IR-emission code (targets rocKE's own `IRBuilder`, not
+MISA's raw-asm-string emitter) — a legitimate architectural reference, not a drop-in port
+target.
+
+### 2a. Work partitioning (`streamk.py`)
+
+- Decomposes the GEMM into `(m_tile, n_tile, k_iter)` triples. `num_macro_tiles =
+  m_tiles * n_tiles * k_iters` is the total unit-of-work count — maximally fine-grained,
+  every output tile split into exactly `k_iters` separate work items.
+- `emit_streamk_decode`: given a linear work-item id, `k_iter = id % k_iters`, `nn = id //
+  k_iters`, `n_tile = nn % n_tiles`, `m_tile = nn // n_tiles` — K-major within a fixed
+  `(m,n)` tile. Also derives `is_first`/`is_last` (k_iter==0 / k_iter==k_iters-1).
+- `compute_streamk_grid_size`: **grid size = `min(num_macro_tiles, num_cus *
+  blocks_per_cu)`** — capped at (a small multiple of) the CU count, never scaled to the
+  problem's total tile/K-iter count. Default `num_cus=304` (MI300X/MI355X).
+- Two reduction strategies:
+  - **Atomic** (fully implemented in rocKE's "v1"): each CTA atomically adds its partial
+    K-sum (`global_atomic_add_f32`) into an f32 workspace slot for that `(m,n)` tile.
+    Needs a separate finalization pass to cast f32→output dtype. Conceptually identical
+    to what MISA already does for wrw's `gemm_k_global_split`, just phrased per-work-item
+    instead of per-shard.
+  - **Reduction** (only the *decode* surface shipped; the actual busy-wait/flag-table
+    reduction pass is explicitly deferred in rocKE's own source — "lands with the
+    StreamK GEMM kernel itself" per its docstring, and that kernel does not exist
+    anywhere on this machine). Contributing CTAs would cooperate via a tile-major
+    workspace + flag table; the first contributor stores, later ones atomic-add, every
+    contributor bumps a flag counter; the CTA that observes `flag == k_iters_per_tile`
+    finalizes in-kernel, avoiding a second launch. **Not usable as a reference today —
+    rocKE's own implementation of the hard part doesn't exist yet.**
+
+### 2b. Persistent-kernel loop mechanics (`persistent.py`)
+
+- Launch a small, constant number of CTAs (~`num_cus * waves_per_cu`), each pulling
+  successive work-item ids from a global atomic counter (`atomic_add(1)`) until the
+  counter exhausts the total tile count.
+- `build_persistent_counter_init`: fetches this CTA's first tile id. **Only thread 0
+  issues the atomic**, then the result is **broadcast** to every lane:
+  - Single-wave CTA (`block_size <= wave_size`): every lane issues the atomic with a
+    per-lane increment (only lane 0 non-zero), then `ds_bpermute(addr=0, val)`
+    broadcasts lane 0's result — pure wave-internal SIMD traffic, no `s_barrier` needed.
+    This replaced an earlier LDS+`s_barrier` design after the compiler was found to
+    **elide the barrier** on the single-wave path at `max_iters>1`, silently skipping
+    ~1.7% of loop bodies — a real, hardware-observed correctness bug in the prior version.
+  - Multi-wave CTA (`block_size > wave_size`): LDS slot + a real `s_barrier` (not elided,
+    since other waves genuinely observe it).
+- `persistent_tile_loop`: a **bounded** `scf.for` of `max_iters` trips (statically sized
+  to `ceil(num_tiles_total / launch_grid_size)`), threading `tile_idx` as a loop-carried
+  value. Each iteration yields `(tile_idx, in_range)`; the caller's body runs under
+  `scf.if(in_range)`. After the body, the loop fetches the *next* tile id for the next
+  iteration. Over-fetching past `num_tiles` is harmless (spurious atomic traffic only);
+  **under-estimating `max_iters` is a latent, uncaught bug** the helper does not defend
+  against.
+
+### 2c. Launch geometry
+
+Grid = `min(total_work_items, num_cus * blocks_per_cu)` — small, constant, decoupled from
+problem size. This is the fundamental structural difference from MISA's current design
+(grid.z scales with the *chosen split count*, up to 4096).
+
+## 3. MISA's current wrw split-K mechanism (file:line references)
+
+### 3a. Grid.z computation and shard K-range decode
+
+- Host (`driver/igemm_wrw_gtc_driver.h`): `time_split(splits)` (~944-992) sets
+  `karg.gemm_k_per_wg = (num_k_blocks / splits) * gemm_k_per_block` and
+  `karg.gemm_k_num_splits = splits`, launches `grid = {grid_x*block_size, grid_y,
+  splits}` (954). **grid.z literally equals the chosen split count** — no
+  persistent/bounded-grid concept exists today. Cap: `MAX_GEMM_K_SPLITS=4096`
+  (`igemm_gtc_base.h:725-732`, `igemm_gemm_k_global_split_cap`); observed candidates up
+  to 1260+ splits historically.
+- Device (`python/igemm/igemm_wrw_gtc_wmma_nhwc.py:688-713`, `emit_kernel_prologue`):
+  gfx1250 packs `blockIdx.y`/`blockIdx.z` into `ttmp7` (low16/high16). Split variant
+  decodes `s_and_b32 s_by, ttmp7, 0xffff` / `s_lshr_b32 s_bz, ttmp7, 16` (698-699) — the
+  **only place in the whole WMMA codebase that decodes a 3rd grid dimension** today.
+  `s_gemm_k_wg_off = s_bz * s_gemm_k_per_wg` (713) is this shard's K-slice base, folded
+  into A's persistent base address (862) and re-added every main-loop iteration to B's
+  gather (`_emit_b_gather`, ~1026, since wrw's GEMM_K is spatial and regathered every
+  iteration, unlike fwd/bwd's constant K stride).
+- `s_knum` (756) = `s_gemm_k_per_wg` (not true `gemm_k`) — **the WMMA main loop itself is
+  unmodified**; shard size is communicated purely by shrinking the loop-counter target.
+  With `wmma_k_tail` set, only the last shard (`bz == gemm_k_num_splits-1`) gets `s_knum`
+  extended by the true remainder (757-766) — shard ranges are exact contiguous multiples
+  of `gemm_k_per_block`, no gap/overlap logic needed.
+
+### 3b. Atomic epilogue
+
+`python/operations/coalescing_store_wmma.py`, `igemm_coalescing_store_wmma_t.__call__`,
+the `elif ctrl.gemm_k_global_split:` branch (592-663). Per accumulator element:
+`global_atomic_add_f32 ... scope:SCOPE_SYS` (657, default) or `global_atomic_add_u32` for
+int8/int4 (656, Phase 57), or (if `wrw_reduction_kernel`) a plain non-atomic
+`global_store_dword` (642) into a disjoint per-shard workspace slice. **`scope:` is
+load-bearing** — a bare atomic silently drops cross-CU updates on this hardware (found
+and fixed in Phase 17). Optional packed-bf16 atomic variant exists but measured a net
+loss (Phase 34) since atomic contention was never actually the bottleneck here
+(`TX_VMW_ATOMIC_SETCONFLICT_STALL` measured at exactly zero).
+
+### 3c. Host-side split-count search (ternary search)
+
+`driver/igemm_wrw_gtc_driver.h` ~773-1038. Only divisors of `num_k_blocks` are valid
+candidates (WMMA main loop has no general K-tail handling); capped by
+`igemm_gemm_k_global_split_cap` = `min(4096, num_k_blocks, gemm_k/32)`. One candidate
+injected from CK Tile's occupancy heuristic (`compute_gemmk_global_splits`, real
+`hipModuleOccupancyMaxActiveBlocksPerMultiprocessor` query). The actual search is a
+**ternary search over the sorted divisor list**, each comparison a real timed launch
+(cached), exploiting empirically-measured unimodality of cost-vs-split-count.
+`IGEMM_GSPLIT_SWEEP` bypasses this for manual research. **This entire search — and its
+sensitivity to per-launch timing noise — is exactly what Stream-K's constant-grid design
+would make unnecessary.**
+
+### 3d. `wrw_reduction_kernel` (closest existing analog to Stream-K's "Reduction" strategy)
+
+Tunable `wrw_reduction_kernel`/`_wsred` (Phase 35, `igemm_base.py:795-803`). Each shard
+does a **plain non-atomic store** into its own disjoint slice of a
+`num_partitions x output_size` fp32 workspace; a separate reduction kernel
+(`wrw_reduce_partials_f32`, `driver/gpu_tensor_cast/gpu_tensor_cast.cpp:263-281`, a
+trivial grid-stride sum over `num_partitions` slices) runs afterward. This is essentially
+CK-Tile's non-atomic disjoint-workspace idea, already shipped and hardware-validated —
+but still driven by the same fixed-grid.z-decided-before-launch split count; only the
+epilogue write mechanism changes, not the work-distribution/launch-grid model.
+
+### 3e. `gsplit_stagger` (launch stagger) — the workaround Stream-K would obsolete
+
+`gsplit_stagger` (`igemm_base.py:608-628`; emission at
+`igemm_wrw_gtc_wmma_nhwc.py:702-710`) emits `s_sleep_var` right after `s_bz` decode — a
+pure wall-clock perturbation to desynchronize simultaneously-launched shards' first
+memory bursts. Measured ~3-4% faster only at very high split counts, no reliable benefit
+at low/moderate splits. **This is exactly the class of workaround Stream-K obviates by
+construction**: persistent CTAs pull work at genuinely different real times (each
+finishes its current unit, then atomically claims the next), so there's no "N shards all
+launched simultaneously, all starting at K-offset 0" pattern to stagger in the first place.
+
+## 4. Concrete engineering gaps and risks
+
+### 4a. No persistent-kernel primitive exists anywhere in MISA's codegen model
+
+MISA hand-emits raw assembly text; there is no `IRBuilder`/`scf_for_iter`/`ds_bpermute`
+abstraction. Every existing loop (main K-loop, wrw's own tap loop) is a hand-written
+label + `s_cbranch_scc0/1` pair over compile-time-known register roles. A persistent
+"claim from atomic counter, loop until exhausted" pattern needs: a new global-memory
+counter kernarg/buffer (zeroed once per dispatch), a new looping macro (fetch tile id via
+single-lane atomic + broadcast — MISA already has the `v_readfirstlane`-style broadcast
+idiom used for `s_wave_id` derivation, `igemm_wrw_gtc_wmma_nhwc.py:686`), decode
+`(m_tile,n_tile,k_iter)` via MISA's existing `macro_int_div_rem_vs_gfx1250_t` (already
+used pervasively — this part is a genuine, low-risk reuse), then branch back to a loop
+top that must **re-run the entire per-tile prologue** (block offsets, address
+recomputation, LDS offset setup) every iteration, not once at kernel entry as today.
+
+### 4b. `coalescing_store_wmma.py`/`wmma_main_loop.py` assume 1 workgroup ↔ 1 (tile,
+K-range), fixed at launch
+
+Epilogue addressing (`v_gemm_im`/`v_gemm_in`, `s_block_m_off`/`s_block_n_off`) is derived
+once in the prologue from `s_bx`/`s_by` and treated as immutable for the kernel's
+lifetime. A persistent kernel that claims a *different* output tile on a later iteration
+needs to recompute these from scratch every iteration. **Useful precedent**: wrw's
+*existing tap loop* already re-enters the main loop with fresh per-iteration addressing
+(re-zero `v_c`, reset `v_addr_a`/`v_addr_b`, re-issue loads, re-invoke
+`emit_kernel_fma_main_loop()`, ~lines 917-953) — but it only varies the *tap* (iy,ix)
+today, not the full `(m_tile,n_tile,k_iter)` triple, and doesn't yet know how to pull that
+triple from a runtime atomic counter rather than a compile-time-nested double loop.
+
+### 4c. What the fixup step needs
+
+The **Atomic** strategy is nearly free to build on MISA's existing atomic epilogue
+(§3b) — the only change is *what decides* the K-range and tile (today: static
+`bz`/`gemm_k_per_wg`; Stream-K: decoded from a claimed linear id). The **Reduction**
+strategy needs a flag-table wait/finalize mechanism that exists in neither MISA nor
+(completely) in rocKE's own reference — genuinely new engineering with no working
+example to copy, and it introduces a busy-wait spin loop, a class of code MISA has zero
+precedent for.
+
+### 4d. gfx1250-specific risks
+
+- `blockIdx.z` packing (`ttmp7` low16/high16) becomes irrelevant if Stream-K abandons
+  grid.z entirely (likely, since persistent kernels want a flat grid sized to CU count)
+  — this actually *removes* the one existing landmine here.
+- Atomic `scope:SCOPE_SYS`/`SCOPE_DEV` must be preserved on any new atomic epilogue path
+  (bare atomics silently drop cross-CU updates on this hardware, Phase 17).
+- **Hang risk**: this exact project already hit an unrecoverable GPU hang (back-to-back
+  same-register WMMA with zero interleaving; required a physical machine reboot — see
+  `docs/claude_persistent_memory_notes.md`'s "gfx1250 WMMA hang risk"). wrw's kernels are
+  always 4-wave (`block_size=128`, multi-wave), so rocKE's single-wave `ds_bpermute`
+  broadcast bug class shouldn't recur verbatim, but MISA would need the LDS+`s_barrier`
+  path instead — a brand-new cross-wave synchronization point per persistent-loop
+  iteration with no precedent in this codebase. Any new barrier/wait logic here needs
+  careful, hardware-supervised testing (not an unsupervised session) given this history.
+- Wave32: WMMA kernels here are wave32-only; any new lane-0-broadcast logic should follow
+  the existing `v_cmpx`/`exec_lo` idiom already used throughout the epilogue (e.g.
+  `wmma_m_tail`/`wmma_n_tail` masking), not a 64-bit saveexec pattern.
+
+## 5. Proposed implementation approaches
+
+### Approach A — "Minimal Stream-K" (recommended starting point)
+
+Launch a constant-size grid (≈ num_cu, or a small multiple, per
+`compute_streamk_grid_size`) instead of `grid.z = splits`. Each persistent workgroup runs
+a bounded loop (`max_iters = ceil(total_work_items / grid_size)`, compile/launch-time
+known — **no data-dependent trip count, so no hang risk from the loop bound itself**)
+that: (1) atomically claims the next linear work-item id (single lane + LDS+barrier
+broadcast, per §4a/4d), (2) decodes `(m_tile,n_tile,k_slice)` via the existing div/rem
+macro, (3) re-derives `s_block_m_off`/`s_block_n_off` and re-runs the tap-loop-style reset
+(zero `v_c`, reset addresses, re-issue loads), (4) runs the existing WMMA main loop
+unmodified over that K-slice, (5) runs the existing atomic epilogue unmodified.
+
+**Reused nearly as-is**: atomic epilogue, div/rem macros, tap-loop's re-entry precedent,
+per-dispatch zero-init discipline, `scope:SCOPE_SYS` atomics.
+**New**: the persistent-loop control flow itself, the tile-claim atomic counter +
+broadcast, generalizing per-tile addressing from prologue-once to recomputed-every-iteration.
+**Effort**: Medium-High. **Risk**: Medium — main risks are getting the multi-wave
+broadcast barrier genuinely correct (rocKE found a real bug in the analogous single-wave
+case), correctly sizing `max_iters`/`in_range` so the tail isn't dropped or
+double-processed, and auditing every prologue-computed register for whether it needs to
+move into the per-iteration reset (e.g. `s_wei_row_c`, group-decode offsets).
+
+### Approach B — "Full Stream-K" (defer)
+
+Arbitrary/fractional K-slice-to-workgroup mapping (CK Tile's classic Stream-K, not just
+exact-divisor shards), via either a generalized Atomic strategy (needs a finalize pass
+per tile) or the Reduction strategy (flag-table + last-contributor finalize — genuinely
+new on both sides of the port, since rocKE's own reference doesn't ship a complete
+version either). **Effort**: High-to-very-high. **Risk**: High — new spin-wait
+synchronization primitive class for this codebase, highest correctness-audit burden, and
+a lost-wakeup/ordering bug here risks a hang, not just a wrong answer. **Not worth
+attempting before Approach A is built and measured.**
+
+### Approach C — Hybrid: persistent grid + existing `wrw_reduction_kernel` fixup
+
+Keep Approach A's persistent/bounded-grid tile-claim loop, but reuse the already-shipped,
+already-validated `wrw_reduction_kernel` disjoint-workspace + separate-reduction-kernel
+path (§3d) as the fixup instead of the atomic epilogue. Avoids the atomic-scope/ordering
+surface for the new mechanism (only the tile-claim counter itself is atomic, a much
+simpler single-atomic-per-work-item pattern), at the cost of a second kernel launch (same
+cost `wrw_reduction_kernel` already pays today) and reworking the workspace addressing
+scheme to be indexed by claimed tile id rather than fixed shard id. **Effort**: Medium
+(between A and B). **Risk**: Medium-Low on the fixup side (proven mechanism), Medium on
+the persistent-loop side (same novel-mechanism risk as A).
+
+### Recommendation
+
+Start with **Approach A** — smallest change that captures Stream-K's core, evidence-backed
+benefit (§1) while reusing the largest fraction of already-hardware-validated MISA
+machinery. Approach C is a reasonable fallback if A's atomic-epilogue-under-dynamic-
+tile-reassignment has correctness wrinkles not anticipated here. Approach B should be
+deferred indefinitely unless A is measured and found insufficient.
+
+## 6. Key files for implementation
+
+- `python/igemm/igemm_wrw_gtc_wmma_nhwc.py` — `kernel_sgpr_t`/`kernel_vgpr_t` (247-420),
+  `emit_kernel_prologue` (657-894), `emit_kernel_tap_loop` (895-1001, the closest existing
+  "re-enter main loop, fresh per-iteration state" precedent), `_emit_b_gather` (1004+).
+- `python/operations/coalescing_store_wmma.py` — `ctrl_coalescing_store_wmma_t` (31-169),
+  the atomic branch (592-663).
+- `python/igemm/igemm_base.py` — `get_igemm_gtc_gemm_k_global_split` (144-153),
+  `gemm_k_global_split`/`atomic_scope`/`gsplit_stagger`/`wrw_reduction_kernel` tunables
+  (~267-803).
+- `driver/igemm_wrw_gtc_driver.h` — grid.z/karg construction and ternary search
+  (760-1038), `if_gemm_k_global_split`/`compute_gemmk_global_splits` (422-509).
+- `driver/igemm_gtc_base.h` — `igemm_gemm_k_global_split_cap` (725-732), `wrw_reduce_karg_t`
+  (75-82).
+- `driver/gpu_tensor_cast/gpu_tensor_cast.cpp:263-281` — `wrw_reduce_partials_f32`, the
+  existing fixup-pass donor for Approach C.
+- Reference: `~/rocm-libraries/dnn-providers/hip-kernel-provider/rocke/platform/python/rocke/helpers/streamk.py`
+  and `.../helpers/persistent.py` (also mirrored at `~/rocm-libs/...`).
+- Docs consulted: `docs/gfx1250_wmma_layout.md` Phase 17 (1733-1857), Phase 18/20/33
+  (1857+, 3257-3320), Phase 34 (3321-3417), Phase 35 (3419+), Phase 41 (4076-4157), Phase
+  50 (~4773+); `docs/gfx1250_vendor_benchmark_vs_miopen.md:574-674`;
+  `docs/claude_persistent_memory_notes.md` (WMMA hang risk, VGPR-MSB, wrw status summary).

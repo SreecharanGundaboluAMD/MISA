@@ -23,6 +23,16 @@ repo across machines, independent of any one assistant's local memory directory.
   MIOpen" number is OBSOLETE (predates wrw split-K) — current numbers already tracked in
   `docs/gfx1250_vendor_benchmark_vs_miopen.md` (~2-5x slower average, updated 2026-08-27),
   spot-confirmed 2026-08-28.
+- **Stream-K / persistent-kernel design for wrw** — researched and documented in full
+  (`docs/gfx1250_streamk_design.md`, 2026-08-28), NOT implemented. Deliberately stopped at
+  the design stage: the device-side codegen (persistent loop, atomic tile-claim, new
+  multi-wave barrier broadcast, per-iteration address re-derivation) is a materially new
+  pattern for this hand-assembled-kernel generator, and this project has already hit one
+  unrecoverable WMMA-related GPU hang requiring a physical reboot (see "gfx1250 WMMA hang
+  risk" below) — attempting genuinely new, unvalidated looping/sync kernel code
+  unsupervised was judged too risky. Read that doc before implementing; it names a
+  recommended starting approach ("Approach A") with file:line pointers into both MISA's
+  current mechanism and the rocKE reference it's based on.
 - **GPU hardware debug technique** — use `rocgdb` to find the faulting PC on
   real-hardware crashes before writing synthetic repro kernels.
 - **gfx1250 WMMA hang risk** — back-to-back same-register WMMA with zero interleaving
