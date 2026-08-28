@@ -403,27 +403,106 @@ resuming the originally-parked 256x256/256x128 tile work (Phase 53's configs alr
 `config/igemm_bwd_gtc_gfx1250_nhwc_bf16_256x128.config`) now that the mechanism is provably
 correct, not just mechanism-proven-in-isolation.
 
+## Phase 55 (2026-08-28, same day): resumed the 256x256/256x128 tile work -- works for a single workgroup, found a SEPARATE pre-existing multi-workgroup bug
+
+Resumed Phase 53's parked configs now that Phase 54's mechanism is hardware-proven correct.
+
+**Switched from packed to full accumulation.** Phase 53's configs used `wmma_acc_bf16=1`
+because at the time that was the only way to have any chance of fitting the 256-VGPR
+ceiling -- and per Phase 53's own math it STILL didn't fit (284 registers, 28 over) even with
+packing. Replaced `wmma_acc_bf16=1` with `wmma_acc_high_bank=1` in both configs and added the
+missing full-F32-accumulate `ctrl_wmma_mapping_t` table entries (`python/operations/
+wmma_mapping.py`'s `'bf16'` key -- previously only `'bf16_bf16acc'`/`'fp16_f16acc'` had
+256x256/256x128 entries). With `v_c` in bank 1, full F32 accumulate needs
+`wave_repeat_m*wave_repeat_n*8 = 256` registers (fits easily; total wave VGPR request is 512,
+confirmed via the generated `.s`'s `.vgpr_count`), avoiding the precision-losing packed
+workaround entirely -- matches this project's stated preference for F32 accumulation
+elsewhere (see the optimization backlog's "confirmed dead ends").
+
+**Hardware-validated `valid:y` for a SINGLE workgroup**: fwd 256x256 and bwd 256x128, both at
+the exact single-tile problem size (`gemm_m<=256, gemm_n<=256`) and with multiple K-blocks
+within that single workgroup (`c` up to 128, i.e. 4 K-iterations) -- both pass cleanly.
+
+**Found a genuine, SEPARATE, pre-existing bug**: any problem needing MULTIPLE workgroups along
+`gemm_m` (`grid_x>1`) reports `valid:n` -- for BOTH fwd and bwd. Bisected this down to
+`wmma_epilogue_chunked` itself, completely independent of VGPR-MSB or tile size: it reproduces
+identically at the ORIGINAL 128x128 tile (`wmma_acc_high_bank` not even set) with
+`wmma_epilogue_chunked=1` and `grid_x>1`. Confirmed via `PRINT_NRMS=1`: single-workgroup nrms
+is `~0.0006` (normal bf16 rounding, well under the `0.0082` tolerance); multi-workgroup nrms is
+`~0.19-0.20` (250-300x over tolerance) -- consistently reproducible across multiple runs with
+different random data each time (ruling out a flaky race, pointing at a deterministic logic
+bug). Bisected further: multiple K-blocks alone is fine (`valid:y`); multiple N-blocks alone is
+fine (tested at 256x256, `k=512`); it's specifically multiple **M**-blocks (`grid_x>1`) that
+breaks it, for both directions.
+
+**Root cause FOUND AND FIXED.** Initial algebraic check of the compact-row-to-native-row
+recovery formula found no error -- because the formula itself is fine; the bug is in one of
+its *inputs*. `wmma_main_loop.py`'s/kernel prologue's `v_gemm_im` gets `s_block_m_off`
+**permanently folded in** right after it's computed (`v_add_u32 v_gemm_im, s_block_m_off,
+v_gemm_im`) -- so from that point on, `v_gemm_im` is a GLOBAL row, not the tile-local value
+the chunked scatter's compact-row derivation assumes. `block_m_off` is always an exact
+multiple of `macro_tile_m` (hence of `wave_tile_m*wave_repeat_m` too), so for workgroup `bx=0`
+(`block_m_off=0`) this was completely invisible -- but for `bx>=1`, right-shifting the
+now-nonzero-in-those-bits `v_gemm_im` by `log2(wave_tile_m*wave_repeat_m)` computes a
+`wave_idx` that's 2 or 3 too high (out of the valid 0/1 range), scattering into LDS bytes
+entirely outside the small per-group chunked region. The sibling **unchunked** path was
+already safe because it explicitly masks (`(v_gemm_im+row_off) & (macro_tile_m-1)`) before
+using `v_gemm_im` for LDS addressing -- the chunked path's scatter was simply missing the
+equivalent mask.
+
+**Found via a position-fingerprint diagnostic**, more decisive than the raw LDS dump:
+replaced the scatter's real accumulator DATA with a small decodable integer encoding
+`(i_rm, j, i_rn)` (same value for every lane, e.g. `i_rm*1000+j*10+i_rn`), left the
+unmodified real gather/store pipeline to carry it to global memory, then read back via
+`DUMP_PRED`'s raw hex. Workgroup `bx=0`'s output showed clean, correctly-decodable
+fingerprints matching hand-computed expectations at every position (e.g. index 128 = row 1 →
+`0x0a` = `i_rm=0,j=1,i_rn=0`, exactly as predicted). Workgroup `bx=1`'s entire output showed
+**zero clean fingerprints anywhere** -- not a wrong-but-decodable value (which would indicate
+a formula error), but what looked like leftover/uninitialized memory, proving the scatter
+was never landing its writes anywhere the gather could find them for that workgroup.
+
+**Fix**: mask `v_gemm_im` to tile-local range (`& (macro_tile_m-1)`) before deriving
+`wave_idx`/`lane_sub` in `coalescing_store_wmma.py`'s `_emit_chunked_non_atomic_store` scatter
+setup, matching the unchunked path's existing discipline.
+
+**Hardware-validated `valid:y`** across every combination tried: fwd 128x128
+(`wmma_epilogue_chunked=1`, no VGPR-MSB) and fwd 256x256 / bwd 256x128 (both with
+`wmma_acc_high_bank=1`), each with single-workgroup, multi-M-block (2 and 3+ blocks),
+multi-N-block, multi-K-block, and combinations of all three. `PRINT_NRMS=1` confirms normal
+bf16 rounding-level error (`~0.0004-0.0006`, previously `~0.19-0.20` for the broken
+multi-workgroup case) in every case. int8 128x128 chunked + multi-workgroup also confirmed
+`valid:y`. Zero regression confirmed (byte-identical `.s` for existing non-`wmma_epilogue_chunked`
+configs).
+
+**Config status**: both `config/igemm_fwd_gtc_gfx1250_nhwc_bf16_256x256.config` and
+`config/igemm_bwd_gtc_gfx1250_nhwc_bf16_256x128.config` are updated (full F32 accumulate) and
+hardware-validated correct for single- AND multi-workgroup problems. Phase 55 is DONE.
+
+Two diagnostic hooks are kept in the tree (env-gated, off by default, zero cost): `CHUNK_RAW_DUMP=1`
+(raw LDS dump, less decisive) and `CHUNK_FINGERPRINT=1` (position fingerprinting, the one that
+actually found this bug) in `coalescing_store_wmma.py`'s `_emit_chunked_non_atomic_store`.
+
 ## How to resume on a different machine
 
-Phase 54's 128x128 mechanism-only test is DONE and hardware-verified (`valid:y` across fwd
-bf16/fp16/int8/fp32, both epilogue implementations, and bwd bf16) — no need to re-litigate any
-of the above. The remaining work is genuinely new:
+Phase 54's 128x128 mechanism-only test is DONE (`valid:y` across fwd bf16/fp16/int8/fp32, both
+epilogue implementations, and bwd bf16). Phase 55's 256x256/256x128 tile work is ALSO DONE, for
+single- AND multi-workgroup problems (the `wmma_epilogue_chunked` masking bug is fixed). No need
+to re-litigate either of the above -- this whole doc is now a closed investigation, kept for
+reference and for the diagnostic techniques (rocgdb, raw-dump hooks, position fingerprinting)
+that generalize to future gfx1250 debugging.
 
 1. Clone/pull this branch (`users/SreecharanGundaboluAMD/gfx1250_bringup`).
 2. Confirm the new machine has a gfx1250 GPU (`rocminfo | grep gfx1250`) and the ROCm toolchain
    (`clang++`/`llvm-objdump` targeting gfx1250; path was `/opt/rocm/llvm/bin/` this session).
-3. Resume Phase 53's parked 256x256/256x128 tile work -- configs already exist:
-   `config/igemm_fwd_gtc_gfx1250_nhwc_bf16_256x256.config`,
-   `config/igemm_bwd_gtc_gfx1250_nhwc_bf16_256x128.config`. These need `wmma_acc_high_bank=1`
-   (now provably correct at 128x128) PLUS a bigger macro-tile, which will exercise more
-   `(i_rm,i_rn)` groups and possibly a different `wave_repeat_m/n`/`wave_tile_m/n` combination
-   than the 4x4 grid tested this session -- re-verify `valid:y` on real hardware for these
-   specific shapes before assuming the fix generalizes, since the row-advance bug this session
-   fixed was specific to the exact loop structure in `coalescing_store_wmma.py`, and a bigger
-   tile may exercise code paths (e.g. `wmma_epilogue_chunked`'s multi-pass-per-group logic, or
-   `wmma_acc_f16`/`wmma_acc_bf16` packed accumulation, both excluded from this session's testing)
-   not covered by the 128x128 mechanism-only test.
-4. `MSB_RAW_DUMP=1` (env var, wired into `igemm_fwd_gtc_wmma_nhwc.py`'s `emit_kernel_epilogue()`)
-   is still in the tree as a reusable diagnostic -- bypasses the epilogue entirely and dumps
-   `v_c` raw. Useful again if a NEW correctness issue appears at the bigger tile size, to quickly
-   rule accumulation in/out before suspecting the epilogue.
+3. Next real work is genuinely new, not a continuation of this doc's investigation -- e.g. wider
+   tile-shape/precision coverage for `wmma_acc_high_bank`+`wmma_epilogue_chunked` (only bf16
+   fwd/bwd tested this session; int8/fp16/fp32 at 256-size tiles, and wrw entirely, are
+   untested), or performance tuning now that correctness is established (double-buffering the
+   256x256 main loop, since the chunked epilogue's small LDS footprint may leave enough headroom
+   -- see Phase 52's note that gfx950's own tuned instance sacrificed this).
+4. `MSB_RAW_DUMP=1` (`igemm_fwd_gtc_wmma_nhwc.py`'s `emit_kernel_epilogue()`),
+   `CHUNK_RAW_DUMP=1`, and `CHUNK_FINGERPRINT=1` (both in `coalescing_store_wmma.py`'s
+   `_emit_chunked_non_atomic_store`) remain in the tree as reusable diagnostics, off by default --
+   the fingerprint technique in particular (replace real data with a decodable per-position
+   constant, let the real address/data-movement pipeline carry it, decode the output) is a
+   generally useful pattern for any future addressing-bug hunt in this codebase.

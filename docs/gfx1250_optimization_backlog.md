@@ -282,29 +282,36 @@ section for the record).
 
 ## Tier 3 — bigger bets (largest structural change, longest-term)
 
-- [ ] **VGPR-MSB register-allocator support** (`S_SET_VGPR_MSB`, up to 1024 VGPRs/wave)
-      — IN PROGRESS (Phase 54). Confirmed real and usable through this project's
-      existing toolchain: verified via a full `llvm-mc` assemble + `llvm-objdump`
-      disassemble round-trip (the disassembler resolves and annotates the true
-      hardware address). The instruction encoding never changes — only the *bank*
-      each register symbol is emitted against does — so this is purely a codegen
-      problem: teach the register allocator to track a bank per symbol beyond the
-      first 256, and teach instruction emission to (a) map each instruction format's
-      DST/SRC0/SRC1/SRC2 slots to its actual operands (VOP1/VOP2/VOP3/VOP3P/VOPD/VDS/
-      VFLAT/VBUFFER/VIMAGE all differ) and (b) emit `S_SET_VGPR_MSB` exactly when the
-      needed bank combination changes from the previous instruction. This is the
-      actual fix for the tile-size ceiling below, not tile-shape tuning. See Phase 53
-      (verification) and Phase 54 (implementation) in `docs/gfx1250_wmma_layout.md`.
-- [ ] **Bigger WMMA macro-tile via the chunked epilogue** (Phase 52/53) — the LDS side
-      of the gfx950-XDLOPS-vs-gfx1250-WMMA tile-size gap is fixed
-      (`wmma_epilogue_chunked` in `coalescing_store_wmma.py`, built and uncommitted),
-      but a 256x256 (or 256x128) tile needs a minimum 284 VGPRs at the best reachable
-      wave/block-size split even with `wmma_acc_bf16`/`wmma_acc_f16` — 28 over today's
-      256-register ceiling, with no tile-shape choice closing the gap (see Phase 53's
-      full derivation). This is exactly what the VGPR-MSB item above unblocks. The
-      chunked mechanism itself is otherwise ready to validate standalone on the
-      existing 128x128 tile (`wmma_epilogue_chunked=1`, should be a no-op on output,
-      different LDS/barrier pattern) whenever picked back up.
+- [x] **VGPR-MSB register-allocator support** (`S_SET_VGPR_MSB`, up to 1024 VGPRs/wave)
+      — DONE (Phase 54, 2026-08-28). `v_c` (the accumulator) now lives in a second,
+      independently-addressed register bank via `wmma_acc_high_bank=1`. Two real bugs
+      found and fixed along the way, both hardware-validated: (1) `dst` MSB left at
+      bank 1 after every WMMA burst with nothing resetting it, corrupting every
+      bank-0 VGPR write in between bursts; (2) `coalescing_store_wmma.py`'s per-row
+      scatter advance (`v_add_u32 v_tmp1, stride, v_tmp1`) put the running address in
+      the instruction's VSRC1 slot, which was still gated by `src1=1` (active for the
+      neighboring `ds_write`'s `v_c` DATA operand) — silently read from bank 1
+      instead of bank 0. `valid:y` across fwd bf16/fp16/int8/fp32 and bwd bf16, both
+      epilogue implementations, at 128x128. See
+      `docs/gfx1250_wmma_vgpr_msb_wip_status.md` for the full writeup.
+- [x] **Bigger WMMA macro-tile via the chunked epilogue** (Phase 52/53/55) — DONE. The
+      VGPR wall is closed (VGPR-MSB above): fwd 256x256 and bwd 256x128 build with full
+      F32 accumulate (`wmma_acc_high_bank=1`, replacing the precision-losing
+      `wmma_acc_bf16` workaround Phase 53 needed and which still didn't fit even with
+      packing). Also found and fixed a genuine, separate, pre-existing
+      `wmma_epilogue_chunked` bug along the way: the chunked scatter derived
+      `wave_idx`/`lane_sub` directly from `v_gemm_im` without masking out the
+      block-offset the prologue permanently folds into it, so every workgroup after the
+      first (`grid_x>1`) scattered into the wrong LDS bytes entirely (invisible for
+      `bx=0`, since `block_m_off=0` there). Found via a position-fingerprint diagnostic
+      (`CHUNK_FINGERPRINT=1`) and fixed by masking to tile-local range, matching the
+      unchunked path's existing discipline. **Hardware-validated `valid:y`** for both
+      directions, single- and multi-workgroup, multi-K-block, multi-N-block. See Phase
+      55 in `docs/gfx1250_wmma_vgpr_msb_wip_status.md` for the full investigation.
+      Untested: int8/fp16/fp32 at 256-size tiles (only bf16 verified), wrw direction,
+      and whether main-loop double-buffering is affordable on top (Phase 52 noted
+      gfx950's own tuned 256x256 sacrifices this for LDS budget — worth re-checking
+      given the chunked epilogue's smaller footprint).
 - [ ] **Stream-K / persistent-kernel design** for wrw's split-K (rocKE has a working
       reference: `helpers/streamk.py`, `helpers/persistent.py`) — a small, constant-size
       grid with an atomic tile-counter dynamically pulling work, instead of a fixed

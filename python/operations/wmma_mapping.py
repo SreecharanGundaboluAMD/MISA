@@ -309,6 +309,19 @@ ctrl_wmma_mapping_table = {
         # already precision-generic (uses self.data_byte throughout), same as the 64x64 port.
         ctrl_wmma_mapping_t(128, 64,  16, 16, 2, 4, 4, v_wmma_f32_16x16x32_bf16),
         ctrl_wmma_mapping_t(64,  128, 16, 16, 2, 4, 4, v_wmma_f32_16x16x32_bf16),
+        # 256x256/256x128, Phase 54 (VGPR-MSB): full F32-accumulate versions of the
+        # 'bf16_bf16acc' entries below -- Phase 53 needed the packed accumulator
+        # (num_v_c=4) to have any chance of fitting the 256-VGPR/wave ceiling, and it
+        # STILL didn't fit (284 registers needed, 28 over) until Phase 54 moved v_c
+        # into a second, independently-addressed bank via `wmma_acc_high_bank=1`. With
+        # v_c in bank 1, full F32 accumulate (total_acc_c = wave_repeat_m*wave_repeat_n*8
+        # = 256) fits easily -- no precision tradeoff needed. Same tile shapes as the
+        # 'bf16_bf16acc' entries (accumulate width doesn't affect tiling). Requires
+        # `wmma_epilogue_chunked=1` (a 256x256 F32-accumulate tile needs 262144 bytes of
+        # LDS to stage one-shot, 4x the 64KB ceiling). See
+        # docs/gfx1250_wmma_vgpr_msb_wip_status.md's Phase 54 fix.
+        ctrl_wmma_mapping_t(256, 256, 16, 16, 8, 4, 8, v_wmma_f32_16x16x32_bf16),
+        ctrl_wmma_mapping_t(256, 128, 16, 16, 4, 8, 4, v_wmma_f32_16x16x32_bf16),
     ],
     # Phase 27 (BF16-accumulate WMMA): mirrors 'fp16_f16acc' above exactly -- same tile shapes
     # as 'bf16', just v_wmma_bf16_16x16x32_bf16 instead of v_wmma_f32_16x16x32_bf16.

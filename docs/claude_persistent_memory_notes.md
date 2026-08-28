@@ -13,6 +13,9 @@ repo across machines, independent of any one assistant's local memory directory.
   hardware/toolchain. Phase 54 is DONE for 128x128: both the dst=1-never-reset bug and
   a `coalescing_store_wmma.py` row-advance MSB-bank bug are found, fixed, and
   hardware-verified `valid:y` across fwd bf16/fp16/int8/fp32 + bwd bf16, both epilogues.
+  Phase 55: resumed 256x256/256x128 tile configs (full F32 accumulate, no more packed
+  workaround) — also found+fixed a separate `wmma_epilogue_chunked` masking bug that
+  broke every `grid_x>1` workgroup. Both configs now `valid:y` single+multi-workgroup.
 - **GPU hardware debug technique** — use `rocgdb` to find the faulting PC on
   real-hardware crashes before writing synthetic repro kernels.
 - **gfx1250 WMMA hang risk** — back-to-back same-register WMMA with zero interleaving
@@ -173,9 +176,45 @@ used for its own address computation.
 `wmma_epilogue_chunked=1`) and bwd bf16. bf16/fp16's earlier "separate small M=0 noise" was NOT a
 separate bug -- same root cause, just looked like rounding noise at bf16's smaller magnitudes.
 Zero regression confirmed. Phase 54's VGPR-MSB mechanism is now genuinely done and correct for
-the 128x128 test across every precision and both epilogues -- see
-`docs/gfx1250_wmma_vgpr_msb_wip_status.md` for the full writeup and the real next step (Phase
-53's parked 256x256/256x128 tile configs, which may exercise untested code paths).
+the 128x128 test across every precision and both epilogues.
+
+**Phase 55 (same day): resumed the 256x256/256x128 tile configs -- DONE, including a second
+real bug found and fixed.** Switched the configs from `wmma_acc_bf16=1` (packed,
+precision-losing, and per Phase 53's own math STILL 28 registers short of fitting) to
+`wmma_acc_high_bank=1` with full F32 accumulate (256 registers, fits easily in bank 1 -- total
+wave VGPR request 512, confirmed via `.vgpr_count`). Added the missing full-F32
+`ctrl_wmma_mapping_t` table entries (`wmma_mapping.py`'s `'bf16'` key only had packed-accumulate
+256-size entries before).
+
+Multi-workgroup (`grid_x>1`) initially reported `valid:n` for both directions -- a genuine,
+separate, pre-existing bug, unrelated to VGPR-MSB or tile size (reproduced at the ORIGINAL
+128x128 tile with just `wmma_epilogue_chunked=1`). This exact code path had never been
+hardware-tested with `grid_x>1` before (Phase 53 was parked before ever running a
+multi-workgroup test). **Root cause**: `v_gemm_im` has `s_block_m_off` permanently folded in by
+the prologue, so it's a GLOBAL row from that point on -- but the chunked scatter's compact-row
+derivation (`wave_idx = v_gemm_im >> log2(wave_tile_m*wave_repeat_m)`) used it directly with no
+masking. `block_m_off` is always a multiple of `macro_tile_m`, so `bx=0` never exposed it;
+`bx>=1` computed a `wave_idx` 2-3 too high, scattering into completely wrong LDS bytes. The
+sibling unchunked path was already safe (masks `v_gemm_im` before use) -- the chunked path was
+just missing the equivalent mask.
+
+**Found via a position-fingerprint diagnostic** (`CHUNK_FINGERPRINT=1`), more decisive than a
+raw LDS dump: replaced the scatter's DATA with a small decodable integer encoding
+`(i_rm,j,i_rn)`, left the real gather/store pipeline untouched, decoded via `DUMP_PRED`'s raw
+hex. `bx=0`'s output showed clean, correctly-decodable fingerprints matching hand-computed
+expectations everywhere; `bx=1`'s showed ZERO clean fingerprints anywhere (leftover/
+uninitialized-looking memory instead) -- proof the scatter was never landing writes where the
+gather could find them for that workgroup. **Fixed** by masking `v_gemm_im` to tile-local range
+before deriving `wave_idx`/`lane_sub`, matching the unchunked path's existing discipline.
+
+**Hardware-validated `valid:y`**: fwd 128x128 (no MSB) and fwd 256x256/bwd 256x128 (with MSB),
+each across single-workgroup, multi-M-block (2 and 3+), multi-N-block, multi-K-block, and
+combinations. int8 128x128 chunked+multi-workgroup also confirmed. `PRINT_NRMS=1` back to
+normal bf16 rounding levels (~0.0004-0.0006, was ~0.19-0.20 broken). Zero regression confirmed.
+Both 256-size configs are DONE -- correct for single- and multi-workgroup problems, both
+directions -- see `docs/gfx1250_wmma_vgpr_msb_wip_status.md`'s Phase 55 for full detail. The
+`CHUNK_FINGERPRINT` technique (decodable per-position constant + real pipeline + decode output)
+is a good reusable pattern for future addressing-bug hunts in this codebase.
 
 ---
 

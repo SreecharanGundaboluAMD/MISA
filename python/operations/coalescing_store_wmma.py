@@ -24,6 +24,7 @@
 #
 ################################################################################
 
+import os
 from .global_memory import *
 from .wmma_mapping import *
 
@@ -295,7 +296,23 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
             # ---- scatter: this group's own wave_repeat_n*num_v_c accumulator slice, at the
             # COMPACT row (v_gemm_im's wave_idx re-packed at log2(wave_tile_m), no i_rm offset --
             # dropped by compaction, recovered on the gather side instead) ----
-            self._emit(f"v_lshrrev_b32 v[{v_tmp1}], {log2_true_tile_m}, v[{v_gemm_im}]   ; wave_idx (native position)")
+            # Bugfix (Phase 55, 2026-08-28): `v_gemm_im` has `s_block_m_off` PERMANENTLY
+            # folded in by the prologue (`v_add_u32 v_gemm_im, s_block_m_off, v_gemm_im`),
+            # so it's a GLOBAL row for every workgroup after the first, not the tile-local
+            # value this compact-row derivation assumes. `block_m_off` is always an exact
+            # multiple of `macro_tile_m` (hence of `wave_tile_m*wave_repeat_m` too), so for
+            # workgroup bx=0 (block_m_off=0) this was invisible, but for bx>=1 the
+            # right-shift below picks up block_m_off's now-nonzero high bits, computing a
+            # `wave_idx` that's 2 or 3 too high (out of the valid 0/1 range) instead of the
+            # intended native wave index -- silently scattering into the wrong LDS bytes
+            # entirely (found via hardware validation: a `CHUNK_FINGERPRINT` diagnostic
+            # showed a SECOND workgroup's output reading pure leftover/uninitialized memory
+            # instead of any of the expected fingerprint values, for every single element).
+            # The sibling unchunked path already masks (`(v_gemm_im+row_off) &
+            # (macro_tile_m-1)`) before using v_gemm_im for LDS addressing -- this was
+            # simply missing here. Mask to tile-local range first, same discipline.
+            self._emit(f"v_and_b32 v[{v_tmp1}], {cxm.macro_tile_m - 1}, v[{v_gemm_im}]   ; tile-local v_gemm_im (strip any block offset folded in)")
+            self._emit(f"v_lshrrev_b32 v[{v_tmp1}], {log2_true_tile_m}, v[{v_tmp1}]   ; wave_idx (native position)")
             self._emit(f"v_and_b32 v[{v_tmp2}], {wave_tile_m - 1}, v[{v_gemm_im}]   ; lane_sub = (lane/16)*8")
             self._emit(f"v_lshl_or_b32 v[{v_tmp2}], v[{v_tmp1}], {log2_wave_tile_m}, v[{v_tmp2}]   ; compact_row = (wave_idx<<log2(wave_tile_m)) | lane_sub")
             self._emit(f"v_and_b32 v[{v_tmp1}], {macro_tile_n - 1}, v[{v_gemm_in}]   ; col (unchanged -- N is never chunked)")
@@ -340,17 +357,51 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                     c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
                     col_off = i_rn * cxm.wave_tile_n * elem_bytes
                     offset_str = f" offset:{col_off}" if col_off != 0 else ""
+                    if os.environ.get('CHUNK_FINGERPRINT'):
+                        # TEMPORARY DIAGNOSTIC: replace the real accumulator DATA with a
+                        # decodable integer fingerprint encoding (i_rm, j, i_rn) -- SAME for
+                        # every lane, unlike the real per-lane v_c value -- then let the rest
+                        # of the pipeline (unmodified barrier/gather/global_store) carry it
+                        # to global memory. Isolates whether the ADDRESS math is right,
+                        # completely independent of accumulator data correctness: read back
+                        # via DUMP_PRED's raw hex and decode fingerprint = i_rm*1000+j*10+i_rn
+                        # at every output position, compare against the position's OWN
+                        # expected (i_rm,j,i_rn) per the row/col formula.
+                        fingerprint = i_rm * 1000 + j * 10 + i_rn
+                        self._emit(f"v_mov_b32 v[{v_tmp1}], {fingerprint}   ; CHUNK_FINGERPRINT: encodes (i_rm={i_rm},j={j},i_rn={i_rn})")
+                        data_reg = v_tmp1
+                    else:
+                        data_reg = f"{v_c}+{c_index}"
                     if ctrl.wmma_acc_f16:
                         hi_off = col_off + padded_stride * elem_bytes
-                        self._emit(f"ds_write_b16 v[{v_tmp2}], v[{v_c}+{c_index}]{offset_str}   ; row j*2 (lo 16 bits)")
-                        self._emit(f"ds_write_b16_d16_hi v[{v_tmp2}], v[{v_c}+{c_index}] offset:{hi_off}   ; row j*2+1 (hi 16 bits)")
+                        self._emit(f"ds_write_b16 v[{v_tmp2}], v[{data_reg}]{offset_str}   ; row j*2 (lo 16 bits)")
+                        self._emit(f"ds_write_b16_d16_hi v[{v_tmp2}], v[{data_reg}] offset:{hi_off}   ; row j*2+1 (hi 16 bits)")
                     else:
-                        self._emit(f"ds_write_b32 v[{v_tmp2}], v[{v_c}+{c_index}]{offset_str}")
+                        self._emit(f"ds_write_b32 v[{v_tmp2}], v[{data_reg}]{offset_str}")
             self._emit_empty_line()
 
             self._emit(f"s_wait_dscnt 0x0")
             self._emit(f"s_barrier_signal -1")
             self._emit(f"s_barrier_wait -1   ; group {i_rm}'s scatter writes must be visible before this group's gather reads")
+
+            if os.environ.get('CHUNK_RAW_DUMP') and i_rm == 0:
+                # TEMPORARY DIAGNOSTIC: dump group 0's raw LDS content (flat tid-based
+                # addressing, bypassing the compact->native row recovery entirely) straight
+                # to s_p_out, then stop -- isolates whether the SCATTER wrote correct data
+                # into LDS (independent of the GATHER's row-recovery math).
+                elems_per_thread_raw = total_elements_g // ctrl.block_size
+                self._emit(f"; CHUNK_RAW_DUMP: raw LDS dump, group 0, bypassing gather recovery")
+                self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {utility_log2(elems_per_thread_raw)}, v[{v_tid}]   ; tid*{elems_per_thread_raw}, flat element index")
+                self._emit(f"v_lshlrev_b32 v[{v_tmp2}], {elem_byte_shift}, v[{v_tmp1}]   ; LDS byte address")
+                self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {elem_byte_shift}, v[{v_tmp1}]   ; global byte address (same flat layout)")
+                for e in range(elems_per_thread_raw):
+                    off = e * elem_bytes
+                    self._emit(f"ds_read_b32 v[{v_gather}], v[{v_tmp2}] offset:{off}")
+                    self._emit(f"s_wait_dscnt 0x0")
+                    self._emit(f"global_store_dword v[{v_tmp1}], v[{v_gather}], s[{s_p_out}:{s_p_out}+1] offset:{off}")
+                self._emit(f"s_wait_storecnt 0x0")
+                self._emit(f"s_endpgm")
+                return
 
             if ctrl.vgpr_msb_tracker is not None:
                 # Phase 54: the ENTIRE gather phase below (address computation AND the
