@@ -147,6 +147,18 @@ typedef struct {
     int   dilation_w;
     int   group;
     int   gemm_k_per_wg;    // Phase 49 (gemm_k_global_split): this workgroup's K-slice length
+    // Phase 60 (Magic Division): host-computed magic multipliers to replace runtime
+    // emulated software division (macro_int_div_rem_vs_gfx1250_t) with 2-instruction
+    // hardware multiplication on the main division sites:
+    //   mdiv_0: ho_wo (divisor for (n, ho*wo) decomposition)
+    //   mdiv_1: wo   (divisor for (ho_idx, wo_idx) decomposition)
+    //   mdiv_2: stride_h (divisor for ho_idx = numerator_h/stride_h)
+    //   mdiv_3: stride_w (divisor for wo_idx = numerator_w/stride_w)
+    uint32_t magic_0;       // magic for ho_wo
+    uint32_t magic_1;       // magic for wo
+    uint32_t magic_2;       // magic for stride_h
+    uint32_t magic_3;       // magic for stride_w
+    uint32_t shift_pack_0;  // packed shifts: ho_wo, wo, stride_h, stride_w (8 bits each)
 } __attribute__((packed)) igemm_fwd_gtc_wmma_nhwc_karg_t;
 
 typedef struct {
@@ -677,6 +689,20 @@ public:
             karg.dilation_h = dilation_h;
             karg.dilation_w = dilation_w;
             karg.group      = group;
+
+            // Phase 60 (Magic Division): precompute magic multipliers for the
+            // three-division hot path in the tap gather
+            {
+                magic_div_u32_t mdiv_0 = magic_div_u32_gen(ho * wo);
+                magic_div_u32_t mdiv_1 = magic_div_u32_gen(wo);
+                magic_div_u32_t mdiv_2 = magic_div_u32_gen(stride_h);
+                magic_div_u32_t mdiv_3 = magic_div_u32_gen(stride_w);
+                karg.magic_0      = mdiv_0.magic;
+                karg.magic_1      = mdiv_1.magic;
+                karg.magic_2      = mdiv_2.magic;
+                karg.magic_3      = mdiv_3.magic;
+                karg.shift_pack_0 = magic_div_u32_pack_shift(mdiv_0.shift, mdiv_1.shift, mdiv_2.shift, mdiv_3.shift);
+            }
 
             hipFunction_t kernel_func;
             std::string kernel_name = get_kernel_name(tunable);

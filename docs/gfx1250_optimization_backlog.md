@@ -56,6 +56,20 @@ section for the record).
 
 ## Tier 1 — small effort (cross-validated or ISA-doc-motivated, cheap to try)
 
+- [ ] **[P1] Host-precomputed Magic Division (`magic_div.h`) in hot coordinate paths**
+      — Replace emulated 15-instruction software division macros (`.v_u32_div_rem_vs_gfx1250`)
+      with host-precomputed magic multipliers and shifts passed via kernargs or SGPRs.
+      Turns 15 VALU instructions into 2 (`v_mul_hi_u32` + `v_lshrrev_b32`) per division/modulo
+      in the prologue, group decoding, and multi-tap spatial coordinate index loops.
+      Expected payoff: 15–30% speedup on multi-tap and spatial-division-bound shapes.
+- [ ] **[P2] Complete Direct Store (`direct_store=1`) expansion across all master configs**
+      — Wire `direct_store=1` into all non-split master config sections. Direct store bypasses
+      LDS reshuffle and writes coalesced dwords straight to global memory, cutting LDS barriers
+      and latency on exact-fit non-split shapes.
+- [ ] **[P3] 32-bit SADDR base offsets for in-loop global loads**
+      — Replace 64-bit carry-chain address stepping in inner K-loops with 32-bit byte offset
+      VGPRs + SADDR base SGPRs (`global_load_dwordx4 vdst, v_off, s_p_base offset:N`).
+      Saves 1 VGPR and 1 VALU carry op per address step across all directions.
 - [ ] **`disable_xdl_arb_stall` (`SCHED_MODE` bit[2]) A/B test on a wrw split-K shape.**
       **Attempted 2026-08-27, blocked — not a guess we should make.** The CDNA5 ISA doc
       (§5.7.2.1) documents this bit's *existence and semantics* but gives no `S_SETREG`
