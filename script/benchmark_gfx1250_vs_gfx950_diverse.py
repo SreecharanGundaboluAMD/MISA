@@ -171,15 +171,12 @@ def build_all_configs_parallel(direction, precision, build_dir, rebuild):
     """Build all configs for a (direction, precision) pair in parallel.
     Returns list of (out_dir, config_label) for successfully built configs.
     """
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     configs_to_build = []
 
-    # Monolithic master config (the original approach)
-    master_cfg = MASTER_CONFIG_FILES[(direction, precision)]
-    master_out = os.path.join(build_dir, f'{direction}_{precision}_master')
-    configs_to_build.append((master_cfg, master_out, 'master'))
-
-    # Per-tile combinatorial configs
+    # Per-tile combinatorial configs only (the monolithic _all.config is too big
+    # for the assembler's branch-range limit with 168 sections, so we search each
+    # tile shape independently and aggregate the best result per shape)
     for tile_m, tile_n, tile_cfg in find_per_tile_configs(direction, precision):
         tile_out = os.path.join(build_dir, f'{direction}_{precision}_{tile_m}x{tile_n}_combo')
         configs_to_build.append((tile_cfg, tile_out, f'{tile_m}x{tile_n}_combo'))
@@ -217,19 +214,14 @@ def run_shape(out_dir, direction, precision, n, c, H, W, k, y, x, p, q, u, v, l,
         result = subprocess.run(args, cwd=out_dir, env=env, capture_output=True, text=True,
                                  timeout=480)
     except subprocess.TimeoutExpired as e:
-        # master builds now search many more candidates per shape (Phase 48/49's new
-        # gsplit/32x32 sections) -- a big shape (e.g. n=256,H=449,W=449) sweeping ~18
-        # candidates at the default warmup/repeat can genuinely take minutes. Report as
-        # a timeout rather than crashing the whole run and losing every other shape's
-        # already-computed result.
         def _decode(x):
             return x.decode('utf-8', 'replace') if isinstance(x, bytes) else (x or '')
         partial = _decode(e.stdout) + _decode(e.stderr)
-        return None, f"TIMED OUT after {e.timeout}s\n{partial}"
+        return None, f"TIMED OUT after {e.timeout}s\n{partial}", ''
     costs = [float(m.group(2)) for m in COST_RE.finditer(result.stdout) if m.group(1) == direction]
     if not costs:
-        return None, result.stdout + result.stderr
-    return min(costs), None
+        return None, result.stdout + result.stderr, ''
+    return min(costs), None, result.stdout
 
 
 def fmt_ratio(misa_ms, ref_ms):
@@ -248,6 +240,7 @@ def main():
     ap.add_argument('--verify', action='store_true', help='run with -V 1 instead of -V 0')
     ap.add_argument('--build-dir', default=os.path.join(REPO_ROOT, 'bench_out'))
     ap.add_argument('--markdown-out', default=None)
+    ap.add_argument('--log-dir', default=None, help='Directory to write full per-shape conv_driver.exe output logs')
     args = ap.parse_args()
 
     check_gpu_contention()
@@ -274,17 +267,41 @@ def main():
     for (direction, n, c, H, W, k, y, x, p, q, u, v, l, j, precision, ref950) in shapes:
         configs = all_configs.get((direction, precision), [])
         best_ms, best_label = None, None
+        all_candidates = []
         for out_dir, label in configs:
-            misa_ms, err = run_shape(out_dir, direction, precision, n, c, H, W, k, y, x,
+            misa_ms, err, stdout = run_shape(out_dir, direction, precision, n, c, H, W, k, y, x,
                                       p, q, u, v, l, j, args.warmup, args.repeat, args.verify)
+            all_candidates.append((label, misa_ms))
+            if args.log_dir and stdout:
+                os.makedirs(args.log_dir, exist_ok=True)
+                logfile = os.path.join(args.log_dir,
+                    f"{direction}_{precision}_{n}x{c}x{H}x{W}_{k}_{y}x{x}.log")
+                with open(logfile, 'w') as f:
+                    f.write(stdout)
             if misa_ms is not None and (best_ms is None or misa_ms < best_ms):
                 best_ms, best_label = misa_ms, label
         misa_ms = best_ms
         shape_str = f"{n},{c},{H},{W},{k},{y}x{x},{p},{q},{u},{v}"
+        # Log all candidates
+        cand_str = " | ".join(f"{cn}={cm:.4f}ms" if cm else f"{cn}=N/A"
+                              for cn, cm in sorted(all_candidates, key=lambda x: (x[1] if x[1] else 999.0)))
+        print(f"[{direction} {precision} {shape_str}] candidates: {cand_str}")
         if misa_ms is None:
             label = 'not applicable'
             rows.append(f"| {direction} | {precision} | {shape_str} | {label} | {ref950} | - |")
             print(f"[{direction} {precision} {shape_str}] not applicable")
+        else:
+            r950 = fmt_ratio(misa_ms, ref950)
+            rows.append(f"| {direction} | {precision} | {shape_str} | {misa_ms:.5f} | {ref950:.5f} | {r950} |")
+            per_dir_ratios.setdefault(direction, []).append(misa_ms / ref950)
+            print(f"[{direction} {precision} {shape_str}] BEST={misa_ms:.5f}ms  gfx950={ref950:.5f}ms ({r950})")
+        # Write incremental markdown after each shape
+        if args.markdown_out:
+            lines_sofar = [header, sep] + rows
+            lines_sofar.append("")
+            lines_sofar.append("(benchmark in progress...)")
+            with open(args.markdown_out, 'w') as f:
+                f.write("\n".join(lines_sofar) + "\n")
 
     lines = [header, sep] + rows
     lines.append("")

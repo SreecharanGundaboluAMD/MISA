@@ -210,11 +210,11 @@ def run_shape(out_dir, direction, c, H, W, k, y, x, p, warmup, repeat, verify):
         result = subprocess.run(args, cwd=out_dir, env=env, capture_output=True, text=True,
                                  timeout=480)
     except subprocess.TimeoutExpired:
-        return None, 'TIMEOUT'
+        return None, 'TIMEOUT', ''
     costs = [float(m.group(2)) for m in COST_RE.finditer(result.stdout) if m.group(1) == direction]
     if not costs:
-        return None, result.stdout + result.stderr
-    return min(costs), None
+        return None, result.stdout + result.stderr, ''
+    return min(costs), None, result.stdout
 
 
 def fmt_ratio(misa_ms, ref_ms):
@@ -233,6 +233,7 @@ def main():
     ap.add_argument('--verify', action='store_true', help='run with -V 1 instead of -V 0')
     ap.add_argument('--build-dir', default=os.path.join(REPO_ROOT, 'bench_out'))
     ap.add_argument('--markdown-out', default=None)
+    ap.add_argument('--log-dir', default=None, help='Directory to write full per-shape conv_driver.exe output logs')
     args = ap.parse_args()
 
     check_gpu_contention()
@@ -282,18 +283,30 @@ def main():
     for (direction, c, H, W, k, y, x, p, config, ref950, ref1250, solver1250) in shapes:
         dir_built = all_built.get(direction, {})
         best_ms, best_config, best_err = None, config, None
+        all_candidates = []  # track every candidate's result
         for cand_config in candidates_for(direction, config):
             out_dir = dir_built.get(cand_config)
             if out_dir is None:
                 continue  # this config failed to build
-            cand_ms, cand_err = run_shape(out_dir, direction, c, H, W, k, y, x, p,
+            cand_ms, cand_err, cand_output = run_shape(out_dir, direction, c, H, W, k, y, x, p,
                                            args.warmup, args.repeat, args.verify)
+            all_candidates.append((cand_config, cand_ms))
+            if args.log_dir and cand_output:
+                os.makedirs(args.log_dir, exist_ok=True)
+                logfile = os.path.join(args.log_dir,
+                    f"{direction}_{c}x{H}x{W}_{k}_{y}x{x}_{x}_{cand_config}.log")
+                with open(logfile, 'w') as f:
+                    f.write(cand_output)
             if cand_ms is not None and (best_ms is None or cand_ms < best_ms):
                 best_ms, best_config, best_err = cand_ms, cand_config, None
             elif best_ms is None:
                 best_err = cand_err
         misa_ms, config, err = best_ms, best_config, best_err
         shape_str = f"{c},{H},{W},{k},{y}x{x}"
+        # Log all candidate results
+        cand_str = " | ".join(f"{cn}={cm:.4f}ms" if cm else f"{cn}=N/A"
+                              for cn, cm in sorted(all_candidates, key=lambda x: (x[1] if x[1] else 999.0)))
+        print(f"[{direction} {shape_str}] candidates: {cand_str}")
         if misa_ms is None:
             rows.append(f"| {direction} | {shape_str} | {config} | FAILED | {ref950} | {ref1250} | - | - | {solver1250} |")
             print(f"[{direction} {shape_str}] FAILED to parse cost -- raw output:\n{err}", file=sys.stderr)
@@ -304,7 +317,7 @@ def main():
                      f"{ref1250:.5f} | {r950} | {r1250} | {solver1250} |")
         per_dir_ratios_950.setdefault(direction, []).append(misa_ms / ref950)
         per_dir_ratios_1250.setdefault(direction, []).append(misa_ms / ref1250)
-        print(f"[{direction} {shape_str} {config}] MISA={misa_ms:.5f}ms  "
+        print(f"[{direction} {shape_str} {config}] BEST: {misa_ms:.5f}ms  "
               f"gfx950={ref950:.5f}ms ({r950})  gfx1250={ref1250:.5f}ms ({r1250})")
         # Write incremental results after each shape
         if args.markdown_out:
