@@ -632,11 +632,14 @@ class igemm_gtc_tunable_parameter_t(object):
             # half-wave's scalar stores are already coalesced at the memory controller level.
             # FlyDSL and MISA's own coalescing_store_wmma.py docstring confirm this adjacency.
             # Only applies to the non-atomic (non-split-K) epilogue path.
-            self.direct_store = utility_dict_with_default_t(tunable_dict)('direct_store', 1)
-            # Phase 59: Phase 4 perf A/B across 5 fwd shapes (n=8,c=128,H=30,W=40,k=128, n=4,c=256,H=56,W=56,k=256,
-            # n=8,c=128,H=30,W=40,k=512) showed direct_store is consistently 1.07-1.25x faster than the LDS-reshuffle,
-            # with zero regression on any shape tested. Made default 1. Override with direct_store=0 in any config to
-            # opt out (e.g. if a future precision/tile-shape combination fails the assert).
+            self.direct_store = utility_dict_with_default_t(tunable_dict)('direct_store', 0)
+            # Phase 59: Phase 4 perf A/B across 5 fwd shapes showed direct_store is 1.07-1.25x
+            # faster than LDS-reshuffle on all tested shapes (n=8,c=128,H=30,W=40,k=128/512,
+            # n=4,c=256,H=56,W=56,k=256) with zero regressions — strong evidence for the
+            # new epilogue. LEFT AS OPT-IN (default 0) because LDS-reshuffle may win on
+            # memory-bandwidth-bound shapes or future precision/tile combinations not yet
+            # tested. The master config union should include both direct_store=0 and
+            # direct_store=1 variants so the driver's per-shape search picks the best.
             # Phase 25 (GEMM_M tail): optional, defaults to 0 (today's exact-gemm_m-multiple-
             # only requirement, every existing config unaffected). When 1, the driver's
             # tunable_is_valid() allows gemm_m % gemm_m_per_block != 0, and this kernel emits
