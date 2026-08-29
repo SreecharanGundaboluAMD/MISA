@@ -1079,19 +1079,32 @@ public:
                     ? std::max(1, (target_total_workers + grid_size - 1) / grid_size)
                     : target_total_workers;
 
-                // Shard-count target: a handful of claims per worker (enough to load-balance
-                // the tail without every worker's very first claim already being its last),
-                // but ALSO capped in absolute terms -- every claim costs a real atomic +
-                // LDS-broadcast + double-barrier round trip, so even spread evenly across
-                // many workers, thousands of total shards means thousands of synchronization
-                // events. Snapped down to the largest divisor of num_k_blocks (every shard
+                // Shard count: snapped to an exact divisor of num_k_blocks (every shard
                 // must be an exact multiple of gemm_k_per_block -- no K-tail relief here).
-                const int claims_per_worker_target = env_get_int("STREAMK_CLAIMS_PER_WORKER", 4);
+                // Default max_shards=256 caps total claims (each claim costs a real atomic
+                // + LDS-broadcast + double-barrier round trip). The idle-GPU max_iters sweep
+                // (docs/gfx1250_streamk_design.md) proved max_iters=1 is always best --
+                // per-claim barrier overhead scales linearly with max_iters. So the default
+                // sizing targets grid_z == total_shards (max_iters=1): functionally identical
+                // to _gsplit's one-workgroup-per-shard launch, but with the atomic-claim
+                // mechanism in place for the contention-resilience benefit. Override via
+                // STREAMK_MAX_SHARDS / STREAMK_CLAIMS_PER_WORKER / STREAMK_GRID_Z for
+                // experimentation; max_iters>1 is expected to be slower but more predictable
+                // under contention (see the contention-resilience section of the design doc).
+                const int claims_per_worker_target = env_get_int("STREAMK_CLAIMS_PER_WORKER", 1);
                 const int max_total_shards = env_get_int("STREAMK_MAX_SHARDS", 256);
-                int shard_count_target = std::min(per_tile_workers * claims_per_worker_target, max_total_shards);
+                int shard_count_target = std::min(target_total_workers * claims_per_worker_target, max_total_shards);
                 int total_shards = largest_divisor_leq(num_k_blocks, shard_count_target);
 
-                streamk_persistent_grid_z = std::max(1, std::min(per_tile_workers, total_shards));
+                // Grid.z: defaults to total_shards (max_iters=1, proven best on idle GPU).
+                // STREAMK_GRID_Z override forces a smaller persistent grid (max_iters>1)
+                // for contention-resilience experimentation -- see design doc's max_iters
+                // sweep section for why this is slower on idle GPU but potentially more
+                // predictable under contention.
+                int grid_z_override = env_get_int("STREAMK_GRID_Z", 0);
+                streamk_persistent_grid_z = grid_z_override > 0
+                    ? std::min(grid_z_override, total_shards)
+                    : total_shards;
                 int max_iters = (total_shards + streamk_persistent_grid_z - 1) / streamk_persistent_grid_z;
 
                 karg.gemm_k_per_wg = (num_k_blocks / total_shards) * tunable->gemm_k_per_block;
