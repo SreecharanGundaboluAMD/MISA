@@ -1401,6 +1401,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
         # regardless of these tunables' values there.
         if tunable.epilogue_lds_pad:
             kernel_name += "_ldspad"
+        if tunable.direct_store:
+            kernel_name += "_direct"
         if tunable.local_prefetch_num != 1:
             kernel_name += f"_lp{tunable.local_prefetch_num}"
         if tunable.atomic_scope != 'SCOPE_SYS':

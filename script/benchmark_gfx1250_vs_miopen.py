@@ -143,11 +143,14 @@ def check_gpu_contention():
 
 def build_config(direction, config, build_dir, rebuild):
     # Phase 59: direct_store configs are separate files
-    if config.endswith('_direct'):
+    if config.startswith('combo_'):
+        tm, tn = config.split('_')[1].split('x')
+        config_file = f'config/igemm_{direction}_gtc_gfx1250_nhwc_bf16_{tm}x{tn}_all.config'
+    elif config.endswith('_direct'):
         config_file = DIRECT_STORE_CONFIGS[(direction, config.replace('_direct', '')[:].split('_direct')[0])]
-        # Reconstruct: e.g. 'mtail_direct' -> ('fwd','mtail') from DIRECT_STORE_CONFIGS
         config_key = (direction, config[:-(len('_direct'))])
-        config_file = DIRECT_STORE_CONFIGS.get(config_key, CONFIG_FILES.get((direction, config), None))
+        config_file = DIRECT_STORE_CONFIGS.get(config_key,
+                      CONFIG_FILES.get((direction, config), None))
     else:
         config_file = CONFIG_FILES[(direction, config)]
     out_dir = os.path.join(build_dir, f'{direction}_{config}')
@@ -210,10 +213,15 @@ def main():
         if gsplit and gsplit != config and (direction, gsplit) in CONFIG_FILES:
             cands.append(gsplit)
         # Phase 59: try direct_store variant for every non-rwr bf16 config
-        # (gsplit uses gemm_k_global_split, excluded by direct_store assert)
         direct = config + '_direct'
         if direction in ('fwd', 'bwd') and (direction, config) in DIRECT_STORE_CONFIGS:
             cands.append(direct)
+        # Combinatorial sweep (2026-08-28): also try per-tile master configs which
+        # include every valid tunable combination for that tile shape
+        for tm, tn in [(128,128), (64,64), (128,64), (64,128), (32,32)]:
+            combo_cfg = f'config/igemm_{direction}_gtc_gfx1250_nhwc_bf16_{tm}x{tn}_all.config'
+            if os.path.exists(os.path.join(REPO_ROOT, combo_cfg)):
+                cands.append(f'combo_{tm}x{tn}')
         return cands
 
     needed_configs = sorted(set((s[0], cfg) for s in shapes for cfg in candidates_for(s[0], s[8])))
