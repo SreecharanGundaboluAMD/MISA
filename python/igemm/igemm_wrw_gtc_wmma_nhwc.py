@@ -884,16 +884,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {out_elem_byte_shift_group}   ; D-operand is fp32/int32 (4B) normally, fp16 (2B) under wmma_acc_f16")
         self._emit(f"s_add_u32 s[{s.s_p_out()}], s[{s.s_p_out()}], s[{s.s_tmp(0)}]")
         self._emit(f"s_addc_u32 s[{s.s_p_out(1)}], s[{s.s_p_out(1)}], 0")
-        if self.tunable.wrw_reduction_kernel:
-            # Phase 35: shift s_p_out to point at THIS shard's own disjoint slice of the
-            # workspace buffer (driver already redirected p_out to the workspace base --
-            # see igemm_wrw_gtc_driver.h's WMMA run()). Slice size = the TOTAL output size
-            # across all groups (group*gemm_m*wei_row_c, matching the driver's
-            # wsred_output_size), always fp32 (4 bytes) -- asserted mutually exclusive with
-            # wmma_acc_f16/bf16 in igemm_base.py, so no other byte-width case applies here.
-            # Added once here (like the group offset above), so every tap's s_p_out_tap
-            # (recomputed fresh FROM s_p_out) automatically inherits it.
-            self._emit(f"; wrw_reduction_kernel: shard offset = bz * group * gemm_m * wei_row_c elements")
+        if self.tunable.wrw_reduction_kernel and not self.tunable.wrw_streamk:
             self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group()}], s[{s.s_gemm_m()}]")
             self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_wei_row_c()}]")
             self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_bz()}]")
@@ -1593,6 +1584,36 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_mul_i32 s[{s.s_gemm_k_wg_off()}], s[{s.s_streamk_tile_idx()}], s[{s.s_gemm_k_per_wg()}]")
         self._emit_empty_line()
 
+        # ---- Phase 58 Approach C: per-iteration workspace-shard offset for non-atomic
+        # wrw_reduction_kernel epilogue. The existing prologue computes s_p_out += bz *
+        # group * gemm_m * wei_row_c once from the static blockIdx.z -- wrong when the
+        # shard index changes each iteration. Recomputed here from s_streamk_tile_idx
+        # instead, into a fresh per-iteration copy (s_p_out_tap -- which already exists and
+        # is normally used for per-tap column offsets; since nxe==0 guarantees y=x=1, the
+        # column offset is always 0, so s_p_out_tap is freely reusable as the shard-offset
+        # base). The coalescing-store call below passes s_p_out_tap rather than s_p_out,
+        # matching what emit_kernel_tap_loop() already does for its own non-atomic path.
+        # For the atomic-epilogue path (wrw_reduction_kernel=0), the original prologue
+        # offset (bz=0, i.e. no workspace) is untouched, and the atomic-add address
+        # mechanism is shard-agnostic anyway -- but for consistency the coalescing-store
+        # call always receives the freshly-computed s_p_out_tap. ----
+        if self.tunable.wrw_reduction_kernel:
+            self._emit(f"; wrw_reduction_kernel + streamk: shard offset = tile_idx * group * gemm_m * wei_row_c elements")
+            self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group()}], s[{s.s_gemm_m()}]")
+            self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_wei_row_c()}]")
+            self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_streamk_tile_idx()}]")
+            self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], 2   ; workspace is always fp32 (4B)")
+            self._emit(f"s_add_u32 s[{s.s_p_out_tap()}], s[{s.s_p_out()}], s[{s.s_tmp(0)}]")
+            self._emit(f"s_addc_u32 s[{s.s_p_out_tap(1)}], s[{s.s_p_out(1)}], 0")
+        else:
+            # Atomic epilogue: s_p_out_tap == s_p_out (no shard-offset workspace needed).
+            # The copy is still done to keep the coalescing-store argument uniform
+            # regardless of the reduction strategy -- and to match emit_kernel_tap_loop()'s
+            # own convention (always passes s_p_out_tap).
+            self._emit(f"s_mov_b32 s[{s.s_p_out_tap()}], s[{s.s_p_out()}]")
+            self._emit(f"s_mov_b32 s[{s.s_p_out_tap(1)}], s[{s.s_p_out(1)}]")
+        self._emit_empty_line()
+
         self._emit(f"; clear accumulator (fresh per claimed shard)")
         for i in range(self.tunable.num_vgpr_accumulate_c):
             self._emit(f"v_mov_b32 v[{v.v_c(i)}], 0")
@@ -1621,10 +1642,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self.emit_kernel_fma_main_loop()
         self._emit_empty_line()
 
-        # ---- atomic-epilogue store this shard's partial sum (iy=ix=0 always -- nxe==0 --
-        # so the tap-offset s_p_out_tap machinery emit_kernel_tap_loop() needs is unnecessary
-        # here; s_p_out itself is already this shard's correct output base) ----
-        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(),
+        # ---- epilogue store this shard's partial sum (iy=ix=0 always -- nxe==0 -- so the
+        # per-tap column offset is always 0, but the shard-offset has been computed into
+        # s_p_out_tap above for both the non-atomic wrw_reduction_kernel path and the
+        # atomic path). ----
+        self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(),
                 s.s_block_m_off(), s.s_block_n_off(),
                 s.s_gemm_m.label if self.tunable.wmma_m_tail else None, v.v_m_tail_row() if self.tunable.wmma_m_tail else None,
                 s.s_gemm_n.label if self.tunable.wmma_n_tail else None, v.v_n_tail_col() if self.tunable.wmma_n_tail else None,

@@ -832,8 +832,11 @@ class igemm_gtc_tunable_parameter_t(object):
                     "wrw_streamk's first pass doesn't yet compose with wmma_k_tail's last-shard-remainder-extension logic -- untested, not attempted"
                 assert not self.tdm_global_load, \
                     "wrw_streamk's first pass doesn't compose with tdm_global_load (both declare s_wave_id independently) -- untested, not attempted"
-                assert not self.wrw_reduction_kernel, \
-                    "wrw_streamk's first pass only supports the atomic epilogue -- wrw_reduction_kernel's workspace-slot addressing is computed once from the static bz in the prologue, which is wrong once the shard index is dynamically claimed per persistent-loop iteration instead"
+                # Phase 58 Approach C: wrw_reduction_kernel is now compatible with wrw_streamk --
+# the per-iteration workspace-shard offset is computed from s_streamk_tile_idx
+# inside emit_kernel_streamk_loop() instead of from the static blockIdx.z in the
+# prologue. See igemm_wrw_gtc_wmma_nhwc.py's emit_kernel_streamk_loop() and
+# docs/gfx1250_streamk_design.md.
             if self.wmma_acc_f16:
                 wmma_mapping_key = self.precision + '_f16acc'
             elif self.wmma_acc_bf16:
