@@ -174,9 +174,12 @@ def build_all_configs_parallel(direction, precision, build_dir, rebuild):
     from concurrent.futures import ThreadPoolExecutor, as_completed
     configs_to_build = []
 
-    # Per-tile combinatorial configs only (the monolithic _all.config is too big
-    # for the assembler's branch-range limit with 168 sections, so we search each
-    # tile shape independently and aggregate the best result per shape)
+    # Master config (contains all validated combinations)
+    master_cfg = MASTER_CONFIG_FILES[(direction, precision)]
+    master_out = os.path.join(build_dir, f'{direction}_{precision}_master')
+    configs_to_build.append((master_cfg, master_out, 'master'))
+
+    # Per-tile combinatorial configs (for additional tile-level exploration)
     for tile_m, tile_n, tile_cfg in find_per_tile_configs(direction, precision):
         tile_out = os.path.join(build_dir, f'{direction}_{precision}_{tile_m}x{tile_n}_combo')
         configs_to_build.append((tile_cfg, tile_out, f'{tile_m}x{tile_n}_combo'))
@@ -285,16 +288,16 @@ def main():
         # Log all candidates
         cand_str = " | ".join(f"{cn}={cm:.4f}ms" if cm else f"{cn}=N/A"
                               for cn, cm in sorted(all_candidates, key=lambda x: (x[1] if x[1] else 999.0)))
-        print(f"[{direction} {precision} {shape_str}] candidates: {cand_str}")
+        print(f"[{direction} {precision} {shape_str}] candidates: {cand_str}", flush=True)
         if misa_ms is None:
             label = 'not applicable'
             rows.append(f"| {direction} | {precision} | {shape_str} | {label} | {ref950} | - |")
-            print(f"[{direction} {precision} {shape_str}] not applicable")
+            print(f"[{direction} {precision} {shape_str}] not applicable", flush=True)
         else:
             r950 = fmt_ratio(misa_ms, ref950)
             rows.append(f"| {direction} | {precision} | {shape_str} | {misa_ms:.5f} | {ref950:.5f} | {r950} |")
             per_dir_ratios.setdefault(direction, []).append(misa_ms / ref950)
-            print(f"[{direction} {precision} {shape_str}] BEST={misa_ms:.5f}ms  gfx950={ref950:.5f}ms ({r950})")
+            print(f"[{direction} {precision} {shape_str}] BEST={misa_ms:.5f}ms ({best_label})  gfx950={ref950:.5f}ms ({r950})", flush=True)
         # Write incremental markdown after each shape
         if args.markdown_out:
             lines_sofar = [header, sep] + rows
@@ -302,6 +305,7 @@ def main():
             lines_sofar.append("(benchmark in progress...)")
             with open(args.markdown_out, 'w') as f:
                 f.write("\n".join(lines_sofar) + "\n")
+                f.flush()
 
     lines = [header, sep] + rows
     lines.append("")
