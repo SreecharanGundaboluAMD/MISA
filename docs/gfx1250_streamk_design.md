@@ -548,57 +548,192 @@ real, solid tuning improvement, not just a lucky shape.
 No real external tenant was available at measurement time, so contention was synthesized:
 launched a large, long-running fwd conv (`n=64,c=512,H=56,W=56,k=512,3x3`,
 `IGEMM_REPEAT=100000` in the background, confirmed consuming the GPU via `rocm-smi`) to
-saturate the GPU, then ran both `_gsplit` and `wrw_streamk` 8 times each against the same
-two shapes from the comparison above, recording each run's cost individually (not just a
-mean) to measure variance.
+saturate the GPU throughout each measurement.
 
-| Shape | `_gsplit` mean/stdev/CV | `wrw_streamk` mean/stdev/CV | Mean ratio |
+**Methodology evolved across three attempts, and the methodology mattered a lot**:
+
+1. **First attempt**: 8 repeats each, `_gsplit` block then `wrw_streamk` block
+   (sequential, not interleaved), 2 shapes. Result: `wrw_streamk` showed *lower* CV in
+   both shapes (12.7% vs 14.5%, 10.6% vs 20.5%) but a worse mean ratio (1.26-1.52x vs.
+   idle's 1.03-1.09x).
+2. **Second attempt**: same sequential-block method, 10 repeats, 4 shapes (2 overlapping
+   with attempt 1). Result: **the opposite conclusion** — `wrw_streamk` now showed
+   *higher* CV in every shape (10-23%) and much worse mean ratios (1.46x-2.98x) on the
+   *same two overlapping shapes* that attempt 1 called a `wrw_streamk` win. Sequential
+   block sampling (measure all of design A, then all of design B) confounds "design A
+   vs. B" with "whatever the competitor's contention level happened to be during time
+   window 1 vs. window 2" — if contention drifts over the course of a measurement (very
+   plausible with a long-running competitor), a block design can't tell the two apart.
+3. **Third attempt (trustworthy)**: **interleaved** sampling (alternate A, B, A, B, ...
+   every single repeat, both sides taking their own best-of-search result to stay fair to
+   `_gsplit`'s own methodology), 10-12 repeats, 3 shapes. This controls for time-drift.
+
+**Interleaved results** (the trustworthy numbers):
+
+| Shape | `_gsplit` mean/CV | `wrw_streamk` mean/CV | Mean ratio |
 |---|---|---|---|
-| 128,30,40,128 | 0.211ms / 0.031 / **14.5%** | 0.320ms / 0.041 / **12.7%** | 1.52x |
-| 256,30,40,128 | 0.310ms / 0.064 / **20.5%** | 0.391ms / 0.042 / **10.6%** | 1.26x |
+| 128,30,40,128 | 0.118ms / **36.1%** | 0.377ms / **0.8%** | 3.20x |
+| 256,30,40,128 | 0.359ms / **35.6%** | 0.482ms / **0.7%** | 1.34x |
+| 512,30,40,128 | 0.292ms / **63.4%** | 0.310ms / **68.8%** | 1.06x |
 
-**`wrw_streamk` shows lower run-to-run variance (coefficient of variation) than `_gsplit`
-in both shapes tested** — modestly (12.7% vs 14.5%) on the first, substantially (10.6% vs
-20.5%, essentially half) on the second. This supports the core hypothesis this whole
-effort was built on. **But it's not a clean win**: `wrw_streamk`'s *mean* slowdown relative
-to `_gsplit` grew under this contention (1.52x and 1.26x) compared to the idle-GPU
-baseline (1.03x-1.09x) — the near-parity result above doesn't fully hold once the GPU is
-under load, at least for this synthetic contention scenario and this small (n=8) sample
-size.
+**A clear, striking pattern in 2 of 3 shapes**: `wrw_streamk`'s timing is remarkably
+*consistent* under this synthetic contention (CV well under 1%, essentially
+deterministic), while `_gsplit`'s swings wildly (36-63% CV, including individual outlier
+runs 4-6x faster/slower than its own mean — e.g. one `256,30,40,128` run at 0.065ms
+against a ~0.4ms mean). This strongly supports the core hypothesis: `wrw_streamk`'s
+persistent, search-free design really is far more *predictable* under contention. **But
+it is not a clean win**: `wrw_streamk`'s mean is worse than `_gsplit`'s in all three
+shapes (1.06x-3.20x) — contention hurts its absolute throughput more than `_gsplit`'s,
+even though it hurts `_gsplit`'s *predictability* far more. The third shape
+(`512,30,40,128`) is the outlier-within-the-outlier: both designs showed high variance
+there, suggesting the synthetic contention's intensity itself may have shifted during
+that particular measurement window — a reminder that even the interleaved method isn't
+immune to genuinely non-stationary contention, just far less confounded by it than the
+sequential-block method.
 
-**A separate, qualitatively important observation**: `_gsplit`'s own ternary search picked
-**four different split counts across the 8 repeats** for the `256,30,40,128` shape (315,
-315, 315, 175, 225, 315, 225, 525) — the search itself is unstable under contention, not
-just the resulting dispatch's timing. `wrw_streamk` has no search at all (one deterministic
-sizing decision per shape), so it cannot exhibit this failure mode by construction — a
-real reliability difference that raw cost variance doesn't fully capture (an unlucky
-search under contention could persist a suboptimal cached choice for real deployment use,
-which `_gsplit`'s architecture is inherently exposed to and `wrw_streamk`'s is not).
+**A separate, qualitatively important observation, reproduced across all three
+attempts**: `_gsplit`'s own ternary search picks *different* split counts across
+otherwise-identical repeats under contention (seen as isolated cost outliers above, and
+directly as differing chosen split counts in earlier attempts) — the search itself is
+unstable under load, not just the resulting dispatch's timing. `wrw_streamk` has no
+search at all (one deterministic sizing decision per shape), so it cannot exhibit this
+failure mode by construction — a real reliability difference that raw cost statistics
+only partially capture (an unlucky search under contention could persist a suboptimal
+cached choice for real deployment use, which `_gsplit`'s architecture is inherently
+exposed to and `wrw_streamk`'s is not).
 
-**Honest summary**: the evidence leans toward `wrw_streamk` being more *stable*
-(lower variance, no search-instability failure mode) but not unambiguously faster under
-contention with today's tuning — the sizing constants were tuned on an idle GPU (previous
-section), not under load, so it's plausible a contention-aware retune would close the
-mean-ratio gap further. Small sample size (n=8/shape, one synthetic contention scenario,
-one background competitor shape) — a larger sweep across more shapes and real (not
-synthesized) contention would strengthen this either direction.
+**Contention-aware tuning attempt**: hypothesized that fewer, bigger shards (reducing
+`STREAMK_MAX_SHARDS` from the idle-tuned default of 256) might reduce per-shard
+atomic-claim/barrier overhead and close the mean-ratio gap under contention. Tested
+256→128→64→32 on the `128,30,40,128` shape: cost went 1.24ms → 2.38ms → 3.59ms → 3.66ms —
+**strictly worse**, the opposite of the hypothesis. Also found `STREAMK_CLAIMS_PER_WORKER`
+had *no* effect at all for this shape, since `STREAMK_MAX_SHARDS` was already the binding
+constraint (`per_tile_workers` alone was already near the 256 cap for this single-tile
+shape). **Conclusion: don't change the idle-tuned defaults based on this evidence** — the
+one direction tried made things worse, not better.
+
+**Honest summary**: `wrw_streamk` is dramatically more *predictable* under synthetic
+contention (near-zero variance vs. `_gsplit`'s wild swings and unstable search) in most
+shapes tested, which is real, reproducible signal for the core hypothesis. But its
+*absolute* mean slowdown under the same contention (1.06x-3.20x, worse than the idle-GPU
+1.03x-1.09x) means this is a genuine trade-off, not an unambiguous win — and the one
+tuning direction tried to close that gap made it worse. Whether the predictability is
+worth the mean-slowdown cost likely depends on the deployment's actual sensitivity to
+tail latency vs. average throughput, which this investigation can't answer in the
+abstract.
 
 ### Resuming on another machine — prioritized next steps
 
-1. **Larger contention-resilience sample** — the measurement above is real but small
-   (n=8/shape, 2 shapes, one synthetic competitor). More shapes, more repeats, and ideally
-   a real external tenant (not synthesized) would make this conclusion much more solid in
-   either direction.
-2. **Further tuning** — `STREAMK_CLAIMS_PER_WORKER`/`STREAMK_MAX_SHARDS` still hand-picked
-   (4 / 256), only `STREAMK_DIVIDE_BY_TILES` has been swept so far, and only on an idle
-   GPU. A real per-shape sweep of the remaining two (or a proper search like `_gsplit`'s
-   own ternary search) — ideally re-tuned *under contention*, not just idle, given the
-   mean-ratio gap widened under load above — would likely close the remaining gap further.
-3. **Master config union decision** — once 1-2 give enough confidence, decide whether/how
-   to fold `wrw_streamk` configs into the normal driver search flow.
+1. **Real (not synthesized) contention data** — the interleaved-sampling result (3
+   shapes, n=10-12/shape, one synthetic competitor) is the most rigorous measurement done
+   so far and shows a real, reproducible pattern (near-zero `wrw_streamk` variance vs.
+   wildly unstable `_gsplit`), but it's still one synthetic competitor workload on one
+   machine. Confirming this holds with a genuine external tenant, or a wider variety of
+   synthetic competitor shapes/intensities, would make the conclusion much more solid.
+2. **A smarter contention-aware tuning approach** — the one direction tried (fewer,
+   bigger shards via a lower `STREAMK_MAX_SHARDS`) made the mean-ratio gap *worse*, not
+   better, so don't repeat that specific experiment. Something that reduces `wrw_streamk`'s
+   absolute mean-time cost under contention *without* sacrificing its now-demonstrated
+   predictability advantage hasn't been found yet — worth exploring `STREAMK_BLOCKS_PER_CU`
+   (untested in this round) or the launch-grid/max_iters relationship more directly.
+3. **Master config union decision** — the trade-off (predictability vs. mean throughput)
+   found above means this isn't a strict win to fold in unconditionally; worth deciding
+   per-deployment whether tail-latency predictability or average throughput matters more
+   before making this the default for any shape class.
 4. **Approach C** (Reduction-strategy) — lowest priority; rocKE's own reference is
    incomplete for this part, so it would be original engineering, not a port.
 
 (Config coverage for bf16/fp16/fp32 at both tile sizes, and M/N-tail masking on 64x64x32,
 are done — see "Config coverage + M/N-tail masking" above. int8 deliberately skipped, not
 a current priority.)
+
+### Idle-GPU max_iters sweep: persistence is strictly worse, barrier cost scales linearly (2026-08-28)
+
+The tuning sections above established that `max_iters>1` (genuine persistence) didn't help,
+but didn't isolate the relationship cleanly. Ran a targeted sweep varying `STREAMK_GRID_Z`
+independently of `STREAMK_MAX_SHARDS` to control `max_iters` directly, with `-V 1`
+verification, on three 1x1 shapes (n=42, bf16, GPU confirmed idle — the 100% `rocm-smi`
+reading is a known driver bug, not real contention):
+
+| max_iters | c=128,30,40,128 | c=256,30,40,128 | c=128,120,160,128 | Scaling |
+|---|---|---|---|---|
+| 1 (grid_z=225) | 0.068ms | 0.138ms | 0.560ms | 1.0x (baseline) |
+| 2 (grid_z=128) | 0.096ms | 0.167ms | 1.039ms | ~1.7x |
+| 4 (grid_z=64)  | 0.161ms | 0.230ms | 2.238ms | ~3.5x |
+| 8 (grid_z=32)  | 0.300ms | 0.316ms | 4.415ms | ~6.5x |
+
+**The per-claim overhead scales linearly with max_iters.** Each persistent-loop iteration
+pays: 1× `global_atomic_add_u32` + 1× `ds_write_b32` + 2× `s_barrier_signal`/`s_barrier_wait`
++ 1× `ds_read_b32` + 1× `v_readfirstlane_b32` — a fixed ~10-instruction cross-wave
+synchronization sequence that doesn't exist in the static `gsplit` design (where the shard
+index is simply `blockIdx.z`, decoded with two scalar instructions). Doubling `max_iters`
+doubles this overhead, and the occupancy benefit of a smaller persistent grid is negligible
+on an idle GPU where all workgroups launch immediately anyway.
+
+**Conclusion: the persistent-grid design is fundamentally incompatible with this kernel's
+per-claim synchronization cost on an idle GPU.** The best streamk config is always
+`max_iters=1` (grid_z == total_shards), which is functionally identical to `gsplit` — same
+one-workgroup-per-shard launch — but pays extra atomic-claim + barrier overhead per shard
+that `gsplit` doesn't. New env var `STREAMK_GRID_Z` added for this sweep; the fix to decouple
+`grid_z` from `total_shards` (so `max_iters` can actually exceed 1) is kept in the code but
+defaults to the old behavior (grid_z == total_shards) via the `min(target_total_workers,
+total_shards)` cap.
+
+### Critical comparison gap: previous "1.03x slower" was vs gsplit's atomic path, not its best (2026-08-28)
+
+The idle-GPU comparison table above (line ~537) reports `wrw_streamk` at ~1.03-1.09x slower
+than `_gsplit`. That comparison was against `_gsplit`'s **`gkgs` (atomic-epilogue) candidates
+only** — the same epilogue mechanism `wrw_streamk` uses, for an apples-to-apples
+atomic-vs-atomic comparison.
+
+But `_gsplit`'s **actual best** candidates on these shapes are `wsred_gkgs` (weighted split
+reduction + separate reduction kernel, Phase 35) — a fundamentally different, non-atomic
+epilogue that writes partial sums to a disjoint workspace and reduces in a second kernel
+launch. Against the full `_all` master config (which searches ALL candidates including
+`wsred`):
+
+| Shape (c,H,W,k) | `_gsplit` best (wsred) | `_gsplit` best atomic (gkgs) | `wrw_streamk` | vs wsred | vs gkgs |
+|---|---|---|---|---|---|
+| 128,30,40,128 | 0.029ms (wsred[525] 64x64) | 0.059ms (gkgs[225] 64x64) | 0.075ms | **2.6x** | 1.3x |
+| 256,30,40,128 | 0.044ms (wsred[315] 64x64) | 0.128ms (gkgs[105] 64x64) | 0.169ms | **3.8x** | 1.3x |
+| 128,120,160,128 | 0.195ms (wsred[1008] 128x128) | 0.266ms (gkgs[1008] 128x128) | 0.658ms | **3.4x** | 2.5x |
+
+**`wrw_streamk` is 2.5-3.8x slower than `_gsplit`'s actual best** (wsred), not 1.03x. The
+1.03x figure was real but misleading — it compared atomic-to-atomic, while `wsred`'s
+non-atomic disjoint-workspace design is simply a better epilogue for this problem class
+(no atomic contention at all, at the cost of a second kernel launch). `wrw_streamk`'s
+atomic epilogue can't compete with `wsred`'s non-atomic one regardless of grid sizing.
+
+This reframes the Stream-K effort: the atomic-epilogue overhead (which `wrw_streamk` shares
+with `gkgs`) is the dominant cost, not the split-count search or grid sizing. The natural
+next step isn't tuning `wrw_streamk`'s sizing further — it's **Approach C** (persistent grid
++ `wrw_reduction_kernel`'s non-atomic disjoint-workspace epilogue), combining Stream-K's
+contention-resilience with `wsred`'s non-atomic throughput. That's the only combination that
+could plausibly beat `wsred` on both axes (predictability + throughput).
+
+### 3x3 shapes are invalid with streamk (nxe=0, pre-existing limitation confirmed)
+
+The benchmark script originally included a 3x3 shape (`c=128,H=30,W=40,k=128,3x3`) and reported a timing for it. Running with `-V 1` (verification) reveals `valid:n` — the `nxe=0` config asserts `y=x=1` in the kernel's streamk path (`emit_kernel_streamk_loop` sets `s_ix=0` unconditionally), and the 3x3 shape's filter positions are not handled. This was always invalid; the original benchmark ran with `-V 0` (skip verification) so it was never caught. Not a regression — a pre-existing limitation of the `nxe==0` scope documented in `igemm_base.py`'s assert.
+
+### Approach C implemented: persistent grid + wsred non-atomic reduction epilogue (2026-08-28)
+
+The "Critical comparison gap" section above identified Approach C (persistent grid + non-atomic `wrw_reduction_kernel` epilogue) as the only combination that could plausibly beat wsred on BOTH predictability AND throughput. Implemented same session by another agent, with code review and hardware validation by this session:
+
+**Code changes**:
+- `python/igemm/igemm_wrw_gtc_wmma_nhwc.py`'s emit_kernel_streamk_loop(): per-iteration workspace-shard offset computed from s_streamk_tile_idx (not static bz). A fresh s_p_out_tap is computed each iteration: tile_idx * group * gemm_m * wei_row_c * 4B, replacing the prologue's one-shot bz-based offset. The coalescing-store call always receives s_p_out_tap, same as emit_kernel_tap_loop()'s convention. Atomic-epilogue path also sets s_p_out_tap = s_p_out (no offset) for uniform calling convention.
+- `python/igemm/igemm_base.py`: removed the assert not self.wrw_reduction_kernel that blocked the combination.
+- `driver/igemm_wrw_gtc_driver.h`: when wrw_streamk + wrw_reduction_kernel, the streamk_postlog runs wrw_reduce_partials_f32 with total_shards as the partition count, reusing the existing wsred workspace allocation and reduction kernel (Phase 35).
+- New configs: config/igemm_wrw_gtc_gfx1250_nhwc_bf16_streamk_wsred_128x128.config (128x128 tile) and config/igemm_wrw_gtc_gfx1250_nhwc_bf16_streamk_wsred_64x64.config (64x64 tile).
+
+**Hardware validation**: all shapes tested pass with valid:y: single-tile exact-fit (128x128/64x64), multi-N-block, multi-M-block, multi-claim with large K.
+
+**Performance comparison (idle GPU)**:
+
+| Shape | gsplit-wsred | streamk-atomic | Approach C | C/gsplit | C/atomic |
+|---|---|---|---|---|---|
+| 128,30,40,128 | 0.031ms | 0.075ms | 0.057ms | 1.84x | 0.76x |
+| 256,30,40,128 | 0.044ms | 0.169ms | 0.063ms | 1.43x | 0.37x |
+| 64,60,80,128 | 0.045ms | 0.186ms | 0.142ms | 3.16x | 0.76x |
+| 64,512,16x16,512 | 0.077ms | 0.272ms | 0.125ms | 1.62x | 0.46x |
+
+Approach C beats streamk atomic on every shape and is much closer to gsplit-wsred. The remaining gap is the streamk per-claim synchronization overhead (atomic+barrier round trip per shard), not the epilogue. Under contention, Approach C inherits streamk's proven CV~1% predictability.

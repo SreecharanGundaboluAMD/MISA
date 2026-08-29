@@ -48,18 +48,46 @@ repo across machines, independent of any one assistant's local memory directory.
   worker count was divided across tiles, starving multi-tile shapes) — fixed by exposing
   the sizing constants as env-var overrides and defaulting to not dividing; all 3 shapes
   now sit at ~1.03-1.09x slower. **Then measured the actual motivating question**
-  (contention-resilience) via synthesized background GPU load: `wrw_streamk` showed LOWER
-  run-to-run variance in both shapes tested (12.7% vs 14.5%, and 10.6% vs 20.5%) —
-  supports the hypothesis — but its MEAN slowdown grew under load (1.26-1.52x vs idle's
-  1.03-1.09x), so it's an honest mixed result, not a clean win. Separately: `_gsplit`'s
-  own ternary search picked 4 different split counts across 8 repeats under contention —
-  a distinct instability `wrw_streamk` cannot have (no search at all). Small sample
-  (n=8/shape, synthetic contention) — needs more shapes/repeats and ideally real
-  contention to firm up either direction. See `docs/gfx1250_streamk_design.md`'s
-  "Resuming on another machine" for the current prioritized list: (1) bigger
-  contention-resilience sample; (2) further tuning, ideally contention-aware not just
-  idle-tuned; (3) only one config exists (128x128x32 bf16); (4) no M/N-tail, no
-  Approach C.
+  (contention-resilience) rigorously via synthesized background GPU load. First two
+  attempts used sequential-block sampling (all `_gsplit` repeats, then all `wrw_streamk`
+  repeats) and gave OPPOSITE conclusions between an 8-repeat/2-shape run and a
+  10-repeat/4-shape run — block sampling confounds "design A vs B" with "contention level
+  during time window 1 vs 2" when contention drifts over a measurement. Fixed by
+  INTERLEAVING (alternate A/B every repeat), 3 shapes, 10-12 repeats each: `wrw_streamk`'s
+  timing is dramatically more consistent (CV <1%, near-deterministic, in 2 of 3 shapes)
+  than `_gsplit`'s (CV 36-63%, including outlier runs 4-6x off its own mean) — strong,
+  reproducible support for the core hypothesis. But `wrw_streamk`'s mean is worse in all
+  three shapes (1.06x-3.20x) — contention hurts its absolute throughput more even though
+  it hurts `_gsplit`'s predictability far more. Reproduced across every attempt:
+  `_gsplit`'s own ternary search picks different split counts across identical repeats
+  under contention — an instability `wrw_streamk` cannot have (no search at all). Tried
+  reducing `STREAMK_MAX_SHARDS` as a contention-aware retune — made it strictly worse
+  (1.24ms→3.66ms); don't repeat that experiment. **Also done same day**: config coverage
+  (64x64x32 bf16 + new fp16/fp32 configs, both tile sizes; int8 skipped per explicit
+  earlier deprioritization) and M/N-tail masking — needed zero code changes (tail flags
+  are prologue-computed constants, already wired in — just untested before). 128x128x32
+  doesn't fit (already at the 256-VGPR wall), 64x64x32 hardware-validates cleanly
+  (M-only, N-only, both, + multi-claim) — new `bf16_streamk_mntail.config`. See
+  `docs/gfx1250_streamk_design.md`'s "Resuming on another machine" for the current
+  prioritized list. **Update (2026-08-28, idle-GPU max_iters sweep + wsred comparison)**:
+  targeted sweep varying `STREAMK_GRID_Z` (new env var) independently proved per-claim
+  barrier overhead scales LINEARLY with max_iters (max_iters 1→2→4→8 = 1x→1.4x→2.3x→4.3x
+  slower) — persistence is strictly worse on idle GPU; the best config is always
+  max_iters=1 (grid_z==total_shards), which is just _gsplit with extra atomic-claim
+  overhead. Defaults changed to produce max_iters=1. **Critical gap found**: the "~1.03x
+  slower" figure was vs _gsplit's ATOMIC (gkgs) candidates only; against _gsplit's actual
+  BEST (wsred_gkgs — non-atomic disjoint-workspace + separate reduction kernel, Phase 35),
+  wrw_streamk is **2.5-3.8x slower**. The atomic epilogue is the dominant cost, not
+  split-count search or grid sizing. **Atomic-epilogue streamk tuning is a dead end.**
+  The natural next step is **Approach C** (persistent grid + wrw_reduction_kernel's
+  non-atomic epilogue) — the only combination that could plausibly beat wsred on BOTH
+  predictability and throughput. Now highest priority in the reprioritized list: (1)
+  Approach C; (2) real contention data; (3) master config union decision deferred pending
+  Approach C. Also confirmed: 3x3 shapes with streamk's nxe=0 config give `valid:n`
+  (always invalid — original benchmark ran -V 0 so never caught; pre-existing nxe==0
+  limitation, not a regression). Driver env vars: `STREAMK_GRID_Z`, `STREAMK_MAX_SHARDS`,
+  `STREAMK_CLAIMS_PER_WORKER`, `STREAMK_BLOCKS_PER_CU`, `STREAMK_DIVIDE_BY_TILES`,
+  `STREAMK_DEBUG` — all in `driver/igemm_wrw_gtc_driver.h`'s `time_streamk()`.
 - **GPU hardware debug technique** — use `rocgdb` to find the faulting PC on
   real-hardware crashes before writing synthetic repro kernels.
 - **gfx1250 WMMA hang risk** — back-to-back same-register WMMA with zero interleaving
