@@ -626,6 +626,17 @@ class igemm_gtc_tunable_parameter_t(object):
             if self.gsplit_stagger:
                 assert self.gemm_k_global_split, \
                     "gsplit_stagger only applies to the atomic (gemm_k_global_split) epilogue -- there is only one shard otherwise, nothing to stagger"
+            # Phase 59 (experimental): skip the LDS-reshuffle epilogue entirely and store each
+            # v_c element directly via global_store_dword. 16 consecutive lanes cover 16
+            # consecutive columns per wmma_mapping.py's lane%16->column derivation, so the
+            # half-wave's scalar stores are already coalesced at the memory controller level.
+            # FlyDSL and MISA's own coalescing_store_wmma.py docstring confirm this adjacency.
+            # Only applies to the non-atomic (non-split-K) epilogue path.
+            self.direct_store = utility_dict_with_default_t(tunable_dict)('direct_store', 1)
+            # Phase 59: Phase 4 perf A/B across 5 fwd shapes (n=8,c=128,H=30,W=40,k=128, n=4,c=256,H=56,W=56,k=256,
+            # n=8,c=128,H=30,W=40,k=512) showed direct_store is consistently 1.07-1.25x faster than the LDS-reshuffle,
+            # with zero regression on any shape tested. Made default 1. Override with direct_store=0 in any config to
+            # opt out (e.g. if a future precision/tile-shape combination fails the assert).
             # Phase 25 (GEMM_M tail): optional, defaults to 0 (today's exact-gemm_m-multiple-
             # only requirement, every existing config unaffected). When 1, the driver's
             # tunable_is_valid() allows gemm_m % gemm_m_per_block != 0, and this kernel emits

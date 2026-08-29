@@ -191,6 +191,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_coalescing_store_wmma.wmma_m_tail = tunable.wmma_m_tail
         ctrl_coalescing_store_wmma.wmma_n_tail = tunable.wmma_n_tail
         ctrl_coalescing_store_wmma.wrw_reduction_kernel = tunable.wrw_reduction_kernel
+        ctrl_coalescing_store_wmma.direct_store          = tunable.direct_store
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
 
         # A-region (grad_output) and B-region (input): both natural [GEMM_K rows][M or N

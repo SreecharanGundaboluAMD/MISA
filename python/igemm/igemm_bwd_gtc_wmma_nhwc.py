@@ -175,6 +175,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         # Phase 48: switches the shared epilogue from its direct (LDS-reshuffle) store path
         # to an atomic-add path -- direction-agnostic, mirrors wrw's identical wiring.
         ctrl_coalescing_store_wmma.gemm_k_global_split = tunable.gemm_k_global_split
+        ctrl_coalescing_store_wmma.direct_store          = tunable.direct_store
         # Phase 53: see igemm_fwd_gtc_wmma_nhwc.py's identical comment.
         ctrl_coalescing_store_wmma.wmma_epilogue_chunked = tunable.wmma_epilogue_chunked
         ctrl_coalescing_store_wmma.vgpr_msb_tracker = self.vgpr_msb_tracker

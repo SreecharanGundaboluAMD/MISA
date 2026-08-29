@@ -293,6 +293,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # Phase 49: switches the shared epilogue from its direct (LDS-reshuffle) store path
         # to an atomic-add path -- direction-agnostic, mirrors wrw/bwd's identical wiring.
         ctrl_coalescing_store_wmma.gemm_k_global_split = tunable.gemm_k_global_split
+        ctrl_coalescing_store_wmma.direct_store          = tunable.direct_store
         # Phase 53: switches the non-atomic epilogue from staging the whole macro-tile in
         # LDS at once to reusing a small, tile-size-invariant region across wave_repeat_m
         # groups -- see docs/gfx1250_wmma_layout.md's Phase 52/53.

@@ -167,6 +167,11 @@ class ctrl_coalescing_store_wmma_t(object):
         # required bank combination actually changes. See igemm_base.py's
         # wmma_acc_high_bank docstring.
         self.vgpr_msb_tracker = None
+        # Phase 59: skip LDS reshuffle, store per-element directly.
+        # 16 consecutive lanes cover 16 consecutive columns (lane%16 -> column per
+        # wmma_mapping.py), so the half-wave's scalar stores are already contiguous
+        # at the memory controller level -- the LDS reshuffle is unnecessary overhead.
+        self.direct_store = False
 
 
 class igemm_coalescing_store_wmma_t(mc_base_t):
@@ -661,6 +666,12 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                         if ctrl.wmma_m_tail and j != inst_wmma.num_v_c - 1:
                             self._emit(f"v_add_u32 v[{v_tmp3}], 1, v[{v_tmp3}]   ; wmma_m_tail: advance to row {row_off + j + 1}")
                 self._emit_empty_line()
+            elif ctrl.direct_store:
+                assert not ctrl.wrw_reduction_kernel, "direct_store + wrw_reduction_kernel not implemented"
+                assert not ctrl.wmma_epilogue_chunked, "direct_store + wmma_epilogue_chunked not implemented"
+                self._emit_direct_store(ctrl, cxm, inst_wmma, v_c, v_gemm_im, v_gemm_in,
+                    s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1,
+                    s_gemm_m, v_tmp3, s_gemm_n, v_tmp4)
             else:
                 # ---- non-atomic: LDS-reshuffle coalescing store ----
                 assert v_tid is not None and v_gather is not None and s_block_m_off is not None and s_block_n_off is not None
@@ -979,3 +990,50 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                                 self._emit(f"v_add_u32 v[{v_tmp3}], {row_step_per_pass}, v[{v_tmp3}]   ; wmma_m_tail: advance absolute row")
                     self._emit_empty_line()
         return self._get_deferred()
+    def _emit_direct_store(self, ctrl, cxm, inst_wmma, v_c, v_gemm_im, v_gemm_in,
+        s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1,
+        s_gemm_m, v_tmp3, s_gemm_n, v_tmp4):
+        '''
+        Phase 59: direct per-lane global_store_dword epilogue, no LDS reshuffle.
+        16 consecutive lanes cover 16 consecutive columns (lane%16 -> column per
+        wmma_mapping.py), so the half-wave's scalar stores are already contiguous
+        at the memory controller level. Eliminates the scatter/barrier/gather round
+        trip. The address computation mirrors the atomic path's per-element loop
+        exactly (same cur/nxt ping-pong, same row*stride+col formula, same tail
+        masking) — only the store opcode differs: global_store_dword instead of
+        global_atomic_add_f32. See docs/gfx1250_direct_store_plan.md.
+        '''
+        self._emit(f"; wmma direct per-lane store epilogue (no LDS reshuffle), "
+                   f"{cxm.wave_repeat_m}x{cxm.wave_repeat_n} tiles, {inst_wmma.num_v_c} rows/tile")
+        self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], 2   ; row-to-row byte stride")
+        for i_rm in range(cxm.wave_repeat_m):
+            row_off = i_rm * cxm.wave_tile_m
+            cur, nxt = v_tmp1, v_tmp2
+            # cur = byte address of (row_off, col 0): row = v_gemm_im + row_off
+            self._emit(f"v_add_u32 v[{cur}], {row_off}, v[{v_gemm_im}]" if row_off != 0 else f"v_mov_b32 v[{cur}], v[{v_gemm_im}]")
+            if ctrl.wmma_m_tail:
+                self._emit(f"v_mov_b32 v[{v_tmp3}], v[{cur}]   ; wmma_m_tail: absolute row (row {row_off}, j=0)")
+            self._emit(f"v_mul_lo_u32 v[{cur}], s[{s_gemm_m_stride}], v[{cur}]")
+            self._emit(f"v_add_u32 v[{cur}], v[{v_gemm_in}], v[{cur}]")
+            self._emit(f"v_lshlrev_b32 v[{cur}], 2, v[{cur}]  ; byte address, row {row_off}, col 0")
+            for j in range(inst_wmma.num_v_c):
+                if j != inst_wmma.num_v_c - 1:
+                    self._emit(f"v_add_u32 v[{nxt}], v[{cur}], s[{s_tmp1}]   ; precompute row {row_off + j + 1} address")
+                for i_rn in range(cxm.wave_repeat_n):
+                    c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
+                    col_off = i_rn * cxm.wave_tile_n * 4
+                    offset_str = f" offset:{col_off}" if col_off != 0 else ""
+                    masked = ctrl.wmma_m_tail or ctrl.wmma_n_tail
+                    if ctrl.wmma_m_tail:
+                        self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
+                    if ctrl.wmma_n_tail:
+                        col_val = i_rn * cxm.wave_tile_n
+                        self._emit(f"v_add_u32 v[{v_tmp4}], {col_val}, v[{v_gemm_in}]" if col_val != 0 else f"v_mov_b32 v[{v_tmp4}], v[{v_gemm_in}]")
+                        self._emit(f"v_cmpx_gt_u32 s[{s_gemm_n}], v[{v_tmp4}]   ; wmma_n_tail: col < real gemm_n")
+                    self._emit(f"global_store_dword v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str}")
+                    if masked:
+                        self._emit(f"s_mov_b32 exec_lo, -1")
+                cur, nxt = nxt, cur
+                if ctrl.wmma_m_tail and j != inst_wmma.num_v_c - 1:
+                    self._emit(f"v_add_u32 v[{v_tmp3}], 1, v[{v_tmp3}]   ; wmma_m_tail: advance to row {row_off + j + 1}")
+        self._emit_empty_line()
