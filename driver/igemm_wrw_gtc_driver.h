@@ -1132,7 +1132,30 @@ public:
                 result.dumpdata.push_back(kernel_launchers.back());
                 result.dumpdata.back().ktype = kargtype_t::igemm_wrw_gtc_wmma_nhwc_karg_t;
 
-                float duration = igemm_launch_kernels(kernel_launchers, wrw_gsplit_prolog, noop, this->warmup, this->repeat);
+                // Phase 58 Approach C: when wrw_reduction_kernel is set alongside wrw_streamk,
+                // the main kernel writes non-atomic partial sums into disjoint workspace
+                // slices (one per claimed shard, indexed by s_streamk_tile_idx computed
+                // per-iteration inside emit_kernel_streamk_loop() -- NOT the static bz of
+                // the old design). The postlog reduces them with the same
+                // wrw_reduce_partials_f32 kernel time_split() already uses, parameterized
+                // on total_shards (the actual partition count, guaranteed exact by the
+                // divisor-snap logic above).
+                std::function<float()> streamk_postlog = noop;
+                if (tunable->wrw_reduction_kernel) {
+                    streamk_postlog = [&, total_shards]() -> float {
+                        wrw_reduce_karg_t karg_reduce;
+                        karg_reduce.output = p_wei;
+                        karg_reduce.workspace = p_wei_workspace_wsred;
+                        karg_reduce.num_partitions = total_shards;
+                        karg_reduce.output_size = static_cast<int>(wsred_output_size);
+                        size_t karg_reduce_size = sizeof(karg_reduce);
+                        size_t grid_reduce = (wsred_output_size + 255) / 256 * 256;
+                        igemm_launch_kernel_single(wrw_reduce_func, &karg_reduce, karg_reduce_size, {grid_reduce, 1, 1}, {256, 1, 1});
+                        return 0.f;
+                    };
+                }
+
+                float duration = igemm_launch_kernels(kernel_launchers, wrw_gsplit_prolog, streamk_postlog, this->warmup, this->repeat);
                 if (dump_dir.size())
                     dump_shader_args(dump_dir, result.dumpheader, result.dumpdata, result.kernel_name);
                 return duration;
