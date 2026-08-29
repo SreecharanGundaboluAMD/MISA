@@ -155,31 +155,27 @@ def build_one_config(config_file, out_dir, rebuild):
         return None
 
 
-def build_all_configs_parallel(direction, build_dir, rebuild):
-    """Build all config candidates for a direction in parallel (ThreadPoolExecutor)."""
-    from concurrent.futures import ThreadPoolExecutor
+def config_name_to_file(direction, config_name):
+    """Map a logical config name to its file path."""
+    if config_name.startswith('combo_'):
+        tm, tn = config_name.split('_')[1].split('x')
+        return f'config/igemm_{direction}_gtc_gfx1250_nhwc_bf16_{tm}x{tn}_all.config'
+    elif config_name.endswith('_direct'):
+        return DIRECT_STORE_CONFIGS.get((direction, config_name.replace('_direct', '')))
+    else:
+        return CONFIG_FILES.get((direction, config_name))
+
+
+def build_all_configs_parallel(direction, build_dir, candidate_names, rebuild):
+    """Build all config candidates in parallel (ThreadPoolExecutor, 8 workers)."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     configs_to_build = []
-    shapes_set = set()
-
-    # Collect all needed config names from SHAPES
-    for s in SHAPES:
-        if s[0] == direction:
-            for cfg in candidates_for(s[0], s[8]):
-                shapes_set.add(cfg)
-
-    for config in sorted(shapes_set):
-        if config.startswith('combo_'):
-            tm, tn = config.split('_')[1].split('x')
-            config_file = f'config/igemm_{direction}_gtc_gfx1250_nhwc_bf16_{tm}x{tn}_all.config'
-        elif config.endswith('_direct'):
-            config_file = DIRECT_STORE_CONFIGS.get((direction, config.replace('_direct', '')),
-                          CONFIG_FILES.get((direction, config), None))
-        else:
-            config_file = CONFIG_FILES.get((direction, config))
+    for config_name in candidate_names:
+        config_file = config_name_to_file(direction, config_name)
         if config_file is None:
             continue
-        out_dir = os.path.join(build_dir, f'{direction}_{config}')
-        configs_to_build.append((config_file, out_dir, config))
+        out_dir = os.path.join(build_dir, f'{direction}_{config_name}')
+        configs_to_build.append((config_file, out_dir, config_name))
 
     results = {}
     futures = {}
@@ -210,8 +206,11 @@ def run_shape(out_dir, direction, c, H, W, k, y, x, p, warmup, repeat, verify):
         '-V', '1' if verify else '0',
     ]
     env = dict(os.environ, IGEMM_WARMUP=str(warmup), IGEMM_REPEAT=str(repeat))
-    result = subprocess.run(args, cwd=out_dir, env=env, capture_output=True, text=True,
-                             timeout=120)
+    try:
+        result = subprocess.run(args, cwd=out_dir, env=env, capture_output=True, text=True,
+                                 timeout=480)
+    except subprocess.TimeoutExpired:
+        return None, 'TIMEOUT'
     costs = [float(m.group(2)) for m in COST_RE.finditer(result.stdout) if m.group(1) == direction]
     if not costs:
         return None, result.stdout + result.stderr
@@ -263,8 +262,14 @@ def main():
     print("=== Building all configs (parallel, up to 8 workers) ===\n")
     all_built = {}
     for d in sorted(set(s[0] for s in shapes)):
-        print(f"\n--- {d} ---")
-        all_built[d] = build_all_configs_parallel(d, args.build_dir, args.rebuild)
+        # Collect candidate names for this direction
+        cand_names = set()
+        for s in shapes:
+            if s[0] == d:
+                for cfg in candidates_for(s[0], s[8]):
+                    cand_names.add(cfg)
+        print(f"\n--- {d}: {len(cand_names)} config targets ---")
+        all_built[d] = build_all_configs_parallel(d, args.build_dir, cand_names, args.rebuild)
     print(f"\n=== Build complete. Starting benchmark ===\n")
 
     header = ("| Direction | Shape (c,H,W,k,y×x) | Config | MISA (ms) | MIOpen/gfx950 (ms) "
@@ -301,6 +306,13 @@ def main():
         per_dir_ratios_1250.setdefault(direction, []).append(misa_ms / ref1250)
         print(f"[{direction} {shape_str} {config}] MISA={misa_ms:.5f}ms  "
               f"gfx950={ref950:.5f}ms ({r950})  gfx1250={ref1250:.5f}ms ({r1250})")
+        # Write incremental results after each shape
+        if args.markdown_out:
+            lines_sofar = [header, sep] + rows
+            lines_sofar.append("")
+            lines_sofar.append("(benchmark in progress...)")
+            with open(args.markdown_out, 'w') as f:
+                f.write("\n".join(lines_sofar) + "\n")
 
     lines = [header, sep] + rows
     lines.append("")
