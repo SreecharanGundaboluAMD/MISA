@@ -65,6 +65,19 @@ CONFIG_FILES = {
 # is faster, rather than only running the row's originally-hardcoded config.
 GSPLIT_CANDIDATE = {'fwd': 'gsplit', 'bwd': 'gsplit'}
 
+# Phase 59: direct_store=1 variant added as a third candidate for all non-split
+# bf16 fwd/bwd configs (base/mtail/ntail/mntail/tdm). Uses the same config file
+# plus direct_store=1 appended. See docs/gfx1250_direct_store_plan.md.
+DIRECT_STORE_CONFIGS = {
+    ('fwd', 'base'):   'config/igemm_fwd_gtc_gfx1250_nhwc_bf16_direct.config',
+    ('fwd', 'mtail'):  'config/igemm_fwd_gtc_gfx1250_nhwc_bf16_mtail_direct.config',
+    ('fwd', 'ntail'):  'config/igemm_fwd_gtc_gfx1250_nhwc_bf16_ntail_direct.config',
+    ('fwd', 'mntail'): 'config/igemm_fwd_gtc_gfx1250_nhwc_bf16_mntail_direct.config',
+    ('fwd', 'tdm'):    'config/igemm_fwd_gtc_gfx1250_nhwc_bf16_tdm_direct.config',
+    ('bwd', 'base'):   'config/igemm_bwd_gtc_gfx1250_nhwc_bf16_direct.config',
+    ('bwd', 'mtail'):  'config/igemm_bwd_gtc_gfx1250_nhwc_bf16_mtail_direct.config',
+}
+
 # The 38 shapes from docs/gfx1250_vendor_benchmark_vs_miopen.md's "full re-triage"
 # and "vs. MIOpen running natively on gfx1250" tables (2026-08-27 updates), batch=42
 # bf16/NHWC throughout, group=1. MIOpen numbers are read directly from
@@ -129,7 +142,14 @@ def check_gpu_contention():
 
 
 def build_config(direction, config, build_dir, rebuild):
-    config_file = CONFIG_FILES[(direction, config)]
+    # Phase 59: direct_store configs are separate files
+    if config.endswith('_direct'):
+        config_file = DIRECT_STORE_CONFIGS[(direction, config.replace('_direct', '')[:].split('_direct')[0])]
+        # Reconstruct: e.g. 'mtail_direct' -> ('fwd','mtail') from DIRECT_STORE_CONFIGS
+        config_key = (direction, config[:-(len('_direct'))])
+        config_file = DIRECT_STORE_CONFIGS.get(config_key, CONFIG_FILES.get((direction, config), None))
+    else:
+        config_file = CONFIG_FILES[(direction, config)]
     out_dir = os.path.join(build_dir, f'{direction}_{config}')
     exe = os.path.join(out_dir, 'conv_driver.exe')
     if os.path.exists(exe) and not rebuild:
@@ -189,6 +209,11 @@ def main():
         gsplit = GSPLIT_CANDIDATE.get(direction)
         if gsplit and gsplit != config and (direction, gsplit) in CONFIG_FILES:
             cands.append(gsplit)
+        # Phase 59: try direct_store variant for every non-rwr bf16 config
+        # (gsplit uses gemm_k_global_split, excluded by direct_store assert)
+        direct = config + '_direct'
+        if direction in ('fwd', 'bwd') and (direction, config) in DIRECT_STORE_CONFIGS:
+            cands.append(direct)
         return cands
 
     needed_configs = sorted(set((s[0], cfg) for s in shapes for cfg in candidates_for(s[0], s[8])))
