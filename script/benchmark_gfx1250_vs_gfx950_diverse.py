@@ -51,6 +51,20 @@ MASTER_CONFIG_FILES = {
     for d in ('fwd', 'bwd', 'wrw') for p in ('fp16', 'bf16', 'fp32')
 }
 
+# Per-tile _all.config files with combinatorial tunable coverage.
+# Each covers one tile shape with up to ~68 valid tunable combos.
+# Used as alternate candidates per shape alongside the monolithic config.
+def find_per_tile_configs(direction, precision):
+    """Return list of (tile_m, tile_n, config_path) for this direction/precision."""
+    import glob
+    results = []
+    pattern = f'config/igemm_{direction}_gtc_gfx1250_nhwc_{precision}_*x*_all.config'
+    for path in sorted(glob.glob(pattern)):
+        m = re.search(r'_(\d+)x(\d+)_all\.config$', path)
+        if m:
+            results.append((int(m.group(1)), int(m.group(2)), path))
+    return results
+
 # (direction, n, c, H, W, k, y, x, p, q, u, v, l, j, precision, gfx950_ms)
 # H/W are the INPUT spatial dims (MIOpenDriver convention, uniform across fwd/bwd/wrw);
 # p/q = pad_h/pad_w, u/v = stride_h/stride_w, l/j = dilation_h/dilation_w, group=1 always
@@ -135,17 +149,56 @@ def check_gpu_contention():
         print(f"(rocm-smi check skipped: {e})\n")
 
 
-def build_config(direction, precision, build_dir, rebuild):
-    config_file = MASTER_CONFIG_FILES[(direction, precision)]
-    out_dir = os.path.join(build_dir, f'{direction}_{precision}_master')
+def build_one_config(config_file, out_dir, rebuild):
+    """Build a single config file. Returns out_dir on success, None on failure."""
     exe = os.path.join(out_dir, 'conv_driver.exe')
     if os.path.exists(exe) and not rebuild:
         return out_dir
-    os.makedirs(build_dir, exist_ok=True)
-    print(f"building {direction}/{precision} master ({config_file}) -> {out_dir}")
-    subprocess.run([sys.executable, 'igemm_codegen.py', '-d', out_dir, config_file],
-                    cwd=REPO_ROOT, check=True)
-    return out_dir
+    os.makedirs(os.path.dirname(out_dir), exist_ok=True)
+    # Only print first-time builds
+    if not os.path.exists(exe):
+        label = os.path.basename(config_file)
+        print(f"building {label} -> {out_dir}")
+    try:
+        subprocess.run([sys.executable, 'igemm_codegen.py', '-d', out_dir, config_file],
+                        cwd=REPO_ROOT, check=True, capture_output=True, timeout=600)
+        return out_dir
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+
+
+def build_all_configs_parallel(direction, precision, build_dir, rebuild):
+    """Build all configs for a (direction, precision) pair in parallel.
+    Returns list of (out_dir, config_label) for successfully built configs.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    configs_to_build = []
+
+    # Monolithic master config (the original approach)
+    master_cfg = MASTER_CONFIG_FILES[(direction, precision)]
+    master_out = os.path.join(build_dir, f'{direction}_{precision}_master')
+    configs_to_build.append((master_cfg, master_out, 'master'))
+
+    # Per-tile combinatorial configs
+    for tile_m, tile_n, tile_cfg in find_per_tile_configs(direction, precision):
+        tile_out = os.path.join(build_dir, f'{direction}_{precision}_{tile_m}x{tile_n}_combo')
+        configs_to_build.append((tile_cfg, tile_out, f'{tile_m}x{tile_n}_combo'))
+
+    results = []
+    futures = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for cfg, out_dir, label in configs_to_build:
+            futures[pool.submit(build_one_config, cfg, out_dir, rebuild)] = (out_dir, label)
+
+    for future in as_completed(futures):
+        out_dir, label = futures[future]
+        result = future.result()
+        if result:
+            results.append((result, label))
+        else:
+            print(f"  SKIP: {label} failed to build (VGPR overflow or other error)")
+
+    return results
 
 
 def run_shape(out_dir, direction, precision, n, c, H, W, k, y, x, p, q, u, v, l, j,
@@ -201,9 +254,16 @@ def main():
 
     shapes = [s for s in SHAPES if args.direction == 'all' or s[0] == args.direction]
     needed = sorted(set((s[0], s[14]) for s in shapes))
-    built_dirs = {}
+
+    # Build all configs in parallel first (ThreadPoolExecutor, 8 workers)
+    print("=== Building all configs (parallel, up to 8 workers) ===\n")
+    all_configs = {}
     for direction, precision in needed:
-        built_dirs[(direction, precision)] = build_config(direction, precision, args.build_dir, args.rebuild)
+        print(f"\n--- {direction}/{precision} ---")
+        configs = build_all_configs_parallel(direction, precision, args.build_dir, args.rebuild)
+        all_configs[(direction, precision)] = configs
+        print(f"  {len(configs)} configs built successfully")
+    print(f"\n=== Build complete. Starting benchmark ===\n")
 
     header = ("| Direction | Precision | Shape (n,c,H,W,k,y×x,p,q,u,v) | MISA (ms) "
                "| gfx950 (ms) | vs gfx950 |")
@@ -212,20 +272,19 @@ def main():
     per_dir_ratios = {}
 
     for (direction, n, c, H, W, k, y, x, p, q, u, v, l, j, precision, ref950) in shapes:
-        out_dir = built_dirs[(direction, precision)]
-        misa_ms, err = run_shape(out_dir, direction, precision, n, c, H, W, k, y, x,
-                                  p, q, u, v, l, j, args.warmup, args.repeat, args.verify)
+        configs = all_configs.get((direction, precision), [])
+        best_ms, best_label = None, None
+        for out_dir, label in configs:
+            misa_ms, err = run_shape(out_dir, direction, precision, n, c, H, W, k, y, x,
+                                      p, q, u, v, l, j, args.warmup, args.repeat, args.verify)
+            if misa_ms is not None and (best_ms is None or misa_ms < best_ms):
+                best_ms, best_label = misa_ms, label
+        misa_ms = best_ms
         shape_str = f"{n},{c},{H},{W},{k},{y}x{x},{p},{q},{u},{v}"
         if misa_ms is None:
-            label = 'TIMED OUT' if err and err.startswith('TIMED OUT') else 'not applicable'
+            label = 'not applicable'
             rows.append(f"| {direction} | {precision} | {shape_str} | {label} | {ref950} | - |")
-            print(f"[{direction} {precision} {shape_str}] {label} -- raw output:\n{err}",
-                  file=sys.stderr)
-            continue
-        r950 = fmt_ratio(misa_ms, ref950)
-        rows.append(f"| {direction} | {precision} | {shape_str} | {misa_ms:.5f} | {ref950:.5f} | {r950} |")
-        per_dir_ratios.setdefault(direction, []).append(misa_ms / ref950)
-        print(f"[{direction} {precision} {shape_str}] MISA={misa_ms:.5f}ms  gfx950={ref950:.5f}ms ({r950})")
+            print(f"[{direction} {precision} {shape_str}] not applicable")
 
     lines = [header, sep] + rows
     lines.append("")

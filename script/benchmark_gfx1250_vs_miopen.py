@@ -141,27 +141,62 @@ def check_gpu_contention():
         print(f"(rocm-smi check skipped: {e})\n")
 
 
-def build_config(direction, config, build_dir, rebuild):
-    # Phase 59: direct_store configs are separate files
-    if config.startswith('combo_'):
-        tm, tn = config.split('_')[1].split('x')
-        config_file = f'config/igemm_{direction}_gtc_gfx1250_nhwc_bf16_{tm}x{tn}_all.config'
-    elif config.endswith('_direct'):
-        config_file = DIRECT_STORE_CONFIGS[(direction, config.replace('_direct', '')[:].split('_direct')[0])]
-        config_key = (direction, config[:-(len('_direct'))])
-        config_file = DIRECT_STORE_CONFIGS.get(config_key,
-                      CONFIG_FILES.get((direction, config), None))
-    else:
-        config_file = CONFIG_FILES[(direction, config)]
-    out_dir = os.path.join(build_dir, f'{direction}_{config}')
+def build_one_config(config_file, out_dir, rebuild):
+    """Build a single config. Returns out_dir on success, None on failure."""
     exe = os.path.join(out_dir, 'conv_driver.exe')
     if os.path.exists(exe) and not rebuild:
         return out_dir
-    os.makedirs(build_dir, exist_ok=True)
-    print(f"building {direction}/{config} ({config_file}) -> {out_dir}")
-    subprocess.run([sys.executable, 'igemm_codegen.py', '-d', out_dir, config_file],
-                    cwd=REPO_ROOT, check=True)
-    return out_dir
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        subprocess.run([sys.executable, 'igemm_codegen.py', '-d', out_dir, config_file],
+                        cwd=REPO_ROOT, check=True, capture_output=True, timeout=600)
+        return out_dir
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return None
+
+
+def build_all_configs_parallel(direction, build_dir, rebuild):
+    """Build all config candidates for a direction in parallel (ThreadPoolExecutor)."""
+    from concurrent.futures import ThreadPoolExecutor
+    configs_to_build = []
+    shapes_set = set()
+
+    # Collect all needed config names from SHAPES
+    for s in SHAPES:
+        if s[0] == direction:
+            for cfg in candidates_for(s[0], s[8]):
+                shapes_set.add(cfg)
+
+    for config in sorted(shapes_set):
+        if config.startswith('combo_'):
+            tm, tn = config.split('_')[1].split('x')
+            config_file = f'config/igemm_{direction}_gtc_gfx1250_nhwc_bf16_{tm}x{tn}_all.config'
+        elif config.endswith('_direct'):
+            config_file = DIRECT_STORE_CONFIGS.get((direction, config.replace('_direct', '')),
+                          CONFIG_FILES.get((direction, config), None))
+        else:
+            config_file = CONFIG_FILES.get((direction, config))
+        if config_file is None:
+            continue
+        out_dir = os.path.join(build_dir, f'{direction}_{config}')
+        configs_to_build.append((config_file, out_dir, config))
+
+    results = {}
+    futures = {}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for cfg_file, out_dir, label in configs_to_build:
+            futures[pool.submit(build_one_config, cfg_file, out_dir, rebuild)] = (out_dir, label)
+
+    for future in as_completed(futures):
+        out_dir, label = futures[future]
+        result = future.result()
+        if result:
+            results[label] = result
+            print(f"  OK: {label}")
+        else:
+            print(f"  SKIP: {label} (build failed)")
+
+    return results
 
 
 def run_shape(out_dir, direction, c, H, W, k, y, x, p, warmup, repeat, verify):
@@ -224,10 +259,13 @@ def main():
                 cands.append(f'combo_{tm}x{tn}')
         return cands
 
-    needed_configs = sorted(set((s[0], cfg) for s in shapes for cfg in candidates_for(s[0], s[8])))
-    built_dirs = {}
-    for direction, config in needed_configs:
-        built_dirs[(direction, config)] = build_config(direction, config, args.build_dir, args.rebuild)
+    # Build all configs in parallel per direction first (ThreadPoolExecutor, 8 workers)
+    print("=== Building all configs (parallel, up to 8 workers) ===\n")
+    all_built = {}
+    for d in sorted(set(s[0] for s in shapes)):
+        print(f"\n--- {d} ---")
+        all_built[d] = build_all_configs_parallel(d, args.build_dir, args.rebuild)
+    print(f"\n=== Build complete. Starting benchmark ===\n")
 
     header = ("| Direction | Shape (c,H,W,k,y×x) | Config | MISA (ms) | MIOpen/gfx950 (ms) "
                "| MIOpen/gfx1250 (ms) | vs gfx950 | vs gfx1250 | MIOpen/gfx1250 solver |")
@@ -237,9 +275,12 @@ def main():
     per_dir_ratios_1250 = {}
 
     for (direction, c, H, W, k, y, x, p, config, ref950, ref1250, solver1250) in shapes:
+        dir_built = all_built.get(direction, {})
         best_ms, best_config, best_err = None, config, None
         for cand_config in candidates_for(direction, config):
-            out_dir = built_dirs[(direction, cand_config)]
+            out_dir = dir_built.get(cand_config)
+            if out_dir is None:
+                continue  # this config failed to build
             cand_ms, cand_err = run_shape(out_dir, direction, c, H, W, k, y, x, p,
                                            args.warmup, args.repeat, args.verify)
             if cand_ms is not None and (best_ms is None or cand_ms < best_ms):

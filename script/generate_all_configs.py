@@ -105,16 +105,7 @@ def is_valid(direction, precision, tile_m, tile_n, gemm_k, vals):
     if gs and elp:           return False
     if nt and tile_m != tile_n: return False  # wmma_n_tail requires row_repeat_b==1
     if tdm and tile_m != tile_n: return False  # TDM not supported with row_repeat_a>1
-    # VGPR budget: bwd fp16/bf16 128x128 is at exactly 256 VGPRs today.
-    # Only direct_store + wmma_setprio can be added without overflow.
-    if direction == 'bwd' and precision in ('fp16', 'bf16') and tile_m == 128:
-        # Only allow: direct_store (no VGPR cost, skips LDS) and wmma_setprio (SOPP only)
-        # Everything else pushes past 256 VGPRs
-        if ldb or gs or tdm or lpn > 1 or elp or mli or mt or nt:
-            return False
-    if tile_m == 64 and tile_n == 128:
-        if ldb or gs:
-            return False
+    # NOTE: VGPR-budget exclusions removed -- now handled by a post-build filter
     if tdm and gs:           return False
     if tdm and (lpn > 1 or mli): return False
     if tdm and tile_m != 128: return False
