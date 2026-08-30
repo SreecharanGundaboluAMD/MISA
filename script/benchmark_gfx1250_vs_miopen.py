@@ -157,7 +157,9 @@ def build_one_config(config_file, out_dir, rebuild):
 
 def config_name_to_file(direction, config_name):
     """Map a logical config name to its file path."""
-    if config_name.startswith('combo_'):
+    if config_name == 'master':
+        return f'config/igemm_{direction}_gtc_gfx1250_nhwc_bf16_all.config'
+    elif config_name.startswith('combo_'):
         tm, tn = config_name.split('_')[1].split('x')
         return f'config/igemm_{direction}_gtc_gfx1250_nhwc_bf16_{tm}x{tn}_all.config'
     elif config_name.endswith('_direct'):
@@ -257,6 +259,14 @@ def main():
             combo_cfg = f'config/igemm_{direction}_gtc_gfx1250_nhwc_bf16_{tm}x{tn}_all.config'
             if os.path.exists(os.path.join(REPO_ROOT, combo_cfg)):
                 cands.append(f'combo_{tm}x{tn}')
+        # Also try the direction/precision master config (union of every standalone
+        # config/*.config file, incl. row_stride-widened-K tiles/tails/multi-group --
+        # see script/build_gfx1250_master_configs.py) -- these aren't covered by the
+        # per-tile combo files above, which only know about the tile shapes hardcoded
+        # in script/generate_all_configs.py.
+        master_cfg = f'config/igemm_{direction}_gtc_gfx1250_nhwc_bf16_all.config'
+        if os.path.exists(os.path.join(REPO_ROOT, master_cfg)):
+            cands.append('master')
         return cands
 
     # Build all configs in parallel per direction first (ThreadPoolExecutor, 8 workers)
