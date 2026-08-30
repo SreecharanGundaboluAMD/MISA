@@ -2,6 +2,10 @@ out/
 *.py[cod]
 __pycache__
 *.s
+# Hand-written, permanent reproducer source (not a MISA-generated build artifact) --
+# tracked deliberately so the human-readable source ships alongside the compiled
+# kernel.hsaco/repro binary for hardware-team escalation.
+!docs/gfx1250_fp32_wmma_race_repro/kernel.s
 .vscode/
 driver/xdnn_conv.h
 *.log
