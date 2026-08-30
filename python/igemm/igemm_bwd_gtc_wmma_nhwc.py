@@ -26,6 +26,7 @@
 # pylint: disable=maybe-no-member
 from ..codegen import *
 from ..operations import *
+import os
 from .igemm_base import *
 
 class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
@@ -1635,6 +1636,21 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
     def emit_kernel_epilogue(self):
         v = self.vgpr
         s = self.sgpr
+        if os.environ.get('BWD_RAW_DUMP'):
+            # DIAGNOSTIC: bypass coalescing_store, dump v_c raw to s_p_out (one dword per
+            # register per thread). Proves whether v_c is already correct after the K-loop
+            # (bug is in epilogue) or wrong (bug is in K-loop). Mirrors fwd's MSB_RAW_DUMP.
+            # Layout: thread tid writes v_c[0..num_vgpr_accumulate_c-1] to
+            # p_out + tid * num_vgpr_accumulate_c * 4, giving a flat raw dump.
+            self._emit(f"; BWD_RAW_DUMP: raw v_c dump, bypassing coalescing_store")
+            self._emit(f"v_lshlrev_b32 v[{v.v_addr_out()}], {utility_log2(self.tunable.num_vgpr_accumulate_c * 4)}, v[{v.v_tid()}]")
+            self._emit(f"v_mov_b32 v[{v.v_addr_out(1)}], s[{s.s_p_out(1)}]")
+            self._emit(f"v_add_co_u32 v[{v.v_addr_out()}], vcc_lo, s[{s.s_p_out()}], v[{v.v_addr_out()}]")
+            self._emit(f"v_add_co_ci_u32 v[{v.v_addr_out(1)}], vcc_lo, 0, v[{v.v_addr_out(1)}], vcc_lo")
+            for i in range(self.tunable.num_vgpr_accumulate_c):
+                self._emit(f"global_store_dword v[{v.v_addr_out()}:{v.v_addr_out(1)}], v[{v.v_c(i)}] offset:{i*4}")
+            self._emit(f"s_wait_storecnt 0x0")
+            return
         # s_out_c_total (=gemm_n*group) is grad_input's TOTAL row stride (NOT K_out, and not
         # just the per-group gemm_n either once group>1 -- see class docstring's Phase 7 note).
         self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_c_total.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off(),
