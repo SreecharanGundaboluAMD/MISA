@@ -242,6 +242,17 @@ typedef struct {
     // can match Python's exact string comparison.
     int local_prefetch_num = 1;
     int epilogue_lds_pad = 0;
+    // Phase 59: direct per-lane global_store_dword epilogue (skips the LDS-reshuffle
+    // gather/scatter). Changes the epilogue's generated code just like
+    // wrw_reduction_kernel/atomic_pack_bf16 above, so must be folded into the kernel name
+    // -- this was missed when Phase 59 landed: kernel_name never gained a "_direct" suffix
+    // here (see below), so hipModuleGetFunction either silently found a same-named
+    // non-direct sibling kernel (whenever one happened to exist in the same build, e.g.
+    // every master combinatorial config) or failed outright with "named symbol not found"
+    // (whenever it didn't, e.g. every standalone hand-curated *_direct.config) -- direct
+    // store was never actually exercised through the normal driver search path. Found
+    // while hardware-validating the P2 (direct_store config expansion) backlog item.
+    int direct_store = 0;
     // Default-member-initialized (unlike the int fields above, which zero-init safely via
     // aggregate-init anyway) so a default-constructed igemm_gtc_tunable_t{} -- e.g.
     // driver_mode_heuristic's still-unimplemented heuristic_select_kernel() stub -- doesn't
@@ -324,6 +335,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.wrw_streamk                 = sec.count("wrw_streamk") > 0 ? sec.at("wrw_streamk").get_int() : 0;
                 tunable.local_prefetch_num         = sec.count("local_prefetch_num") > 0 ? sec.at("local_prefetch_num").get_int() : 1;
                 tunable.epilogue_lds_pad           = sec.count("epilogue_lds_pad") > 0 ? sec.at("epilogue_lds_pad").get_int() : 0;
+                tunable.direct_store               = sec.count("direct_store") > 0 ? sec.at("direct_store").get_int() : 0;
                 tunable.atomic_scope               = sec.count("atomic_scope") > 0 ? sec.at("atomic_scope").get_string() : "SCOPE_SYS";
             }
             else{
@@ -550,6 +562,8 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
         // mirrors igemm_base.py's identical extension -- must stay in sync.
         if(tunable->epilogue_lds_pad)
             kernel_name += std::string("_ldspad");
+        if(tunable->direct_store)
+            kernel_name += std::string("_direct");
         if(tunable->local_prefetch_num != 1)
             kernel_name += std::string("_lp") + std::to_string(tunable->local_prefetch_num);
         if(tunable->atomic_scope != "SCOPE_SYS")

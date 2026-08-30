@@ -77,10 +77,34 @@ section for the record).
       (computed and loaded into kernargs/SGPRs but never consumed -- fwd WMMA has no
       multi-tap/strided config yet to exercise them), and bwd/wrw (not attempted).
       Performance not yet measured (this pass was scoped to correctness).
-- [ ] **[P2] Complete Direct Store (`direct_store=1`) expansion across all master configs**
-      — Wire `direct_store=1` into all non-split master config sections. Direct store bypasses
-      LDS reshuffle and writes coalesced dwords straight to global memory, cutting LDS barriers
-      and latency on exact-fit non-split shapes.
+- [x] ~~**[P2] Complete Direct Store (`direct_store=1`) expansion across all master configs**~~
+      — the codegen mechanism (`coalescing_store_wmma.py`'s `_emit_direct_store`) was already
+      direction-agnostic and the combinatorial `_all.config` generator already covered
+      `direct_store=1` for bf16/fp16/fp32 across fwd/bwd/wrw before this pass. Filled the real
+      remaining gaps: int8 (`igemm_fwd_gtc_gfx1250_nhwc_int8_direct.config`, zero coverage
+      anywhere before this), standalone hand-curated wrw configs (`*_direct`/`*_mntail_direct`/
+      `*_ktail_direct` for bf16/fp16/fp32, wrw had none before — fwd/bwd already had them), and
+      the missing 128x128 section in fwd/bwd's existing `*_direct.config` files (only 64x64 had
+      `direct_store=1`). **Found and fixed a real, previously-undetected bug while validating
+      this**: the driver's C++ kernel-name builder (`driver/igemm_gtc_base.h`'s
+      `igemm_gtc_encode_kernel_name`, which must mirror `igemm_base.py`'s Python version byte
+      for byte) never gained a `_direct` suffix when Phase 59 added `direct_store` — so
+      `direct_store=1` was NEVER actually reachable through `conv_driver.exe`'s normal
+      candidate-search path: `hipModuleGetFunction` either silently ran a same-named
+      non-`_direct` sibling kernel (whenever one happened to coexist in the same build, e.g.
+      every combinatorial `_all.config` — meaning **every prior "direct_store" benchmark
+      number in `docs/gfx1250_vendor_benchmark_vs_miopen.md` was actually measuring the
+      non-direct-store kernel**) or failed loudly with "named symbol not found" (every
+      standalone `*_direct.config`, which have no same-named sibling). Fixed by adding the
+      missing `direct_store` struct field, config-parse line, and `_direct` name-suffix line
+      (matching `epilogue_lds_pad`'s exact pattern immediately above it). Hardware-validated
+      `valid:y` after the fix, on odd (non-power-of-2) shapes, across bf16/fp16/fp32/int8 (fwd
+      only for int8), fwd/bwd/wrw, both tile shapes, and wrw's mtail+ntail/ktail combinations.
+      Zero regression on non-`direct_store` configs (the fix only appends a suffix when
+      `direct_store=1`, which was never true for them). **Not done**: re-running the vendor
+      benchmark now that direct_store is actually reachable (the existing "direct_store wins
+      on N shapes" narrative needs to be re-measured, not trusted) — flagged as a new,
+      separate follow-up, not silently absorbed into this item's scope.
 - [ ] **[P3] 32-bit SADDR base offsets for in-loop global loads**
       — Replace 64-bit carry-chain address stepping in inner K-loops with 32-bit byte offset
       VGPRs + SADDR base SGPRs (`global_load_dwordx4 vdst, v_off, s_p_base offset:N`).

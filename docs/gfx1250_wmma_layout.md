@@ -5194,3 +5194,66 @@ per-tap gather, `_emit_tap_gather`) was updated identically but remains untested
 `stride_h`/`stride_w` divisors (`magic_2`/`magic_3` are computed host-side and loaded
 into kernargs/SGPRs but never actually consumed by any division in this kernel --
 multi-tap/strided convs have no fwd WMMA config exercising them yet, see the backlog).
+
+## Phase 61 (2026-08-30): Direct Store config expansion -- and a real bug that made `direct_store` unreachable through the normal driver path since Phase 59
+
+Backlog P1's sibling item: `docs/gfx1250_optimization_backlog.md`'s P2 asked to "wire
+`direct_store=1` into all non-split master config sections." Survey first: the codegen
+(`coalescing_store_wmma.py`'s `_emit_direct_store`) was already direction-agnostic and
+wired into all of fwd/bwd/wrw, and `script/generate_all_configs.py`'s combinatorial
+`_all.config` generator already produced `direct_store=1` sections for bf16/fp16/fp32
+across every direction and tile shape in its `BASE_SECTIONS`. The real gaps: int8 had
+zero `direct_store` coverage anywhere (not in `BASE_SECTIONS`, no standalone config);
+wrw had zero standalone hand-curated `*_direct.config` files (fwd/bwd each have
+`_direct`/`_mtail_direct`/`_ntail_direct`/`_tdm_direct` per precision, used for quick
+single-feature testing outside the big combinatorial search); fwd/bwd's existing
+standalone `_direct.config` files only had a 64x64 section with `direct_store=1`, not
+128x128 (even though the combinatorial file proves 128x128+direct_store builds fine).
+Added: `igemm_fwd_gtc_gfx1250_nhwc_int8_direct.config` (new); wrw
+`*_direct`/`*_mntail_direct`/`*_ktail_direct` for bf16/fp16/fp32 (new); the missing
+128x128 section in fwd's and bwd's existing bf16/fp16/fp32 `_direct.config` files.
+
+**Found and fixed a real, previously-undetected bug while hardware-validating this**:
+none of it actually ran through `conv_driver.exe`'s normal candidate-search path. The
+driver's C++ kernel-name builder (`driver/igemm_gtc_base.h`'s
+`igemm_gtc_encode_kernel_name`, an explicitly-commented-as-must-stay-in-sync mirror of
+`igemm_base.py`'s Python kernel-naming function used at codegen time) never gained a
+`_direct` suffix when Phase 59 added `direct_store` -- the Python side has
+`if tunable.direct_store: kernel_name += "_direct"` (`igemm_base.py:1404-1405`); the
+C++ side had no `direct_store` field on `igemm_gtc_tunable_t` at all, so nothing was
+ever appended. Two distinct failure modes depending on what else was in the same
+build: standalone `*_direct.config` files (a section with `direct_store=1` and no
+same-shaped `direct_store=0` sibling) failed outright --
+`hipModuleGetFunction(...) (500)(named symbol not found)` -- since the driver requested
+the un-suffixed name and no such symbol exists. Combinatorial `_all.config` files
+(every `direct_store=1` combination paired with an otherwise-identical
+`direct_store=0` twin) failed silently instead: the un-suffixed name request resolved
+to the TWIN'S symbol via `hipModuleGetFunction`, so every "direct_store" candidate in
+the driver's search actually ran the ordinary LDS-reshuffle kernel the whole time, with
+no error and a plausible-looking (but wrong) result. This means **every direct_store
+performance number in `docs/gfx1250_vendor_benchmark_vs_miopen.md`'s Phase 59 update is
+invalid** -- see that doc's own new correction section. The `valid:y` correctness
+claims in that doc's earlier phases are unaffected (`valid:y`/`valid:n` still reflects
+whatever kernel actually ran; it's the *identity* of that kernel, and therefore any
+comparison BETWEEN direct-store and non-direct-store, that was wrong).
+
+Fixed by adding the missing three pieces to `driver/igemm_gtc_base.h`, each mirroring
+`epilogue_lds_pad`'s existing pattern exactly (declared, parsed, and folded into the
+name immediately after it, matching Python's exact ordering): the `int direct_store = 0`
+struct field on `igemm_gtc_tunable_t`, the `sec.count("direct_store") > 0 ? ... : 0`
+config-parse line, and the `if(tunable->direct_store) kernel_name += "_direct";` naming
+line in `igemm_gtc_encode_kernel_name`.
+
+**Hardware-validated** (`PRINT_NRMS=1`, non-power-of-2 shapes, `-V 1`): every new/edited
+config above, `valid:y` at normal per-precision rounding levels, for fwd/bwd/wrw, both
+tile shapes, and wrw's `mtail`+`ntail`/`ktail` combinations. Confirmed the fix actually
+changes which kernel runs (not just cosmetic): re-ran a combinatorial
+`_all.config` after the fix and every `_direct`-suffixed candidate now appears as its
+own distinct line with its own timing, where before the fix the driver's request for
+its name would have silently matched a same-shaped non-direct sibling. Zero regression
+on non-`direct_store` configs (`direct_store` defaults to `0`, appends no suffix, byte-
+identical driver behavior for every existing config).
+
+**Not done**: re-running the vendor benchmark's performance comparison now that
+`direct_store` is actually reachable -- flagged as a new, separate backlog follow-up,
+since the old numbers cannot be trusted or reused.
