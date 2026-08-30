@@ -172,6 +172,14 @@ typedef struct {
     // kernel name (matches async_global_load's treatment) since it's the same category of
     // load-mechanism flag, even though it doesn't change buffer layout.
     int tdm_global_load;
+    // Phase 61: 32-bit SADDR-based global loads for fwd's default (non-async, non-TDM)
+    // path -- an alternative addressing mode, same category as async_global_load/
+    // tdm_global_load above, folded into the kernel name for the same
+    // hipModuleGetFunction-lookup reason (see this project's Phase 61 postmortem on
+    // direct_store: a flag added to Python's kernel naming but missed here made
+    // direct_store unreachable through the normal driver path for an entire phase --
+    // added here from the start specifically to avoid repeating that).
+    int saddr_global_load;
     int main_loop_interleave;
     // Phase 24: also folded into the kernel name (unlike local_prefetch_num/atomic_scope/
     // atomic_cascade/epilogue_lds_pad, which are purely internal-codegen choices that don't
@@ -322,6 +330,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.lds_double_buffer        = sec.count("lds_double_buffer") > 0 ? sec.at("lds_double_buffer").get_int() : 0;
                 tunable.async_global_load        = sec.count("async_global_load") > 0 ? sec.at("async_global_load").get_int() : 0;
                 tunable.tdm_global_load          = sec.count("tdm_global_load") > 0 ? sec.at("tdm_global_load").get_int() : 0;
+                tunable.saddr_global_load         = sec.count("saddr_global_load") > 0 ? sec.at("saddr_global_load").get_int() : 0;
                 tunable.main_loop_interleave     = sec.count("main_loop_interleave") > 0 ? sec.at("main_loop_interleave").get_int() : 0;
                 tunable.wmma_acc_f16             = sec.count("wmma_acc_f16") > 0 ? sec.at("wmma_acc_f16").get_int() : 0;
                 tunable.wmma_acc_bf16             = sec.count("wmma_acc_bf16") > 0 ? sec.at("wmma_acc_bf16").get_int() : 0;
@@ -536,6 +545,8 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += std::string("_async");
         if(tunable->tdm_global_load)
             kernel_name += std::string("_tdm");
+        if(tunable->saddr_global_load)
+            kernel_name += std::string("_saddr");
         if(tunable->main_loop_interleave)
             kernel_name += std::string("_interleave");
         if(tunable->wmma_acc_f16)

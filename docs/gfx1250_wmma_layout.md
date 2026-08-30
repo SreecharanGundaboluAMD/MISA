@@ -5257,3 +5257,73 @@ identical driver behavior for every existing config).
 **Not done**: re-running the vendor benchmark's performance comparison now that
 `direct_store` is actually reachable -- flagged as a new, separate backlog follow-up,
 since the old numbers cannot be trusted or reused.
+
+## Phase 62 (2026-08-30): 32-bit SADDR global loads (backlog P3), fwd pilot
+
+Backlog P3: replace the default (non-async, non-TDM) global-load path's 64-bit
+carry-chain VGPR address pair (`v_addr_a`/`v_addr_b`, stepped per K-iteration via
+`v_add_co_u32`+`v_add_co_ci_u32`) with a 32-bit byte-offset VGPR plus a scalar SADDR
+base, saving 1 VGPR and 1 VALU op per address step. User explicitly scoped this pass
+to fwd only (bwd's B operand and wrw are real follow-up work, not attempted).
+
+**A ready-made pattern already existed in the same file, not new design work.**
+`async_global_load=1`'s `global_load_async_to_lds_b128` path already computes exactly
+this 32-bit offset (`v_off_a`/`v_off_b`/`v_off_b_base`, `kernel_vgpr_t`) and steps it
+with a single `v_add_u32` (`move_slice_window_a/b_functor`'s `elif async_global_load`
+branch) -- it just uses a different load instruction (loads straight to LDS, no VGPR
+staging) than the default path's `global_load_dwordx4` (loads into a small reused VGPR
+buffer, then `ds_write_b128`s to LDS separately). Confirmed via `llvm-mc -mcpu=gfx1250`
+that `global_load_dwordx4 vdst, voff, s[..]:.. offset:N` (SADDR form) assembles cleanly
+on this arch -- a standard GLOBAL_* "GVS" addressing mode (ISA doc §5445/5884:
+`addr = IOFFSET + SADDR[63:0] + VADDR[31:0]`), the same mechanism
+`global_load_async_to_lds_b128` already relies on, not something requiring discovery.
+
+**Implementation**: new tunable `saddr_global_load` (`igemm_base.py`, default 0),
+asserted mutually exclusive with `async_global_load`/`tdm_global_load` (both already
+have their own, different, alternatives to the 64-bit pair), `main_loop_interleave`,
+`gemm_k_global_split`, and `row_repeat_a/b > 1` -- the same "narrowest
+correctness-first slice" discipline every other addressing mechanism in this file
+follows (TDM, async, wmma_k_tail all did this too). In
+`igemm_fwd_gtc_wmma_nhwc.py`: widened every `if outer.tunable.async_global_load:` gate
+that produces the 32-bit-offset registers/arithmetic (VGPR declarations in
+`kernel_vgpr_t`, the prologue's `v_off_a`/`v_off_b_base` setup, `_emit_tap_gather`'s
+per-tap `v_off_a`/`v_off_b` computation, `move_slice_window_a/b_functor`'s single-add
+step) to `async_global_load or saddr_global_load` -- these are pure offset arithmetic,
+identical for both mechanisms. The only genuinely NEW code is at the actual load
+instruction: `_emit_gld_chunk_load` gained an optional `saddr=` parameter that, when
+set, emits `global_load_dwordx4 v[gld:gld+3], v[v_addr], s[saddr:saddr+1] offset:N`
+(single VADDR register, scalar base) instead of the default `v[v_addr:v_addr+1], off
+offset:N` (64-bit VADDR pair) -- threaded through `_emit_sst_remaining_chunks` so every
+K-sub-loop chunk in a tile uses it, and `global_load_a/b_functor` /
+`shared_store_a/b_functor` gained a `saddr_global_load` branch passing `v.v_off_a`/
+`v.v_off_b` + `s.s_p_in`/`s.s_p_wei` instead of `v.v_addr_a`/`v.v_addr_b`. No
+kernarg/driver-side pointer changes needed -- `s_p_in`/`s_p_wei` are already the
+correct 64-bit base (group offset already folded in by the prologue before any address
+computation runs), SADDR just reads them directly.
+
+Also added `saddr_global_load` to BOTH Python's `igemm_gtc_encode_kernel_name` and the
+C++ driver's mirror in `driver/igemm_gtc_base.h` (struct field, config-parse line,
+name-suffix line) from the start, in that order, specifically to avoid repeating the
+exact class of bug this same session found for `direct_store` (Phase 61 above) --
+a flag folded into one kernel-naming function but not its mirror silently breaks
+`hipModuleGetFunction` lookups.
+
+**Hardware-validated** (`PRINT_NRMS=1`, non-power-of-2 shapes, `-V 1`): bf16/fp16/
+fp32/int8, both tile shapes, `wmma_m_tail`+`wmma_n_tail` together, `wmma_k_tail` (with
+a shape that gives it a genuinely non-exact K so the tail path actually executes, not
+just compiles in), and `group_count>1` -- all `valid:y` at normal per-precision
+rounding levels. Confirmed the VGPR savings actually materialize: the 128x128 bf16
+tile's `.amdhsa_next_free_vgpr` drops from 252 (plain) to 248 (saddr) -- more than the
+naively-expected 1 (row_repeat_a==1 in every config today, so A's pair, B's pair, and
+B's persistent base pair each individually go from 2 VGPRs to 1, summing to more than
+a single register's worth). Confirmed zero regression: with `saddr_global_load`
+defaulting to 0, the generated `.s`/`.inc` for `igemm_fwd_gtc_gfx1250_nhwc_bf16.config`
+is byte-identical before/after this change (git-stash side-by-side, same technique
+used in Phase 60/61).
+
+**Not done**: bwd (its B operand has no existing 32-bit-offset precedent under
+`async_global_load` to copy -- `move_slice_window_b_functor` always uses the 64-bit
+carry chain there, even when async is on, so this would need fresh address-arithmetic
+design, not just gate-widening) and wrw (not yet surveyed). Both are genuine follow-up
+backlog items, not silently folded into this "done" pilot. Performance not yet
+measured -- this pass was scoped to correctness, matching Phase 60/61's approach.

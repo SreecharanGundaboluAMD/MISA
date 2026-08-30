@@ -105,10 +105,31 @@ section for the record).
       benchmark now that direct_store is actually reachable (the existing "direct_store wins
       on N shapes" narrative needs to be re-measured, not trusted) — flagged as a new,
       separate follow-up, not silently absorbed into this item's scope.
-- [ ] **[P3] 32-bit SADDR base offsets for in-loop global loads**
+- [~] **[P3] 32-bit SADDR base offsets for in-loop global loads**
       — Replace 64-bit carry-chain address stepping in inner K-loops with 32-bit byte offset
       VGPRs + SADDR base SGPRs (`global_load_dwordx4 vdst, v_off, s_p_base offset:N`).
       Saves 1 VGPR and 1 VALU carry op per address step across all directions.
+      **Fwd pilot done** (new `saddr_global_load` tunable, `igemm_fwd_gtc_wmma_nhwc.py`):
+      the default (non-async, non-TDM) global-load path for A/B now shares
+      `async_global_load`'s existing 32-bit-offset address computation (a ready-made
+      pattern already in the same file), only changing the actual load instruction's
+      addressing operands (SADDR + 32-bit offset instead of a 64-bit VADDR pair) --
+      confirmed via `llvm-mc -mcpu=gfx1250` that plain `global_load_dwordx4` already
+      supports this addressing mode (standard GLOBAL_* "GVS" form, ISA doc §5884), not
+      something new to discover. Mutually exclusive with `async_global_load`/
+      `tdm_global_load`/`main_loop_interleave`/`gemm_k_global_split`/`row_repeat_a/b>1`
+      for this pass (narrowest-slice discipline, same as every other addressing
+      mechanism in this file). Hardware-validated `valid:y` across bf16/fp16/fp32/int8,
+      both tile shapes, `wmma_m_tail`+`wmma_n_tail`, `wmma_k_tail` (with a genuinely
+      active tail boundary), and `group_count>1`. Confirmed ~4 fewer VGPRs
+      (`.amdhsa_next_free_vgpr` 252→248 on the 128x128 tile) and zero regression
+      (`saddr_global_load=0`'s generated `.s`/`.inc` byte-identical to before). Also
+      fixed the new tunable's kernel-naming into BOTH Python and C++ driver-side name
+      builders from the start (see the P2 entry above for why that specific gap is a
+      known, previously-costly failure mode in this codebase). **Not done**: bwd (B
+      operand has no existing 32-bit-offset precedent to copy, needs fresh design) and
+      wrw (not yet surveyed) -- explicit follow-up, not attempted this pass. Performance
+      not yet measured. See `docs/gfx1250_wmma_layout.md`'s Phase 62.
 - [ ] **`disable_xdl_arb_stall` (`SCHED_MODE` bit[2]) A/B test on a wrw split-K shape.**
       **Attempted 2026-08-27, blocked — not a guess we should make.** The CDNA5 ISA doc
       (§5.7.2.1) documents this bit's *existence and semantics* but gives no `S_SETREG`

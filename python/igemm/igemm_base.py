@@ -218,6 +218,21 @@ class igemm_gtc_tunable_parameter_t(object):
             # operands (fwd A/B, bwd A) use global_load_async_to_lds_b128 instead -- no VGPR
             # staging buffer, global memory -> LDS directly.
             self.async_global_load              = utility_dict_with_default_t(tunable_dict)('async_global_load', 0)
+            # Phase 61: optional, defaults to 0 (today's 64-bit-VADDR-pair global_load_dwordx4
+            # path, every existing config unaffected). When 1, the default (non-async,
+            # non-TDM) global-load path for fwd's A/B operands uses a 32-bit byte-offset VGPR
+            # + a scalar SADDR base (s_p_in/s_p_wei) instead of a per-thread 64-bit VGPR
+            # address pair -- same GLOBAL_* "GVS" addressing mode
+            # (addr = IOFFSET + SADDR[63:0] + VADDR[31:0]) async_global_load's
+            # global_load_async_to_lds_b128 already uses, just applied to the ordinary
+            # VGPR-staged global_load_dwordx4 the ASYNC/TDM paths don't take. Saves 1 VGPR
+            # (2*row_repeat -> 1) and 1 VALU carry op per address step. fwd-only pilot for
+            # now -- mutually exclusive with async_global_load/tdm_global_load/
+            # main_loop_interleave/gemm_k_global_split/row_repeat_a>1/row_repeat_b>1, asserted
+            # in igemm_fwd_gtc_wmma_nhwc.py's __init__, same "narrowest correctness-first
+            # slice" discipline as every other addressing mechanism there. See
+            # docs/gfx1250_wmma_layout.md's Phase 62.
+            self.saddr_global_load              = utility_dict_with_default_t(tunable_dict)('saddr_global_load', 0)
             # Phase 28: TDM (Tensor Data Mover)-based global-to-LDS load for the A operand --
             # optional, defaults to 0 (today's exact byte-identical behavior). When 1, uses
             # tensor_load_to_lds (the dedicated TDM hardware unit) instead of
@@ -1356,6 +1371,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_async"
         if tunable.tdm_global_load:
             kernel_name += "_tdm"
+        if tunable.saddr_global_load:
+            kernel_name += "_saddr"
         if tunable.main_loop_interleave:
             kernel_name += "_interleave"
         if tunable.wmma_acc_f16:
