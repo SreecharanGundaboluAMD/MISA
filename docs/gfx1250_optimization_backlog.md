@@ -56,12 +56,27 @@ section for the record).
 
 ## Tier 1 — small effort (cross-validated or ISA-doc-motivated, cheap to try)
 
-- [ ] **[P1] Host-precomputed Magic Division (`magic_div.h`) in hot coordinate paths**
-      — Replace emulated 15-instruction software division macros (`.v_u32_div_rem_vs_gfx1250`)
-      with host-precomputed magic multipliers and shifts passed via kernargs or SGPRs.
-      Turns 15 VALU instructions into 2 (`v_mul_hi_u32` + `v_lshrrev_b32`) per division/modulo
-      in the prologue, group decoding, and multi-tap spatial coordinate index loops.
-      Expected payoff: 15–30% speedup on multi-tap and spatial-division-bound shapes.
+- [x] ~~**[P1] Host-precomputed Magic Division (`magic_div.h`) in hot coordinate paths**~~
+      — done for fwd's GEMM_M decode (`igemm_fwd_gtc_wmma_nhwc.py`'s one-time
+      `m_idx -> (n_idx, ho_idx, wo_idx)` prologue decomposition): replaced the emulated
+      15-instruction `.v_u32_div_rem_vs_gfx1250` with the project's existing
+      `macro_mdiv_u32_rem_vs_t` (host-computed magic multiplier + shift, 3 VALU
+      instructions), magic values passed via 5 new kernargs. Implemented in a prior
+      session but never actually hardware-validated (deferred). Picked back up
+      2026-08-30: found `valid:n` on real hardware, root-caused to two bugs (an
+      SMEM-load/`s_wait_kmcnt` ordering race reading `s_shift_pack` before its load
+      landed, and a missing 4-SGPR-alignment requirement on `s_magic_ho_wo` that broke
+      the master combinatorial config's assembly for some tunable combinations), both
+      fixed. Hardware-validated `valid:y` across bf16/fp16/fp32/int8, every
+      `wmma_m_tail`/`wmma_n_tail`/`wmma_k_tail` combination, `gemm_k_global_split`, and
+      `group_count>1`, using non-power-of-2 spatial shapes (power-of-2 shapes make
+      `magic=1` degenerate to a plain shift and don't actually exercise the magic
+      multiply). See `docs/gfx1250_wmma_layout.md`'s Phase 60 for the full trail.
+      **Not done**: group decoding's own division (still the old emulated macro, a
+      separate call site not touched by this pass), `stride_h`/`stride_w` magic values
+      (computed and loaded into kernargs/SGPRs but never consumed -- fwd WMMA has no
+      multi-tap/strided config yet to exercise them), and bwd/wrw (not attempted).
+      Performance not yet measured (this pass was scoped to correctness).
 - [ ] **[P2] Complete Direct Store (`direct_store=1`) expansion across all master configs**
       — Wire `direct_store=1` into all non-split master config sections. Direct store bypasses
       LDS reshuffle and writes coalesced dwords straight to global memory, cutting LDS barriers

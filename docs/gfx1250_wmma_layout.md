@@ -5112,3 +5112,85 @@ isolation from the tile-growth question.
 **Backlog**: `docs/gfx1250_optimization_backlog.md` not yet updated for this phase --
 do that when resuming, along with a decision on whether to keep the two new config
 files (harmless but non-buildable today) or remove them until the wall clears.
+
+## Phase 60 (2026-08-29/30): host-precomputed Magic Division for fwd's GEMM_M decode -- implemented, found broken on real hardware, root-caused and fixed
+
+Ported the backlog's P1 item (`docs/gfx1250_optimization_backlog.md`) to fwd's WMMA
+kernel (`igemm_fwd_gtc_wmma_nhwc.py`): the one-time prologue decomposition of this
+thread's flat GEMM_M index into `(n_idx, ho_idx, wo_idx)` (`m_idx / ho_wo` then
+`hw_idx / wo`) now uses the project's existing `macro_mdiv_u32_rem_vs_t` (host-computed
+magic multiplier + shift, 3 VALU instructions) instead of the emulated
+`macro_int_div_rem_vs_gfx1250_t` (~15 VALU instructions per call). Magic
+values/shifts are computed host-side (`magic_div_u32_gen`, `driver/magic_div.h`,
+already used by every non-WMMA kernel in this codebase) and passed via 5 new kernargs
+(`magic_0..3` + a packed `shift_pack_0`, offsets 92-112).
+
+**Initial implementation (previous session) compiled and looked plausible but was never
+actually hardware-validated** -- committed with "GPU-contended, hardware validation
+deferred." Picked back up this session specifically to find and fix that gap.
+
+**Bug 1 (the real one): SMEM read-before-`s_wait_kmcnt` race.** The shift-unpacking
+code (`s_and_b32`/`s_lshr_b32` decoding the 4 packed shift bytes out of
+`s_shift_pack`) was emitted *immediately* after the `s_load_dword` that loads
+`s_shift_pack` from kernargs, with no `s_wait_kmcnt` in between -- the existing
+`s_wait_kmcnt 0x0` that (correctly) covers every other kernarg load in the prologue
+sits several instructions *later* (workgroup-id decode happens in between), so this
+one specific load's result was being read before the hardware guaranteed it had
+landed. This is a genuine, unconditional SMEM hazard, but it was **not reliably
+reproducible** -- `PRINT_NRMS=1` runs against the plain (no-tail) config and every
+single-tail (`wmma_m_tail` xor `wmma_n_tail` xor `wmma_k_tail`) config came back
+`valid:y` (bf16, nrms ~0.0004-0.0005, normal bf16 rounding level) across several odd
+(non-power-of-2 `ho_wo`/`wo`) shapes -- while `wmma_m_tail` + `wmma_k_tail` compiled
+*together* (`igemm_fwd_gtc_gfx1250_nhwc_bf16_mnktail.config`, and a synthetic
+`mtail`+`ktail`-only config with no real K-tail boundary in the test shape) reliably
+came back `valid:n` (nrms ~0.09-0.16) on the *same* shapes. A `git worktree`-free
+bisect (built the pre-Phase-60 commit's `igemm_fwd_gtc_wmma_nhwc.py`/
+`igemm_fwd_gtc_driver.h` side by side with the current tree, swapping only the two
+prologue division calls between `macro_mdiv_u32_rem_vs_t` and
+`macro_int_div_rem_vs_gfx1250_t` while leaving every other Phase 60 change -- kernarg
+layout, SGPR declarations, driver-side magic value population -- untouched) proved the
+regression was specifically in the two magic-division call sites, not in the
+kernarg/driver plumbing around them. The mtail+ktail-vs-single-tail split turned out to
+be a red herring from timing sensitivity, not a real logic dependency: re-testing a
+`group_count > 1` shape (unrelated to K-tail entirely, group decode still uses the old
+emulated-divide macro) with plain `wmma_m_tail` also reproduced `valid:n` on the
+as-committed code, and was fixed by the exact same change -- confirming this is a
+genuine hardware race whose visibility depends on incidental instruction scheduling
+around the surrounding kernel variant, not a mtail/ktail-specific interaction. **Fix**:
+moved the shift-unpacking block to after the existing `s_wait_kmcnt 0x0` (right before
+it's needed, group-decode division and the GEMM_M decomposition both come later).
+
+**Bug 2 (found while checking the master combinatorial config, not a runtime
+correctness bug -- an assembly failure): missing SGPR alignment.** `s_load_dwordx4 s[s_magic_ho_wo:s_magic_ho_wo+3]`
+requires its destination to start on a 4-SGPR-aligned boundary, but `s_magic_ho_wo`
+was declared with a plain `sseq(1)` -- whatever SGPR offset the sequencer happened to
+be at when it reached that declaration, which varies per tunable combination (how many
+of the conditionally-declared `tdm_global_load`/`gemm_k_global_split` SGPR groups
+precede it). Building `igemm_fwd_gtc_gfx1250_nhwc_bf16_all.config` (168 combinatorial
+sections) hit this for several sections with `invalid register alignment` from the
+assembler. Fixed by declaring `s_magic_ho_wo` with `sseq(1, 4)` (explicit re-alignment
+before allocating), which keeps `s_magic_wo`/`s_magic_stride_h`/`s_magic_stride_w`
+consecutive right after it (unchanged plain `sseq(1)`), exactly like `s_tdm_g0`/`s_tdm_g1`'s
+existing `sseq(4, 4)`/`sseq(8, 4)` pattern elsewhere in the same class. Confirmed via a
+`git stash`-based side-by-side: the *same* 24 `register index is out of range` errors
+(a separate, pre-existing VGPR-budget overflow in one `_064x128x032` combinatorial
+section, unrelated to Magic Division and present even in the pre-Phase-60 commit) are
+the only errors left after this fix -- the alignment errors are gone, nothing new
+appeared.
+
+**Hardware-validated after both fixes** (`PRINT_NRMS=1`, non-power-of-2 `ho_wo`/`wo`
+shapes to actually exercise the magic-multiply path, not just its power-of-2-denominator
+degenerate case where `magic=1` trivially reduces to a plain shift): bf16/fp16/fp32/int8
+base configs, `wmma_m_tail`/`wmma_n_tail`/`wmma_k_tail` individually and in every
+pairwise + all-three combination, `gemm_k_global_split`, and `group_count>1` (2 and 3),
+each `valid:y` at normal per-precision rounding levels (bf16/fp16 nrms ~0.0002-0.0006,
+fp32 essentially exact, int8 exact). Zero regression: the master `_all.config`'s
+remaining build errors are the identical pre-existing VGPR-overflow set from before
+this phase (bug 2's paragraph above); every previously-passing shape/config combination
+still passes. `row_repeat_a > 1`'s own magic-division call site (asymmetric-tile
+per-tap gather, `_emit_tap_gather`) was updated identically but remains untested --
+`row_repeat_a == 1` for every existing config, same caveat as every other
+`row_repeat_a > 1` code path in this file. Not extended to bwd/wrw or to fwd's
+`stride_h`/`stride_w` divisors (`magic_2`/`magic_3` are computed host-side and loaded
+into kernargs/SGPRs but never actually consumed by any division in this kernel --
+multi-tap/strided convs have no fwd WMMA config exercising them yet, see the backlog).

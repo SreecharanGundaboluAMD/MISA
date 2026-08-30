@@ -436,14 +436,19 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             # software division in the coordinate decomposition hot paths. Four 32-bit
             # magic words + one packed shift word, loaded from kernargs with one
             # s_load_dwordx4 + one s_load_dword.
-            self.s_magic_ho_wo = sym_t('s_magic_ho_wo'  , sseq(1))
+            # s_load_dwordx4 below requires its destination base to be 4-SGPR-aligned --
+            # how many SGPRs precede this point varies per tunable combination (tdm_global_load's
+            # groups, gemm_k_global_split's fields, etc.), so the sequencer must be explicitly
+            # re-aligned here rather than assumed to already land on a multiple of 4 (a master
+            # combinatorial config build caught this: some per-tile sections landed
+            # s_magic_ho_wo on a non-4-aligned offset, and the assembler rejected it with
+            # "invalid register alignment").
+            self.s_magic_ho_wo = sym_t('s_magic_ho_wo'  , sseq(1, 4))
             self.s_magic_wo    = sym_t('s_magic_wo'     , sseq(1))
             self.s_magic_stride_h = sym_t('s_magic_stride_h', sseq(1))
             self.s_magic_stride_w = sym_t('s_magic_stride_w', sseq(1))
             self.s_shift_pack  = sym_t('s_shift_pack'   , sseq(1))
-            # Phase 60: unpacked shifts (one per divisor). s_shift_wo is free to
-            # alias s_tmp(0) since the prologue only uses it before s_tmp is needed
-            # for scratch. The actual alias is set via sseq(1) in the declaration order.
+            # Phase 60: unpacked shifts (one per divisor).
             self.s_shift_ho_wo    = sym_t('s_shift_ho_wo'    , sseq(1))
             self.s_shift_wo       = sym_t('s_shift_wo'       , sseq(1))
             self.s_shift_stride_h = sym_t('s_shift_stride_h' , sseq(1))
@@ -897,14 +902,6 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # Phase 60 (Magic Division): load 4 magic values + 1 packed shift from kernargs
         self._emit(f"s_load_dwordx4 s[{s.s_magic_ho_wo()}:{s.s_magic_ho_wo(3)}], s[{s.s_ka()}:{s.s_ka(1)}], 92")
         self._emit(f"s_load_dword s[{s.s_shift_pack()}], s[{s.s_ka()}:{s.s_ka(1)}], 108")
-        # Phase 60: unpack the per-divisor shifts from the packed shift word.
-        # shift_pack_0 layout (magic_div_u32_pack_shift in driver/magic_div.h):
-        #   [7:0] = ho_wo shift, [15:8] = wo shift,
-        #   [23:16] = stride_h shift, [31:24] = stride_w shift
-        self._emit(f"s_and_b32 s[{s.s_shift_ho_wo()}], s[{s.s_shift_pack()}], 0xff")
-        self._emit(f"s_lshr_b32 s[{s.s_shift_wo()}], s[{s.s_shift_pack()}], 8")
-        self._emit(f"s_lshr_b32 s[{s.s_shift_stride_h()}], s[{s.s_shift_pack()}], 16")
-        self._emit(f"s_lshr_b32 s[{s.s_shift_stride_w()}], s[{s.s_shift_pack()}], 24")
         self._emit(f"v_mov_b32 v[{v.v_tid()}], v0")
         if self.tunable.tdm_global_load:
             # Phase 29: derive this wave's index within the workgroup, once, while EXEC is
@@ -928,6 +925,21 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         else:
             self._emit(f"s_mov_b32 s[{s.s_by()}], ttmp7")
         self._emit(f"s_wait_kmcnt 0x0")
+        # Phase 60 (Magic Division): unpack the per-divisor shifts from the packed shift
+        # word, now that s_wait_kmcnt above has guaranteed s_shift_pack's s_load_dword
+        # (issued above, right after the magic values) has actually landed -- reading it
+        # any earlier (as an initial version of this code did, immediately after the load
+        # with no intervening wait) is an SMEM read-before-completion race: usually masked
+        # by incidental scheduling, but reproducibly wrong on real hardware for at least
+        # one combination (wmma_m_tail + wmma_k_tail together), see
+        # docs/gfx1250_wmma_layout.md's Phase 60 bugfix.
+        # shift_pack_0 layout (magic_div_u32_pack_shift in driver/magic_div.h):
+        #   [7:0] = ho_wo shift, [15:8] = wo shift,
+        #   [23:16] = stride_h shift, [31:24] = stride_w shift
+        self._emit(f"s_and_b32 s[{s.s_shift_ho_wo()}], s[{s.s_shift_pack()}], 0xff")
+        self._emit(f"s_lshr_b32 s[{s.s_shift_wo()}], s[{s.s_shift_pack()}], 8")
+        self._emit(f"s_lshr_b32 s[{s.s_shift_stride_h()}], s[{s.s_shift_pack()}], 16")
+        self._emit(f"s_lshr_b32 s[{s.s_shift_stride_w()}], s[{s.s_shift_pack()}], 24")
         if self.tunable.gemm_k_global_split:
             self._emit(f"s_mul_i32 s[{s.s_gemm_k_wg_off()}], s[{s.s_bz()}], s[{s.s_gemm_k_per_wg()}]   ; this workgroup's K-slice base")
         self._emit_empty_line()
