@@ -261,6 +261,20 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             self.s_ho          = sym_t('s_ho'          , sseq(1))    # bound + row-pitch factor for grad_output address
             self.s_wo          = sym_t('s_wo'          , sseq(1))    # bound + divisor for grad_output address
             self.s_ho_wo       = sym_t('s_ho_wo'       , sseq(1))    # = s_ho*s_wo, computed on-device once
+            # Phase 60 (Magic Division): host-precomputed magic multipliers + packed shifts
+            # for the hi_wi/wi/stride_h/stride_w divisors. Loaded from kernargs (computed
+            # driver-side via magic_div_u32_gen), replacing the ~24-instruction emulated
+            # macro_int_div_rem_vs_gfx1250_t with 5-instruction magic multiply.
+            # s_magic_hi_wi is 4-aligned (sseq(1, 4)) for s_load_dwordx4.
+            self.s_magic_hi_wi     = sym_t('s_magic_hi_wi'    , sseq(1, 4))
+            self.s_magic_wi         = sym_t('s_magic_wi'      , sseq(1))
+            self.s_magic_stride_h   = sym_t('s_magic_stride_h', sseq(1))
+            self.s_magic_stride_w   = sym_t('s_magic_stride_w', sseq(1))
+            self.s_shift_pack       = sym_t('s_shift_pack'    , sseq(1))
+            self.s_shift_hi_wi      = sym_t('s_shift_hi_wi'   , sseq(1))
+            self.s_shift_wi         = sym_t('s_shift_wi'      , sseq(1))
+            self.s_shift_stride_h   = sym_t('s_shift_stride_h', sseq(1))
+            self.s_shift_stride_w   = sym_t('s_shift_stride_w', sseq(1))
             # Phase 5e (multi-tap + dilation) kernarg fields, contiguous, matching
             # get_kernel_args()'s trailing layout.
             self.s_y           = sym_t('s_y'           , sseq(1))
@@ -455,7 +469,14 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         # Phase 48 (gemm_k_global_split): this workgroup's K-slice length. Always present in
         # the karg layout (even for non-split kernels, which never read it) so both variants
         # share one struct on the driver side -- mirrors wrw's identical field.
-        kas.append(amdgpu_kernel_arg_t('gemm_k_per_wg', 4, 88, 'by_value', 'i32'))
+        # Phase 60 (Magic Division): host-precomputed magic multipliers for the
+        # hi_wi/wi/stride_h/stride_w divisors. Always present so all variants share one
+        # karg struct. Placed after gemm_k_per_wg to avoid shifting existing offsets.
+        kas.append(amdgpu_kernel_arg_t('magic_hi_wi'   , 4, 92, 'by_value', 'u32'))
+        kas.append(amdgpu_kernel_arg_t('magic_wi'      , 4, 96, 'by_value', 'u32'))
+        kas.append(amdgpu_kernel_arg_t('magic_stride_h', 4, 100, 'by_value', 'u32'))
+        kas.append(amdgpu_kernel_arg_t('magic_stride_w', 4, 104, 'by_value', 'u32'))
+        kas.append(amdgpu_kernel_arg_t('shift_pack'    , 4, 108, 'by_value', 'u32'))
         return kas
 
     def get_kernel_code(self):
@@ -489,7 +510,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             'enable_sgpr_workgroup_id_y'       :   1,
             'enable_vgpr_workitem_id'          :   0,
             'workgroup_group_segment_byte_size':   max(self.lds_single_size * self.lds_buffer_num, epilogue_lds_bytes),
-            'kernarg_segment_byte_size'         :   92,
+            'kernarg_segment_byte_size'         :   112,  # Phase 60: always full struct size (C++ struct is always 112 bytes with magic fields)
             'wavefront_sgpr_count'              :   self.sgpr.s_end.value + 2 * 3,
             # Phase 54 (VGPR-MSB): see igemm_fwd_gtc_wmma_nhwc.py's identical comment --
             # bank 1 always starts at physical VGPR 256, so the wave must be granted
@@ -707,6 +728,9 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_load_dword s[{s.s_group()}], s[{s.s_ka()}:{s.s_ka(1)}], 84")
         if self.tunable.gemm_k_global_split:
             self._emit(f"s_load_dword s[{s.s_gemm_k_per_wg()}], s[{s.s_ka()}:{s.s_ka(1)}], 88")
+        # Phase 60 (Magic Division): load magic multipliers + packed shift from kernargs
+        self._emit(f"s_load_dwordx4 s[{s.s_magic_hi_wi()}:{s.s_magic_hi_wi(3)}], s[{s.s_ka()}:{s.s_ka(1)}], 92")
+        self._emit(f"s_load_dword s[{s.s_shift_pack()}], s[{s.s_ka()}:{s.s_ka(1)}], 108")
         self._emit(f"v_mov_b32 v[{v.v_tid()}], v0")
         if self.tunable.tdm_global_load:
             # Phase 42: mirrors igemm_fwd_gtc_wmma_nhwc_t's identical Phase 29 computation --
@@ -725,6 +749,13 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         else:
             self._emit(f"s_mov_b32 s[{s.s_by()}], ttmp7")
         self._emit(f"s_wait_kmcnt 0x0")
+        # Phase 60 (Magic Division): unpack the per-divisor shifts from the packed shift
+        # word, now that s_wait_kmcnt has guaranteed s_shift_pack's s_load_dword has landed.
+        # shift_pack layout: [7:0]=hi_wi, [15:8]=wi, [23:16]=stride_h, [31:24]=stride_w
+        self._emit(f"s_and_b32 s[{s.s_shift_hi_wi()}], s[{s.s_shift_pack()}], 0xff")
+        self._emit(f"s_lshr_b32 s[{s.s_shift_wi()}], s[{s.s_shift_pack()}], 8")
+        self._emit(f"s_lshr_b32 s[{s.s_shift_stride_h()}], s[{s.s_shift_pack()}], 16")
+        self._emit(f"s_lshr_b32 s[{s.s_shift_stride_w()}], s[{s.s_shift_pack()}], 24")
         if self.tunable.gemm_k_global_split:
             self._emit(f"s_mul_i32 s[{s.s_gemm_k_wg_off()}], s[{s.s_bz()}], s[{s.s_gemm_k_per_wg()}]   ; this workgroup's K-slice base")
         self._emit_empty_line()
@@ -842,11 +873,13 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         # ---- one-time decomposition of this thread's GEMM_M index into (n_idx, hi_idx,
         # wi_idx), kept persistent: every tap re-derives ho_idx/wo_idx/flag from these ----
         self._emit(f"s_mul_i32 s[{s.s_ho_wo()}], s[{s.s_ho()}], s[{s.s_wo()}]")
-        self._emit(f"; decode this thread's absolute GEMM_M index into (n_idx, hi_idx, wi_idx)")
         self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_block_m_off()}], v[{v.v_tid()}]   ; m_idx")
-        self._emit(m_int_div_rem_vs(v.v_gtc_tmp(1), v.v_n_idx(), v.v_gtc_tmp(0), s.s_hi_wi(), v.v_tmp(), s.s_tmp()))
+        # Phase 60 (Magic Division): replace ~24-instruction emulated divide with
+        # 5-instruction magic multiply+shift for hi_wi and wi divisors
+        m_mdiv_rem_vs = macro_mdiv_u32_rem_vs_t(self.mc)
+        self._emit(m_mdiv_rem_vs(v.v_gtc_tmp(1), v.v_n_idx(), v.v_gtc_tmp(0), s.s_magic_hi_wi(), s.s_shift_hi_wi(), s.s_hi_wi(), v.v_tmp()))
         self._emit(f"; v_gtc_tmp(1)=hw_idx (rem), v_n_idx=n_idx (quo)")
-        self._emit(m_int_div_rem_vs(v.v_wi_idx(), v.v_hi_idx(), v.v_gtc_tmp(1), s.s_wi(), v.v_tmp(), s.s_tmp()))
+        self._emit(m_mdiv_rem_vs(v.v_wi_idx(), v.v_hi_idx(), v.v_gtc_tmp(1), s.s_magic_wi(), s.s_shift_wi(), s.s_wi(), v.v_tmp()))
         self._emit(f"; v_wi_idx=wi_idx (rem), v_hi_idx=hi_idx (quo)")
         self._emit_empty_line()
 
@@ -932,7 +965,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         '''
         s = self.sgpr
         v = self.vgpr
-        m_int_div_rem_vs = macro_int_div_rem_vs_gfx1250_t(self.mc)
+        m_mdiv_rem_vs = macro_mdiv_u32_rem_vs_t(self.mc)
 
         for i in range(self.row_repeat_a):
             tag = '' if i == 0 else f'({i})'
@@ -947,8 +980,8 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             else:
                 self._emit(f"v_add_u32 v[{v.v_gtc_tmp(4)}], {i * self.tunable.block_size}, v[{v.v_tid()}]")
                 self._emit(f"v_add_u32 v[{v.v_gtc_tmp(4)}], s[{s.s_block_m_off()}], v[{v.v_gtc_tmp(4)}]   ; m_idx (row {i})")
-                self._emit(m_int_div_rem_vs(v.v_gtc_tmp(3), v.v_gtc_tmp(2), v.v_gtc_tmp(4), s.s_hi_wi(), v.v_tmp(), s.s_tmp(2)))
-                self._emit(m_int_div_rem_vs(v.v_gtc_tmp(1), v.v_gtc_tmp(0), v.v_gtc_tmp(3), s.s_wi(), v.v_tmp(), s.s_tmp(2)))
+                # Phase 60 (Magic Division): magic multiply+shift for hi_wi and wi divisors
+                self._emit(m_mdiv_rem_vs(v.v_gtc_tmp(3), v.v_gtc_tmp(2), v.v_gtc_tmp(4), s.s_magic_hi_wi(), s.s_shift_hi_wi(), s.s_hi_wi(), v.v_tmp()))
                 self._emit(f"; v_gtc_tmp(0)=hi_idx({i}), v_gtc_tmp(1)=wi_idx({i}), v_gtc_tmp(2)=n_idx({i})")
                 hi_src, wi_src, n_src = v.v_gtc_tmp(0), v.v_gtc_tmp(1), v.v_gtc_tmp(2)
             self._emit(f"v_add_u32 v[{v.v_gtc_tmp(4)}], v[{hi_src}], s[{s.s_tmp(0)}]   ; numerator_h{tag}")
@@ -958,9 +991,10 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"; ho_idx{tag} = numerator_h/stride_h (valid iff exact division & in bounds --")
             self._emit(f"; a negative numerator wraps to a huge u32, which the bounds check below")
             self._emit(f"; naturally rejects via quotient overflow, no separate sign check needed)")
-            self._emit(m_int_div_rem_vs(v.v_gtc_tmp(5), v.v_gtc_tmp(6), v.v_gtc_tmp(4), s.s_stride_h(), v.v_tmp(), s.s_tmp()))
+            # Phase 60 (Magic Division): magic multiply+shift for stride_h and stride_w divisors
+            self._emit(m_mdiv_rem_vs(v.v_gtc_tmp(5), v.v_gtc_tmp(6), v.v_gtc_tmp(4), s.s_magic_stride_h(), s.s_shift_stride_h(), s.s_stride_h(), v.v_tmp()))
             self._emit(f"; v_gtc_tmp(5)=rem_h, v_gtc_tmp(6)=ho_idx{tag}")
-            self._emit(m_int_div_rem_vs(v.v_gtc_tmp(7), v.v_gtc_tmp(8), v.v_gtc_tmp(3), s.s_stride_w(), v.v_tmp(), s.s_tmp()))
+            self._emit(m_mdiv_rem_vs(v.v_gtc_tmp(7), v.v_gtc_tmp(8), v.v_gtc_tmp(3), s.s_magic_stride_w(), s.s_shift_stride_w(), s.s_stride_w(), v.v_tmp()))
             self._emit(f"; v_gtc_tmp(7)=rem_w, v_gtc_tmp(8)=wo_idx{tag}")
             self._emit_empty_line()
 

@@ -122,6 +122,11 @@ typedef struct {
                                 // count = ceil(total_shards / launched_grid_z).
     int   streamk_grid_y;      // Phase 58: grid.y (N-block count), for this tile's counter
                                 // index = (bx*grid_y + by).
+    // Phase 60 (Magic Division): host-computed magic multipliers for the ho_wo/wo
+    // divisors in _emit_b_gather_one_row's K-decomposition. Always present.
+    uint32_t magic_ho_wo;    // magic for ho_wo
+    uint32_t magic_wo;       // magic for wo
+    uint32_t shift_pack;     // packed shifts: ho_wo[7:0], wo[15:8]
 } __attribute__((packed)) igemm_wrw_gtc_wmma_nhwc_karg_t;
 
 static void dump_wrw_karg(igemm_wrw_gtc_karg_t * karg){
@@ -878,6 +883,17 @@ public:
             karg.dilation_h = dilation_h;
             karg.dilation_w = dilation_w;
             karg.group      = group;
+
+            // Phase 60 (Magic Division): precompute magic multipliers for the ho_wo/wo
+            // divisors in _emit_b_gather_one_row's K-decomposition, replacing ~24-instruction
+            // emulated division with 5-instruction magic multiply.
+            {
+                magic_div_u32_t mdiv_ho_wo = magic_div_u32_gen(ho * wo);
+                magic_div_u32_t mdiv_wo    = magic_div_u32_gen(wo);
+                karg.magic_ho_wo = mdiv_ho_wo.magic;
+                karg.magic_wo    = mdiv_wo.magic;
+                karg.shift_pack  = magic_div_u32_pack_shift(mdiv_ho_wo.shift, mdiv_wo.shift, 0, 0);
+            }
             size_t karg_size = sizeof(karg);
 
             hipFunction_t kernel_func;

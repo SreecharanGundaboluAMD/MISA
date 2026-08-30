@@ -171,6 +171,13 @@ typedef struct {
                             // length. Always present (even for non-split kernels, which
                             // never read it) -- see python/igemm/igemm_bwd_gtc_wmma_nhwc.py's
                             // identical karg comment.
+    // Phase 60 (Magic Division): host-computed magic multipliers for the
+    // hi_wi/wi/stride_h/stride_w divisors. Always present.
+    uint32_t magic_hi_wi;       // magic for hi_wi
+    uint32_t magic_wi;          // magic for wi
+    uint32_t magic_stride_h;    // magic for stride_h
+    uint32_t magic_stride_w;    // magic for stride_w
+    uint32_t shift_pack;        // packed shifts: hi_wi[7:0], wi[15:8], stride_h[23:16], stride_w[31:24]
 } __attribute__((packed)) igemm_bwd_gtc_wmma_nhwc_karg_t;
 
 #ifdef IGEMM_BWD_UPSAMPLING_USE_CUSTOM_KERNEL
@@ -725,6 +732,21 @@ public:
             karg.dilation_h = dilation_h;
             karg.dilation_w = dilation_w;
             karg.group      = group;
+
+            // Phase 60 (Magic Division): precompute magic multipliers for the
+            // hi_wi/wi/stride_h/stride_w divisors, replacing ~24-instruction
+            // emulated division with 5-instruction magic multiply.
+            {
+                magic_div_u32_t mdiv_hi_wi    = magic_div_u32_gen(hi * wi);
+                magic_div_u32_t mdiv_wi       = magic_div_u32_gen(wi);
+                magic_div_u32_t mdiv_stride_h = magic_div_u32_gen(stride_h);
+                magic_div_u32_t mdiv_stride_w = magic_div_u32_gen(stride_w);
+                karg.magic_hi_wi    = mdiv_hi_wi.magic;
+                karg.magic_wi       = mdiv_wi.magic;
+                karg.magic_stride_h = mdiv_stride_h.magic;
+                karg.magic_stride_w = mdiv_stride_w.magic;
+                karg.shift_pack     = magic_div_u32_pack_shift(mdiv_hi_wi.shift, mdiv_wi.shift, mdiv_stride_h.shift, mdiv_stride_w.shift);
+            }
 
             hipFunction_t kernel_func;
             std::string kernel_name = get_kernel_name(tunable);

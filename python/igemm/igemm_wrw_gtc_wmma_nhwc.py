@@ -320,6 +320,17 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self.s_hi          = sym_t('s_hi'          , sseq(1))    # bound for hi_idx
             self.s_wi          = sym_t('s_wi'          , sseq(1))    # bound for wi_idx, and multiplier for hi_idx*wi
             self.s_hi_wi       = sym_t('s_hi_wi'       , sseq(1))    # = s_hi*s_wi, computed on-device once
+            # Phase 60 (Magic Division): host-precomputed magic multipliers + packed shifts
+            # for the ho_wo/wo divisors in _emit_b_gather_one_row. Loaded from kernargs
+            # (computed driver-side via magic_div_u32_gen), replacing the ~24-instruction
+            # emulated macro_int_div_rem_vs_gfx1250_t with 5-instruction magic multiply.
+            # s_magic_ho_wo is 4-aligned (sseq(1, 4)) so it can be loaded via s_load_dwordx4
+            # alongside s_magic_wo -- mirrors fwd's identical layout.
+            self.s_magic_ho_wo  = sym_t('s_magic_ho_wo'  , sseq(1, 4))
+            self.s_magic_wo     = sym_t('s_magic_wo'     , sseq(1))
+            self.s_shift_pack   = sym_t('s_shift_pack'   , sseq(1))
+            self.s_shift_ho_wo  = sym_t('s_shift_ho_wo'  , sseq(1))
+            self.s_shift_wo     = sym_t('s_shift_wo'     , sseq(1))
             # Phase 5f (multi-tap + dilation) kernarg fields, contiguous, matching
             # get_kernel_args()'s trailing layout.
             self.s_y           = sym_t('s_y'           , sseq(1))
@@ -569,7 +580,14 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             kas.append(amdgpu_kernel_arg_t('gemm_k_num_splits', 4, 96, 'by_value', 'i32'))
             kas.append(amdgpu_kernel_arg_t('p_streamk_counter', 8, 104, 'global_buffer', 'u32', address_space='global', is_const='false'))
             kas.append(amdgpu_kernel_arg_t('streamk_max_iters', 4, 112, 'by_value', 'i32'))
-            kas.append(amdgpu_kernel_arg_t('streamk_grid_y', 4, 116, 'by_value', 'i32'))
+        # Phase 60 (Magic Division): host-precomputed magic multipliers for the ho_wo/wo
+        # divisors in _emit_b_gather_one_row's K-decomposition. Always present (even for
+        # 1x1 configs where ho_wo=1, wo=1 -- magic_div_u32_gen(1) produces valid values)
+        # so all variants share one karg struct on the driver side. Placed after all
+        # existing fields to avoid shifting any gated field's offset.
+        kas.append(amdgpu_kernel_arg_t('magic_ho_wo', 4, 120, 'by_value', 'u32'))
+        kas.append(amdgpu_kernel_arg_t('magic_wo',    4, 124, 'by_value', 'u32'))
+        kas.append(amdgpu_kernel_arg_t('shift_pack',  4, 128, 'by_value', 'u32'))
         return kas
 
     def get_kernel_code(self):
@@ -596,8 +614,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             'enable_sgpr_workgroup_id_y'       :   1,
             'enable_vgpr_workitem_id'          :   0,
             'workgroup_group_segment_byte_size':   max(self.lds_single_size * self.lds_buffer_num, epilogue_lds_bytes) + (4 if self.tunable.wrw_streamk else 0),
-            'kernarg_segment_byte_size'         :   120 if self.tunable.wrw_streamk else
-                                                     100 if (self.tunable.wmma_k_tail and self.tunable.gemm_k_global_split) else 92,
+            'kernarg_segment_byte_size'         :   132,  # Phase 60: always full struct size (C++ struct is always 132 bytes with magic fields)
             'wavefront_sgpr_count'              :   self.sgpr.s_end.value + 2 * 3,
             'workitem_vgpr_count'               :   self.vgpr.v_end.value,
             'wavefront_size'                    :   32,
@@ -802,6 +819,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"s_load_dwordx2 s[{s.s_streamk_counter_ptr()}:{s.s_streamk_counter_ptr(1)}], s[{s.s_ka()}:{s.s_ka(1)}], 104")
             self._emit(f"s_load_dword s[{s.s_streamk_max_iters()}], s[{s.s_ka()}:{s.s_ka(1)}], 112")
             self._emit(f"s_load_dword s[{s.s_streamk_grid_y()}], s[{s.s_ka()}:{s.s_ka(1)}], 116")
+        # Phase 60 (Magic Division): load magic multipliers + packed shift from kernargs
+        self._emit(f"s_load_dwordx2 s[{s.s_magic_ho_wo()}:{s.s_magic_ho_wo(1)}], s[{s.s_ka()}:{s.s_ka(1)}], 120")
+        self._emit(f"s_load_dword s[{s.s_shift_pack()}], s[{s.s_ka()}:{s.s_ka(1)}], 128")
         self._emit(f"v_mov_b32 v[{v.v_tid()}], v0")
         if self.tunable.tdm_global_load:
             # Phase 45: mirrors fwd/bwd's identical Phase 29/42 computation -- this wave's
@@ -832,6 +852,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"s_and_b32 s[{s.s_tmp()}], s[{s.s_bz()}], 0x7f   ; gsplit_stagger: bz mod 128")
             self._emit(f"s_sleep_var s[{s.s_tmp()}]")
         self._emit(f"s_wait_kmcnt 0x0")
+        # Phase 60 (Magic Division): unpack the per-divisor shifts from the packed shift
+        # word, now that s_wait_kmcnt above has guaranteed s_shift_pack's s_load_dword
+        # has actually landed. shift_pack layout: [7:0] = ho_wo shift, [15:8] = wo shift.
+        self._emit(f"s_and_b32 s[{s.s_shift_ho_wo()}], s[{s.s_shift_pack()}], 0xff")
+        self._emit(f"s_lshr_b32 s[{s.s_shift_wo()}], s[{s.s_shift_pack()}], 8")
         if self.tunable.wrw_streamk:
             # Phase 58: s_gemm_k_wg_off is NOT computed here -- unlike the static-shard
             # design, this workgroup's shard index isn't known until the persistent loop
@@ -1230,7 +1255,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
     def _emit_b_gather_one_row(self, s_k_block_off, row_offset):
         s = self.sgpr
         v = self.vgpr
-        m_int_div_rem_vs = macro_int_div_rem_vs_gfx1250_t(self.mc)
+        m_mdiv_rem_vs = macro_mdiv_u32_rem_vs_t(self.mc)
         row_note = f" + row_offset({row_offset})" if row_offset else ""
         if s_k_block_off is not None:
             self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], s[{s_k_block_off}], v[{v.v_row_local()}]   ; k_abs (within this workgroup's K-slice){row_note}")
@@ -1243,25 +1268,24 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         if self.tunable.wmma_k_tail:
             # Phase 35: capture the K-in-range check NOW, while v_gtc_tmp(0) still holds the
             # raw global k_abs -- it's about to be destroyed by the div/rem decomposition
-            # below. MUST use the dedicated v_flag_b_ktail register, NOT v_tmp scratch -- the
-            # div/rem macro below clobbers ALL FOUR v_tmp registers internally (its own
-            # division algorithm's scratch), which would silently destroy a v_tmp-based flag
-            # before it's consumed by the v_flag AND further down (a real bug found via
-            # multi-tap hardware testing).
+            # below. MUST use the dedicated v_flag_b_ktail register, NOT v_tmp scratch --
+            # the magic division macro below clobbers v_tmp(0) internally (Phase 60: only
+            # 1 VGPR now, vs 4 in the old emulated macro), which would silently destroy a
+            # v_tmp-based flag before it's consumed by the v_flag AND further down
+            # (original bug found via multi-tap hardware testing).
             self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_gemm_k()}], v[{v.v_gtc_tmp(0)}]")
             self._emit(f"v_cndmask_b32 v[{v.v_flag_b_ktail()}], 0, 1, vcc_lo   ; wmma_k_tail: k_abs < real gemm_k")
-        # row_stride redesign: this function runs once per owned row (row_stride>1), all
-        # sharing the SAME s_k_block_off argument (move_slice_window_b_functor passes
-        # s.s_tmp() once for every row). s.s_tmp() (index 0) is also the div/rem macro's
-        # own scratch below -- fine for a single call (k_abs is read into v_gtc_tmp(0)
-        # before the macro clobbers it), but row_offset>=1's call would silently re-read
-        # a clobbered s_k_block_off left over from row_offset=0's division. Route the
-        # macro's scratch through s.s_tmp(1) instead whenever row_stride>1, so s.s_tmp()
-        # itself is never written inside this function and stays valid for every row.
-        div_rem_scratch = s.s_tmp(1) if self.row_stride > 1 else s.s_tmp()
-        self._emit(m_int_div_rem_vs(v.v_gtc_tmp(1), v.v_gtc_tmp(2), v.v_gtc_tmp(0), s.s_ho_wo(), v.v_tmp(), div_rem_scratch))
+        # Phase 60 (Magic Division): replace ~24-instruction emulated divide with
+        # 5-instruction magic multiply+shift. The magic macro clobbers only a SINGLE
+        # VGPR (v_tmp), not 4 like the old macro -- but the row_stride redesign's
+        # s_k_block_off preservation concern still applies (s.s_tmp() is live across
+        # this function for row_stride>1), and s.s_tmp() is NOT clobbered by the magic
+        # macro (which has no SGPR scratch argument), so the div_rem_scratch workaround
+        # is no longer needed. Kept here as a no-op for minimal diff.
+        # Phase 60: magic multiply+shift for ho_wo and wo divisors
+        self._emit(m_mdiv_rem_vs(v.v_gtc_tmp(1), v.v_gtc_tmp(2), v.v_gtc_tmp(0), s.s_magic_ho_wo(), s.s_shift_ho_wo(), s.s_ho_wo(), v.v_tmp()))
         self._emit(f"; v_gtc_tmp(1)=hw_idx (rem), v_gtc_tmp(2)=n_idx (quo)")
-        self._emit(m_int_div_rem_vs(v.v_gtc_tmp(3), v.v_gtc_tmp(4), v.v_gtc_tmp(1), s.s_wo(), v.v_tmp(), div_rem_scratch))
+        self._emit(m_mdiv_rem_vs(v.v_gtc_tmp(3), v.v_gtc_tmp(4), v.v_gtc_tmp(1), s.s_magic_wo(), s.s_shift_wo(), s.s_wo(), v.v_tmp()))
         self._emit(f"; v_gtc_tmp(3)=wo_idx (rem), v_gtc_tmp(4)=ho_idx (quo)")
         self._emit_empty_line()
 
