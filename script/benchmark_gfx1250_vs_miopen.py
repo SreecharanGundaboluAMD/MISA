@@ -78,6 +78,15 @@ DIRECT_STORE_CONFIGS = {
     ('bwd', 'base'):   'config/igemm_bwd_gtc_gfx1250_nhwc_bf16_direct.config',
     ('bwd', 'mtail'):  'config/igemm_bwd_gtc_gfx1250_nhwc_bf16_mtail_direct.config',
 }
+# Phase 15: interleave variant added as a candidate for 1x1-filter bf16 configs.
+# Only applies to 128x128 tiles with gemm_k_per_block=64 (k2x), and only for 1x1
+# filters (nxe=0). The benchmark script tries this alongside the primary config
+# and reports whichever is fastest.
+INTERLEAVE_CONFIGS = {
+    ('fwd', 'interleave'): 'config/igemm_fwd_gtc_gfx1250_nhwc_bf16_interleave.config',
+    ('bwd', 'interleave'): 'config/igemm_bwd_gtc_gfx1250_nhwc_bf16_interleave.config',
+    ('wrw', 'interleave'): 'config/igemm_wrw_gtc_gfx1250_nhwc_bf16_interleave.config',
+}
 
 # The 38 shapes from docs/gfx1250_vendor_benchmark_vs_miopen.md's "full re-triage"
 # and "vs. MIOpen running natively on gfx1250" tables (2026-08-27 updates), batch=42
@@ -172,6 +181,8 @@ def config_name_to_file(direction, config_name):
     elif config_name.startswith('combo_'):
         tm, tn = config_name.split('_')[1].split('x')
         return f'config/igemm_{direction}_gtc_gfx1250_nhwc_bf16_{tm}x{tn}_all.config'
+    elif config_name == 'interleave':
+        return INTERLEAVE_CONFIGS.get((direction, config_name))
     elif config_name.endswith('_direct'):
         return DIRECT_STORE_CONFIGS.get((direction, config_name.replace('_direct', '')))
     else:
@@ -261,7 +272,7 @@ def main():
     # candidate configs per shape = its own hardcoded config, plus 'gsplit' for
     # bwd/fwd (see GSPLIT_CANDIDATE) if not already the same and if a gsplit config
     # exists for that direction -- report whichever candidate is fastest.
-    def candidates_for(direction, config):
+    def candidates_for(direction, config, y=1, x=1):
         cands = [config]
         gsplit = GSPLIT_CANDIDATE.get(direction)
         if gsplit and gsplit != config and (direction, gsplit) in CONFIG_FILES:
@@ -270,6 +281,10 @@ def main():
         direct = config + '_direct'
         if direction in ('fwd', 'bwd') and (direction, config) in DIRECT_STORE_CONFIGS:
             cands.append(direct)
+        # Phase 15: try interleave variant for 1x1-filter shapes only
+        # (interleave configs have nxe=0, so only applicable to 1x1 convolutions)
+        if y == 1 and x == 1 and (direction, 'interleave') in INTERLEAVE_CONFIGS:
+            cands.append('interleave')
         # Combinatorial sweep (2026-08-28): also try per-tile master configs which
         # include every valid tunable combination for that tile shape
         for tm, tn in [(128,128), (64,64), (128,64), (64,128), (32,32)]:
@@ -294,7 +309,7 @@ def main():
         cand_names = set()
         for s in shapes:
             if s[0] == d:
-                for cfg in candidates_for(s[0], s[8]):
+                for cfg in candidates_for(s[0], s[8], s[5], s[6]):
                     cand_names.add(cfg)
         print(f"\n--- {d}: {len(cand_names)} config targets ---")
         all_built[d] = build_all_configs_parallel(d, args.build_dir, cand_names, args.rebuild)
@@ -311,7 +326,7 @@ def main():
         dir_built = all_built.get(direction, {})
         best_ms, best_config, best_err = None, config, None
         all_candidates = []  # track every candidate's result
-        for cand_config in candidates_for(direction, config):
+        for cand_config in candidates_for(direction, config, y, x):
             out_dir = dir_built.get(cand_config)
             if out_dir is None:
                 continue  # this config failed to build

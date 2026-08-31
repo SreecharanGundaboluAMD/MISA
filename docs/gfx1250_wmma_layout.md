@@ -1666,24 +1666,55 @@ tunable (`main_loop_interleave=0` for every existing config) costs nothing to ke
 `_interleave` config is a reference point for future re-benchmarking, not a recommended
 setting today.
 
+### Ported to bwd and wrw (2026-08-31)
+
+Extended to bwd and wrw using a per-operand design: the single `ctrl.interleave` flag was
+replaced with `ctrl.interleave_a`/`ctrl.interleave_b`, and `emit_interleaved_substeps` was
+rewritten as `emit_mixed_substeps` handling mixed interleave/non-interleave per operand.
+- **bwd**: `interleave_a=True, interleave_b=False`. A (grad_output) is untransposed and
+  interleaves directly. B (weight) is transposed and reuses `v_gld_b` as scratch in
+  `shared_load_b` — interleaving would clobber in-flight chunk loads, so B stays on the
+  deferred bulk path.
+- **wrw**: `interleave_a=True, interleave_b=False`. A (grad_output) is transposed but its
+  `shared_load_a` scratch is redirected to a dedicated `v_scratch` VGPR (4 regs), freeing
+  `v_gld_a` for interleaved chunk loads. B (input) is transposed, same scratch-clobber
+  risk as bwd's B.
+- **fwd**: `interleave_a=interleave_b=True` (unchanged behavior, both operands untransposed).
+
+**Hardware-validated**: all three directions pass `conv_driver.exe -V 1` (valid:y) across
+multiple shapes. Non-interleave configs regression-checked.
+
+**Performance**: No improvement on bwd or wrw.
+- BWD: ~7-10% **slower** (0.90-0.93x baseline speed) across shapes — same regression
+  pattern as fwd's original Phase 15 finding.
+- WRW: flat (~1.0x, within noise) — wrw's transposed A shared_load is already
+  latency-heavy, and the interleave overhead (per-chunk `s_wait_loadcnt`+`ds_write_b128`)
+  offsets any latency-hiding gain.
+The feature is correct and available behind `main_loop_interleave=1` but not beneficial
+for current tile shapes, consistent with fwd's own Phase 15 regression finding.
+
 ### Not yet done
 
 Testing at `num_k_substeps > 2` (e.g. `gemm_k_per_block=128`, if/when such a config exists) to
 see whether the regression narrows or widens with more chunks to interleave; extending to
-bf16/int8/fp32; extending to bwd's A (untransposed, same mechanism should port directly) and
-combining with bwd's already-ported `row_repeat_a` (currently mutually exclusive); root-causing
-why interleaving regresses rather than wins, if a future session wants to pursue it further.
-
+bf16/int8/fp32 for bwd/wrw; root-causing why interleaving regresses rather than wins, if a
+future session wants to pursue it further.
 ### Critical files
 
-- `python/operations/wmma_main_loop.py` -- `ctrl.interleave`, `emit_interleaved_substeps()`,
-  the new single-chunk functor fields
+- `python/operations/wmma_main_loop.py` -- `ctrl.interleave_a`/`ctrl.interleave_b`,
+  `emit_mixed_substeps()`, the single-chunk functor fields
 - `python/igemm/igemm_fwd_gtc_wmma_nhwc.py` -- `global_load_chunk_a/b_functor`,
   `shared_store_chunk_a/b_functor`, the `main_loop_interleave` asserts (mutual exclusion with
   `async_global_load`/`row_repeat`, requires `lds_double_buffer`)
-- `python/igemm/igemm_base.py` -- new `main_loop_interleave` tunable (WMMA branch)
-- `config/igemm_fwd_gtc_gfx1250_nhwc_fp16_interleave.config` -- new config (k-sub-loop +
+- `python/igemm/igemm_bwd_gtc_wmma_nhwc.py` -- `global_load_chunk_a_functor`,
+  `shared_store_chunk_a_functor`, bwd interleave asserts, `ctrl.interleave_a=True/interleave_b=False`
+- `python/igemm/igemm_wrw_gtc_wmma_nhwc.py` -- `v_scratch` VGPR, `shared_load_a` scratch
+  redirect, `global_load_chunk_a_functor`, `shared_store_chunk_a_functor`, wrw interleave asserts
+- `python/igemm/igemm_base.py` -- `main_loop_interleave` tunable (WMMA branch)
+- `config/igemm_fwd_gtc_gfx1250_nhwc_fp16_interleave.config` -- fwd config (k-sub-loop +
   double-buffer + interleave combined)
+- `config/igemm_bwd_gtc_gfx1250_nhwc_fp16_interleave.config` -- bwd config
+- `config/igemm_wrw_gtc_gfx1250_nhwc_fp16_interleave.config` -- wrw config
 
 ### Phase 16 (2026-08-25): fold `lds_double_buffer`/`async_global_load`/`main_loop_interleave` into the mangled kernel name
 

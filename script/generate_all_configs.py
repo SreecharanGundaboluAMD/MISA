@@ -113,7 +113,6 @@ def is_valid(direction, precision, tile_m, tile_n, gemm_k, vals):
     if mli and lpn > 1:      return False
     if mli and not ldb:      return False
     if mli and gs:           return False
-    if mli and direction != 'fwd': return False
     if mli and tile_m != tile_n: return False
     if lpn > 1 and precision in ('fp16', 'bf16') and tile_m == 128: return False
     if elp and tile_m == 128: return False
