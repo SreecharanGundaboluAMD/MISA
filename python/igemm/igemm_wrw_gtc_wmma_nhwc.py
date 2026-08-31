@@ -306,6 +306,19 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         assert not (tunable.main_loop_interleave and (tunable.gemm_k_global_split or tunable.wrw_streamk)), \
             "gemm_k_global_split/wrw_streamk is not yet combined with main_loop_interleave for wrw -- not audited together"
 
+        # Phase 61 (32-bit SADDR global loads, wrw port): same discipline as fwd/bwd --
+        # mutually exclusive with async/tdm, main_loop_interleave, gemm_k_global_split/
+        # wrw_streamk, and row_stride>1 (untested combinations).
+        assert not (tunable.saddr_global_load and tunable.async_global_load), \
+            "saddr_global_load and async_global_load are mutually exclusive -- both are alternatives to the default 64-bit VADDR-pair path"
+        assert not (tunable.saddr_global_load and tunable.tdm_global_load), \
+            "saddr_global_load and tdm_global_load are mutually exclusive -- both are alternatives to the default 64-bit VADDR-pair path"
+        assert not (tunable.saddr_global_load and tunable.main_loop_interleave), \
+            "saddr_global_load is not yet combined with main_loop_interleave for wrw -- not audited together"
+        assert not (tunable.saddr_global_load and (tunable.gemm_k_global_split or tunable.wrw_streamk)), \
+            "saddr_global_load is not yet combined with gemm_k_global_split/wrw_streamk for wrw -- not audited together"
+        assert not (tunable.saddr_global_load and self.row_stride > 1), \
+            "saddr_global_load is not yet supported together with row_stride > 1 (untested combination)"
         self.sgpr = self.kernel_sgpr_t(mc, self)
         self.vgpr = self.kernel_vgpr_t(mc, self)
 
@@ -453,12 +466,19 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             # K-rows, each needing its own persistent address -- sized 2*row_stride (row r's
             # pair is registers 2*r/2*r+1); row_stride==1 (every existing config) keeps this
             # byte-identical to a single pair.
-            self.v_addr_a      = sym_t('v_addr_a'      , vseq(2 * outer.row_stride, 2))    # persistent global A address(es) (64-bit each)
-            self.v_addr_b      = sym_t('v_addr_b'      , vseq(2 * outer.row_stride, 2))
-            # Phase 5f: A's tap-independent base address (row_local/block_m_off/col_start only
-            # -- no Y,X dependence), reset into v_addr_a fresh at the start of every tap since
-            # move_slice_window_a incrementally bumps v_addr_a across a tap's own K-loop.
-            self.v_addr_a_base = sym_t('v_addr_a_base' , vseq(2 * outer.row_stride, 2))
+            if outer.tunable.saddr_global_load:
+                # Phase 61: 32-bit byte offsets (SADDR carries s_p_in/s_p_wei separately).
+                # row_stride==1 asserted when saddr is on.
+                self.v_off_a      = sym_t('v_off_a'      , vseq(1))
+                self.v_off_b      = sym_t('v_off_b'      , vseq(1))
+                self.v_off_a_base = sym_t('v_off_a_base' , vseq(1))
+            else:
+                self.v_addr_a      = sym_t('v_addr_a'      , vseq(2 * outer.row_stride, 2))    # persistent global A address(es) (64-bit each)
+                self.v_addr_b      = sym_t('v_addr_b'      , vseq(2 * outer.row_stride, 2))
+                # Phase 5f: A's tap-independent base address (row_local/block_m_off/col_start only
+                # -- no Y,X dependence), reset into v_addr_a fresh at the start of every tap since
+                # move_slice_window_a incrementally bumps v_addr_a across a tap's own K-loop.
+                self.v_addr_a_base = sym_t('v_addr_a_base' , vseq(2 * outer.row_stride, 2))
             self.v_addr_out    = sym_t('v_addr_out'    , vseq(2))    # scratch used by coalescing_store_wmma (ping-pong pair)
             if outer.tunable.wmma_m_tail:
                 # Phase 35: extra scratch for coalescing_store_wmma's per-element absolute-row
@@ -1049,9 +1069,13 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             # v_addr_a_base stays shard-independent; emit_kernel_streamk_loop() adds the current
             # iteration's offset directly onto v_addr_a (not v_addr_a_base) after each claim.
             self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.data_byte)}, v[{v.v_tmp()}]")
-            self._emit(f"v_mov_b32 v[{v.v_addr_a_base(1)}], s[{s.s_p_in(1)}]")
-            self._emit(f"v_add_co_u32 v[{v.v_addr_a_base()}], vcc_lo, s[{s.s_p_in()}], v[{v.v_tmp()}]")
-            self._emit(f"v_add_co_ci_u32 v[{v.v_addr_a_base(1)}], vcc_lo, 0, v[{v.v_addr_a_base(1)}], vcc_lo")
+            if self.tunable.saddr_global_load:
+                # Phase 61: byte OFFSET only -- s_p_in passed separately as SADDR
+                self._emit(f"v_mov_b32 v[{v.v_off_a_base()}], v[{v.v_tmp()}]")
+            else:
+                self._emit(f"v_mov_b32 v[{v.v_addr_a_base(1)}], s[{s.s_p_in(1)}]")
+                self._emit(f"v_add_co_u32 v[{v.v_addr_a_base()}], vcc_lo, s[{s.s_p_in()}], v[{v.v_tmp()}]")
+                self._emit(f"v_add_co_ci_u32 v[{v.v_addr_a_base(1)}], vcc_lo, 0, v[{v.v_addr_a_base(1)}], vcc_lo")
             self._emit_empty_line()
 
             # ---- persistent setup for B's per-iteration gather (input, gathered through
@@ -1177,9 +1201,12 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             # ---- reset A's address(es) to its tap-independent base (move_slice_window_a
             # bumped it across the PREVIOUS tap's K-loop). row_stride>1: one pair per owned
             # row; row_stride==1 is a single pair, byte-identical to before. ----
-            for row_offset in range(self.row_stride):
-                self._emit(f"v_mov_b32 v[{v.v_addr_a(2 * row_offset)}], v[{v.v_addr_a_base(2 * row_offset)}]")
-                self._emit(f"v_mov_b32 v[{v.v_addr_a(2 * row_offset + 1)}], v[{v.v_addr_a_base(2 * row_offset + 1)}]")
+            if self.tunable.saddr_global_load:
+                self._emit(f"v_mov_b32 v[{v.v_off_a()}], v[{v.v_off_a_base()}]   ; Phase 61: reset A byte offset to base")
+            else:
+                for row_offset in range(self.row_stride):
+                    self._emit(f"v_mov_b32 v[{v.v_addr_a(2 * row_offset)}], v[{v.v_addr_a_base(2 * row_offset)}]")
+                    self._emit(f"v_mov_b32 v[{v.v_addr_a(2 * row_offset + 1)}], v[{v.v_addr_a_base(2 * row_offset + 1)}]")
             self._emit_empty_line()
 
             # ---- B's initial (k_block_off=0) gather for this tap's first global load --
@@ -1356,11 +1383,16 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_b_n_total()}], v[{v.v_gtc_tmp(0)}]   ; row_idx * b_n_total")
         self._emit(f"v_lshlrev_b32 v[{v.v_gtc_tmp(0)}], {utility_log2(self.data_byte)}, v[{v.v_gtc_tmp(0)}]")
         self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], v[{v.v_b_col_off()}]")
-        self._emit(f"v_mov_b32 v[{v.v_addr_b(2 * row_offset + 1)}], s[{s.s_p_wei(1)}]")
-        self._emit(f"v_add_co_u32 v[{v.v_addr_b(2 * row_offset)}], vcc_lo, s[{s.s_p_wei()}], v[{v.v_gtc_tmp(0)}]")
-        self._emit(f"v_add_co_ci_u32 v[{v.v_addr_b(2 * row_offset + 1)}], vcc_lo, 0, v[{v.v_addr_b(2 * row_offset + 1)}], vcc_lo")
+        if self.tunable.saddr_global_load:
+            # Phase 61: byte OFFSET only -- s_p_wei passed separately as SADDR.
+            # row_stride==1 asserted when saddr is on, so row_offset is always 0.
+            self._emit(f"v_mov_b32 v[{v.v_off_b()}], v[{v.v_gtc_tmp(0)}]   ; v_off_b = row_idx * b_n_total * databyte + v_b_col_off")
+        else:
+            self._emit(f"v_mov_b32 v[{v.v_addr_b(2 * row_offset + 1)}], s[{s.s_p_wei(1)}]")
+            self._emit(f"v_add_co_u32 v[{v.v_addr_b(2 * row_offset)}], vcc_lo, s[{s.s_p_wei()}], v[{v.v_gtc_tmp(0)}]")
+            self._emit(f"v_add_co_ci_u32 v[{v.v_addr_b(2 * row_offset + 1)}], vcc_lo, 0, v[{v.v_addr_b(2 * row_offset + 1)}], vcc_lo")
 
-    def _emit_gld_chunk_load(self, v_gld, v_addr, chunk_idx, v_flag=None, v_flag_col=None):
+    def _emit_gld_chunk_load(self, v_gld, v_addr, chunk_idx, v_flag=None, v_flag_col=None, saddr=None):
         ''' Phase 1 (k-sub-loop): issues (does not wait) ONE inst_wmma.k-wide chunk's
         global load into the small, reused v_gld buffer.
 
@@ -1395,7 +1427,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 self._emit(f"v_cmpx_le_u32 1, v[{v_flag_col(sub_chunk)}]")
         for i in range(self.chunk_num_dwordx4):
             idx = sub_chunk * self.chunk_num_dwordx4 + i
-            self._emit(f"global_load_dwordx4 v[{v_gld(i*4)}:{v_gld(i*4+3)}], v[{a_lo}:{a_hi}], off offset:{idx*16}")
+            if saddr is not None:
+                self._emit(f"global_load_dwordx4 v[{v_gld(i*4)}:{v_gld(i*4+3)}], v[{v_addr()}], s[{saddr()}:{saddr(1)}] offset:{idx*16}")
+            else:
+                self._emit(f"global_load_dwordx4 v[{v_gld(i*4)}:{v_gld(i*4+3)}], v[{a_lo}:{a_hi}], off offset:{idx*16}")
         if v_flag is not None or v_flag_col is not None:
             self._emit(f"s_mov_b32 exec_lo, -1")
 
@@ -1418,7 +1453,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             idx = sub_chunk * self.chunk_num_dwordx4 + i
             self._emit(f"ds_write_b128 v[{v_sst_os()}], v[{v_gld(i*4)}:{v_gld(i*4+3)}] offset:{sst_extra_off + row_offset * row_pitch_bytes + idx*16}")
 
-    def _emit_sst_remaining_chunks(self, v_gld, v_addr, v_sst_os, sst_extra_off, v_flag=None, v_flag_col=None):
+    def _emit_sst_remaining_chunks(self, v_gld, v_addr, v_sst_os, sst_extra_off, v_flag=None, v_flag_col=None, saddr=None):
         '''
         Phase 1 (k-sub-loop): stores chunk 0 (already loaded+waited via the existing
         global_load_a/b_functor + outer s_wait_loadcnt call sequence in
@@ -1433,11 +1468,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         '''
         self._emit_sst_chunk(v_gld, v_sst_os, sst_extra_off, 0)
         for c in range(1, self.num_k_chunks):
-            self._emit_gld_chunk_load(v_gld, v_addr, c, v_flag=v_flag, v_flag_col=v_flag_col)
+            self._emit_gld_chunk_load(v_gld, v_addr, c, v_flag=v_flag, v_flag_col=v_flag_col, saddr=saddr)
             self._emit(f"s_wait_loadcnt 0x0")
             self._emit_sst_chunk(v_gld, v_sst_os, sst_extra_off, c)
 
-    def _emit_sst_all_chunks(self, v_gld, v_addr, v_sst_os, sst_extra_off, v_flag=None, v_flag_col=None):
+    def _emit_sst_all_chunks(self, v_gld, v_addr, v_sst_os, sst_extra_off, v_flag=None, v_flag_col=None, saddr=None):
         '''
         Phase 1 (k-sub-loop): like _emit_sst_remaining_chunks, but load+wait+stores ALL
         num_k_chunks chunks here (including chunk 0 -- global_load_a/b_functor issues no
@@ -1452,8 +1487,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         _emit_sst_remaining_chunks itself guards against).
         '''
         for c in range(self.num_k_chunks):
-            self._emit_gld_chunk_load(v_gld, v_addr, c, v_flag=v_flag, v_flag_col=v_flag_col)
-            self._emit(f"s_wait_loadcnt 0x0")
+            self._emit_gld_chunk_load(v_gld, v_addr, c, v_flag=v_flag, v_flag_col=v_flag_col, saddr=saddr)
             self._emit_sst_chunk(v_gld, v_sst_os, sst_extra_off, c)
 
     def _a_flag_symbol(self):
@@ -1512,7 +1546,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                         # tile straight into LDS, wave-0-only issue.
                         outer._emit_wave0_only(lambda: outer._emit(f"tensor_load_to_lds s[{s.s_tdm_g0()}:{s.s_tdm_g0(3)}], s[{s.s_tdm_g1()}:{s.s_tdm_g1(7)}]"))
                     elif outer.num_k_chunks == 1 or outer.tunable.main_loop_interleave:
-                        outer._emit_gld_chunk_load(v.v_gld_a, v.v_addr_a, 0, v_flag=outer._a_flag_symbol())
+                        if outer.tunable.saddr_global_load:
+                            outer._emit_gld_chunk_load(v.v_gld_a, v.v_off_a, 0, v_flag=outer._a_flag_symbol(), saddr=s.s_p_in)
+                        else:
+                            outer._emit_gld_chunk_load(v.v_gld_a, v.v_addr_a, 0, v_flag=outer._a_flag_symbol())
                 return outer._get_deferred()
             def get_issues(self):
                 return outer.chunk_num_dwordx4
@@ -1538,7 +1575,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                         # Phase 45: mirrors global_load_a_functor's TDM branch above.
                         outer._emit_wave0_only(lambda: outer._emit(f"tensor_load_to_lds s[{s.s_tdm_g0_b()}:{s.s_tdm_g0_b(3)}], s[{s.s_tdm_g1_b()}:{s.s_tdm_g1_b(7)}]"))
                     elif outer.num_k_chunks == 1:
-                        outer._emit_gld_chunk_load(v.v_gld_b, v.v_addr_b, 0, v_flag=v.v_flag)
+                        if outer.tunable.saddr_global_load:
+                            outer._emit_gld_chunk_load(v.v_gld_b, v.v_off_b, 0, v_flag=v.v_flag, saddr=s.s_p_wei)
+                        else:
+                            outer._emit_gld_chunk_load(v.v_gld_b, v.v_addr_b, 0, v_flag=v.v_flag)
                 return outer._get_deferred()
             def get_issues(self):
                 return outer.chunk_num_dwordx4
@@ -1549,15 +1589,14 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
+                s = outer.sgpr
                 with outer._deferred_context():
+                    v_a_addr = v.v_off_a if outer.tunable.saddr_global_load else v.v_addr_a
+                    s_a_saddr = s.s_p_in if outer.tunable.saddr_global_load else None
                     if outer.num_k_chunks == 1 or outer.tunable.main_loop_interleave:
-                        # Phase 15 (interleave): chunk 0 already loaded by global_load_a_functor
-                        # -- use _emit_sst_remaining_chunks (stores chunk 0, then loads+stores
-                        # 1..N-1). row_stride==1 asserted when interleave is on, so v_flag_col
-                        # is always None here.
-                        outer._emit_sst_remaining_chunks(v.v_gld_a, v.v_addr_a, v.v_sst_os, 0, v_flag=outer._a_flag_symbol(), v_flag_col=outer._a_flag_col_symbol())
+                        outer._emit_sst_remaining_chunks(v.v_gld_a, v_a_addr, v.v_sst_os, 0, v_flag=outer._a_flag_symbol(), v_flag_col=outer._a_flag_col_symbol(), saddr=s_a_saddr)
                     else:
-                        outer._emit_sst_all_chunks(v.v_gld_a, v.v_addr_a, v.v_sst_os, 0, v_flag=outer._a_flag_symbol(), v_flag_col=outer._a_flag_col_symbol())
+                        outer._emit_sst_all_chunks(v.v_gld_a, v_a_addr, v.v_sst_os, 0, v_flag=outer._a_flag_symbol(), v_flag_col=outer._a_flag_col_symbol(), saddr=s_a_saddr)
                 return outer._get_deferred()
             def get_issues(self):
                 return outer.chunk_num_dwordx4
@@ -1568,11 +1607,14 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
+                s = outer.sgpr
                 with outer._deferred_context():
+                    v_b_addr = v.v_off_b if outer.tunable.saddr_global_load else v.v_addr_b
+                    s_b_saddr = s.s_p_wei if outer.tunable.saddr_global_load else None
                     if outer.num_k_chunks == 1:
-                        outer._emit_sst_remaining_chunks(v.v_gld_b, v.v_addr_b, v.v_sst_os, outer.lds_a_size, v_flag=v.v_flag, v_flag_col=outer._b_flag_col_symbol())
+                        outer._emit_sst_remaining_chunks(v.v_gld_b, v_b_addr, v.v_sst_os, outer.lds_a_size, v_flag=v.v_flag, v_flag_col=outer._b_flag_col_symbol(), saddr=s_b_saddr)
                     else:
-                        outer._emit_sst_all_chunks(v.v_gld_b, v.v_addr_b, v.v_sst_os, outer.lds_a_size, v_flag=v.v_flag, v_flag_col=outer._b_flag_col_symbol())
+                        outer._emit_sst_all_chunks(v.v_gld_b, v_b_addr, v.v_sst_os, outer.lds_a_size, v_flag=v.v_flag, v_flag_col=outer._b_flag_col_symbol(), saddr=s_b_saddr)
                 return outer._get_deferred()
             def get_issues(self):
                 return outer.chunk_num_dwordx4
@@ -1587,8 +1629,12 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         class functor_t:
             def __call__(self, chunk_idx):
                 v = outer.vgpr
+                s = outer.sgpr
                 with outer._deferred_context():
-                    outer._emit_gld_chunk_load(v.v_gld_a, v.v_addr_a, chunk_idx, v_flag=outer._a_flag_symbol(), v_flag_col=outer._a_flag_col_symbol())
+                    if outer.tunable.saddr_global_load:
+                        outer._emit_gld_chunk_load(v.v_gld_a, v.v_off_a, chunk_idx, v_flag=outer._a_flag_symbol(), v_flag_col=outer._a_flag_col_symbol(), saddr=s.s_p_in)
+                    else:
+                        outer._emit_gld_chunk_load(v.v_gld_a, v.v_addr_a, chunk_idx, v_flag=outer._a_flag_symbol(), v_flag_col=outer._a_flag_col_symbol())
                 return outer._get_deferred()
         return functor_t()
 
@@ -1753,6 +1799,13 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                         outer._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim1 (remaining K) hi16")
                         outer._emit(f"s_or_b32 s[{s.s_tdm_g1(3)}], s[{s.s_tmp(0)}], {outer.tunable.gemm_m_per_block << 16}   ; | tile_dim0 (compile-time)")
                         outer._emit_front(f"{skip_label}:")
+                    elif outer.tunable.saddr_global_load:
+                        # Phase 61: v_off_a is a plain 32-bit byte OFFSET, advance by
+                        # s_a_k_stride (one K-tile's worth of rows) -- no carry chain.
+                        outer._emit(f"v_add_u32 v[{v.v_off_a()}], s[{s.s_a_k_stride()}], v[{v.v_off_a()}]")
+                        if outer.tunable.wmma_k_tail:
+                            outer._emit(f"s_sub_i32 s[{s.s_tmp(1)}], s[{s.s_knum()}], s[{s.s_kitr()}]   ; k_block_off")
+                            outer._emit_a_kflag(s.s_tmp(1))
                     else:
                         # row_stride redesign: every owned row advances by the SAME
                         # s_a_k_stride (one whole K-block's worth of rows) each iteration --
