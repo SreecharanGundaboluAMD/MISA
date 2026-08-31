@@ -177,8 +177,15 @@ static inline double get_theoritical_gpu_gflops(int sclk_mhz, driverDataType_t d
     HIP_CALL(hipGetDeviceProperties(&dev_prop, dev));
     num_cu = dev_prop.multiProcessorCount;
     gcn_arch = get_gcn_arch(dev_prop.gcnArchName);
-    if(gcn_arch >= 1000)
+    // gfx10/RDNA reports WGP count (each = 2 CUs), so double for those.
+    // gfx1250/CDNA5 reports actual CU count, so don't double.
+    if(gcn_arch >= 1000 && gcn_arch != 1250)
         num_cu *= 2;
+
+    // If the caller didn't override sclk via IGEMM_SCLK_MHZ (left it at the
+    // hardcoded default), use the device's actual clock rate instead.
+    if(sclk_mhz == 1283)
+        sclk_mhz = dev_prop.clockRate / 1000;
 
     int fp_factor = 1;
     if(data_type == driverHalf){
@@ -188,6 +195,22 @@ static inline double get_theoritical_gpu_gflops(int sclk_mhz, driverDataType_t d
             fp_factor = 4;  // xdlops
         else if(gcn_arch == 1250)
             fp_factor = 8;  // wmma, v_wmma_f32_16x16x32_f16
+        else
+            fp_factor = 2;  // dlops
+        if(gcn_arch >= 1000 && gcn_arch != 1250)
+            fp_factor = 2;
+    }
+    // bf16 WMMA has the same matrix dimensions and throughput as fp16 WMMA
+    // (v_wmma_f32_16x16x32_bf16 vs v_wmma_f32_16x16x32_f16), so the bf16
+    // fp_factor must match fp16. Without this branch, bf16 fell through to
+    // fp_factor=1, understating peak by 8x and inflating efficiency 8x.
+    if(data_type == driverBFloat16){
+        if(gcn_arch == 950 || gcn_arch == 942 || gcn_arch == 941 || gcn_arch == 940)
+            fp_factor = 8;  // xdlops
+        else if(gcn_arch == 908 || gcn_arch == 910)
+            fp_factor = 4;  // xdlops
+        else if(gcn_arch == 1250)
+            fp_factor = 8;  // wmma, v_wmma_f32_16x16x32_bf16
         else
             fp_factor = 2;  // dlops
         if(gcn_arch >= 1000 && gcn_arch != 1250)

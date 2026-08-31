@@ -17,7 +17,8 @@ Options:
     --rebuild                       force-rebuild every MISA config even if already built
     --warmup N                      IGEMM_WARMUP (default 5, matches the doc's methodology)
     --repeat N                      IGEMM_REPEAT (default 20, matches the doc's methodology)
-    --verify                        run with -V 1 (correctness check) instead of -V 0 (timing only)
+    --verify                        (always on) -V 1 is now always used so the cost filter
+                                    can require valid:y; this flag only gates --log-dir logs
     --build-dir DIR                 where to build MISA configs (default: bench_out/, gitignored)
     --markdown-out FILE             also write the results table to FILE
 
@@ -127,7 +128,16 @@ SHAPES = [
     ('wrw', 256, 60,  80,  64,  1, 1, 0, 'gsplit', 0.058897, 0.052172, '156/ConvHipImplicitGemmGroupWrwXdlops'),
 ]
 
-COST_RE = re.compile(r'\[(fwd|bwd|wrw):\s*\d+\][^\n]*?cost:([0-9.]+)ms')
+# Must require a trailing `valid:y`: the driver only emits a `valid:` field under
+# -V 1, and an invalid/faulting tunable (e.g. the Phase-58 stream-K wrw kernels,
+# which fault the GPU with HSA_STATUS_ERROR_MEMORY_FAULT) still prints a `cost:`
+# line under -V 0 with NO validity flag -- so a bare min(costs) silently picked
+# the fault-abort time (~0.03ms) as "fastest", faking "wrw faster than MIOpen".
+# See docs/gfx1250_vendor_benchmark_vs_miopen.md's 2026-08-31 finding and the
+# benchmark-script-validn-trap memory. Requiring valid:y excludes both invalid
+# tunables (valid:n) and any stray -V 0 lines (no field). run_shape() always
+# passes -V 1 so this field is always present.
+COST_RE = re.compile(r'\[(fwd|bwd|wrw):\s*\d+\][^\n]*?cost:([0-9.]+)ms[^\n]*?valid:y\b')
 
 
 def check_gpu_contention():
@@ -205,7 +215,11 @@ def run_shape(out_dir, direction, c, H, W, k, y, x, p, warmup, repeat, verify):
         '-u', '1', '-v', '1', '-l', '1', '-j', '1',
         '-m', 'conv', '-g', '1', '-F', str(FORW_FLAG[direction]), '-t', '1',
         '--in_layout', 'NHWC', '--fil_layout', 'NHWC', '--out_layout', 'NHWC',
-        '-V', '1' if verify else '0',
+        # Always -V 1: the cost filter requires a valid:y field, which the driver
+        # only emits under verification. The old -V 0 path picked invalid/faulting
+        # tunables' abort times as "fastest" (see COST_RE note). --verify now only
+        # controls whether logs are written.
+        '-V', '1',
     ]
     env = dict(os.environ, IGEMM_WARMUP=str(warmup), IGEMM_REPEAT=str(repeat))
     try:
@@ -232,7 +246,10 @@ def main():
     ap.add_argument('--rebuild', action='store_true', help='force-rebuild every config even if already built')
     ap.add_argument('--warmup', type=int, default=5)
     ap.add_argument('--repeat', type=int, default=20)
-    ap.add_argument('--verify', action='store_true', help='run with -V 1 instead of -V 0')
+    ap.add_argument('--verify', action='store_true',
+                    help='(always on) -V 1 is now always used so the cost filter can require '
+                         'valid:y; this flag is kept for backward compatibility and only gates '
+                         'whether full per-shape logs are written via --log-dir')
     ap.add_argument('--build-dir', default=os.path.join(REPO_ROOT, 'bench_out'))
     ap.add_argument('--markdown-out', default=None)
     ap.add_argument('--log-dir', default=None, help='Directory to write full per-shape conv_driver.exe output logs')

@@ -39,23 +39,25 @@ def run_shape(exe_dir, shape, warmup, repeat):
         "-u", str(u), "-v", str(u), "-l", "1", "-j", "1", "-g", "1",
         "-F", "4", "-t", "1",
         "--in_layout", "NHWC", "--fil_layout", "NHWC", "--out_layout", "NHWC",
-        "-V", "0",
+        "-V", "1",
     ]
     env = os.environ.copy()
     env["IGEMM_WARMUP"] = str(warmup)
     env["IGEMM_REPEAT"] = str(repeat)
     result = subprocess.run(args, capture_output=True, text=True, timeout=120, env=env, cwd=exe_dir)
-    # Parse cost lines — find the minimum (best candidate)
+    # Parse cost lines — keep only valid:y lines so a fast-but-wrong kernel
+    # can never win the min(costs) comparison.
     costs = []
     valid = None
     for line in result.stdout.splitlines():
         m = re.search(r'cost:([\d.]+)ms', line)
         if m:
-            costs.append(float(m.group(1)))
-        if 'valid:' in line:
             vm = re.search(r'valid:(\w+)', line)
-            if vm:
-                valid = vm.group(1)
+            line_valid = vm.group(1) if vm else None
+            if line_valid:
+                valid = line_valid
+            if line_valid == 'y':
+                costs.append(float(m.group(1)))
     best = min(costs) if costs else float('inf')
     return best, valid, costs
 

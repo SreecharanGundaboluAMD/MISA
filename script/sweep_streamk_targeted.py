@@ -35,7 +35,7 @@ COMBOS = [
     (105, 64),   # even fewer, small grid
 ]
 
-def run_shape(shape, env_overrides, warmup=3, repeat=5, verify=True):
+def run_shape(shape, env_overrides, warmup=3, repeat=5):
     c, H, W, k, y, x, p, u = shape
     args = [
         os.path.join(STREAMK_DIR, "conv_driver.exe"), "convbfp16",
@@ -44,7 +44,7 @@ def run_shape(shape, env_overrides, warmup=3, repeat=5, verify=True):
         "-u", str(u), "-v", str(u), "-l", "1", "-j", "1", "-g", "1",
         "-F", "4", "-t", "1",
         "--in_layout", "NHWC", "--fil_layout", "NHWC", "--out_layout", "NHWC",
-        "-V", "1" if verify else "0",
+        "-V", "1",
     ]
     env = os.environ.copy()
     env["IGEMM_WARMUP"] = str(warmup)
@@ -57,13 +57,15 @@ def run_shape(shape, env_overrides, warmup=3, repeat=5, verify=True):
     valid = None
     for line in result.stdout.splitlines():
         m = re.search(r'cost:([\d.]+)ms', line)
+        vm = re.search(r'valid:(\w+)', line)
         if m:
-            costs.append(float(m.group(1)))
+            line_valid = vm.group(1) if vm else None
+            if line_valid:
+                valid = line_valid
+            if line_valid == 'y':
+                costs.append(float(m.group(1)))
         if "STREAMK_DEBUG" in line:
             debug_line = re.sub(r'p_streamk_counter=0x[0-9a-f]+ ', '', line.strip()).replace('STREAMK_DEBUG: ', '')
-        vm = re.search(r'valid:(\w+)', line)
-        if vm:
-            valid = vm.group(1)
     best = min(costs) if costs else float('inf')
     return best, valid, debug_line
 
@@ -83,7 +85,7 @@ def main():
             if grid_z > 0:
                 env["STREAMK_GRID_Z"] = str(grid_z)
             try:
-                best, valid, debug = run_shape(shape, env, verify=True)
+                best, valid, debug = run_shape(shape, env)
                 print(f"{max_shards:>10} {grid_z:>7} {best:>10.3f} {valid:>6} {debug}")
             except Exception as e:
                 print(f"{max_shards:>10} {grid_z:>7} {'ERR':>10} {'':>6} {e}")
@@ -102,7 +104,7 @@ def main():
             "-u", str(u), "-v", str(u), "-l", "1", "-j", "1", "-g", "1",
             "-F", "4", "-t", "1",
             "--in_layout", "NHWC", "--fil_layout", "NHWC", "--out_layout", "NHWC",
-            "-V", "0",
+            "-V", "1",
         ]
         env = os.environ.copy()
         env["IGEMM_WARMUP"] = "5"
@@ -111,7 +113,7 @@ def main():
         costs = []
         for line in result.stdout.splitlines():
             m = re.search(r'cost:([\d.]+)ms', line)
-            if m:
+            if m and 'valid:y' in line:
                 costs.append(float(m.group(1)))
         best = min(costs) if costs else float('inf')
         print(f"  {shape_str}: gsplit best = {best:.3f}ms")

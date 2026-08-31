@@ -45,7 +45,7 @@ def run_shape(shape, env_overrides, warmup=3, repeat=5):
         "-u", str(u), "-v", str(u), "-l", "1", "-j", "1", "-g", "1",
         "-F", "4", "-t", "1",
         "--in_layout", "NHWC", "--fil_layout", "NHWC", "--out_layout", "NHWC",
-        "-V", "0",
+        "-V", "1",
     ]
     env = os.environ.copy()
     env["IGEMM_WARMUP"] = str(warmup)
@@ -57,7 +57,7 @@ def run_shape(shape, env_overrides, warmup=3, repeat=5):
     debug_line = ""
     for line in result.stdout.splitlines():
         m = re.search(r'cost:([\d.]+)ms', line)
-        if m:
+        if m and 'valid:y' in line:
             costs.append(float(m.group(1)))
         if "STREAMK_DEBUG" in line:
             debug_line = line.strip()

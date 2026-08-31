@@ -1151,8 +1151,7 @@ public:
         const size_t thread_length_cast = (static_cast<size_t>(n) * c * hi * wi + 8 * 256) / (8 * 256) * (8 * 256) / 8;
         auto bwd_postlog = use_workspace == 1 ?
             std::function<float()>{[&]() -> float{
-                igemm_launch_kernel_single(tensor_cast_func, &karg_tensor_cast, karg_tensor_cast_size, {thread_length_cast, 1, 1}, {256, 1, 1});
-                return .0;
+                return igemm_launch_kernel_single(tensor_cast_func, &karg_tensor_cast, karg_tensor_cast_size, {thread_length_cast, 1, 1}, {256, 1, 1});
             }} :
             std::function<float()>{[&]() -> float{
                 return .0;

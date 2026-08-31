@@ -134,7 +134,7 @@ SHAPES = [
     ('wrw', 512, 510, 10, 10, 512, 3, 3, 1, 1, 1, 1, 1, 1, 'fp16', 0.4809),
 ]
 
-COST_RE = re.compile(r'\[(fwd|bwd|wrw):\s*\d+\][^\n]*?cost:([0-9.]+)ms')
+COST_RE = re.compile(r'\[(fwd|bwd|wrw):\s*\d+\][^\n]*?cost:([0-9.]+)ms[^\n]*?valid:y\b')
 
 
 def check_gpu_contention():
@@ -202,7 +202,7 @@ def build_all_configs_parallel(direction, precision, build_dir, rebuild):
 
 
 def run_shape(out_dir, direction, precision, n, c, H, W, k, y, x, p, q, u, v, l, j,
-              warmup, repeat, verify):
+              warmup, repeat):
     args = [
         './conv_driver.exe', MODE_STRING[precision],
         '-n', str(n), '-c', str(c), '-H', str(H), '-W', str(W), '-k', str(k),
@@ -210,7 +210,10 @@ def run_shape(out_dir, direction, precision, n, c, H, W, k, y, x, p, q, u, v, l,
         '-u', str(u), '-v', str(v), '-l', str(l), '-j', str(j),
         '-m', 'conv', '-g', '1', '-F', str(FORW_FLAG[direction]), '-t', '1',
         '--in_layout', 'NHWC', '--fil_layout', 'NHWC', '--out_layout', 'NHWC',
-        '-V', '1' if verify else '0',
+        # Always -V 1: COST_RE requires a valid:y field on the cost line, which
+        # the driver only emits under verification. A bare min(costs) under -V 0
+        # silently picks invalid/faulting tunables' abort times as "fastest".
+        '-V', '1',
     ]
     env = dict(os.environ, IGEMM_WARMUP=str(warmup), IGEMM_REPEAT=str(repeat))
     try:
@@ -240,7 +243,10 @@ def main():
     ap.add_argument('--rebuild', action='store_true', help='force-rebuild every master config even if already built')
     ap.add_argument('--warmup', type=int, default=5)
     ap.add_argument('--repeat', type=int, default=20)
-    ap.add_argument('--verify', action='store_true', help='run with -V 1 instead of -V 0')
+    ap.add_argument('--verify', action='store_true',
+                    help='(always on) -V 1 is now always used so the cost filter can require '
+                         'valid:y; this flag is kept for backward compatibility and only gates '
+                         'whether full per-shape logs are written via --log-dir')
     ap.add_argument('--build-dir', default=os.path.join(REPO_ROOT, 'bench_out'))
     ap.add_argument('--markdown-out', default=None)
     ap.add_argument('--log-dir', default=None, help='Directory to write full per-shape conv_driver.exe output logs')
@@ -273,7 +279,7 @@ def main():
         all_candidates = []
         for out_dir, label in configs:
             misa_ms, err, stdout = run_shape(out_dir, direction, precision, n, c, H, W, k, y, x,
-                                      p, q, u, v, l, j, args.warmup, args.repeat, args.verify)
+                                      p, q, u, v, l, j, args.warmup, args.repeat)
             all_candidates.append((label, misa_ms))
             if args.log_dir and stdout:
                 os.makedirs(args.log_dir, exist_ok=True)

@@ -1024,7 +1024,7 @@ public:
                         // hardware ("invalid argument" whenever that block count itself isn't
                         // also a multiple of 256).
                         size_t grid_reduce = (wsred_output_size + 255) / 256 * 256;
-                        igemm_launch_kernel_single(wrw_reduce_func, &karg_reduce, karg_reduce_size, {grid_reduce, 1, 1}, {256, 1, 1});
+                        return igemm_launch_kernel_single(wrw_reduce_func, &karg_reduce, karg_reduce_size, {grid_reduce, 1, 1}, {256, 1, 1});
                     }
                     return .0;
                 }};
@@ -1166,8 +1166,7 @@ public:
                         karg_reduce.output_size = static_cast<int>(wsred_output_size);
                         size_t karg_reduce_size = sizeof(karg_reduce);
                         size_t grid_reduce = (wsred_output_size + 255) / 256 * 256;
-                        igemm_launch_kernel_single(wrw_reduce_func, &karg_reduce, karg_reduce_size, {grid_reduce, 1, 1}, {256, 1, 1});
-                        return 0.f;
+                        return igemm_launch_kernel_single(wrw_reduce_func, &karg_reduce, karg_reduce_size, {grid_reduce, 1, 1}, {256, 1, 1});
                     };
                 }
 
@@ -1377,8 +1376,7 @@ public:
         const size_t thread_length_cast = (static_cast<size_t>(group) * (k / group) * (c / group) * y * x + 8 * 256) / (8 * 256) * (8 * 256) / 8;
         auto wrw_postlog = use_workspace == 1 ?
             std::function<float()>{[&]() -> float{
-                igemm_launch_kernel_single(tensor_cast_func, &karg_tensor_cast, karg_tensor_cast_size, {thread_length_cast, 1, 1}, {256, 1, 1});
-                return .0;
+                return igemm_launch_kernel_single(tensor_cast_func, &karg_tensor_cast, karg_tensor_cast_size, {thread_length_cast, 1, 1}, {256, 1, 1});
             }} :
             std::function<float()>{[&]() -> float{
                 return .0;
