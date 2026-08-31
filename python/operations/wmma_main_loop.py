@@ -105,7 +105,7 @@ class ctrl_wmma_main_loop_t(object):
         # compute -- chunks 1..num_k_chunks-1 (== num_k_substeps, by construction: both count
         # inst_wmma.k-wide slices of the same row) were previously loaded+waited+stored
         # SEQUENTIALLY, all AFTER every substep's compute was already done, so their global-
-        # load latency was never hidden behind anything. When True (requires
+        # load latency was never hidden behind anything. When True for an operand (requires
         # num_k_chunks==num_k_substeps > 1, i.e. Phase 1's k-sub-loop feature is in use, and
         # is mutually exclusive with async_global_to_lds_a/b -- the async instruction has no
         # small reused staging buffer to interleave around, see igemm_fwd_gtc_wmma_nhwc.py's
@@ -116,8 +116,15 @@ class ctrl_wmma_main_loop_t(object):
         # its wait is reached. Requires the new global_load_chunk_a/b_functor and
         # shared_store_chunk_a/b_functor (single-chunk primitives, chunk_idx explicit)
         # instead of the bulk global_load_a/b_functor/shared_store_a/b_functor used by the
-        # non-interleaved path. Default False = today's exact byte-identical behavior.
-        self.interleave                  = False
+        # non-interleaved path. Per-operand (interleave_a / interleave_b) so that directions
+        # with a TRANSPOSED operand that reuses v_gld as scratch in shared_load (bwd's B,
+        # wrw's A and B) can interleave only their UNTRANSPOSED operand, leaving the
+        # transposed one on the deferred-load path (num_k_chunks>1 already forces its
+        # global_load functor to issue nothing -- v_gld is free during compute). fwd sets
+        # both True (both operands untransposed). Default False = today's exact byte-identical
+        # behavior.
+        self.interleave_a                 = False
+        self.interleave_b                 = False
 
         # Phase 32: brackets emit_wmma_tile()'s WMMA-issue burst with s_setprio 1 (before)
         # / s_setprio 0 (after) -- see igemm_base.py's wmma_setprio docstring for the
@@ -133,7 +140,7 @@ class ctrl_wmma_main_loop_t(object):
         self.shared_load_b_functor       = None
         self.move_slice_window_a_functor = None
         self.move_slice_window_b_functor = None
-        # Phase 15 (interleaving): single-chunk primitives, only used when ctrl.interleave.
+        # Phase 15 (interleaving): single-chunk primitives, only used when interleave_a/b.
         # Callable as f(chunk_idx) -- see docstring above.
         self.global_load_chunk_a_functor  = None
         self.global_load_chunk_b_functor  = None
@@ -148,7 +155,7 @@ class ctrl_wmma_main_loop_t(object):
         # holds -- classic 2-slot software pipelining, intra-K-substep only (mirrors
         # mfma_main_loop.py's local_prefetch_num=2 exactly, one level down at the LDS-read
         # layer instead of the global-load layer that Phase 15's interleave already covers).
-        # Mutually exclusive with ctrl.interleave for this first implementation -- both
+        # Mutually exclusive with interleave_a/b for this first implementation -- both
         # rewrite the same k-substep drain loop, and composing them isn't validated yet.
         self.local_prefetch_num          = 1
 
@@ -184,17 +191,25 @@ class wmma_main_loop_t(mc_base_t):
         assert ctrl.lds_buffer_num in (1, 2), "wmma main loop supports single (1) or double (2) buffered LDS only"
         double_buffer = ctrl.lds_buffer_num == 2
         num_k_substeps = ctrl.unroll_k // inst_wmma.k
-        if ctrl.interleave:
+        interleave_a = ctrl.interleave_a
+        interleave_b = ctrl.interleave_b
+        if interleave_a or interleave_b:
             assert num_k_substeps > 1, \
                 "interleave requires num_k_substeps>1 (Phase 1's k-sub-loop) -- nothing to interleave otherwise"
-            assert not (ctrl.async_global_to_lds_a or ctrl.async_global_to_lds_b), \
-                "interleave is not supported together with async_global_to_lds_a/b (no staging buffer to interleave around)"
+            assert not (interleave_a and ctrl.async_global_to_lds_a), \
+                "interleave_a is not supported together with async_global_to_lds_a (no staging buffer to interleave around)"
+            assert not (interleave_b and ctrl.async_global_to_lds_b), \
+                "interleave_b is not supported together with async_global_to_lds_b (no staging buffer to interleave around)"
+            assert not (interleave_a and ctrl.tdm_global_to_lds_a), \
+                "interleave_a is not supported together with tdm_global_to_lds_a (no staging buffer to interleave around)"
+            assert not (interleave_b and ctrl.tdm_global_to_lds_b), \
+                "interleave_b is not supported together with tdm_global_to_lds_b (no staging buffer to interleave around)"
         assert ctrl.local_prefetch_num in (1, 2), "wmma main loop supports local_prefetch_num of 1 or 2 only"
         prefetch = ctrl.local_prefetch_num == 2
         if prefetch:
             assert num_k_substeps > 1, \
                 "local_prefetch_num=2 requires num_k_substeps>1 (Phase 1's k-sub-loop) -- nothing to prefetch into otherwise"
-            assert not ctrl.interleave, \
+            assert not (interleave_a or interleave_b), \
                 "local_prefetch_num=2 is not supported together with interleave (both rewrite the k-substep drain loop)"
         num_v_a_total = wmma_m.wave_repeat_m * inst_wmma.num_v_a   # one local_prefetch_num slot's worth
         num_v_b_total = wmma_m.wave_repeat_n * inst_wmma.num_v_b
@@ -329,35 +344,55 @@ class wmma_main_loop_t(mc_base_t):
                 if nxt < num_k_substeps:
                     self._emit(f"s_wait_dscnt 0x0")
 
-        def emit_interleaved_substeps():
+        def emit_mixed_substeps():
             '''
             Phase 15: replaces emit_extra_substeps() + the later bulk wait+store when
-            ctrl.interleave. Substep 0's compute (using v_a/v_b already read at the top of
-            the loop body) has already happened by the time this is called; chunk 0's global
-            load (issued via f_gld_a()/f_gld_b() before this, unchanged from the
-            non-interleaved path) is waited+stored here, THEN each remaining substep ks
-            (1..num_k_substeps-1) issues chunk ks's load BEFORE its own (unrelated,
-            already-in-LDS) shared_load+compute -- giving that load real time to complete in
-            the background -- and only waits+stores it after the compute. The final chunk
-            (num_k_substeps-1) still gets this same treatment; its wait+store simply lands
-            right before the loop's own trailing bookkeeping (buffer switch / branch), same
-            as the non-interleaved path's bulk store did.
+            interleave_a and/or interleave_b is set. Substep 0's compute (using v_a/v_b
+            already read at the top of the loop body) has already happened by the time this
+            is called; chunk 0's global load (issued via f_gld_a()/f_gld_b() before this,
+            unchanged from the non-interleaved path) is waited+stored here for whichever
+            operands interleave, THEN each remaining substep ks (1..num_k_substeps-1):
+              - issues chunk ks's load (interleaved operands only)
+              - shared_load+compute for substep ks
+              - waits+stores chunk ks (interleaved operands only)
+            Non-interleaved operands: their chunk 0 load was issued by f_gld_a/b() (the bulk
+            functor), and ALL remaining chunks are loaded+waited+stored via the bulk
+            shared_store functor (f_sst_a/f_sst_b) right here, BEFORE any interleaved compute
+            begins -- exactly the old _emit_sst_remaining_chunks path, preserving the
+            cross-wave LDS safety invariant for those operands.
             '''
-            self._emit(f"s_wait_loadcnt 0x0   ; chunk 0's load")
-            self._emit(f_sst_chunk_a(0))
-            self._emit(f_sst_chunk_b(0))
+            # Non-interleaved operands: bulk wait+store now (chunk 0 was already issued by
+            # f_gld_a/b; remaining chunks are loaded+waited+stored inside the bulk functor).
+            if not interleave_a or not interleave_b:
+                self._emit(f"s_wait_loadcnt 0x0   ; bulk loads (non-interleaved operands)")
+            if not interleave_a:
+                self._emit(f_sst_a())
+            if not interleave_b:
+                self._emit(f_sst_b())
+            # Interleaved operands: wait+store chunk 0 now.
+            if interleave_a or interleave_b:
+                self._emit(f"s_wait_loadcnt 0x0   ; chunk 0's load (interleaved operands)")
+            if interleave_a:
+                self._emit(f_sst_chunk_a(0))
+            if interleave_b:
+                self._emit(f_sst_chunk_b(0))
             for ks in range(1, num_k_substeps):
                 off_a = ks * ctrl.k_substep_stride_bytes_a
                 off_b = ks * ctrl.k_substep_stride_bytes_b
-                self._emit(f_gld_chunk_a(ks))
-                self._emit(f_gld_chunk_b(ks))
+                if interleave_a:
+                    self._emit(f_gld_chunk_a(ks))
+                if interleave_b:
+                    self._emit(f_gld_chunk_b(ks))
                 self._emit(f_sld_a(v_a(), v_sld_a_os(), off_a))
                 self._emit(f_sld_b(v_b(), v_sld_b_os(), off_b))
                 self._emit(f"s_wait_dscnt 0x0")
                 emit_wmma_tile()
-                self._emit(f"s_wait_loadcnt 0x0   ; chunk {ks}'s load")
-                self._emit(f_sst_chunk_a(ks))
-                self._emit(f_sst_chunk_b(ks))
+                if interleave_a or interleave_b:
+                    self._emit(f"s_wait_loadcnt 0x0   ; chunk {ks}'s load (interleaved operands)")
+                if interleave_a:
+                    self._emit(f_sst_chunk_a(ks))
+                if interleave_b:
+                    self._emit(f_sst_chunk_b(ks))
 
         def emit_buffer_switch():
             # Phase 2 (double-buffering): toggle the store offset (v_sst_a_os and
@@ -449,15 +484,17 @@ class wmma_main_loop_t(mc_base_t):
             self._emit(f"s_sub_i32 s[{ctrl.s_tdm_k_remain()}], s[{ctrl.s_tdm_k_remain()}], {ctrl.unroll_k}   ; Phase 31: remaining valid K for the tile about to be issued")
         self._emit(f_move_slice_window_a())
         self._emit(f_move_slice_window_b())
-        if ctrl.interleave:
+        if interleave_a or interleave_b:
             # Phase 15: chunk 0 issued exactly as the non-interleaved path does; substep 0's
-            # compute happens next, then emit_interleaved_substeps() takes over chunk 0's
-            # wait+store AND every remaining chunk/substep, interleaved.
+            # compute happens next, then emit_mixed_substeps() takes over chunk 0's
+            # wait+store AND every remaining chunk/substep, interleaved (per-operand).
+            # Non-interleaved operands still issue their bulk global_load here too (their
+            # bulk shared_store is handled inside emit_mixed_substeps).
             self._emit(f_gld_a())
             self._emit(f_gld_b())
             self._emit_empty_line()
             emit_wmma_tile()
-            emit_interleaved_substeps()
+            emit_mixed_substeps()
             self._emit_empty_line()
         else:
             if not a_style_async:

@@ -286,6 +286,25 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         assert not (tunable.tdm_global_load and tunable.async_global_load), \
             "tdm_global_load and async_global_load are mutually exclusive -- two different load mechanisms for the same operand"
         self._tdm_label_counter = 0
+        # Phase 15 (main-loop interleaving, wrw port): A (grad_output, TRANSPOSED)
+        # interleaves -- its chunk loads occupy v_gld_a in-flight during compute, and
+        # shared_load_a is redirected to v_scratch (allocated above) instead of v_gld_a for
+        # its read-and-pack scratch. B (input, TRANSPOSED) does NOT interleave: its
+        # shared_load_b reuses v_gld_b as scratch, and interleaving would issue chunk N+1's
+        # load into v_gld_b between substep N's shared_load (scratch clobber) and chunk N's
+        # store. interleave_b stays False. Requires lds_double_buffer=1 (same cross-wave LDS
+        # race as fwd, confirmed on hardware) and is mutually exclusive with
+        # async_global_load/tdm_global_load and row_stride>1 (untested combinations).
+        assert not (tunable.main_loop_interleave and tunable.async_global_load), \
+            "main_loop_interleave is not supported together with async_global_load"
+        assert not (tunable.main_loop_interleave and tunable.tdm_global_load), \
+            "main_loop_interleave is not supported together with tdm_global_load"
+        assert not (tunable.main_loop_interleave and self.row_stride > 1), \
+            "main_loop_interleave is not yet supported together with row_stride > 1"
+        assert not (tunable.main_loop_interleave and not tunable.lds_double_buffer), \
+            "main_loop_interleave requires lds_double_buffer=1 (single-buffered interleaving races across waves, confirmed on hardware)"
+        assert not (tunable.main_loop_interleave and (tunable.gemm_k_global_split or tunable.wrw_streamk)), \
+            "gemm_k_global_split/wrw_streamk is not yet combined with main_loop_interleave for wrw -- not audited together"
 
         self.sgpr = self.kernel_sgpr_t(mc, self)
         self.vgpr = self.kernel_vgpr_t(mc, self)
@@ -421,6 +440,13 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self.v_gld_a       = sym_t('v_gld_a'       , vseq(outer.chunk_num_dwords))   # also
                                                                        # reused as scratch by the transposed shared_load_a
             self.v_gld_b       = sym_t('v_gld_b'       , vseq(outer.chunk_num_dwords))   # ditto, reused by the transposed shared_load_b
+            # Phase 15 (main-loop interleaving, wrw port): when main_loop_interleave is
+            # active, A's chunk loads occupy v_gld_a in-flight during compute, so
+            # shared_load_a can no longer reuse v_gld_a as scratch for its transposed
+            # read-and-pack. v_scratch provides an alternative scratch (sized to
+            # elem_per_dword=4, the int8 worst case). Only allocated when interleave is on.
+            if outer.tunable.main_loop_interleave:
+                self.v_scratch     = sym_t('v_scratch'     , vseq(4))
             self.v_tid         = sym_t('v_tid'         , vseq(1))
             # 64-bit VADDR pairs must be even-aligned on gfx1250 (verified with llvm-mc).
             # row_stride redesign: when row_stride>1 a thread owns row_stride separate
@@ -1470,7 +1496,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
 
     def global_load_a_functor(self):
         ''' Phase 1: only issues chunk 0's load when num_k_chunks==1 (no clobbering risk
-        then, since emit_extra_substeps() never runs) -- see _emit_sst_all_chunks. '''
+        then, since emit_extra_substeps() never runs) -- see _emit_sst_all_chunks.
+        Phase 15 (main_loop_interleave): issues chunk 0's load even when num_k_chunks>1 --
+        the interleaved main loop needs chunk 0 in-flight early, and shared_load_a no longer
+        clobbers v_gld_a (redirected to v_scratch). '''
         outer = self
         class functor_t:
             def __call__(self):
@@ -1482,7 +1511,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                         # instruction moves the whole gemm_k_per_block x gemm_m_per_block
                         # tile straight into LDS, wave-0-only issue.
                         outer._emit_wave0_only(lambda: outer._emit(f"tensor_load_to_lds s[{s.s_tdm_g0()}:{s.s_tdm_g0(3)}], s[{s.s_tdm_g1()}:{s.s_tdm_g1(7)}]"))
-                    elif outer.num_k_chunks == 1:
+                    elif outer.num_k_chunks == 1 or outer.tunable.main_loop_interleave:
                         outer._emit_gld_chunk_load(v.v_gld_a, v.v_addr_a, 0, v_flag=outer._a_flag_symbol())
                 return outer._get_deferred()
             def get_issues(self):
@@ -1521,7 +1550,11 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    if outer.num_k_chunks == 1:
+                    if outer.num_k_chunks == 1 or outer.tunable.main_loop_interleave:
+                        # Phase 15 (interleave): chunk 0 already loaded by global_load_a_functor
+                        # -- use _emit_sst_remaining_chunks (stores chunk 0, then loads+stores
+                        # 1..N-1). row_stride==1 asserted when interleave is on, so v_flag_col
+                        # is always None here.
                         outer._emit_sst_remaining_chunks(v.v_gld_a, v.v_addr_a, v.v_sst_os, 0, v_flag=outer._a_flag_symbol(), v_flag_col=outer._a_flag_col_symbol())
                     else:
                         outer._emit_sst_all_chunks(v.v_gld_a, v.v_addr_a, v.v_sst_os, 0, v_flag=outer._a_flag_symbol(), v_flag_col=outer._a_flag_col_symbol())
@@ -1543,6 +1576,32 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 return outer._get_deferred()
             def get_issues(self):
                 return outer.chunk_num_dwordx4
+        return functor_t()
+
+    def global_load_chunk_a_functor(self):
+        ''' Phase 15 (wrw port): single-chunk primitive for the interleaved main loop --
+        issues ONE chunk's global load of A (grad_output, transposed). Reuses _emit_gld_chunk_load
+        with the same flag/flag_col as global_load_a_functor's chunk-0 call. row_stride==1
+        asserted when interleave is on, so v_flag_col is always None here. '''
+        outer = self
+        class functor_t:
+            def __call__(self, chunk_idx):
+                v = outer.vgpr
+                with outer._deferred_context():
+                    outer._emit_gld_chunk_load(v.v_gld_a, v.v_addr_a, chunk_idx, v_flag=outer._a_flag_symbol(), v_flag_col=outer._a_flag_col_symbol())
+                return outer._get_deferred()
+        return functor_t()
+
+    def shared_store_chunk_a_functor(self):
+        ''' Phase 15 (wrw port): single-chunk primitive for the interleaved main loop --
+        stores ONE already-loaded-and-waited chunk of A to LDS (reuses _emit_sst_chunk). '''
+        outer = self
+        class functor_t:
+            def __call__(self, chunk_idx):
+                v = outer.vgpr
+                with outer._deferred_context():
+                    outer._emit_sst_chunk(v.v_gld_a, v.v_sst_os, 0, chunk_idx)
+                return outer._get_deferred()
         return functor_t()
 
     def shared_load_a_functor(self):
@@ -1571,18 +1630,25 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                     read_instr = 'ds_read_b32'   # fp32: full-dword read, no zero-extension needed
                 else:
                     read_instr = 'ds_read_u8'
+                # Phase 15 (wrw port): when main_loop_interleave is active, v_gld_a holds
+                # in-flight A chunk loads during compute -- use v_scratch instead of v_gld_a
+                # for the read-and-pack scratch. v_scratch is sized to elem_per_dword (max 4).
+                if outer.tunable.main_loop_interleave:
+                    v_scratch = lambda s: v.v_scratch(s)
+                else:
+                    v_scratch = lambda s: v.v_gld_a(s)
                 with outer._deferred_context():
                     for i_rm in range(outer.tunable.wmma_repeat_m):
                         col_off = i_rm * outer.tunable.wmma_tile_m * outer.data_byte
                         for a in range(num_v_a):
                             for s in range(elem_per_dword):
                                 off = col_off + (a * elem_per_dword + s) * row_pitch
-                                outer._emit(f"{read_instr} v[{v.v_gld_a(s)}], v[{v.v_sld_a_os()}] offset:{extra_off + off}")
+                                outer._emit(f"{read_instr} v[{v_scratch(s)}], v[{v.v_sld_a_os()}] offset:{extra_off + off}")
                             outer._emit(f"s_wait_dscnt 0x0")
-                            outer._emit(f"v_mov_b32 v[{v.v_a(slot_off+i_rm*num_v_a+a)}], v[{v.v_gld_a(0)}]")
+                            outer._emit(f"v_mov_b32 v[{v.v_a(slot_off+i_rm*num_v_a+a)}], v[{v_scratch(0)}]")
                             for s in range(1, elem_per_dword):
                                 shift = s * 8 * outer.data_byte
-                                outer._emit(f"v_lshl_or_b32 v[{v.v_a(slot_off+i_rm*num_v_a+a)}], v[{v.v_gld_a(s)}], {shift}, v[{v.v_a(slot_off+i_rm*num_v_a+a)}]")
+                                outer._emit(f"v_lshl_or_b32 v[{v.v_a(slot_off+i_rm*num_v_a+a)}], v[{v_scratch(s)}], {shift}, v[{v.v_a(slot_off+i_rm*num_v_a+a)}]")
                 return outer._get_deferred()
         return functor_t()
 
@@ -1747,6 +1813,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.lds_single_size  = self.lds_single_size
         ctrl.lds_buffer_num   = self.lds_buffer_num
         ctrl.local_prefetch_num = self.tunable.local_prefetch_num
+        # Phase 15 (wrw port): A (transposed, but redirected to v_scratch) interleaves;
+        # B (transposed, v_gld_b reused as scratch by shared_load_b) stays deferred.
+        ctrl.interleave_a = self.tunable.main_loop_interleave
+        ctrl.interleave_b = False
         ctrl.wmma_setprio = self.tunable.wmma_setprio
         ctrl.tdm_global_to_lds_a = self.tunable.tdm_global_load
         ctrl.tdm_global_to_lds_b = self.tunable.tdm_global_load
@@ -1765,6 +1835,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.shared_load_b_functor       = self.shared_load_b_functor()
         ctrl.move_slice_window_a_functor = self.move_slice_window_a_functor()
         ctrl.move_slice_window_b_functor = self.move_slice_window_b_functor()
+        if self.tunable.main_loop_interleave:
+            ctrl.global_load_chunk_a_functor  = self.global_load_chunk_a_functor()
+            ctrl.shared_store_chunk_a_functor = self.shared_store_chunk_a_functor()
         ctrl.v_a       = sym_t(self.vgpr.v_a.label)
         ctrl.v_b       = sym_t(self.vgpr.v_b.label)
         ctrl.v_c       = sym_t(self.vgpr.v_c.label)

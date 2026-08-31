@@ -1926,7 +1926,8 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.async_global_to_lds_b = self.tunable.async_global_load
         ctrl.tdm_global_to_lds_a = self.tunable.tdm_global_load
         ctrl.tdm_global_to_lds_b = self.tunable.tdm_global_load   # Phase 30: B operand too
-        ctrl.interleave = self.tunable.main_loop_interleave
+        ctrl.interleave_a = self.tunable.main_loop_interleave
+        ctrl.interleave_b = self.tunable.main_loop_interleave
         ctrl.wmma_setprio = self.tunable.wmma_setprio
         ctrl.local_prefetch_num = self.tunable.local_prefetch_num
         ctrl.vgpr_msb_tracker = self.vgpr_msb_tracker

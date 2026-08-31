@@ -129,6 +129,26 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             "tdm_global_load is not yet supported together with local_prefetch_num > 1"
         assert not (tunable.tdm_global_load and tunable.async_global_load), \
             "tdm_global_load and async_global_load are mutually exclusive -- two different load mechanisms for the same operand"
+        # Phase 15 (main-loop interleaving, bwd port): A (grad_output, untransposed)
+        # interleaves -- same as fwd's A/B. B (weight, TRANSPOSED) does NOT interleave: its
+        # shared_load_b_functor reuses v_gld_b as scratch for the read-and-pack technique,
+        # and interleaving would issue chunk N+1's load into v_gld_b between substep N's
+        # shared_load (scratch clobber) and chunk N's store -- the same clobbering risk that
+        # already forces global_load_b_functor to issue nothing when num_k_chunks>1 (see
+        # _emit_sst_all_chunks). interleave_b stays False unconditionally. Requires
+        # lds_double_buffer=1 (same cross-wave LDS race as fwd, confirmed on hardware) and
+        # is mutually exclusive with async_global_load/tdm_global_load (A's path -- no
+        # staging buffer to interleave around) and row_repeat_a>1 (untested combination).
+        assert not (tunable.main_loop_interleave and tunable.async_global_load), \
+            "main_loop_interleave is not supported together with async_global_load"
+        assert not (tunable.main_loop_interleave and tunable.tdm_global_load), \
+            "main_loop_interleave is not supported together with tdm_global_load"
+        assert not (tunable.main_loop_interleave and self.row_repeat_a > 1), \
+            "main_loop_interleave is not yet supported together with row_repeat_a > 1"
+        assert not (tunable.main_loop_interleave and not tunable.lds_double_buffer), \
+            "main_loop_interleave requires lds_double_buffer=1 (single-buffered interleaving races across waves, confirmed on hardware)"
+        assert not (tunable.main_loop_interleave and tunable.gemm_k_global_split), \
+            "gemm_k_global_split is not yet combined with main_loop_interleave for bwd -- not audited together"
         # Phase 48 (gemm_k_global_split, bwd): not yet combined with TDM -- TDM's own
         # s_tdm_k_remain init reads s_gemm_k directly (the true, un-sharded total), not
         # s_knum/s_gemm_k_per_wg, so combining the two would silently give every shard the
@@ -1412,6 +1432,32 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                 return outer.chunk_num_dwordx4
         return functor_t()
 
+    def global_load_chunk_a_functor(self):
+        ''' Phase 15 (bwd port): single-chunk primitive for the interleaved main loop --
+        issues ONE chunk's global load of A (grad_output, untransposed). Reuses the exact
+        same helper (_emit_gld_chunk_load) and v_flag masking as global_load_a_functor's
+        chunk-0 call, just parameterized by chunk_idx instead of hardcoded to 0. '''
+        outer = self
+        class functor_t:
+            def __call__(self, chunk_idx):
+                v = outer.vgpr
+                with outer._deferred_context():
+                    outer._emit_gld_chunk_load(v.v_gld_a, v.v_addr_a, chunk_idx, v_flag=v.v_flag)
+                return outer._get_deferred()
+        return functor_t()
+
+    def shared_store_chunk_a_functor(self):
+        ''' Phase 15 (bwd port): single-chunk primitive for the interleaved main loop --
+        stores ONE already-loaded-and-waited chunk of A to LDS (reuses _emit_sst_chunk). '''
+        outer = self
+        class functor_t:
+            def __call__(self, chunk_idx):
+                v = outer.vgpr
+                with outer._deferred_context():
+                    outer._emit_sst_chunk(v.v_gld_a, v.v_sst_os, 0, chunk_idx)
+                return outer._get_deferred()
+        return functor_t()
+
     def _emit_ds_read_chunked(self, v_base_sym, v_os_sym, base_off, num_v):
         '''
         Reads `num_v` contiguous dwords from LDS starting at `base_off`, into
@@ -1600,6 +1646,10 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.tdm_global_to_lds_a = self.tunable.tdm_global_load
         ctrl.tdm_global_to_lds_b = self.tunable.tdm_global_load
         ctrl.local_prefetch_num = self.tunable.local_prefetch_num
+        # Phase 15 (bwd port): A (untransposed) interleaves; B (transposed, v_gld_b reused
+        # as scratch by shared_load_b) stays on the deferred bulk path -- interleave_b=False.
+        ctrl.interleave_a = self.tunable.main_loop_interleave
+        ctrl.interleave_b = False
         ctrl.wmma_setprio = self.tunable.wmma_setprio
         ctrl.vgpr_msb_tracker = self.vgpr_msb_tracker
         # Phase 1 (k-sub-loop): A (grad_output/input, untransposed) advances K-contiguous
@@ -1617,6 +1667,9 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.shared_load_b_functor       = self.shared_load_b_functor()
         ctrl.move_slice_window_a_functor = self.move_slice_window_a_functor()
         ctrl.move_slice_window_b_functor = self.move_slice_window_b_functor()
+        if self.tunable.main_loop_interleave:
+            ctrl.global_load_chunk_a_functor  = self.global_load_chunk_a_functor()
+            ctrl.shared_store_chunk_a_functor = self.shared_store_chunk_a_functor()
         ctrl.v_a       = sym_t(self.vgpr.v_a.label)
         ctrl.v_b       = sym_t(self.vgpr.v_b.label)
         ctrl.v_c       = sym_t(self.vgpr.v_c.label)
