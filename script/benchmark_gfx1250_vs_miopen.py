@@ -87,6 +87,13 @@ INTERLEAVE_CONFIGS = {
     ('bwd', 'interleave'): 'config/igemm_bwd_gtc_gfx1250_nhwc_bf16_interleave.config',
     ('wrw', 'interleave'): 'config/igemm_wrw_gtc_gfx1250_nhwc_bf16_interleave.config',
 }
+# Phase 61: saddr variant added as a candidate for 1x1-filter bf16 configs.
+# Only applies to 128x128 tiles, and only for 1x1 filters (nxe=0).
+SADDR_CONFIGS = {
+    ('fwd', 'saddr'): 'config/igemm_fwd_gtc_gfx1250_nhwc_bf16_saddr.config',
+    ('bwd', 'saddr'): 'config/igemm_bwd_gtc_gfx1250_nhwc_bf16_saddr.config',
+    ('wrw', 'saddr'): 'config/igemm_wrw_gtc_gfx1250_nhwc_bf16_saddr.config',
+}
 
 # The 38 shapes from docs/gfx1250_vendor_benchmark_vs_miopen.md's "full re-triage"
 # and "vs. MIOpen running natively on gfx1250" tables (2026-08-27 updates), batch=42
@@ -183,6 +190,8 @@ def config_name_to_file(direction, config_name):
         return f'config/igemm_{direction}_gtc_gfx1250_nhwc_bf16_{tm}x{tn}_all.config'
     elif config_name == 'interleave':
         return INTERLEAVE_CONFIGS.get((direction, config_name))
+    elif config_name == 'saddr':
+        return SADDR_CONFIGS.get((direction, config_name))
     elif config_name.endswith('_direct'):
         return DIRECT_STORE_CONFIGS.get((direction, config_name.replace('_direct', '')))
     else:
@@ -285,6 +294,9 @@ def main():
         # (interleave configs have nxe=0, so only applicable to 1x1 convolutions)
         if y == 1 and x == 1 and (direction, 'interleave') in INTERLEAVE_CONFIGS:
             cands.append('interleave')
+        # Phase 61: try saddr variant for 1x1-filter shapes only
+        if y == 1 and x == 1 and (direction, 'saddr') in SADDR_CONFIGS:
+            cands.append('saddr')
         # Combinatorial sweep (2026-08-28): also try per-tile master configs which
         # include every valid tunable combination for that tile shape
         for tm, tn in [(128,128), (64,64), (128,64), (64,128), (32,32)]:
