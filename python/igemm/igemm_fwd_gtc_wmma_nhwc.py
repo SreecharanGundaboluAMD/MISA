@@ -1038,8 +1038,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             msb_line = self.vgpr_msb_tracker.ensure(dst=1)
             if msb_line:
                 self._emit(msb_line)
-        for i in range(self.tunable.num_vgpr_accumulate_c):
-            self._emit(f"v_mov_b32 v[{v.v_c(i)}], 0")
+        emit_vopd_paired_zero_init(self._emit, v.v_c, self.tunable.num_vgpr_accumulate_c)
         if self.vgpr_msb_tracker is not None:
             # Phase 54 bugfix: reset dst back to bank 0 immediately -- everything
             # after this point in the prologue (GEMM_M index decomposition, tap-loop
@@ -1058,8 +1057,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         if self.tunable.async_global_load:
             self._emit(f"; Phase 13: persistent zero quad, used to zero-fill padding lanes' LDS")
             self._emit(f"; destinations after a masked global_load_async_to_lds_b128 (see global_load_a_functor)")
-            for i in range(4):
-                self._emit(f"v_mov_b32 v[{v.v_zero(i)}], 0")
+            emit_vopd_paired_zero_init(self._emit, v.v_zero, 4)
             self._emit_empty_line()
 
         self._emit(f"s_lshl_b32 s[{s.s_block_m_off()}], s[{s.s_bx()}], {utility_log2(self.tunable.gemm_m_per_block)}   ; *gemm_m_per_block")
@@ -1371,8 +1369,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         (v_off_a/v_off_b) and the load uses the SADDR form (scalar base + 32-bit VGPR
         offset, no VADDR carry chain) instead of the default 64-bit VADDR pair. '''
         if v_flag is not None:
-            for i in range(self.chunk_num_dwords):
-                self._emit(f"v_mov_b32 v[{v_gld(i)}], 0")
+            emit_vopd_paired_zero_init(self._emit, v_gld, self.chunk_num_dwords)
             self._emit(f"v_cmpx_le_u32 1, v[{v_flag()}]")
         for i in range(self.chunk_num_dwordx4):
             idx = chunk_idx * self.chunk_num_dwordx4 + i
@@ -2040,7 +2037,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_k_total.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off(),
                     s.s_gemm_m.label if self.tunable.wmma_m_tail else None, v.v_m_tail_row() if self.tunable.wmma_m_tail else None,
                     s.s_gemm_n.label if self.tunable.wmma_n_tail else None, v.v_n_tail_col() if self.tunable.wmma_n_tail else None,
-                    s.s_tmp(1) if self.tunable.wmma_n_tail else None,
+                    # Phase 66: always passed now (not just under wmma_n_tail) --
+                    # direct_store's outer-loop address hoist reuses this scratch SGPR
+                    # too; the two uses are mutually exclusive (direct_store vs.
+                    # LDS-reshuffle), so sharing the slot is safe.
+                    s.s_tmp(1),
                     v_chunked_col=v.v_chunked_col() if self.tunable.wmma_epilogue_chunked else None))
         self._emit(f"s_wait_storecnt 0x0")
 

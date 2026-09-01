@@ -179,6 +179,70 @@ class igemm_wmma_mapping_t(mc_base_t):
             self._emit_empty_line()
         return self._get_deferred()
 
+    def get_gemm_index_for_src_matrix_transposed_ds_tr16(self, v_byte_offset, v_thread_id, v_tmp2, row_pitch_bytes, elem_bytes, side, **options):
+        '''
+        Phase 63: address formula for ds_load_tr16_b128-based transposed-operand loads
+        (fp16/bf16 only, elem_bytes==2 -- no fp32 hardware variant exists). Sibling to
+        get_gemm_index_for_src_matrix_transposed, but for the NATIVE hardware transpose-load
+        instruction instead of the manual per-element ds_read+pack loop that function's
+        byte offset was designed for.
+
+        Empirically-confirmed hardware mechanism (2026-09-01, standalone probe -- the ISA
+        doc's exact per-lane semantics are only in an unextracted diagram, not prose; see
+        docs/gfx1250_wmma_layout.md's Phase 63 for the full writeup): within each
+        consecutive 8-lane group of a wave32 (lanes 0-7, 8-15, 16-23, 24-31), ds_load_tr16_b128
+        performs an in-flight 8-lane x 8-subelement register TRANSPOSE using each lane's own
+        ordinary LDS address (no shared/implicit stride) -- lane p's destination slot q
+        equals (the value at byte offset q*2 within lane q's own 16-byte/8-element
+        contiguous read).
+
+        For lane L (0..31, local to this wave), the WMMA operand needs col = L%16,
+        k = (L//16)*16 + (per-call k-sub-range). Setting this function's returned base
+        address to `[(L//16)*half_k + (L%8)] * row_pitch_bytes + [(L%16) & ~7] * elem_bytes`
+        (plus the same waves_per_side wave-offset term
+        get_gemm_index_for_src_matrix_transposed folds in, added identically) makes ONE
+        ds_load_tr16_b128 call at this address deliver k = k_half_base + (L%8) for this
+        lane's own col = L%16 -- i.e. covers half of one k-half's 16 values (8 of them) in
+        one call. The CALLER issues a second call at `offset: half_k * row_pitch_bytes / 2`
+        (i.e. 8 * row_pitch_bytes) from this same base to cover the other 8 -- 2 calls total
+        replace the entire manual 16-read/8-pack loop for one wave_repeat_n step, landing
+        directly in v_b's expected dword slots with zero packing/waits. See
+        igemm_bwd_gtc_wmma_nhwc.py's shared_load_b_functor for the concrete 2-call sequence.
+
+        side: 'm' or 'n' -- which wave axis this operand's non-contraction dimension
+        belongs to (same convention as get_gemm_index_for_src_matrix_transposed).
+        '''
+        ctrl = self.ctrl
+        assert ctrl.wave_tile_m == 16 and ctrl.wave_tile_n == 16
+        assert side in ('m', 'n')
+        assert elem_bytes == 2, "ds_load_tr16_b128 is a 16-bit-element-only instruction -- no fp32 variant exists"
+        waves_per_side = ctrl.waves_per_m() if side == 'm' else ctrl.waves_per_n()
+        wave_tile_side = ctrl.wave_tile_m if side == 'm' else ctrl.wave_tile_n
+        wave_repeat_side = ctrl.wave_repeat_m if side == 'm' else ctrl.wave_repeat_n
+        half_k = ctrl.inst_wmma.k // 2   # 16 for fp16/bf16's K=32
+        with self._deferred_context():
+            self._emit(f"; wmma mapping, ds_load_tr16_b128 transposed source address (side={side})")
+            # row term: [k_half*half_k + (lane%8)] * row_pitch_bytes
+            self._emit(f"v_and_b32 v[{v_byte_offset}], 7, v[{v_thread_id}]          ; lane % 8 -> row-within-8lane-group")
+            self._emit(f"v_lshrrev_b32 v[{v_tmp2}], 4, v[{v_thread_id}]             ; lane / 16")
+            self._emit(f"v_and_b32 v[{v_tmp2}], 1, v[{v_tmp2}]                     ; k_half (0/1)")
+            self._emit(f"v_lshl_or_b32 v[{v_byte_offset}], v[{v_tmp2}], {utility_log2(half_k)}, v[{v_byte_offset}]   ; | k_half*{half_k}")
+            self._emit(f"v_lshlrev_b32 v[{v_byte_offset}], {utility_log2(row_pitch_bytes)}, v[{v_byte_offset}]       ; * {row_pitch_bytes} row_pitch_bytes")
+            # colbase term: ((lane%16) & ~7) [+ wave-offset if waves_per_side>1] * elem_bytes
+            self._emit(f"v_and_b32 v[{v_tmp2}], 15, v[{v_thread_id}]               ; lane % 16")
+            self._emit(f"v_and_b32 v[{v_tmp2}], -8, v[{v_tmp2}]                    ; & ~7 -> colbase (0 or 8)")
+            if waves_per_side != 1:
+                self._emit(f"v_lshrrev_b32 v[{v_tmp2}+1], 5, v[{v_thread_id}]      ; wave id")
+                if side == 'n':
+                    self._emit(f"v_and_b32 v[{v_tmp2}+1], {waves_per_side - 1}, v[{v_tmp2}+1]  ; waves_per_n index")
+                else:
+                    self._emit(f"v_lshrrev_b32 v[{v_tmp2}+1], {utility_log2(ctrl.waves_per_n())}, v[{v_tmp2}+1]  ; waves_per_m index")
+                self._emit(f"v_lshl_or_b32 v[{v_tmp2}], v[{v_tmp2}+1], {utility_log2(wave_tile_side * wave_repeat_side)}, v[{v_tmp2}]")
+            self._emit(f"v_lshlrev_b32 v[{v_tmp2}], {utility_log2(elem_bytes)}, v[{v_tmp2}]  ; colbase * {elem_bytes} elem_bytes")
+            self._emit(f"v_add_u32 v[{v_byte_offset}], v[{v_tmp2}], v[{v_byte_offset}]")
+            self._emit_empty_line()
+        return self._get_deferred()
+
     def get_gemm_index_for_dst_matrix(self, v_gemm_in, v_gemm_im, v_thread_id, v_tmp2):
         '''
         compute this thread's base (im, in) position in the macro-tile output, i.e. the

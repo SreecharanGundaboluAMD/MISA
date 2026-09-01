@@ -105,7 +105,28 @@ section for the record).
       benchmark now that direct_store is actually reachable (the existing "direct_store wins
       on N shapes" narrative needs to be re-measured, not trusted) — flagged as a new,
       separate follow-up, not silently absorbed into this item's scope.
-- [~] **[P3] 32-bit SADDR base offsets for in-loop global loads**
+- [x] ~~**Pre-existing bug: bwd's master `_all.config` fails to assemble for
+      bf16/fp16/fp32**~~ — **FIXED 2026-09-01, hardware-validated.** Root-caused via
+      `git log -S` bisection: commit `78af72c` ("Port saddr_global_load from fwd to bwd
+      and wrw") accidentally DELETED two lines from `move_slice_window_b_functor`'s
+      `tdm_global_load` branch while splicing in its own new `elif
+      tunable.saddr_global_load` clause immediately after — the final
+      `s_or_b32 s[s_tdm_g1_b(3)], ...` (combining tensor_dim1's hi16 with the
+      compile-time tile_dim0 constant) and the `outer._emit_front(f"{skip_label}:")`
+      label definition itself. This wasn't a label-uniqueness collision as first
+      suspected — the label was simply never emitted anywhere, so ANY
+      `tdm_global_load=1` bwd kernel (standalone or master-combined) has failed to
+      assemble since that commit landed (2026-08-31 22:57), not just combined master
+      configs; this session's master-config rebuild was apparently the first rebuild
+      attempt since. Restored both deleted lines in their original position (before the
+      new saddr `elif`, matching A's identically-structured, still-correct
+      `move_slice_window_a_functor` sibling). Hardware-validated `-V 1` after the fix:
+      bf16/fp16/fp32, a genuine K-tail shape (`gemm_k=100`, not a multiple of
+      `gemm_k_per_block`, actually exercising the rebuilt `s_tdm_g1_b(3)` register --
+      not just an assembly check), a multi-K-block+tail shape (`k=200`, 6 full blocks +
+      partial), and the `tdm_direct` (TDM + `direct_store`) combo. All three
+      directions' master configs (all three precisions) now build cleanly.
+- [x] **[P3] 32-bit SADDR base offsets for in-loop global loads**
       — Replace 64-bit carry-chain address stepping in inner K-loops with 32-bit byte offset
       VGPRs + SADDR base SGPRs (`global_load_dwordx4 vdst, v_off, s_p_base offset:N`).
       Saves 1 VGPR and 1 VALU carry op per address step across all directions.
@@ -126,10 +147,20 @@ section for the record).
       (`saddr_global_load=0`'s generated `.s`/`.inc` byte-identical to before). Also
       fixed the new tunable's kernel-naming into BOTH Python and C++ driver-side name
       builders from the start (see the P2 entry above for why that specific gap is a
-      known, previously-costly failure mode in this codebase). **Not done**: bwd (B
-      operand has no existing 32-bit-offset precedent to copy, needs fresh design) and
-      wrw (not yet surveyed) -- explicit follow-up, not attempted this pass. Performance
-      not yet measured. See `docs/gfx1250_wmma_layout.md`'s Phase 62.
+      known, previously-costly failure mode in this codebase). See
+      `docs/gfx1250_wmma_layout.md`'s Phase 62.
+      **Correction (2026-09-01, Phase 67)**: "bwd/wrw not done" above was stale --
+      `saddr_global_load` had already been fully ported to bwd's and wrw's A+B operands
+      (commit `78af72c`, landed before Phase 67 started) and was hardware-validated at
+      that time. The only real remaining gap was config-coverage: no fp32 standalone
+      `*_saddr.config` for bwd/wrw (added, `gemm_k_per_block=4` +
+      `lds_double_buffer=1`), and bwd's/wrw's existing bf16/fp16 saddr configs were
+      never folded into their master `_all.config` unions (fwd's was) -- re-ran
+      `script/build_gfx1250_master_configs.py --write` (pure glob-and-union, no code
+      changes) to fold all of them in. Hardware-validated `valid:y` for every
+      newly-covered saddr section (bwd/wrw x bf16/fp16/fp32, both standalone and from
+      inside the regenerated master configs). Performance still not separately
+      measured. See `docs/gfx1250_wmma_layout.md`'s Phase 67.
 - [ ] **`disable_xdl_arb_stall` (`SCHED_MODE` bit[2]) A/B test on a wrw split-K shape.**
       **Attempted 2026-08-27, blocked — not a guess we should make.** The CDNA5 ISA doc
       (§5.7.2.1) documents this bit's *existence and semantics* but gives no `S_SETREG`
@@ -515,10 +546,175 @@ section for the record).
       pattern) as a longer-term supplement to MISA's hand-curated `.config` files,
       specifically for shapes where static configs are demonstrably failing (wrw's tail
       cases).
-- [ ] **Hardware transpose-load** (`global_load_tr_b128_v8f16`, confirmed gfx1250-valid
-      via CK's own audit) to skip materializing an NHWC copy inside the hand-assembled
-      kernel's own load functors — no correct reference implementation exists anywhere
-      for a 16x16x32-layout WMMA yet; new engineering, not a port.
+- [x] ~~**Hardware transpose-load for the WMMA B-operand (bwd) and A+B operands (wrw)**~~ —
+      **DONE 2026-09-01 (Phase 63 bwd, Phase 64 wrw), hardware-validated, real measured
+      win, tail-mask/split-K composition confirmed free.** Built a standalone hardware
+      probe to reverse-engineer `ds_load_tr16_b128`'s exact per-lane addressing/lane-remap
+      semantics (the ISA doc's diagram isn't text-extractable), confirmed the mechanism
+      (8-lane-group in-flight transpose), derived and hardware-confirmed the exact address
+      formula MISA's operands need, and wired it into bwd's `shared_load_b_functor` and
+      wrw's `shared_load_a_functor`/`shared_load_b_functor` behind a new opt-in
+      `ds_load_tr_b` tunable — 2 native instructions replace the entire ~160-instruction
+      manual read+pack loop per wave_repeat step, per operand.
+      **Measured** (rocprofv3, same shape before/after): bwd `SQ_INSTS_ALL` -43.1%
+      (~28% faster wall-clock); wrw `SQ_INSTS_ALL` -57.1% (~17.4% faster wall-clock,
+      larger win since both operands benefit). Hardware-validated `valid:y`: bwd and wrw,
+      bf16/fp16, both tile shapes, multi-K-block, multi-block grids, `group_count>1`;
+      wrw's `gemm_k_global_split=1` (its primary path, both tile shapes); bwd's
+      `wmma_m_tail`+`wmma_n_tail`+`wmma_k_tail` combined and `wmma_n_tail` alone; wrw's
+      `wmma_k_tail` and `wmma_m_tail`+`wmma_n_tail` combined. Zero regression (default
+      config's generated `.s` has zero `ds_load_tr16_b128` occurrences). Kernel naming
+      synced in both Python and C++ from the start. Tail-mask/split-K composition
+      required NO new masking code at all -- code review confirmed all masking happens
+      at LDS WRITE time (global-load `v_flag` + shared-store tail-dword AND-mask), not
+      LDS READ time, so the transpose-load just reads whatever's already correctly-masked
+      in LDS; the four mutual-exclusion asserts added in Phase 63 were removed. See
+      `docs/gfx1250_wmma_layout.md`'s Phase 63/64 for the full derivation, probe
+      methodology, and address formula.
+      **Not done, tracked as follow-ups**:
+      1. **bwd's own `gemm_k_global_split` could not be hardware-validated** — confirmed
+         (via testing the unmodified pre-Phase-63 codebase too) that bwd's split-K driver
+         path currently fails with an illegal-memory-access on every shape/split-count
+         tried in this environment, a real pre-existing regression unrelated to this
+         work (see the new backlog entry below). No code-level reason to expect it
+         behaves differently once that's fixed (wrw's structurally similar split-K
+         composes correctly).
+      2. **Full benchmark-suite sweep** — only a couple of shapes measured per direction
+         so far; needs `script/benchmark_gfx1250_vs_miopen.py` across the full shape
+         corpus for both directions, plus folding `ds_load_tr_b=1` into the master
+         config union once broader coverage is confirmed.
+      3. ~~**`GLOBAL_LOAD_TR16_B128`**~~ — **investigated 2026-09-01, REJECTED with
+         quantified reasoning (not merely deferred).** Hardware mechanism confirmed
+         identical to the LDS variant via a second standalone probe. But the actual
+         instruction count left to save turned out tiny: post-Phase-63, B's entire
+         remaining global-load+LDS-store pipeline (everything this would skip) is only
+         **8 instructions** per main-loop iteration (4 `global_load_dwordx4` + 4
+         `ds_write_b128`, measured directly from the generated 128x128x32 bf16 kernel).
+         Preserving the existing double-buffer's latency-hiding for a direct-to-global
+         version needs either (a) a register-copy into `v_b`'s static destination each
+         iteration -- **32 `v_mov_b32` instructions** for this tile shape, a net
+         **+24/iteration regression**, or (b) main-loop-body duplication to avoid the
+         copy -- large, invasive, touches every interacting main-loop mode, for an
+         8-instruction prize. Neither is worth it. Not implementing. See
+         `docs/gfx1250_wmma_layout.md`'s Phase 64 (section "4b") for the full numbers
+         and reasoning -- keep this closed unless a future tile shape or main-loop
+         redesign changes the underlying instruction-count math.
+- [x] ~~**fp32 B-operand LDS-load overhead reduction / batch the per-element
+      `s_wait_dscnt 0x0`**~~ — **DONE 2026-09-01 (Phase 64), hardware-validated.**
+      `shared_load_b_functor`'s (bwd) and `shared_load_a_functor`'s (wrw) manual-loop
+      fallback (used by fp32 always, since no `ds_load_tr16_b128` variant exists for it,
+      and by int8 / any `ds_load_tr_b`-unset fp16/bf16 config) now batches reads up to
+      the scratch buffer's real capacity (`chunk_num_dwords`: 16 for fp16/bf16/int8, 4
+      for fp32) before a single wait, instead of one wait per vgpr index -- up to 8x
+      fewer wait instructions. Not gated behind an opt-in flag (changes generated code
+      for every existing fp32/int8 config and any `ds_load_tr_b`-unset fp16/bf16 config)
+      -- hardware-validated `valid:y` across fp32, int8, and bf16-default (all both tile
+      shapes) to confirm the reordering is safe. See `docs/gfx1250_wmma_layout.md`'s
+      Phase 64.
+- [ ] **Pre-existing bug: bwd's `gemm_k_global_split` crashes (illegal memory access) --
+      extensively investigated 2026-09-01, NOT root-caused, real progress made.**
+      Reproduces on the unmodified pre-Phase-63 codebase too. Ruled out with concrete
+      evidence (see `docs/gfx1250_wmma_layout.md`'s Phase 65 for the full trail):
+      search-heuristic instability (crashes at every pinned split count including the
+      degenerate single-shard case), the shape/tile itself (identical shape works
+      perfectly with split-K off), kernarg struct layout mismatch, missing per-launch
+      zero-init, a HIP-event resource leak, and a generic host-side timing-harness bug
+      (wrw's structurally similar split-K path, same harness, works correctly). **New,
+      narrower findings**: (a) crash correlates with total dispatch COUNT specifically
+      -- 5 repeats succeeds, 10+ (including the driver's true default) crashes, same
+      pinned split/shape; (b) requires an actual multi-iteration K-loop -- a trivial
+      single-K-block shape never crashes regardless of repeat count; (c) `rocgdb` shows
+      all waves halted mid-main-loop with individually-plausible-looking addresses (no
+      obviously-wrong value found by inspection); (d) applying the fix from this
+      codebase's one other known barrier/LDS-visibility race
+      (`docs/gfx1250_fp32_wmma_occupancy_race.md`'s `lds_double_buffer=1`) did NOT fix
+      it. Next steps for whoever picks this up: rocgdb single-stepping (breakpoints on
+      GPU kernel code didn't behave as expected this session, needs a different
+      technique), testing whether the specific failing iteration varies run-to-run
+      (confirming/refuting a genuine race), and an occupancy-controlled comparison
+      (fewer workgroups, same repeat count).
+- [x] **VOPD/VOPD3 dual-issue VALU** — CDNA5 ISA §7.8/7.8.1 (dual-issue VALU, two
+      independent ops per cycle on eligible opcode pairs) was used nowhere in this
+      codebase. **Scoped and (partially) implemented 2026-09-01 (Phase 67)**: the
+      originally-suspected target (the tail-dword masking helper,
+      `igemm_bwd_gtc_wmma_nhwc.py:1264-1290`) turned out to be a dead end -- its
+      `v_cmp`/`v_and`/`v_or` opcodes aren't a VOPD-eligible pair and the chain is mostly
+      sequentially dependent, so no amount of scoping would have made it pair. The real,
+      safe target found instead: the `v_mov_b32 v[reg], 0` zero-init loops present in
+      all three direction generators (accumulator clear, prologue `v_zero`, and the
+      per-K-iteration tail-masked global-load zero-init) -- fully independent,
+      fully VOPD-eligible, shared-literal-legal. New shared helper
+      `emit_vopd_paired_zero_init` (`python/igemm/igemm_base.py`) applied at all 9
+      matching call sites across fwd/bwd/wrw, unconditionally (bit-identical output,
+      same category as Phase 64's wait-batching -- no new opt-in tunable). Confirmed
+      safe with `wmma_acc_high_bank=1` (VGPR-MSB, Phase 54) on hardware. Does NOT cover
+      every VALU chain in the codebase -- only the zero-init pattern; other independent
+      VALU chains (if any exist) are still unscoped. See
+      `docs/gfx1250_wmma_layout.md`'s Phase 67.
+- [ ] **wrw's mandatory atomic-epilogue is a structural cost, not just a tuning gap** —
+      found during the original profiling investigation (2026-09-01, before Phase 63),
+      never turned into a tracked item until now. wrw's `gemm_k_global_split` path (its
+      PRIMARY path per CLAUDE.md) always pays a scalar, per-element, non-coalesced
+      `global_atomic_add_f32` epilogue (`coalescing_store_wmma.py:597-668`) — no
+      vectorized store, no coalescing across lanes, unlike fwd/bwd's cheap
+      `direct_store` epilogue (a plain per-lane `global_store_dword`, already confirmed
+      LDS-free and cheap in Phase 64's investigation). `atomic_pack_bf16` doesn't reduce
+      VALU either — it *adds* ~5 instructions per pair (`v_permlane_xor_b32`,
+      `v_cvt_pk_bf16_f32`, `v_and_b32`, `v_cmpx_eq_u32`, `s_mov_b32` restore) purely to
+      halve atomic-RMW traffic, trading VALU for less memory contention. This plausibly
+      explains why wrw's benchmark ratios are consistently worse than fwd/bwd's
+      (`bench_results.md`: wrw 1.09x-5.32x slower vs gfx1250 MIOpen, notably worse than
+      fwd/bwd's typical ≤2x). **Not yet investigated**: whether shapes where GEMM_K fits
+      in a single pass (no genuine need for a K-reduction split) could skip
+      `gemm_k_global_split` entirely and reuse the cheap `direct_store` epilogue instead
+      — would need checking `tunable_is_valid`'s current requirements and whether wrw's
+      non-split-K path (already exists, per `igemm_wrw_gtc_gfx1250_nhwc_bf16.config`) is
+      being under-used by the driver's shape-to-config selection for GEMM_K-small
+      shapes that don't actually need splitting.
+- [x] ~~**Address-hoist in `_emit_direct_store`'s epilogue `i_rm` loop**~~ — **DONE
+      2026-09-01 (Phase 66), hardware-validated.** The outer `i_rm` loop used to
+      recompute `row*stride+col` from scratch every iteration (4 instructions:
+      row+base, mul by stride, add col, shift to bytes) even though consecutive
+      blocks are separated by a compile-time-constant row gap. Precomputes a
+      `s_row_gap = row_stride * gap_rows` SGPR once, then each subsequent i_rm
+      transition is a single `v_add_u32` instead of the 4-instruction recompute --
+      confirmed in the generated 128x128 bf16 kernel (`wave_repeat_m=4`, 3
+      transitions, each dropping from 4 to 1 instruction). This was NOT as trivial
+      as it looked when filed -- two real bugs found and fixed only by trusting
+      `-V 1` over hand-derivation, not skipped:
+      1. **Wrong source register.** The cur/nxt ping-pong's PYTHON aliases return to
+         their block-starting binding (cur=v_tmp1) after an even number of swaps,
+         but the CONTENT holding the last row's real address ends up in v_tmp2
+         (nxt's binding), not v_tmp1 -- v_tmp1 holds a stale, one-row-behind value.
+         An initial version read from v_tmp1 and got `valid:n`.
+      2. **Off-by-one in the gap itself.** The gap from the last row a block
+         touches (`row_off+num_v_c-1`) to the next block's first row
+         (`row_off+wave_tile_m`) is `wave_tile_m-num_v_c+1`, not
+         `wave_tile_m-num_v_c` -- missing the `+1` also produced `valid:n`, caught
+         separately after fixing bug 1.
+      Both root-caused by reading the actual generated disassembly line-by-line and
+      hand-tracing register bindings against it, not by re-deriving from the
+      formula alone. Needed threading a second scratch SGPR (`s_tmp2`, already
+      existed as an optional parameter used only by the mutually-exclusive
+      LDS-reshuffle path's `wmma_n_tail` branch, now always passed) through
+      fwd/bwd/wrw's `coalescing_store` call sites (wrw actually DOES support
+      `direct_store` -- an earlier claim in this conversation that it didn't was
+      wrong; found while wiring this up, both of wrw's two call sites needed the
+      same fix). Hardware-validated `valid:y`: fwd/bwd/wrw direct_store (both tile
+      shapes), `wmma_m_tail`+direct_store (exercises the tail-row-tracker's own
+      hoist), fp32 direct_store, int8 direct_store (fwd), and a zero-regression
+      check on the non-direct_store `wmma_n_tail` LDS-reshuffle path (confirms
+      sharing the scratch SGPR slot is safe). See
+      `docs/gfx1250_wmma_layout.md`'s Phase 66.
+- [ ] **hipconv's block-diagonal channel packing across conv groups** — fills small WMMA
+      tiles when the group count is high, a structurally different way to solve
+      "GEMM_M/N too small to fill a tile" than tail-masking.
+- [ ] **Deeper main-loop pipelining** (N-stage, beyond MISA's current double-buffer),
+      gated by LDS headroom, per FlyDSL's `num_buffers` pattern.
+- [ ] **Autotuning-with-build-cache infrastructure** (FlyDSL's `conv3d_autotune.py`
+      pattern) as a longer-term supplement to MISA's hand-curated `.config` files,
+      specifically for shapes where static configs are demonstrably failing (wrw's tail
+      cases).
 
 ## Confirmed dead ends (kept for reference — do not re-attempt without new evidence)
 

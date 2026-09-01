@@ -616,8 +616,15 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
 
         # ---- shared-memory load offset for B (TRANSPOSED -- weight is [K][N] in LDS) ----
         # row_pitch_bytes = gemm_n_per_block * databyte (128 * databyte)
-        self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix_transposed(v.v_sld_b_os(), v.v_tid(), v.v_tmp(),
-                self.tunable.gemm_n_per_block * self.data_byte, self.data_byte, 'n'))
+        # Phase 63: ds_load_tr_b uses a different per-lane address formula (hardware
+        # transpose-load, not the manual read+pack loop) -- see wmma_mapping.py's
+        # get_gemm_index_for_src_matrix_transposed_ds_tr16 docstring.
+        if self.tunable.ds_load_tr_b:
+            self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix_transposed_ds_tr16(v.v_sld_b_os(), v.v_tid(), v.v_tmp(),
+                    self.tunable.gemm_n_per_block * self.data_byte, self.data_byte, 'n'))
+        else:
+            self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix_transposed(v.v_sld_b_os(), v.v_tid(), v.v_tmp(),
+                    self.tunable.gemm_n_per_block * self.data_byte, self.data_byte, 'n'))
         self._emit_empty_line()
 
     def _emit_tdm_descriptor_setup_a(self):
@@ -851,8 +858,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             msb_line = self.vgpr_msb_tracker.ensure(dst=1)
             if msb_line:
                 self._emit(msb_line)
-        for i in range(self.tunable.num_vgpr_accumulate_c):
-            self._emit(f"v_mov_b32 v[{v.v_c(i)}], 0")
+        emit_vopd_paired_zero_init(self._emit, v.v_c, self.tunable.num_vgpr_accumulate_c)
         if self.vgpr_msb_tracker is not None:
             # Phase 54 bugfix: see igemm_fwd_gtc_wmma_nhwc.py's identical comment --
             # reset dst back to bank 0 immediately, before the rest of the prologue's
@@ -865,8 +871,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         if self.tunable.async_global_load:
             self._emit(f"; Phase 13: persistent zero quad, used to zero-fill padding lanes' LDS")
             self._emit(f"; destinations after a masked global_load_async_to_lds_b128 (see global_load_a_functor)")
-            for i in range(4):
-                self._emit(f"v_mov_b32 v[{v.v_zero(i)}], 0")
+            emit_vopd_paired_zero_init(self._emit, v.v_zero, 4)
             self._emit_empty_line()
 
         self._emit(f"s_lshl_b32 s[{s.s_block_m_off()}], s[{s.s_bx()}], {utility_log2(self.tunable.gemm_m_per_block)}   ; *gemm_m_per_block")
@@ -1161,8 +1166,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         (s.s_p_in/s.s_p_wei). When set, v_addr is a single 32-bit byte-offset VGPR
         (v_off_a/v_off_b) and the load uses the SADDR form. '''
         if v_flag is not None:
-            for i in range(self.chunk_num_dwords):
-                self._emit(f"v_mov_b32 v[{v_gld(i)}], 0")
+            emit_vopd_paired_zero_init(self._emit, v_gld, self.chunk_num_dwords)
             self._emit(f"v_cmpx_le_u32 1, v[{v_flag()}]")
         for i in range(self.chunk_num_dwordx4):
             idx = chunk_idx * self.chunk_num_dwordx4 + i
@@ -1567,6 +1571,30 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                 num_v_b_total = outer.tunable.wmma_repeat_n * num_v_b   # Phase 22: one local_prefetch_num slot's worth
                 slot_off = slot * num_v_b_total
                 row_pitch = outer.tunable.gemm_n_per_block * outer.data_byte
+                if outer.tunable.ds_load_tr_b:
+                    # Phase 63: native ds_load_tr16_b128 replaces the entire manual
+                    # read+pack loop below -- 2 calls per wave_repeat_n step (one per
+                    # half of this k-half's 16 values), landing directly in v_b's
+                    # expected dword slots with zero packing/waits. See
+                    # wmma_mapping.py's get_gemm_index_for_src_matrix_transposed_ds_tr16
+                    # docstring for the address formula and the empirically-confirmed
+                    # hardware mechanism (docs/gfx1250_wmma_layout.md's Phase 63).
+                    assert outer.data_byte == 2 and num_v_b == 8
+                    with outer._deferred_context():
+                        for i_rn in range(outer.tunable.wmma_repeat_n):
+                            col_off = i_rn * outer.tunable.wmma_tile_n * outer.data_byte
+                            base = extra_off + outer.lds_a_size + col_off
+                            dst0 = slot_off + i_rn * num_v_b
+                            dst4 = dst0 + num_v_b // 2
+                            # Phase 63: the address's ROW component is [k_half*half_k +
+                            # (lane%8)]*row_pitch (see the address-helper docstring) -- this
+                            # call's 4 dwords cover k = k_half*half_k + 0..7 (dst0), the
+                            # second call must shift ROW by +8 (half of half_k=16, NOT
+                            # num_v_b/2's dword count) to reach k = k_half*half_k + 8..15.
+                            k_shift = outer.wmma_mapping.ctrl.inst_wmma.k // 4   # = half_k // 2 = 8
+                            outer._emit(f"ds_load_tr16_b128 v[{v.v_b(dst0)}:{v.v_b(dst0+3)}], v[{v.v_sld_b_os()}] offset:{base}")
+                            outer._emit(f"ds_load_tr16_b128 v[{v.v_b(dst4)}:{v.v_b(dst4+3)}], v[{v.v_sld_b_os()}] offset:{base + k_shift * row_pitch}")
+                    return outer._get_deferred()
                 elem_per_dword = 4 // outer.data_byte
                 if outer.data_byte == 2:
                     read_instr = 'ds_read_u16'
@@ -1574,20 +1602,41 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                     read_instr = 'ds_read_b32'   # fp32: full-dword read, no zero-extension needed
                 else:
                     read_instr = 'ds_read_u8'
+                # Phase 63 (wait-batching): batch up to chunk_num_dwords (v_gld_b's actual
+                # scratch capacity -- 16 for fp16/bf16/int8, 4 for fp32) sub-element reads
+                # before a single s_wait_dscnt, instead of one wait per `a`. Strictly safer
+                # (more outstanding loads before a wait is always fine; DSCNT-tracked reads
+                # complete in issue order) and reduces wait-instruction count by up to 8x
+                # (fp16/bf16: 16 slots fit in one batch -> 1 wait instead of 8; int8: 32
+                # slots -> 2 batches instead of 8; fp32: 2 slots, already 1 batch). Read
+                # values and pack results are identical to the original per-`a` version --
+                # only the wait GROUPING changes. See docs/gfx1250_optimization_backlog.md.
+                batch_cap = outer.chunk_num_dwords
                 with outer._deferred_context():
                     for i_rn in range(outer.tunable.wmma_repeat_n):
                         col_off = i_rn * outer.tunable.wmma_tile_n * outer.data_byte
-                        for a in range(num_v_b):
-                            # B region starts at outer.lds_a_size within the shared LDS tile;
-                            # v_sld_b_os only carries the offset local to B's own region.
-                            for s in range(elem_per_dword):
-                                off = outer.lds_a_size + col_off + (a * elem_per_dword + s) * row_pitch
-                                outer._emit(f"{read_instr} v[{v.v_gld_b(s)}], v[{v.v_sld_b_os()}] offset:{extra_off + off}")
+                        total_slots = num_v_b * elem_per_dword
+                        slot = 0
+                        while slot < total_slots:
+                            n_batch = min(batch_cap, total_slots - slot)
+                            for j in range(n_batch):
+                                abs_slot = slot + j
+                                # B region starts at outer.lds_a_size within the shared LDS
+                                # tile; v_sld_b_os only carries the offset local to B's own
+                                # region.
+                                off = outer.lds_a_size + col_off + abs_slot * row_pitch
+                                outer._emit(f"{read_instr} v[{v.v_gld_b(j)}], v[{v.v_sld_b_os()}] offset:{extra_off + off}")
                             outer._emit(f"s_wait_dscnt 0x0")
-                            outer._emit(f"v_mov_b32 v[{v.v_b(slot_off+i_rn*num_v_b+a)}], v[{v.v_gld_b(0)}]")
-                            for s in range(1, elem_per_dword):
-                                shift = s * 8 * outer.data_byte
-                                outer._emit(f"v_lshl_or_b32 v[{v.v_b(slot_off+i_rn*num_v_b+a)}], v[{v.v_gld_b(s)}], {shift}, v[{v.v_b(slot_off+i_rn*num_v_b+a)}]")
+                            for j in range(n_batch):
+                                abs_slot = slot + j
+                                a, s = abs_slot // elem_per_dword, abs_slot % elem_per_dword
+                                dst = v.v_b(slot_off+i_rn*num_v_b+a)
+                                if s == 0:
+                                    outer._emit(f"v_mov_b32 v[{dst}], v[{v.v_gld_b(j)}]")
+                                else:
+                                    shift = s * 8 * outer.data_byte
+                                    outer._emit(f"v_lshl_or_b32 v[{dst}], v[{v.v_gld_b(j)}], {shift}, v[{dst}]")
+                            slot += n_batch
                 return outer._get_deferred()
         return functor_t()
 
@@ -1664,6 +1713,8 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                         outer._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim1 (remaining K) lo16")
                         outer._emit(f"s_or_b32 s[{s.s_tdm_g1_b(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
                         outer._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim1 (remaining K) hi16")
+                        outer._emit(f"s_or_b32 s[{s.s_tdm_g1_b(3)}], s[{s.s_tmp(0)}], {outer.tunable.gemm_n_per_block << 16}   ; | tile_dim0 (compile-time)")
+                        outer._emit_front(f"{skip_label}:")
                     elif outer.tunable.saddr_global_load:
                         # Phase 61: v_off_b is a plain 32-bit byte OFFSET, advance by
                         # s_wei_k_stride (one K-tile's worth of weight rows) -- no carry chain.
@@ -1752,7 +1803,11 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_c_total.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off(),
                     s.s_gemm_m.label if self.tunable.wmma_m_tail else None, v.v_m_tail_row() if self.tunable.wmma_m_tail else None,
                     s.s_gemm_n.label if self.tunable.wmma_n_tail else None, v.v_n_tail_col() if self.tunable.wmma_n_tail else None,
-                    s.s_tmp(1) if self.tunable.wmma_n_tail else None,
+                    # Phase 66: always passed now (not just under wmma_n_tail) --
+                    # direct_store's outer-loop address hoist reuses this scratch SGPR
+                    # too; the two uses are mutually exclusive (direct_store vs.
+                    # LDS-reshuffle), so sharing the slot is safe.
+                    s.s_tmp(1),
                     v_chunked_col=v.v_chunked_col() if self.tunable.wmma_epilogue_chunked else None))
         self._emit(f"s_wait_storecnt 0x0")
 

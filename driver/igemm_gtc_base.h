@@ -261,6 +261,12 @@ typedef struct {
     // store was never actually exercised through the normal driver search path. Found
     // while hardware-validating the P2 (direct_store config expansion) backlog item.
     int direct_store = 0;
+    // Phase 63: ds_load_tr16_b128-based B-operand LDS transpose read (bwd, fp16/bf16
+    // only) -- replaces shared_load_b_functor's manual per-element read+pack loop.
+    // Changes the generated kernel's code (not just addressing internals the driver is
+    // ignorant of), so folded into the kernel name from the start -- see this project's
+    // own direct_store postmortem right above for why that specific omission was costly.
+    int ds_load_tr_b = 0;
     // Default-member-initialized (unlike the int fields above, which zero-init safely via
     // aggregate-init anyway) so a default-constructed igemm_gtc_tunable_t{} -- e.g.
     // driver_mode_heuristic's still-unimplemented heuristic_select_kernel() stub -- doesn't
@@ -345,6 +351,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.local_prefetch_num         = sec.count("local_prefetch_num") > 0 ? sec.at("local_prefetch_num").get_int() : 1;
                 tunable.epilogue_lds_pad           = sec.count("epilogue_lds_pad") > 0 ? sec.at("epilogue_lds_pad").get_int() : 0;
                 tunable.direct_store               = sec.count("direct_store") > 0 ? sec.at("direct_store").get_int() : 0;
+                tunable.ds_load_tr_b                = sec.count("ds_load_tr_b") > 0 ? sec.at("ds_load_tr_b").get_int() : 0;
                 tunable.atomic_scope               = sec.count("atomic_scope") > 0 ? sec.at("atomic_scope").get_string() : "SCOPE_SYS";
             }
             else{
@@ -575,6 +582,8 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += std::string("_ldspad");
         if(tunable->direct_store)
             kernel_name += std::string("_direct");
+        if(tunable->ds_load_tr_b)
+            kernel_name += std::string("_dstrb");
         if(tunable->local_prefetch_num != 1)
             kernel_name += std::string("_lp") + std::to_string(tunable->local_prefetch_num);
         if(tunable->atomic_scope != "SCOPE_SYS")

@@ -416,6 +416,80 @@ non-WMMA VALU (address computation), and the appropriate lever is hardware-assis
 (TDM), not LDS conflict reduction. The backlog item for LDS bank-conflict measurement is now
 fully closed.
 
+## Finding 7: bwd instruction-mix profiling (2026-09-01) pinpoints the non-WMMA VALU/LDS
+overhead to the B-operand's manual LDS-transpose-pack loop, and confirms toolchain
+support for a hardware fix
+
+Extended Findings 5/6's instruction-mix methodology to bwd specifically (previously only
+fwd-base and wrw-gsplit had instruction-count breakdowns). Profiled the bf16
+`direct_store=1` kernel at both tile shapes via `rocprofv3 --pmc` with
+`SQ_INSTS_{LDS,SALU,VALU,ALL}` and `SQ_INSTS_VEC32_VALU_WMMA` (raw data in
+`prof_bwd/prof_bwd_insts_counter_collection.csv`, 11 dispatches per tile, same conv shape
+for both tile sizes so the two rows are directly comparable):
+
+| Tile | `SQ_INSTS_VALU` | `SQ_INSTS_VEC32_VALU_WMMA` | `SQ_INSTS_LDS` | `SQ_INSTS_ALL` | WMMA % of ALL | VALU:WMMA | LDS:WMMA |
+|---|---|---|---|---|---|---|---|
+| 128x128x32 | 32,506,720 | 4,734,976 | 23,674,880 | 72,763,264 | 6.5% | 6.87x | 5.00x |
+| 64x64x32 | 58,576,832 | 4,734,976 (identical) | 44,982,272 | 135,538,688 | 3.5% | 12.37x | 9.50x |
+
+This independently re-confirms Finding 5's ~50%-non-WMMA-VALU / LDS-second-largest
+pattern for bwd specifically (here: 44.7% VALU / 32.5% LDS at 128x128, worse at 64x64),
+and adds a new data point: **WMMA instruction count is identical across tile sizes for
+the same problem** (expected — the total math is fixed), while non-WMMA VALU/LDS scale
+with iteration/workgroup count — smaller tiles pay proportionally *more* overhead per
+unit of actual math, not less.
+
+**Root cause, traced to a specific, previously-un-code-located line range**:
+`shared_load_b_functor` (`python/igemm/igemm_bwd_gtc_wmma_nhwc.py:1539-1592`, and
+`igemm_wrw_gtc_wmma_nhwc.py`'s twin) implements the WMMA B-operand's LDS-transpose read
+as a **manual per-sub-dword-element loop**: for each `(wmma_repeat_n, num_v_b)` pair, it
+issues `ds_read_u16`/`ds_read_u8` × `elem_per_dword`, then `s_wait_dscnt 0x0`, then a
+`v_mov_b32` + `v_lshl_or_b32` pack chain. The docstring self-documents this as
+"deliberately correctness-over-speed" (limited VGPR budget forced element-at-a-time
+processing instead of batching). For the profiled config (bf16, `wmma_repeat_n=4`,
+`num_v_b=8`, `elem_per_dword=2`): **~160 LDS+VALU+SALU instructions per K-iteration** for
+the B operand alone, vs. **~8 instructions** for the equivalent A-operand load
+(`shared_load_a_functor`, same file, using bulk `ds_read_b128` via
+`_emit_ds_read_chunked`) — a ~20x asymmetry that plausibly accounts for the majority of
+the measured LDS instruction count and a large fraction of the VALU count.
+
+**fp32 does not hit this same path**: `elem_per_dword = 4 // data_byte` evaluates to 1
+when `data_byte==4`, so fp32 already does a plain full-dword `ds_read_b32` per element
+with no `v_lshl_or_b32` pack chain — this specific root cause is fp16/bf16-scoped. fp32
+still pays one unbatched `s_wait_dscnt` per element in the same loop, a smaller, separate
+issue (see the backlog's new fp32-specific item).
+
+**ISA-doc cross-reference, confirmed against the real toolchain (2026-09-01)**: CDNA5
+ISA §10.9 ("WMMA Matrix Load Ops with Transpose") / §11.2.4 ("LDS to VGPR Matrix Load
+with Transpose") documents `DS_LOAD_TR16_B128` (LDS→VGPR, opcode 252) and its
+global-memory equivalent `GLOBAL_LOAD_TR16_B128` (opcode 87) — both load a 16x16 tile of
+16-bit elements (fp16/bf16; no fp32 variant exists — the only element sizes supported
+are 16/8/6/4-bit) transposed into 4 consecutive VGPRs (128 bits) in ONE instruction,
+with the hardware doing the lane remapping internally (no software pack loop, no
+per-element wait). This is exactly the instruction `shared_load_b_functor`'s own
+docstring gestures at needing, without naming it. **Confirmed both mnemonics assemble
+cleanly** on this project's actual pinned toolchain
+(`/home/sgundabo/rocm-10.1/llvm/bin/clang++ -x assembler -target amdgcn--amdhsa
+-mcpu=gfx1250`, exit 0, disassembly verified via `llvm-objdump`):
+
+```
+ds_load_tr16_b128 v[0:3], v4                               // DBF00000 00000004
+global_load_tr16_b128 v[0:3], v[4:5], off                   // EE15C07C 00000000 00000004
+```
+
+This was already an open Tier 3 backlog item ("Hardware transpose-load") before this
+session, listed with no reference implementation and unconfirmed toolchain support —
+this finding supplies the missing quantitative justification, the exact code location,
+and confirms toolchain support, moving it from "someday" to "in progress." See
+`docs/gfx1250_optimization_backlog.md`'s updated entry.
+
+**Caveat carried over, not yet resolved**: the ISA doc's exact per-lane K/N index
+mapping for these instructions is only in an unextracted diagram (image, not text) — the
+transpose semantics must be empirically validated against MISA's existing WMMA
+B-operand VGPR layout expectations (`docs/gfx1250_wmma_layout.md`) on real hardware
+before trusting them, the same discipline every other Phase in that doc follows. This is
+genuine new engineering, not a port of an existing pattern.
+
 ## Not yet done
 
 - GPU was under contention throughout this session (see

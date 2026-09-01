@@ -124,6 +124,37 @@ def igemm_flatten_list_accumulate(x):
     from functools import reduce
     return reduce(lambda a, b: a+b, x)
 
+def emit_vopd_paired_zero_init(emit_fn, reg_at, count):
+    '''
+    Phase 67: pairs consecutive `v_mov_b32 v[reg], 0` zero-inits into
+    `v_dual_mov_b32 ... :: v_dual_mov_b32 ...` (CDNA5 dual-issue VALU, ISA doc
+    section 7.8) -- halves the instruction count wherever a contiguous run of
+    same-value (0) VGPR zero-inits is emitted. Safe unconditionally (not gated
+    behind an opt-in tunable, unlike most codegen variants in this project):
+    `v_mov_b32` is both X- and Y-slot eligible, the immediate 0 is a single
+    literal SHARED by both halves (VOPD's encoding allows exactly one literal,
+    shared or single-use -- two DIFFERENT literals in one pair would NOT be
+    legal, which is why this helper must not be reused for non-uniform-value
+    zero/const-inits), and any two CONSECUTIVE VGPR indices always differ in
+    destination parity, satisfying VOPD's even/odd-dest-bank constraint for
+    free regardless of the starting register's own parity. Confirmed
+    `v_dual_mov_b32 vN, 0 :: v_dual_mov_b32 vN+1, 0` assembles cleanly on the
+    pinned toolchain for multiple N (both even and odd starting points) via a
+    standalone llvm-mc/clang smoke test -- see docs/gfx1250_wmma_layout.md's
+    Phase 67.
+
+    `reg_at(i)` returns the register label (string, as used inside an
+    f-string's `v[...]`) for zero-init index i (0..count-1); `emit_fn` is
+    typically `self._emit`. Falls back to a single plain `v_mov_b32` for a
+    trailing odd count.
+    '''
+    i = 0
+    while i + 1 < count:
+        emit_fn(f"v_dual_mov_b32 v[{reg_at(i)}], 0 :: v_dual_mov_b32 v[{reg_at(i+1)}], 0")
+        i += 2
+    if i < count:
+        emit_fn(f"v_mov_b32 v[{reg_at(i)}], 0")
+
 def get_igemm_gtc_fma_type(tunable_dict):
     assert type(tunable_dict) is dict
     if 'gemm_m_per_thread' in tunable_dict and 'gemm_n_per_thread' in tunable_dict:
@@ -812,6 +843,29 @@ class igemm_gtc_tunable_parameter_t(object):
                     # construction (also asserted kernel-side).
                     assert not self.tdm_global_load, \
                         "wmma_k_tail (new, non-TDM) and tdm_global_load are mutually exclusive -- TDM already has its own K-tail mechanism"
+            # Phase 63: replace shared_load_b_functor's (bwd) / shared_load_a_functor's and
+            # shared_load_b_functor's (wrw) manual per-element LDS-transpose read+pack loop
+            # (ds_read_u16/u8 -> s_wait_dscnt -> v_mov_b32 -> v_lshl_or_b32, ~160
+            # instructions/K-iteration, see docs/gfx1250_rocprof_profiling.md's Finding 7)
+            # with the native ds_load_tr16_b128 hardware transpose-load instruction (2
+            # calls/wave_repeat_n step, zero packing/waits). fp16/bf16 only -- no fp32
+            # variant of this instruction exists (element sizes supported are 16/8/6/4-bit).
+            # See docs/gfx1250_wmma_layout.md's Phase 63 for the empirically-confirmed
+            # hardware addressing mechanism this relies on (reverse-engineered via a
+            # standalone hardware probe, since the ISA doc's exact per-lane semantics are
+            # only in an unextracted diagram).
+            # Phase 64: composes freely with wmma_m_tail/wmma_n_tail/wmma_k_tail/
+            # gemm_k_global_split -- confirmed by code inspection that all tail/split-K
+            # masking happens at LDS WRITE time (global_load's v_flag + shared_store's
+            # tail-dword mask), not LDS READ time, so shared_load_b/a_functor (whichever
+            # mechanism) just reads whatever's already correctly-masked in LDS regardless.
+            # The original narrower asserts here were overly conservative -- removed after
+            # this review, hardware-validated per combination (see Phase 64 in
+            # docs/gfx1250_wmma_layout.md).
+            self.ds_load_tr_b = utility_dict_with_default_t(tunable_dict)('ds_load_tr_b', 0)
+            if self.ds_load_tr_b:
+                assert self.direction in ('bwd', 'wrw'), "ds_load_tr_b is bwd/wrw only (Phase 63/64) -- fwd's operands aren't LDS-transposed to begin with"
+                assert self.precision in ('fp16', 'bf16'), "ds_load_tr16_b128 is a 16-bit-element instruction only -- no fp32 variant exists"
             # Phase 35 (hipconv-style reduction-kernel epilogue): replaces the atomic epilogue
             # entirely for wrw's split-K path -- each shard writes a plain, non-atomic store
             # into its own disjoint slice of a workspace buffer (num_splits x output_size),
@@ -1420,6 +1474,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_ldspad"
         if tunable.direct_store:
             kernel_name += "_direct"
+        if tunable.ds_load_tr_b:
+            kernel_name += "_dstrb"
         if tunable.local_prefetch_num != 1:
             kernel_name += f"_lp{tunable.local_prefetch_num}"
         if tunable.atomic_scope != 'SCOPE_SYS':

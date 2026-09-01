@@ -669,9 +669,14 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
             elif ctrl.direct_store:
                 assert not ctrl.wrw_reduction_kernel, "direct_store + wrw_reduction_kernel not implemented"
                 assert not ctrl.wmma_epilogue_chunked, "direct_store + wmma_epilogue_chunked not implemented"
+                # Phase 66: s_tmp2 (otherwise only used by the LDS-reshuffle path's
+                # wmma_n_tail branch below, mutually exclusive with direct_store) is
+                # reused here to hold the precomputed inter-i_rm-block row-address gap
+                # stride -- see _emit_direct_store's docstring.
+                assert s_tmp2 is not None, "direct_store's outer-loop address hoist (Phase 66) needs a second scratch SGPR"
                 self._emit_direct_store(ctrl, cxm, inst_wmma, v_c, v_gemm_im, v_gemm_in,
                     s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1,
-                    s_gemm_m, v_tmp3, s_gemm_n, v_tmp4)
+                    s_gemm_m, v_tmp3, s_gemm_n, v_tmp4, s_tmp2)
             else:
                 # ---- non-atomic: LDS-reshuffle coalescing store ----
                 assert v_tid is not None and v_gather is not None and s_block_m_off is not None and s_block_n_off is not None
@@ -992,7 +997,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         return self._get_deferred()
     def _emit_direct_store(self, ctrl, cxm, inst_wmma, v_c, v_gemm_im, v_gemm_in,
         s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1,
-        s_gemm_m, v_tmp3, s_gemm_n, v_tmp4):
+        s_gemm_m, v_tmp3, s_gemm_n, v_tmp4, s_row_gap=None):
         '''
         Phase 59: direct per-lane global_store_dword epilogue, no LDS reshuffle.
         16 consecutive lanes cover 16 consecutive columns (lane%16 -> column per
@@ -1002,20 +1007,80 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         exactly (same cur/nxt ping-pong, same row*stride+col formula, same tail
         masking) — only the store opcode differs: global_store_dword instead of
         global_atomic_add_f32. See docs/gfx1250_direct_store_plan.md.
+
+        Phase 66: the outer i_rm loop used to recompute `row*stride+col` from
+        scratch every iteration even though consecutive i_rm blocks are separated
+        by a compile-time-constant row gap. Each block's inner `j` loop advances
+        num_v_c rows starting at row_off (rows row_off .. row_off+num_v_c-1 -- a
+        given lane only ever covers num_v_c of the wave_tile_m rows a WMMA tile
+        spans, since it covers only its own half; the other wave_tile_m-num_v_c
+        rows belong to other lanes), so the gap from the LAST row this block
+        touches (row_off+num_v_c-1) to the NEXT block's first row
+        (row_off+wave_tile_m) is `wave_tile_m - num_v_c + 1` rows -- the "+1" is
+        easy to drop (an earlier version of this hoist did, and `-V 1` caught it:
+        `valid:n`, off by exactly one row-stride per block).
+
+        The inner loop's cur/nxt ping-pong does num_v_c (even, for every WMMA
+        instruction wired up so far -- num_v_c=8 regardless of precision) swaps,
+        an even count, so the PYTHON aliases return to their block-starting
+        binding (cur=v_tmp1, nxt=v_tmp2) -- but the CONTENT that matters (the last
+        row's address) ends up in v_tmp2, not v_tmp1: the final store
+        (j=num_v_c-1, an odd index) reads from whichever register the
+        alternating swap bound "cur" to at that odd step, which is v_tmp2's
+        fresh-block binding, and v_tmp2 is never overwritten again after that
+        (the last iteration skips the "precompute next" step). v_tmp1 by
+        contrast holds a stale, one-row-behind value from the second-to-last
+        iteration. Verified by hand-tracing all 8 iterations' register bindings
+        AND by reading the actual generated disassembly line-by-line (both the
+        "read from v_tmp1" bug and the missing "+1" gap bug were each caught by
+        `-V 1` in turn, not assumed away).
+
+        So the next block's starting address is
+        `v_tmp2 + (gap_rows)*row_stride`, written into v_tmp1 (this block's
+        fresh "cur"), one instruction instead of the full 4-instruction
+        row/stride/col/shift recompute. Precomputes `s_row_gap = s_tmp1 *
+        gap_rows` once (gap_rows is a compile-time constant, so this is a
+        single `s_mul_i32` with an immediate) instead of per-block. Falls back
+        to the original full-recompute for i_rm==0 (nothing to carry forward
+        yet) and whenever the hoist isn't applicable (single i_rm block, or a
+        hypothetical future WMMA instruction with gap_rows<=0 or odd num_v_c --
+        not exercised by anything wired up today, kept as a safety fallback,
+        not a currently-reachable path).
         '''
         self._emit(f"; wmma direct per-lane store epilogue (no LDS reshuffle), "
                    f"{cxm.wave_repeat_m}x{cxm.wave_repeat_n} tiles, {inst_wmma.num_v_c} rows/tile")
         self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], 2   ; row-to-row byte stride")
+        gap_rows = cxm.wave_tile_m - inst_wmma.num_v_c + 1
+        # Phase 66: hoist is only well-defined when num_v_c is even (see the docstring
+        # above for exactly which register ends up holding the needed value) -- true
+        # for every WMMA instruction wired up so far (num_v_c=8 always), kept as an
+        # explicit condition rather than a silent assumption.
+        can_hoist = (s_row_gap is not None and cxm.wave_repeat_m > 1 and gap_rows > 0 and inst_wmma.num_v_c % 2 == 0)
+        if can_hoist:
+            self._emit(f"s_mul_i32 s[{s_row_gap}], s[{s_tmp1}], {gap_rows}   ; Phase 66: inter-i_rm-block row-address gap stride ({gap_rows} rows)")
         for i_rm in range(cxm.wave_repeat_m):
             row_off = i_rm * cxm.wave_tile_m
             cur, nxt = v_tmp1, v_tmp2
-            # cur = byte address of (row_off, col 0): row = v_gemm_im + row_off
-            self._emit(f"v_add_u32 v[{cur}], {row_off}, v[{v_gemm_im}]" if row_off != 0 else f"v_mov_b32 v[{cur}], v[{v_gemm_im}]")
-            if ctrl.wmma_m_tail:
-                self._emit(f"v_mov_b32 v[{v_tmp3}], v[{cur}]   ; wmma_m_tail: absolute row (row {row_off}, j=0)")
-            self._emit(f"v_mul_lo_u32 v[{cur}], s[{s_gemm_m_stride}], v[{cur}]")
-            self._emit(f"v_add_u32 v[{cur}], v[{v_gemm_in}], v[{cur}]")
-            self._emit(f"v_lshlrev_b32 v[{cur}], 2, v[{cur}]  ; byte address, row {row_off}, col 0")
+            if can_hoist and i_rm > 0:
+                # Phase 66 subtlety: after the inner j loop's num_v_c (even) swaps, the
+                # LAST store (j=num_v_c-1, an ODD index) used whatever "cur" was bound
+                # to at THAT point -- which, by the alternating-swap pattern, is always
+                # nxt's fresh-block binding (v_tmp2), NOT cur's (v_tmp1). v_tmp1 holds
+                # a stale, one-row-behind value (from the second-to-last iteration's
+                # precompute) by the time the loop exits. So the carry-forward must
+                # read from v_tmp2 (nxt), not v_tmp1 (cur) -- verified by hand-tracing
+                # all 8 iterations' register bindings, not just assumed.
+                self._emit(f"v_add_u32 v[{cur}], v[{nxt}], s[{s_row_gap}]   ; byte address, row {row_off}, col 0 (Phase 66: incremental from previous block)")
+                if ctrl.wmma_m_tail:
+                    self._emit(f"v_add_u32 v[{v_tmp3}], {gap_rows}, v[{v_tmp3}]   ; wmma_m_tail: absolute row (row {row_off}, j=0, incremental)")
+            else:
+                # cur = byte address of (row_off, col 0): row = v_gemm_im + row_off
+                self._emit(f"v_add_u32 v[{cur}], {row_off}, v[{v_gemm_im}]" if row_off != 0 else f"v_mov_b32 v[{cur}], v[{v_gemm_im}]")
+                if ctrl.wmma_m_tail:
+                    self._emit(f"v_mov_b32 v[{v_tmp3}], v[{cur}]   ; wmma_m_tail: absolute row (row {row_off}, j=0)")
+                self._emit(f"v_mul_lo_u32 v[{cur}], s[{s_gemm_m_stride}], v[{cur}]")
+                self._emit(f"v_add_u32 v[{cur}], v[{v_gemm_in}], v[{cur}]")
+                self._emit(f"v_lshlrev_b32 v[{cur}], 2, v[{cur}]  ; byte address, row {row_off}, col 0")
             for j in range(inst_wmma.num_v_c):
                 if j != inst_wmma.num_v_c - 1:
                     self._emit(f"v_add_u32 v[{nxt}], v[{cur}], s[{s_tmp1}]   ; precompute row {row_off + j + 1} address")
