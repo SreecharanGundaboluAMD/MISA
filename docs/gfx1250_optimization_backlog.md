@@ -161,6 +161,45 @@ section for the record).
       newly-covered saddr section (bwd/wrw x bf16/fp16/fp32, both standalone and from
       inside the regenerated master configs). Performance still not separately
       measured. See `docs/gfx1250_wmma_layout.md`'s Phase 67.
+      **Follow-up (2026-09-01, Phase 68)**: `saddr_global_load` added to
+      `script/generate_all_configs.py`'s combinatorial `FLAGS` (previously only ever
+      tested in its own single-feature file, never combined with `direct_store`/
+      `wmma_m_tail`/`wmma_setprio`/`lds_double_buffer`/etc.). This surfaced a genuine,
+      previously-unknown correctness bug:
+- [x] **fwd `saddr_global_load` + `wmma_n_tail` produces `valid:n`** — found
+      2026-09-01 (Phase 68) the moment the combinatorial generator tried this pair for
+      the first time. Confirmed real (not a shape artifact): the identical exact-fit
+      shape passes `valid:y` with plain `wmma_n_tail` alone AND with
+      `saddr_global_load` + `wmma_m_tail` alone -- only the `saddr`+`n_tail` pairing on
+      fwd fails. bwd's identical pairing hardware-validates fine (wrw structurally can't
+      combine them: wrw requires `gemm_k_global_split` alongside any tail flag, which
+      `saddr_global_load` already excludes). Not root-caused (plausibly fwd's B-operand
+      N-boundary address computation not accounting for `saddr`'s different addressing
+      path) -- excluded from the generated corpus via a new `is_valid()` rule
+      (`if sa and nt and direction == 'fwd': return False`) rather than left broken in
+      the searched space. Root-causing and fixing this is real, separate follow-up work.
+      See `docs/gfx1250_wmma_layout.md`'s Phase 68.
+- [ ] **`script/build_and_filter_configs.py`'s per-section failure isolation doesn't
+      recognize the `register index is out of range` error class** — found 2026-09-01
+      (Phase 68) while validating the saddr combinatorial expansion above. When a
+      multi-section per-tile combo file fails to assemble as a whole, this script tries
+      to identify and drop just the offending section(s) by pattern-matching a
+      `kernel 'NAME'` string in the compiler output -- but a real, separate,
+      PRE-EXISTING failure class (`<instantiation>:N:M: error: register index is out of
+      range`, apparently a VGPR/register-macro budget overflow in some large multi-tap
+      magic-division / tail-masking combinations) doesn't match that pattern, so the
+      script falls back to "keeping all sections," silently leaving a config file that
+      does NOT actually build via `igemm_codegen.py`. Confirmed via git-stash A/B that 7
+      of 27 per-tile combo files (`bwd` bf16/fp16 128x128; fp32 128x128/64x64 for all
+      three directions; `fwd` bf16/fp16 64x128) hit this and are PRE-EXISTING, not
+      introduced by the saddr work. Not a silent correctness risk today (the benchmark
+      script's `build_one_config` already handles a build failure gracefully and just
+      skips that candidate) but it does silently narrow the searched corpus for those
+      (direction, precision, tile) combinations, and the underlying VGPR/register-budget
+      bug itself is still unknown. Two separate follow-ups here: (1) teach
+      `extract_failing_sections()` to also parse this error format so it can actually
+      isolate and drop just the bad sections, (2) root-cause the register-budget
+      overflow itself. See `docs/gfx1250_wmma_layout.md`'s Phase 68.
 - [ ] **`disable_xdl_arb_stall` (`SCHED_MODE` bit[2]) A/B test on a wrw split-K shape.**
       **Attempted 2026-08-27, blocked — not a guess we should make.** The CDNA5 ISA doc
       (§5.7.2.1) documents this bit's *existence and semantics* but gives no `S_SETREG`
@@ -579,10 +618,21 @@ section for the record).
          work (see the new backlog entry below). No code-level reason to expect it
          behaves differently once that's fixed (wrw's structurally similar split-K
          composes correctly).
-      2. **Full benchmark-suite sweep** — only a couple of shapes measured per direction
-         so far; needs `script/benchmark_gfx1250_vs_miopen.py` across the full shape
-         corpus for both directions, plus folding `ds_load_tr_b=1` into the master
-         config union once broader coverage is confirmed.
+      2. ~~**Full benchmark-suite sweep / folding into the master config union**~~ —
+         **DONE 2026-09-01 (Phase 68).** Turned out `ds_load_tr_b` was reachable by
+         ZERO config files in the entire repo (found via fresh rocprofv3 profiling that
+         re-confirmed the win: bwd -35%/wrw -62% instructions on a fixed shape,
+         real wall-clock gains too). Rather than adding more standalone configs,
+         promoted it to a smart DEFAULT (`1` whenever `direction in ('bwd','wrw')` and
+         `precision in ('fp16','bf16')`, unless `wrw_streamk`) in `igemm_base.py` --
+         every existing bwd/wrw fp16/bf16 config now gets it automatically, matching
+         Phase 64's wait-batching precedent. Validated broadly first (async, dbuf,
+         interleave, ldspad, setprio, tdm(+direct), saddr, gsplit(+setprio),
+         local_prefetch_num=2(+bf16acc), group_count>1 -- all `valid:y`). Also had to
+         fix `driver/igemm_gtc_base.h` (the C++ driver's independent tunable parser) to
+         mirror the identical default -- hit the known kernel-naming-desync failure
+         mode (`hipModuleGetFunction`/"named symbol not found") when the Python and C++
+         defaults briefly disagreed. See `docs/gfx1250_wmma_layout.md`'s Phase 68.
       3. ~~**`GLOBAL_LOAD_TR16_B128`**~~ — **investigated 2026-09-01, REJECTED with
          quantified reasoning (not merely deferred).** Hardware mechanism confirmed
          identical to the LDS variant via a second standalone probe. But the actual

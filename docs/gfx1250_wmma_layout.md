@@ -5911,3 +5911,119 @@ documented occupancy-race mechanism exactly, but fixing it is a large, separate,
 cross-cutting sweep (every affected config needs the field added and ideally a
 high-occupancy re-validation) -- deliberately not undertaken as part of this backlog
 item's scope. Flagged here so it isn't lost; a good candidate for its own Phase.
+
+## Phase 68 (2026-09-01): `ds_load_tr_b` promoted to default-on (bwd/wrw fp16/bf16); `saddr_global_load` joins the combinatorial generator; a real fwd `saddr`+`wmma_n_tail` bug found and excluded
+
+Follow-on to Phase 67's rocprofv3 finding that `ds_load_tr_b` (Phase 63/64's biggest
+measured win) was implemented and hardware-validated but reachable by zero config files
+in the repo, and that the combinatorial generator (`script/generate_all_configs.py`)
+never combined `saddr_global_load`/`ds_load_tr_b` with `direct_store`/tail-relief/
+`lds_double_buffer`/`wmma_setprio`/etc. -- only ever tested each in isolation.
+
+**Part 1 -- `ds_load_tr_b` promoted to default-on.** Rather than adding it as a new
+combinatorial axis (which would double the corpus size for a mechanism with no known
+downside), promoted it the same way Phase 64's wait-batching was: `igemm_base.py` now
+computes a smart default -- `1` whenever `direction in ('bwd','wrw')` and
+`precision in ('fp16','bf16')`, `0` otherwise -- instead of a flat opt-in `0`. A config
+can still explicitly override it either way. `wrw_streamk` is excluded from the default
+(checked via the raw `tunable_dict`, not `self.wrw_streamk`, since that field parses
+later in `__init__`) since stream-K's history of faulting tunables (the
+benchmark-script-validn-trap finding) made it the one combination not exercised here.
+
+**Validated broadly before flipping the default** (existing bwd/wrw bf16/fp16
+standalone configs, each rebuilt with `ds_load_tr_b=1` added and hardware-run):
+`async_global_load`, `lds_double_buffer`, `main_loop_interleave`, `epilogue_lds_pad`,
+`wmma_setprio`, `tdm_global_load` (+`direct_store`), `saddr_global_load`,
+`gemm_k_global_split` (+`wmma_setprio`, wrw's primary path), `local_prefetch_num=2`
+(+`wmma_acc_bf16`), `group_count>1`, multi-K-block, both tile shapes -- all `valid:y`.
+Two failures found (wrw's `interleave`/`k2x_dbuf` sections, both `gemm_k_per_block=64`)
+reproduce identically with `ds_load_tr_b=0` on the unmodified config -- confirmed via
+git-stash A/B, a pre-existing k2x bug, unrelated.
+
+**Deleted the 4 standalone `_dstrb.config` files added earlier this session** (bwd/wrw
+x bf16/fp16) once the promotion made them byte-for-byte duplicates of the base
+128x128/64x64 config sections -- keeping them would have collided on kernel name in the
+master-config text union. Removed the corresponding `DSTRB_CONFIGS`/candidate-list
+wiring from `script/benchmark_gfx1250_vs_miopen.py` for the same reason: every existing
+candidate (base/mtail/gsplit/interleave/saddr/master/combo_*) already gets
+`ds_load_tr_b` for free now.
+
+**Hit, and fixed, exactly the known kernel-naming-desync failure mode** (see the P2
+backlog entry / `gfx1250_kernel_naming_sync_bug` memory): promoting the default in
+`igemm_base.py` (Python codegen) without also updating `driver/igemm_gtc_base.h` (the
+C++ driver's independent tunable parser) left the C++ side still defaulting to `0`,
+so `hipModuleGetFunction` failed with "named symbol not found" for every kernel whose
+name now included a Python-computed `_dstrb` suffix the C++ side didn't know to expect.
+Fixed by mirroring the identical direction/precision/`wrw_streamk` default logic in
+`igemm_gtc_tunable_from_config` (computed after `direction`/`precision` are parsed,
+since they aren't available yet at the point `ds_load_tr_b` was previously read).
+
+**Hardware-validated after the fix**: full-search reruns of the regenerated
+`bwd`/`wrw` bf16/fp16 master configs -- all kernels resolve and validate correctly
+(no more naming-desync errors). Two known-N/A results surfaced during the sweep, both
+independently confirmed pre-existing via git-stash A/B, unrelated to this change:
+bwd's `gemm_k_global_split` illegal-memory-access crash (already tracked, Phase 65) hit
+via a `_dstrb_gkgs` kernel name in both bf16 and fp16; and a `wrw_streamk`+`wmma_m_tail`+
+`wmma_n_tail`+`gemm_k_global_split` combination triggered a real GPU memory fault
+(`HSA_STATUS_ERROR_MEMORY_FAULT`) -- confirmed via kernel name (no `_dstrb` suffix, so
+unrelated to this promotion) and via the GPU recovering cleanly on the next dispatch.
+Also uncovered a broader pre-existing bug family: wrw's `gemm_k_per_block>32`
+(k2x/k4x/k8x-style large-K tiles, e.g. `bt64x64x128`/`bt64x64x256`/`bt128x128x128`)
+fail `valid:n` with `-nan`/`-inf` output across the board -- confirmed via A/B that
+these fail identically without `ds_load_tr_b` too. fwd/fp32/int8 confirmed completely
+unaffected by the promotion (kernel names, generated `.s`, and `valid:y` all unchanged).
+
+**Part 2 -- `saddr_global_load` added to the combinatorial generator.**
+`script/generate_all_configs.py`'s `FLAGS` list gained `saddr_global_load` (10 -> 11
+axes), with exclusion rules copied verbatim from the hard asserts already enforced in
+`igemm_{fwd,bwd,wrw}_gtc_wmma_nhwc.py` (`saddr` excludes `tdm_global_load`,
+`main_loop_interleave`, `gemm_k_global_split`, and asymmetric tiles -- proxied via
+`tile_m != tile_n`, the same pattern the existing `nt`/`tdm`/`mli` rules already use for
+the same underlying row_repeat>1 restriction). `ds_load_tr_b` was deliberately NOT added
+as a combinatorial axis here -- Part 1 already makes it automatic everywhere it applies,
+so adding it as a toggle would just double the corpus for no new coverage.
+
+**A genuinely new correctness bug found by this exact expansion**: fwd's
+`saddr_global_load` + `wmma_n_tail` fails hardware validation (`valid:n`) even on an
+EXACT-FIT shape (no real tail condition active) -- while the identical shape with plain
+`wmma_n_tail` (no saddr) passes `valid:y`, and `saddr_global_load` + `wmma_m_tail` alone
+(no `n_tail`) also passes `valid:y`. This narrows the bug precisely to the
+`saddr`+`n_tail` interaction on fwd specifically -- not a shape artifact (the same
+"tail enabled but not actually triggered" condition applies equally to the passing
+`wmma_m_tail`-alone case). bwd's identical combination (`saddr_global_load` +
+`wmma_n_tail`) hardware-validated `valid:y` -- this is fwd-specific (wrw structurally
+can't combine them at all: wrw requires `gemm_k_global_split` alongside any tail flag,
+and `saddr` already excludes `gemm_k_global_split`). Not root-caused (plausibly fwd's
+B-operand N-boundary address computation not accounting for `saddr`'s different
+addressing path) -- excluded via a new `is_valid()` rule
+(`if sa and nt and direction == 'fwd': return False`) rather than shipped broken in the
+searched corpus. bwd's saddr+n_tail combination is NOT excluded.
+
+**Toolchain gap found, not fixed**: `script/build_and_filter_configs.py`'s
+per-section failure isolation (meant to auto-drop just the broken sections from a
+multi-section build failure) doesn't recognize the `<instantiation>:N:M: error:
+register index is out of range` error format (a real, pre-existing "VGPR/register-macro
+budget exceeded" class of failure in some large multi-tap magic-division / tail-masking
+combinations) -- it only pattern-matches a `kernel 'NAME'` failure format from a
+different warning class, so it falls back to "keeping all sections" on these files,
+silently leaving a file that does NOT actually build via `igemm_codegen.py`. Confirmed
+via git-stash A/B that 7 of the 27 per-tile combo files (`bwd` bf16/fp16 128x128, all
+three precisions' fp32 128x128/64x64, `fwd` bf16/fp16 64x128) fail this way, and that
+the failures are PRE-EXISTING (reproduce identically with `saddr_global_load` reverted
+out of `FLAGS`) -- not introduced by this Phase. `build_one_config()` in the benchmark
+script already handles a build failure gracefully (catches the subprocess error, returns
+`None`, the candidate is just skipped) so this doesn't corrupt benchmark results, only
+silently narrows coverage for those specific (direction, precision, tile) combinations.
+Not fixed here -- fixing the isolation logic and/or root-causing the underlying
+register-budget issue is real, separate work. Flagged in the backlog.
+
+**Hardware-validated** (post-fix corpus): fwd's remaining 16 `saddr`-combined sections
+at the 128x128 tile (`saddr`, `saddr_setprio`, `saddr_mtail`, `saddr_setprio_mtail`,
+each also combined with `dbuf` and `direct`) all `valid:y`; bwd's new saddr+setprio/
++tail-relief/+dbuf combinations at 64x64 all `valid:y`; wrw's new saddr+setprio/+direct
+combinations at 128x128 all `valid:y`. `script/build_gfx1250_master_configs.py --write`
+re-run (its glob explicitly skips any `*_all.config` file, including the per-tile
+combo files this generator writes, by design -- the two systems are independent; the
+benchmark script already reaches the combinatorial corpus via its separate `combo_{tm}x
+{tn}` candidate path, not via `master`) -- confirmed no interaction with this Phase's
+changes.
