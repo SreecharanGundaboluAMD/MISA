@@ -304,6 +304,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
             sec.get_name() == "igemm_wrw_gtc")
         {
             igemm_gtc_tunable_t tunable;
+            bool ds_load_tr_b_specified      = sec.count("ds_load_tr_b") > 0;
             tunable.tensor_layout            = sec.count("tensor_layout") > 0 ? sec.at("tensor_layout").get_string() : "nchw";
             tunable.gemm_m_per_block         = sec.at("gemm_m_per_block").get_int();
             tunable.gemm_n_per_block         = sec.at("gemm_n_per_block").get_int();
@@ -351,7 +352,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.local_prefetch_num         = sec.count("local_prefetch_num") > 0 ? sec.at("local_prefetch_num").get_int() : 1;
                 tunable.epilogue_lds_pad           = sec.count("epilogue_lds_pad") > 0 ? sec.at("epilogue_lds_pad").get_int() : 0;
                 tunable.direct_store               = sec.count("direct_store") > 0 ? sec.at("direct_store").get_int() : 0;
-                tunable.ds_load_tr_b                = sec.count("ds_load_tr_b") > 0 ? sec.at("ds_load_tr_b").get_int() : 0;
+                tunable.ds_load_tr_b                = ds_load_tr_b_specified ? sec.at("ds_load_tr_b").get_int() : 0;
                 tunable.atomic_scope               = sec.count("atomic_scope") > 0 ? sec.at("atomic_scope").get_string() : "SCOPE_SYS";
             }
             else{
@@ -371,6 +372,18 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
             tunable.tensor_b_cluster_lengths = sec.at("tensor_b_cluster_lengths").get_list_int();
             tunable.direction                = sec.at("direction").get_string();
             tunable.precision                = sec.at("precision").get_string();
+            // Phase 67: mirror igemm_base.py's default-on promotion of ds_load_tr_b for
+            // every bwd/wrw fp16/bf16 config (excl. wrw_streamk, not yet validated in
+            // combination -- see igemm_base.py's comment). Computed here, not inline
+            // with the other WMMA fields above, because it needs direction/precision,
+            // which aren't parsed yet at that point. MUST stay in sync with the Python
+            // default or hipModuleGetFunction silently fails to find the kernel
+            // (kernel-naming desync -- see the gfx1250_kernel_naming_sync_bug memory).
+            if(tunable.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA && !ds_load_tr_b_specified){
+                tunable.ds_load_tr_b = (tunable.direction == "bwd" || tunable.direction == "wrw") &&
+                                       (tunable.precision == "fp16" || tunable.precision == "bf16") &&
+                                       !tunable.wrw_streamk ? 1 : 0;
+            }
             tunable.nxb                      = sec.at("nxb").get_int();
             tunable.nxe                      = sec.at("nxe").get_int();
             tunable.gemm_m_unmerge_cluster   = sec.count("gemm_m_unmerge_cluster") > 0 ? sec.at("gemm_m_unmerge_cluster").get_int() : 0;

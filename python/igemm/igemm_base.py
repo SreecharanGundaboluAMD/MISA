@@ -862,7 +862,24 @@ class igemm_gtc_tunable_parameter_t(object):
             # The original narrower asserts here were overly conservative -- removed after
             # this review, hardware-validated per combination (see Phase 64 in
             # docs/gfx1250_wmma_layout.md).
-            self.ds_load_tr_b = utility_dict_with_default_t(tunable_dict)('ds_load_tr_b', 0)
+            # Phase 67: promoted to DEFAULT-ON for every bwd/wrw fp16/bf16 config (same
+            # treatment as Phase 64's wait-batching) -- every combination tried
+            # (direct_store, async_global_load, lds_double_buffer, main_loop_interleave,
+            # epilogue_lds_pad, wmma_setprio, tdm_global_load(+direct), saddr_global_load,
+            # gemm_k_global_split(+wmma_setprio), local_prefetch_num=2(+wmma_acc_bf16),
+            # group_count>1, multi-K-block, both tile shapes) hardware-validated `valid:y`
+            # with zero regression; the only two failures found (wrw's k2x/gemm_k_per_block=64
+            # `interleave`/`k2x_dbuf` sections) reproduce identically with ds_load_tr_b=0,
+            # confirmed via A/B against the unmodified config -- a pre-existing k2x bug,
+            # unrelated to this change. `wrw_streamk` is excluded from the default (checked
+            # via the raw tunable_dict, not self.wrw_streamk, since that field is parsed
+            # later in __init__) -- stream-K's history of faulting tunables (see the
+            # benchmark-script-validn-trap finding) makes it the one combination not
+            # exercised here; a config can still explicitly opt out (or into, for fwd/fp32/
+            # int8 it stays a no-op) by setting ds_load_tr_b explicitly.
+            _dstrb_default = 1 if (self.direction in ('bwd', 'wrw') and self.precision in ('fp16', 'bf16')
+                                    and not tunable_dict.get('wrw_streamk', 0)) else 0
+            self.ds_load_tr_b = utility_dict_with_default_t(tunable_dict)('ds_load_tr_b', _dstrb_default)
             if self.ds_load_tr_b:
                 assert self.direction in ('bwd', 'wrw'), "ds_load_tr_b is bwd/wrw only (Phase 63/64) -- fwd's operands aren't LDS-transposed to begin with"
                 assert self.precision in ('fp16', 'bf16'), "ds_load_tr16_b128 is a 16-bit-element instruction only -- no fp32 variant exists"

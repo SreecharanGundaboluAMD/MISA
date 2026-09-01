@@ -94,6 +94,14 @@ SADDR_CONFIGS = {
     ('bwd', 'saddr'): 'config/igemm_bwd_gtc_gfx1250_nhwc_bf16_saddr.config',
     ('wrw', 'saddr'): 'config/igemm_wrw_gtc_gfx1250_nhwc_bf16_saddr.config',
 }
+# Phase 67: ds_load_tr_b (native ds_load_tr16_b128 operand read) is now DEFAULT-ON for
+# every bwd/wrw fp16/bf16 config (see igemm_base.py) -- promoted the same way Phase 64's
+# wait-batching was, after hardware-validating it composes cleanly with every other
+# mechanism in this file's candidate list. No separate 'dstrb' candidate needed: every
+# existing config (base/mtail/gsplit/interleave/saddr/master/combo_*) already gets it
+# for free. A short-lived standalone `_dstrb.config` + DSTRB_CONFIGS entry existed
+# briefly during initial rollout and was removed once the default made it a byte-for-byte
+# duplicate of the base config (would have collided on kernel name in the master union).
 
 # The 38 shapes from docs/gfx1250_vendor_benchmark_vs_miopen.md's "full re-triage"
 # and "vs. MIOpen running natively on gfx1250" tables (2026-08-27 updates), batch=42

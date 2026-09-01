@@ -59,10 +59,17 @@ BASE_SECTIONS = [
 ]
 
 # Binary tunables to toggle combinatorially
+# Phase 67: added saddr_global_load -- was previously only ever tested in its own
+# bespoke single-feature _saddr.config, never combined with direct_store/tail-relief/
+# lds_double_buffer/wmma_setprio/local_prefetch_num/epilogue_lds_pad in the searched
+# corpus. ds_load_tr_b is NOT added here: it was promoted to an unconditional default
+# for bwd/wrw fp16/bf16 (igemm_base.py), so every combination below already gets it
+# for free without needing a combinatorial toggle.
 FLAGS = [
     'direct_store', 'gemm_k_global_split', 'wmma_m_tail', 'wmma_n_tail',
     'tdm_global_load', 'lds_double_buffer', 'wmma_setprio',
     'local_prefetch_num', 'main_loop_interleave', 'epilogue_lds_pad',
+    'saddr_global_load',
 ]
 
 
@@ -98,7 +105,26 @@ def is_valid(direction, precision, tile_m, tile_n, gemm_k, vals):
     lpn = vals.get('local_prefetch_num', 1)
     mli = vals.get('main_loop_interleave', 0)
     elp = vals.get('epilogue_lds_pad', 0)
+    sa  = vals.get('saddr_global_load', 0)
     ik  = 4 if precision == 'fp32' else 32
+
+    # saddr_global_load exclusions mirror the exact hard asserts in
+    # igemm_{fwd,bwd,wrw}_gtc_wmma_nhwc.py (tdm/interleave/gsplit all explicitly
+    # asserted incompatible; row_repeat_a/b>1 -- i.e. the asymmetric 128x64/64x128
+    # tile shapes -- also asserted incompatible, proxied here via tile_m != tile_n
+    # the same way the nt/tdm/mli rules above already do).
+    if sa and (tdm or mli or gs): return False
+    if sa and tile_m != tile_n: return False
+    # Phase 67: fwd's saddr_global_load + wmma_n_tail is a REAL, newly-discovered
+    # correctness bug -- confirmed via hardware A/B (plain wmma_n_tail alone passes
+    # `valid:y` on an exact-fit shape; the identical shape with saddr_global_load
+    # ALSO set fails `valid:n`; saddr_global_load + wmma_m_tail alone is fine). Not
+    # root-caused (likely fwd's B-operand N-boundary address computation not
+    # accounting for saddr's different addressing path) -- excluded here rather than
+    # silently shipped broken in the searched corpus. bwd's identical combination
+    # (saddr_global_load + wmma_n_tail) hardware-validated fine and is NOT excluded --
+    # this is fwd-specific. See docs/gfx1250_optimization_backlog.md.
+    if sa and nt and direction == 'fwd': return False
 
     if ds and gs:            return False
     if gs and direction != 'wrw' and (mt or nt): return False
