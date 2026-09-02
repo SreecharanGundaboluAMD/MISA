@@ -484,16 +484,16 @@ inline __device__ void batched_transpose_32x32(T* dst,
 }
 
 template <typename T>
-inline __device__ void batched_transpose_32x32_pack_2x2_ediv_2x2(T* /*dst*/,
-                                                                 T* /*src*/,
-                                                                 uint32_t /*height*/,
-                                                                 uint32_t /*width*/,
-                                                                 uint32_t /*dim_stride*/,
-                                                                 uint32_t /*dim_total*/,
-                                                                 uint32_t /*magic_h*/,
-                                                                 uint32_t /*shift_h*/,
-                                                                 uint32_t /*magic_w*/,
-                                                                 uint32_t /*shift_w*/)
+inline __device__ void batched_transpose_32x32_pack_2x2_ediv_2x2(T* ,
+                                                                 T* ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t )
 {
 }
 
@@ -569,16 +569,16 @@ inline __device__ void batched_transpose_32x32_pack_2x2_ediv_2x2<ushort>(ushort*
 }
 
 template <typename T>
-inline __device__ void batched_transpose_32x32_pack_2x2_ediv_1x2(T* /*dst*/,
-                                                                 T* /*src*/,
-                                                                 uint32_t /*height*/,
-                                                                 uint32_t /*width*/,
-                                                                 uint32_t /*dim_stride*/,
-                                                                 uint32_t /*dim_total*/,
-                                                                 uint32_t /*magic_h*/,
-                                                                 uint32_t /*shift_h*/,
-                                                                 uint32_t /*magic_w*/,
-                                                                 uint32_t /*shift_w*/)
+inline __device__ void batched_transpose_32x32_pack_2x2_ediv_1x2(T* ,
+                                                                 T* ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t )
 {
 }
 
@@ -665,16 +665,16 @@ inline __device__ void batched_transpose_32x32_pack_2x2_ediv_1x2<ushort>(ushort*
 }
 
 template <typename T>
-inline __device__ void batched_transpose_32x32_pack_2x2_ediv_2x1(T* /*dst*/,
-                                                                 T* /*src*/,
-                                                                 uint32_t /*height*/,
-                                                                 uint32_t /*width*/,
-                                                                 uint32_t /*dim_stride*/,
-                                                                 uint32_t /*dim_total*/,
-                                                                 uint32_t /*magic_h*/,
-                                                                 uint32_t /*shift_h*/,
-                                                                 uint32_t /*magic_w*/,
-                                                                 uint32_t /*shift_w*/)
+inline __device__ void batched_transpose_32x32_pack_2x2_ediv_2x1(T* ,
+                                                                 T* ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t )
 {
 }
 
@@ -765,16 +765,16 @@ inline __device__ void batched_transpose_32x32_pack_2x2_ediv_2x1<ushort>(ushort*
 }
 
 template <typename T>
-inline __device__ void batched_transpose_32x32_pack_2x2_ediv_1x1(T* /*dst*/,
-                                                                 T* /*src*/,
-                                                                 uint32_t /*height*/,
-                                                                 uint32_t /*width*/,
-                                                                 uint32_t /*dim_stride*/,
-                                                                 uint32_t /*dim_total*/,
-                                                                 uint32_t /*magic_h*/,
-                                                                 uint32_t /*shift_h*/,
-                                                                 uint32_t /*magic_w*/,
-                                                                 uint32_t /*shift_w*/)
+inline __device__ void batched_transpose_32x32_pack_2x2_ediv_1x1(T* ,
+                                                                 T* ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t )
 {
 }
 
@@ -883,16 +883,16 @@ inline __device__ void batched_transpose_32x32_pack_2x2_ediv_1x1<ushort>(ushort*
 }
 
 template <typename T>
-inline __device__ void batched_transpose_64x32_pack_4x2_ediv_4x2(T* /*dst*/,
-                                                                 T* /*src*/,
-                                                                 uint32_t /*height*/,
-                                                                 uint32_t /*width*/,
-                                                                 uint32_t /*dim_stride*/,
-                                                                 uint32_t /*dim_total*/,
-                                                                 uint32_t /*magic_h*/,
-                                                                 uint32_t /*shift_h*/,
-                                                                 uint32_t /*magic_w*/,
-                                                                 uint32_t /*shift_w*/)
+inline __device__ void batched_transpose_64x32_pack_4x2_ediv_4x2(T* ,
+                                                                 T* ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t )
 {
 }
 
@@ -1003,16 +1003,16 @@ inline __device__ void batched_transpose_64x32_pack_4x2_ediv_4x2<ushort>(ushort*
 }
 
 template <typename T>
-inline __device__ void batched_transpose_64x32_pack_4x2_ediv_2x2(T* /*dst*/,
-                                                                 T* /*src*/,
-                                                                 uint32_t /*height*/,
-                                                                 uint32_t /*width*/,
-                                                                 uint32_t /*dim_stride*/,
-                                                                 uint32_t /*dim_total*/,
-                                                                 uint32_t /*magic_h*/,
-                                                                 uint32_t /*shift_h*/,
-                                                                 uint32_t /*magic_w*/,
-                                                                 uint32_t /*shift_w*/)
+inline __device__ void batched_transpose_64x32_pack_4x2_ediv_2x2(T* ,
+                                                                 T* ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t )
 {
 }
 
@@ -1104,16 +1104,16 @@ inline __device__ void batched_transpose_64x32_pack_4x2_ediv_2x2<ushort>(ushort*
 }
 
 template <typename T>
-inline __device__ void batched_transpose_64x32_pack_4x2_ediv_2x1(T* /*dst*/,
-                                                                 T* /*src*/,
-                                                                 uint32_t /*height*/,
-                                                                 uint32_t /*width*/,
-                                                                 uint32_t /*dim_stride*/,
-                                                                 uint32_t /*dim_total*/,
-                                                                 uint32_t /*magic_h*/,
-                                                                 uint32_t /*shift_h*/,
-                                                                 uint32_t /*magic_w*/,
-                                                                 uint32_t /*shift_w*/)
+inline __device__ void batched_transpose_64x32_pack_4x2_ediv_2x1(T* ,
+                                                                 T* ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t )
 {
 }
 
@@ -1224,16 +1224,16 @@ inline __device__ void batched_transpose_64x32_pack_4x2_ediv_2x1<ushort>(ushort*
 }
 
 template <typename T>
-inline __device__ void batched_transpose_32x64_pack_2x4_ediv_2x4(T* /*dst*/,
-                                                                 T* /*src*/,
-                                                                 uint32_t /*height*/,
-                                                                 uint32_t /*width*/,
-                                                                 uint32_t /*dim_stride*/,
-                                                                 uint32_t /*dim_total*/,
-                                                                 uint32_t /*magic_h*/,
-                                                                 uint32_t /*shift_h*/,
-                                                                 uint32_t /*magic_w*/,
-                                                                 uint32_t /*shift_w*/)
+inline __device__ void batched_transpose_32x64_pack_2x4_ediv_2x4(T* ,
+                                                                 T* ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t )
 {
 }
 
@@ -1350,16 +1350,16 @@ inline __device__ void batched_transpose_32x64_pack_2x4_ediv_2x4<ushort>(ushort*
 }
 
 template <typename T>
-inline __device__ void batched_transpose_32x64_pack_2x4_ediv_2x2(T* /*dst*/,
-                                                                 T* /*src*/,
-                                                                 uint32_t /*height*/,
-                                                                 uint32_t /*width*/,
-                                                                 uint32_t /*dim_stride*/,
-                                                                 uint32_t /*dim_total*/,
-                                                                 uint32_t /*magic_h*/,
-                                                                 uint32_t /*shift_h*/,
-                                                                 uint32_t /*magic_w*/,
-                                                                 uint32_t /*shift_w*/)
+inline __device__ void batched_transpose_32x64_pack_2x4_ediv_2x2(T* ,
+                                                                 T* ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t )
 {
 }
 
@@ -1447,16 +1447,16 @@ inline __device__ void batched_transpose_32x64_pack_2x4_ediv_2x2<ushort>(ushort*
 }
 
 template <typename T>
-inline __device__ void batched_transpose_32x64_pack_2x4_ediv_1x2(T* /*dst*/,
-                                                                 T* /*src*/,
-                                                                 uint32_t /*height*/,
-                                                                 uint32_t /*width*/,
-                                                                 uint32_t /*dim_stride*/,
-                                                                 uint32_t /*dim_total*/,
-                                                                 uint32_t /*magic_h*/,
-                                                                 uint32_t /*shift_h*/,
-                                                                 uint32_t /*magic_w*/,
-                                                                 uint32_t /*shift_w*/)
+inline __device__ void batched_transpose_32x64_pack_2x4_ediv_1x2(T* ,
+                                                                 T* ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t )
 {
 }
 
@@ -1569,16 +1569,16 @@ inline __device__ void batched_transpose_32x64_pack_2x4_ediv_1x2<ushort>(ushort*
 }
 
 template <typename T>
-inline __device__ void batched_transpose_16x64_pack_1x4_ediv_1x2(T* /*dst*/,
-                                                                 T* /*src*/,
-                                                                 uint32_t /*height*/,
-                                                                 uint32_t /*width*/,
-                                                                 uint32_t /*dim_stride*/,
-                                                                 uint32_t /*dim_total*/,
-                                                                 uint32_t /*magic_h*/,
-                                                                 uint32_t /*shift_h*/,
-                                                                 uint32_t /*magic_w*/,
-                                                                 uint32_t /*shift_w*/)
+inline __device__ void batched_transpose_16x64_pack_1x4_ediv_1x2(T* ,
+                                                                 T* ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t )
 {
 }
 
@@ -1677,16 +1677,16 @@ inline __device__ void batched_transpose_16x64_pack_1x4_ediv_1x2<ushort>(ushort*
 }
 
 template <typename T>
-inline __device__ void batched_transpose_64x16_pack_4x1_ediv_2x1(T* /*dst*/,
-                                                                 T* /*src*/,
-                                                                 uint32_t /*height*/,
-                                                                 uint32_t /*width*/,
-                                                                 uint32_t /*dim_stride*/,
-                                                                 uint32_t /*dim_total*/,
-                                                                 uint32_t /*magic_h*/,
-                                                                 uint32_t /*shift_h*/,
-                                                                 uint32_t /*magic_w*/,
-                                                                 uint32_t /*shift_w*/)
+inline __device__ void batched_transpose_64x16_pack_4x1_ediv_2x1(T* ,
+                                                                 T* ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t )
 {
 }
 
@@ -1772,16 +1772,16 @@ inline __device__ void batched_transpose_64x16_pack_4x1_ediv_2x1<ushort>(ushort*
 }
 
 template <typename T>
-inline __device__ void batched_transpose_64x64_pack_4x4_ediv_4x4(T* /*dst*/,
-                                                                 T* /*src*/,
-                                                                 uint32_t /*height*/,
-                                                                 uint32_t /*width*/,
-                                                                 uint32_t /*dim_stride*/,
-                                                                 uint32_t /*dim_total*/,
-                                                                 uint32_t /*magic_h*/,
-                                                                 uint32_t /*shift_h*/,
-                                                                 uint32_t /*magic_w*/,
-                                                                 uint32_t /*shift_w*/)
+inline __device__ void batched_transpose_64x64_pack_4x4_ediv_4x4(T* ,
+                                                                 T* ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t )
 {
 }
 
@@ -1878,16 +1878,16 @@ inline __device__ void batched_transpose_64x64_pack_4x4_ediv_4x4<ushort>(ushort*
 }
 
 template <typename T>
-inline __device__ void batched_transpose_64x64_pack_4x4_ediv_2x2(T* /*dst*/,
-                                                                 T* /*src*/,
-                                                                 uint32_t /*height*/,
-                                                                 uint32_t /*width*/,
-                                                                 uint32_t /*dim_stride*/,
-                                                                 uint32_t /*dim_total*/,
-                                                                 uint32_t /*magic_h*/,
-                                                                 uint32_t /*shift_h*/,
-                                                                 uint32_t /*magic_w*/,
-                                                                 uint32_t /*shift_w*/)
+inline __device__ void batched_transpose_64x64_pack_4x4_ediv_2x2(T* ,
+                                                                 T* ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t ,
+                                                                 uint32_t )
 {
 }
 

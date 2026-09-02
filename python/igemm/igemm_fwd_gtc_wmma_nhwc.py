@@ -182,10 +182,34 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # exactly today's single-iteration code (byte-identical).
         assert tunable.gemm_m_per_block % tunable.block_size == 0, \
             f"gemm_m_per_block({tunable.gemm_m_per_block}) must be a multiple of block_size({tunable.block_size})"
-        assert tunable.gemm_n_per_block % tunable.block_size == 0, \
-            f"gemm_n_per_block({tunable.gemm_n_per_block}) must be a multiple of block_size({tunable.block_size})"
+        # Phase 69 (2026-09-02, item #6/PERF-003 extension): gemm_n_per_block may also be
+        # a proper DIVISOR of block_size (not just a multiple) -- the inverse asymmetry
+        # from row_repeat_b above, needed for a "wr4x4 w8" 256x128 tile (8 waves,
+        # block_size=256 > gemm_n_per_block=128): several threads then cooperate on the
+        # SAME output column, each loading a distinct K-sub-range (col_split_b of them)
+        # into that column's LDS row. See the col_split_b derivation below and
+        # _emit_lds_offset_setup/emit_kernel_prologue's B address setup for the
+        # mechanism. A-side has no equivalent (not needed by any table row so far --
+        # every row keeps block_size <= gemm_m_per_block, see the assert above).
+        assert tunable.gemm_n_per_block % tunable.block_size == 0 or tunable.block_size % tunable.gemm_n_per_block == 0, \
+            f"gemm_n_per_block({tunable.gemm_n_per_block}) and block_size({tunable.block_size}) must evenly divide one another"
         self.row_repeat_a = tunable.gemm_m_per_block // tunable.block_size
-        self.row_repeat_b = tunable.gemm_n_per_block // tunable.block_size
+        if tunable.block_size > tunable.gemm_n_per_block:
+            self.row_repeat_b = 1
+            self.col_split_b  = tunable.block_size // tunable.gemm_n_per_block
+            sub_k = tunable.gemm_k_per_block // self.col_split_b if tunable.gemm_k_per_block % self.col_split_b == 0 else 0
+            assert tunable.gemm_n_per_block & (tunable.gemm_n_per_block - 1) == 0 and self.col_split_b & (self.col_split_b - 1) == 0, \
+                "col_split_b's n_idx/k_group decode (shift/and) requires gemm_n_per_block and col_split_b both powers of 2"
+            assert sub_k > 0 and sub_k & (sub_k - 1) == 0, \
+                f"gemm_k_per_block({tunable.gemm_k_per_block}) must be a multiple of col_split_b({self.col_split_b}) with a power-of-2 quotient (per-thread K-sub-range shift)"
+            assert not (tunable.async_global_load or tunable.saddr_global_load or tunable.tdm_global_load or
+                        tunable.wmma_n_tail or tunable.wmma_k_tail or tunable.main_loop_interleave or
+                        tunable.lds_double_buffer), \
+                "col_split_b (B column K-split) is only implemented for the plain VADDR global-load path, no tail masking, no interleaving, and single-buffered LDS -- " \
+                "v_sst_os_b is a genuinely separate register from v_sst_a_os, and wmma_main_loop.py's double-buffer switch only knows how to toggle v_sst_a_os (see that file's emit_buffer_switch)"
+        else:
+            self.row_repeat_b = tunable.gemm_n_per_block // tunable.block_size
+            self.col_split_b  = 1
         # row_repeat > 1 combined with Phase 13's async load is deliberately out of scope for
         # now (kept separate to isolate correctness of each mechanism).
         assert not (tunable.async_global_load and (self.row_repeat_a > 1 or self.row_repeat_b > 1)), \
@@ -343,6 +367,13 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self.chunk_num_dwordx4 = self.inst_wmma_k_bytes // 16
         self.chunk_num_dwords  = self.inst_wmma_k_bytes // 4
         self.num_k_chunks      = self.num_dwordx4 // self.chunk_num_dwordx4
+        # Phase 69 (col_split_b): B's per-thread row is only gemm_k_per_block/col_split_b
+        # wide when several threads split one column's K range (see __init__'s col_split_b
+        # derivation above) -- fewer chunks per thread, same chunk_num_dwordx4 width each.
+        # == self.num_k_chunks (byte-identical) whenever col_split_b==1.
+        assert self.num_k_chunks % self.col_split_b == 0, \
+            f"num_k_chunks({self.num_k_chunks}) must be a multiple of col_split_b({self.col_split_b})"
+        self.num_k_chunks_b    = self.num_k_chunks // self.col_split_b
         self.lds_a_size = tunable.gemm_m_per_block * tunable.gemm_k_per_block * self.data_byte
         self.lds_b_size = tunable.gemm_n_per_block * tunable.gemm_k_per_block * self.data_byte
         # Phase 2 (double-buffering): lds_single_size must be a power of 2 for the
@@ -568,6 +599,14 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 # column-in-range flag -- only allocated when wmma_n_tail is set.
                 self.v_n_tail_col = sym_t('v_n_tail_col' , vseq(1))
             self.v_sst_os      = sym_t('v_sst_os'      , vseq(1))    # shared store offset (same for A/B region)
+            if outer.col_split_b > 1:
+                # Phase 69: B's own store offset -- n_idx*bytes_per_row + k_group's
+                # K-sub-range offset (see _emit_lds_offset_setup) -- a genuinely
+                # different decomposition from A/v_sst_os's plain tid*bytes_per_row,
+                # so it needs its own register rather than aliasing v_sst_os. Only
+                # allocated when col_split_b>1 (every existing config byte-identical,
+                # still shares one register for A/B).
+                self.v_sst_os_b = sym_t('v_sst_os_b'   , vseq(1))
             self.v_sld_a_os    = sym_t('v_sld_a_os'    , vseq(1))
             self.v_sld_b_os    = sym_t('v_sld_b_os'    , vseq(1))
             self.v_gemm_im     = sym_t('v_gemm_im'     , vseq(1))
@@ -666,7 +705,15 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # _emit_chunked_non_atomic_store and docs/gfx1250_wmma_layout.md's Phase 53.
         epilogue_m_rows = (self.wmma_mapping.ctrl.wave_tile_m * self.wmma_mapping.ctrl.waves_per_m()) \
             if self.tunable.wmma_epilogue_chunked else self.tunable.gemm_m_per_block
-        epilogue_lds_bytes = 0 if self.tunable.gemm_k_global_split else \
+        # PERF-007 (2026-09-02): direct_store (Phase 59) is a per-lane global_store_dword
+        # epilogue that skips the LDS-reshuffle gather/scatter entirely (see
+        # igemm_gtc_base.h's direct_store field comment) -- it never touches epilogue LDS,
+        # same as gemm_k_global_split's atomic path just above. Previously only gated on
+        # gemm_k_global_split, so every direct_store config was over-reserving a full
+        # epilogue_lds_bytes' worth of unused LDS on top of its double-buffered main-loop
+        # LDS, needlessly capping occupancy (fewer concurrent workgroups/CU than the
+        # kernel's real LDS footprint requires).
+        epilogue_lds_bytes = 0 if (self.tunable.gemm_k_global_split or self.tunable.direct_store) else \
             epilogue_m_rows * (self.tunable.gemm_n_per_block + epilogue_pad) * epilogue_elem_bytes
         # Phase 23: the 128x128 tile is already exactly at the 64KB/workgroup hardware limit
         # with ZERO headroom (Phase 21) -- padding pushes it over (128*132*4 = 67584 > 65536).
@@ -743,6 +790,22 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # bytes_per_row (=gemm_k_per_block*data_byte) is 64 for fp16/bf16/int8, but 16 for
         # fp32 (gemm_k_per_block forced to 4) -- see class docstring / self.bytes_per_row.
         self._emit(f"v_lshlrev_b32 v[{v.v_sst_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_tid()}]   ; tid*{self.bytes_per_row} bytes")
+        if self.col_split_b > 1:
+            # Phase 69 (2026-09-02, item #6): B's row is n_idx-addressed, not tid-addressed
+            # -- n_idx = tid % gemm_n_per_block, k_group = tid // gemm_n_per_block (both
+            # power-of-2 shifts, asserted in __init__). v_sst_os_b = n_idx*bytes_per_row
+            # (same row stride as the unsplit case) + k_group*bytes_per_row_b (this
+            # thread's K-sub-range position within that row). lds_double_buffer is
+            # asserted off whenever col_split_b>1 (see __init__), so this is computed
+            # once here and never re-toggled -- wmma_main_loop.py's double-buffer switch
+            # (which only knows about v_sst_a_os, see its own docstring) never needs to
+            # touch v_sst_os_b.
+            bytes_per_row_b = self.bytes_per_row // self.col_split_b
+            self._emit(f"v_and_b32 v[{v.v_tmp(1)}], {self.tunable.gemm_n_per_block - 1}, v[{v.v_tid()}]   ; n_idx = tid % gemm_n_per_block")
+            self._emit(f"v_lshrrev_b32 v[{v.v_tmp(2)}], {utility_log2(self.tunable.gemm_n_per_block)}, v[{v.v_tid()}]   ; k_group = tid / gemm_n_per_block")
+            self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], {utility_log2(self.bytes_per_row)}, v[{v.v_tmp(1)}]   ; n_idx*{self.bytes_per_row} byte row-stride")
+            self._emit(f"v_lshlrev_b32 v[{v.v_tmp(2)}], {utility_log2(bytes_per_row_b)}, v[{v.v_tmp(2)}]   ; k_group*{bytes_per_row_b} bytes")
+            self._emit(f"v_add_u32 v[{v.v_sst_os_b()}], v[{v.v_tmp(1)}], v[{v.v_tmp(2)}]")
         self._emit_empty_line()
 
         # ---- shared-memory load offsets (WMMA operand layout, see docs/gfx1250_wmma_layout.md) ----
@@ -1142,6 +1205,31 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"v_mul_lo_u32 v[{v.v_off_b_base()}], s[{s.s_wei_k_stride()}], v[{v.v_off_b_base()}]")
             self._emit(f"v_lshlrev_b32 v[{v.v_off_b_base()}], {utility_log2(self.data_byte)}, v[{v.v_off_b_base()}]")
             self._emit_empty_line()
+        elif self.col_split_b > 1:
+            # Phase 69 (2026-09-02, item #6): block_size > gemm_n_per_block -- decode
+            # v_tid into (k_group, n_idx) instead of using it directly as the column.
+            # n_idx = tid % gemm_n_per_block (this thread's output column within the
+            # block); k_group = tid // gemm_n_per_block (which of the col_split_b
+            # K-sub-ranges of gemm_k_per_block this thread owns). Both power-of-2
+            # shifts (asserted in __init__). k_group's offset is a flat ELEMENT add
+            # (C_in is weight's innermost/contiguous axis here, same reasoning as
+            # Phase 49's gemm_k_global_split shard offset above) -- unlike n_idx's
+            # column, which still needs the *wei_k_stride multiply. row_repeat_b==1
+            # whenever col_split_b>1 (see __init__), so there is only ever row 0 here,
+            # no i-loop -- no masking/flag support for col_split_b yet (asserted off).
+            sub_k = self.tunable.gemm_k_per_block // self.col_split_b
+            self._emit(f"; v_addr_b_base = p_wei + (block_n_off + n_idx) * wei_k_stride * {self.data_byte} bytes + k_group * {sub_k} * {self.data_byte} bytes")
+            self._emit(f"v_and_b32 v[{v.v_tmp(1)}], {self.tunable.gemm_n_per_block - 1}, v[{v.v_tid()}]   ; n_idx = tid % gemm_n_per_block")
+            self._emit(f"v_lshrrev_b32 v[{v.v_tmp(2)}], {utility_log2(self.tunable.gemm_n_per_block)}, v[{v.v_tid()}]   ; k_group = tid / gemm_n_per_block")
+            self._emit(f"v_add_u32 v[{v.v_tmp(1)}], s[{s.s_block_n_off()}], v[{v.v_tmp(1)}]")
+            self._emit(f"v_mul_lo_u32 v[{v.v_tmp(1)}], s[{s.s_wei_k_stride()}], v[{v.v_tmp(1)}]   ; (block_n_off+n_idx) * wei_k_stride")
+            self._emit(f"v_lshlrev_b32 v[{v.v_tmp(2)}], {utility_log2(sub_k)}, v[{v.v_tmp(2)}]   ; k_group * {sub_k} elements")
+            self._emit(f"v_add_u32 v[{v.v_tmp(1)}], v[{v.v_tmp(2)}], v[{v.v_tmp(1)}]   ; += k_group's K-sub-range element offset")
+            self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], {utility_log2(self.data_byte)}, v[{v.v_tmp(1)}]")
+            self._emit(f"v_mov_b32 v[{v.v_addr_b_base(1)}], s[{s.s_p_wei(1)}]")
+            self._emit(f"v_add_co_u32 v[{v.v_addr_b_base(0)}], vcc_lo, s[{s.s_p_wei()}], v[{v.v_tmp(1)}]")
+            self._emit(f"v_add_co_ci_u32 v[{v.v_addr_b_base(1)}], vcc_lo, 0, v[{v.v_addr_b_base(1)}], vcc_lo")
+            self._emit_empty_line()
         else:
             # row_repeat_b>1 (asymmetric tile shapes, B side): thread tid owns rows
             # tid, tid+block_size, tid+2*block_size, ... -- B needs no flag/masking (weight
@@ -1386,7 +1474,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             idx = chunk_idx * self.chunk_num_dwordx4 + i
             self._emit(f"ds_write_b128 v[{v_sst_os()}], v[{v_gld(i*4)}:{v_gld(i*4+3)}] offset:{sst_extra_off + idx*16}")
 
-    def _emit_sst_remaining_chunks(self, v_gld, v_addr, v_sst_os, sst_extra_off, v_flag=None, tail_mask=None, saddr=None):
+    def _emit_sst_remaining_chunks(self, v_gld, v_addr, v_sst_os, sst_extra_off, v_flag=None, tail_mask=None, saddr=None, num_chunks=None):
         '''
         Phase 1 (k-sub-loop): stores chunk 0 (already loaded+waited by the caller, via the
         EXISTING global_load_a/b_functor + outer s_wait_loadcnt call sequence in
@@ -1410,12 +1498,18 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         tail_mask (GEMM_K tail, new): optional (remaining_operand, skip_check_fn) tuple --
         see _emit_tail_dword_mask_guarded. When set, applied to each chunk's data right
         after it's loaded+waited, before that chunk is stored to LDS.
+
+        num_chunks (Phase 69, col_split_b): defaults to self.num_k_chunks -- B's own
+        col_split_b-narrowed chunk count (self.num_k_chunks_b) when this thread only
+        owns a K-sub-range of its column (see __init__'s col_split_b derivation).
+        Byte-identical to today whenever num_chunks is left at its default.
         '''
+        num_chunks = self.num_k_chunks if num_chunks is None else num_chunks
         elem_per_dword = 4 // self.data_byte
         if tail_mask is not None:
             self._emit_tail_dword_mask_guarded(v_gld, self.chunk_num_dwords, 0, tail_mask)
         self._emit_sst_chunk(v_gld, v_sst_os, sst_extra_off, 0)
-        for c in range(1, self.num_k_chunks):
+        for c in range(1, num_chunks):
             self._emit_gld_chunk_load(v_gld, v_addr, c, v_flag=v_flag, saddr=saddr)
             self._emit(f"s_wait_loadcnt 0x0")
             if tail_mask is not None:
@@ -1678,7 +1772,12 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                     if outer.tunable.saddr_global_load:
                         outer._emit_sst_remaining_chunks(v.v_gld_b, v.v_off_b, v.v_sst_os, outer.lds_a_size, v_flag=(v.v_flag_b if outer.tunable.wmma_n_tail else None), tail_mask=k_tail, saddr=s.s_p_wei)
                     else:
-                        outer._emit_sst_remaining_chunks(v.v_gld_b, v.v_addr_b, v.v_sst_os, outer.lds_a_size, v_flag=(v.v_flag_b if outer.tunable.wmma_n_tail else None), tail_mask=k_tail)
+                        # col_split_b>1: this thread's own store offset/chunk-count differ
+                        # from the unsplit case (v_sst_os_b, num_k_chunks_b -- see __init__'s
+                        # col_split_b derivation and _emit_lds_offset_setup). Byte-identical
+                        # to today whenever col_split_b==1 (falls back to v_sst_os/num_k_chunks).
+                        sst_os_b = v.v_sst_os_b if outer.col_split_b > 1 else v.v_sst_os
+                        outer._emit_sst_remaining_chunks(v.v_gld_b, v.v_addr_b, sst_os_b, outer.lds_a_size, v_flag=(v.v_flag_b if outer.tunable.wmma_n_tail else None), tail_mask=k_tail, num_chunks=outer.num_k_chunks_b)
                     for i in range(1, outer.row_repeat_b):
                         row_addr = lambda idx=0, i=i: v.v_addr_b(i * 2 + idx)
                         row_off  = outer.lds_a_size + i * outer.tunable.block_size * outer.bytes_per_row
@@ -1928,6 +2027,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.wmma_setprio = self.tunable.wmma_setprio
         ctrl.local_prefetch_num = self.tunable.local_prefetch_num
         ctrl.vgpr_msb_tracker = self.vgpr_msb_tracker
+        # Phase 71 (PERF-004): both A and B use the plain, untransposed
+        # ds_read_b128-chunked shared_load technique (no internal waits of their
+        # own) -- eligible for wmma_main_loop.py's partial-wait schedule.
+        ctrl.ds_read_plain_a = True
+        ctrl.ds_read_plain_b = True
         # Phase 1 (k-sub-loop): both A and B are untransposed here (K contiguous within
         # an LDS row), so advancing inst_wmma.k K-elements is just inst_wmma.k*data_byte.
         ctrl.k_substep_stride_bytes_a    = self.wmma_mapping.ctrl.inst_wmma.k * self.data_byte

@@ -776,8 +776,15 @@ class igemm_gtc_tunable_parameter_t(object):
             if self.wmma_epilogue_chunked:
                 assert self.direction in ('fwd', 'bwd'), \
                     "wmma_epilogue_chunked is only implemented for fwd/bwd so far, see docs/gfx1250_wmma_layout.md's Phase 53"
-                assert not self.wmma_m_tail and not self.wmma_n_tail, \
-                    "wmma_epilogue_chunked is not yet combined with wmma_m_tail/wmma_n_tail, see docs/gfx1250_wmma_layout.md's Phase 53"
+                # Phase 68 (2026-09-02, PERF-002): relaxed from an outright ban -- see
+                # coalescing_store_wmma.py's _emit_chunked_non_atomic_store for the actual
+                # masking wiring this needed (the gather phase's per-pass loop gained the
+                # same v_cmpx_gt_u32/v_cmpx_gt_i32 EXEC-mask guards the unchunked gather
+                # already used, keyed off the same v_tmp3/v_tmp4 absolute row/col state,
+                # recomputed per-group/per-pass from v_tid like every other chunked
+                # address value). Hardware-validated (-V 1, valid:y) standalone at 128x128
+                # and combined with wmma_acc_high_bank at 256x256/256x128 (non-divisible
+                # gemm_m).
                 assert not self.gemm_k_global_split, \
                     "wmma_epilogue_chunked only applies to the non-atomic epilogue -- gemm_k_global_split's atomic path has no LDS staging to chunk"
             # Phase 54 (VGPR-MSB): moves ONLY the accumulator (v_c) into a second,
@@ -804,13 +811,19 @@ class igemm_gtc_tunable_parameter_t(object):
                 # path are both wired for v_c living in a separate bank. The plain atomic
                 # (gemm_k_global_split) path and atomic_pack_bf16 are not -- both still
                 # read v_c directly (global_atomic_add_f32/global_atomic_pk_add_bf16,
-                # v_permlane_xor_b32) with no tracker awareness. wmma_m_tail/wmma_n_tail's
-                # masked slow-path store (indexing v_gather+i directly, bypassing
-                # v_gather_range) also isn't audited for this yet.
+                # v_permlane_xor_b32) with no tracker awareness.
                 assert not self.gemm_k_global_split, \
                     "wmma_acc_high_bank's atomic epilogue path (gemm_k_global_split) is not yet wired for v_c living in a separate VGPR bank"
-                assert not self.wmma_m_tail and not self.wmma_n_tail, \
-                    "wmma_acc_high_bank is not yet combined with wmma_m_tail/wmma_n_tail's masked slow-path store"
+                # Phase 68 (2026-09-02, PERF-002): wmma_m_tail/wmma_n_tail's masked
+                # slow-path store (indexing v_gather+i directly, bypassing
+                # v_gather_range) only ever reads/writes v_gather/v_tmp3/v_tmp4 -- pure
+                # bank-0 scratch registers, never v_c -- and the ENTIRE gather phase
+                # (address computation and every store variant) runs with the MSB
+                # tracker's src1 pinned to bank 0 for its whole duration (see
+                # coalescing_store_wmma.py's __call__, right before the gather section
+                # begins), so it composes with v_c living in bank 1 with no code changes
+                # needed. Hardware-validated (-V 1, valid:y) on a 128x128 bf16 fwd config
+                # with wmma_acc_high_bank=1+wmma_m_tail=1 standalone.
             # Phase 35 (GEMM_K tail, wrw): no precedent anywhere else in this codebase --
             # unlike the TDM-hardware-OOB K-tail fwd/1x1 uses (Phase 31), this is a genuine
             # software EXEC-mask mechanism, since wrw doesn't use TDM. Composes with
@@ -953,6 +966,18 @@ class igemm_gtc_tunable_parameter_t(object):
                     f"wmma_acc_high_bank (Phase 54) only moves v_c into a SINGLE extra bank -- " \
                     f"num_vgpr_accumulate_c:{self.num_vgpr_accumulate_c} must fit within one 256-register " \
                     f"bank; a bigger accumulator needs multi-bank MSB switching inside the main loop, not implemented"
+            # COR-001 (2026-09-02): fp32 WMMA tunables measured `valid:n` against the GPU
+            # naive-conv reference on real gfx1250 hardware when single-buffered --
+            # fp32's WMMA A/B operand loads are 4x wider than fp16/bf16's per K-element
+            # (4 bytes vs 1), and without LDS double-buffering the main loop can't hide
+            # that load latency behind compute, corrupting results on real hardware (not
+            # just a perf regression). precision/fma_type/lds_double_buffer are all
+            # already set above (lines 215/246/396) by this point. Fail loudly here, at
+            # codegen time, rather than silently on hardware.
+            if self.precision == 'fp32':
+                assert self.lds_double_buffer == 1, \
+                    f"fp32 WMMA tunables require lds_double_buffer=1 (see COR-001) -- " \
+                    f"gemm_m_per_block:{self.gemm_m_per_block}x{self.gemm_n_per_block}x{self.gemm_k_per_block} is missing it"
 
         self.global_prefetch_a_num              = 2 if self.tensor_a_pass_through and not self.tensor_a_pass_through_interleave_gld else 1
         self.global_prefetch_b_num              = 2 if self.tensor_b_pass_through and not self.tensor_b_pass_through_interleave_gld else 1
@@ -1493,6 +1518,16 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_direct"
         if tunable.ds_load_tr_b:
             kernel_name += "_dstrb"
+        # Phase 68 (2026-09-02): wmma_epilogue_chunked/wmma_acc_high_bank (see this
+        # tunable's own definitions above) change the epilogue's generated code (chunked
+        # LDS staging, v_c living in a second VGPR bank respectively) just like every
+        # other flag folded into this block, so must be folded into the kernel name for
+        # the same hipModuleGetFunction-lookup reason -- otherwise a chunked/hibank build
+        # and its plain sibling of the same tile shape collide on symbol name.
+        if tunable.wmma_epilogue_chunked:
+            kernel_name += "_chunked"
+        if tunable.wmma_acc_high_bank:
+            kernel_name += "_hibank"
         if tunable.local_prefetch_num != 1:
             kernel_name += f"_lp{tunable.local_prefetch_num}"
         if tunable.atomic_scope != 'SCOPE_SYS':

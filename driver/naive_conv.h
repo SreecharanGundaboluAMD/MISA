@@ -167,7 +167,6 @@ static inline void naive_conv_fwd_nchw(const float *src, const float *filter,
             for (ik = 0; ik < k_per_group; ik++) {
                 for (ioh = 0; ioh < oh; ioh++) {
                     for (iow = 0; iow < ow; iow++) {
-                        // sliding window for this filter
                         float value = .0f;
                         o_idx = in * k * oh * ow + ig * k_per_group * oh * ow + ik * oh * ow + ioh * ow + iow;
                         for (ic = 0; ic < c_per_group; ic++) {
@@ -414,7 +413,6 @@ static inline void naive_conv_fwd_ncdhw(const float *src, const float *filter, f
                 for (iod = 0; iod < od; iod++) {
                     for (ioh = 0; ioh < oh; ioh++) {
                         for (iow = 0; iow < ow; iow++) {
-                            // sliding window for this filter
                             float value = .0f;
                             o_idx = in * k * od * oh * ow + ig * k_per_group * od * oh * ow + ik * od * oh * ow + iod * oh * ow + ioh * ow + iow;
                             for (ic = 0; ic < c_per_group; ic++) {
@@ -639,7 +637,6 @@ static inline void naive_conv_wrw_ncdhw(const float *src, float *filter_grad, co
 #endif
 }
 
-/************************** nhwc ****************************/
 static inline void naive_conv_fwd_nhwc(const float *src, const float *filter,
                                        float *dst, size_t n, size_t w, size_t h,
                                        size_t c, size_t k, size_t fx, size_t fy,
@@ -682,7 +679,6 @@ static inline void naive_conv_fwd_nhwc(const float *src, const float *filter,
             for (ioh = 0; ioh < oh; ioh++) {
                 for (iow = 0; iow < ow; iow++) {
                     for (ik = 0; ik < k_per_group; ik++) {
-                        // sliding window for this filter
                         float value = .0f;
                         o_idx = in * oh * ow * k + + ioh * ow * k_per_group + iow * k_per_group + ig * k_per_group + ik;
                         for (ir = 0; ir < fy; ir++) {
@@ -908,7 +904,6 @@ static inline void naive_conv_fwd_ndhwc(const float *src, const float *filter, f
                 for (ioh = 0; ioh < oh; ioh++) {
                     for (iow = 0; iow < ow; iow++) {
                         for (ik = 0; ik < k_per_group; ik++) {
-                            // sliding window for this filter
                             float value = .0f;
                             o_idx = in * od * oh * ow * k + iod * oh * ow * k + ioh * ow * k + iow * k + ig * k_per_group + ik;
                             for (iz = 0; iz < fz; iz++) {

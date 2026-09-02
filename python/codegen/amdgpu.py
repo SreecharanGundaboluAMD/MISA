@@ -221,7 +221,7 @@ class amdgpu_arch_detail_t(object):
         self.simd_per_cu    = 0
         self.sclk_mhz       = 0
         self.mclk_mhz       = 0
-        self.lds_size       = 0     # in byte
+        self.lds_size       = 0
         self.lds_banks      = 0
         self.l1_size        = 0
         self.l1_cache_line  = 0
@@ -589,10 +589,10 @@ class amdgpu_metadata_t(mc_base_t):
         self._emit('    .symbol: {}.kd'.format(                     ki_.kernel_name))
         self._emit('    .sgpr_count: {}'.format(                    ki_.kernel_code.wavefront_sgpr_count))
         self._emit('    .vgpr_count: {}'.format(                    ki_.kernel_code.workitem_vgpr_count))
-        self._emit('    .kernarg_segment_align: {}'.format(         8))     # default set to 8
+        self._emit('    .kernarg_segment_align: {}'.format(         8))
         self._emit('    .kernarg_segment_size: {}'.format(          ki_.kernel_code.kernarg_segment_byte_size))
         self._emit('    .group_segment_fixed_size: {}'.format(      ki_.kernel_code.workgroup_group_segment_byte_size))
-        self._emit('    .private_segment_fixed_size: {}'.format(    0))     # hard code to 0
+        self._emit('    .private_segment_fixed_size: {}'.format(    0))
         self._emit('    .wavefront_size: {}'.format(                ki_.kernel_code.wavefront_size))
         self._emit('    .reqd_workgroup_size : [{}]'.format(        '{}, 1, 1'.format( ki_.kernel_block_size) \
                                                                                 if type(ki_.kernel_block_size) is int else \

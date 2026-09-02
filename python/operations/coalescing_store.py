@@ -38,7 +38,7 @@ MAX_LGKMCNT = 16    # 0...15
 
 class ctrl_coalescing_store_t(object):
     def __init__(self):
-        self.ctm = None # ctrl_thread_mapping_t
+        self.ctm = None
         self.coalescing_groups = 1
         self.block_size = 256
         self.vector_write_out = 1
@@ -82,7 +82,7 @@ class ctrl_coalescing_store_t(object):
         g_nr = math.gcd(num_n_groups, self.ctm.t_nr())
         g_n1 = math.gcd(num_n_groups//g_nr, self.ctm.t_n1())
         g_n0 = math.gcd(num_n_groups//(g_nr*g_n1), self.ctm.t_n0())
-        return g_mr, g_m1, g_m0, g_nr, g_n1, g_n0   # g_m1 always 1
+        return g_mr, g_m1, g_m0, g_nr, g_n1, g_n0 
 
     def get_transposed_thread_mapping(self):
         # after coalescing, the thread mapping is indeed transposed
@@ -119,7 +119,6 @@ class ctrl_coalescing_store_t(object):
         g_mr, g_m1, g_m0, g_nr, g_n1, g_n0 = self.get_subgroups()
         assert g_m1 == 1
 
-        # do some assert
         if self.gemm_m_order == IGEMM_COALESCING_GEMM_M_ORDER_M0_M1:
             m_index_per_group = self.get_m_index_per_group()
             thread_m_stride = g_m0 * ttm.n_m0()
@@ -252,7 +251,6 @@ class igemm_coalescing_store_t(mc_base_t):
 
     def init_co_sub_m_index(self, v_co_sub_m_index, v_tid, v_tmp2):
         ctrl = self.ctrl
-        # need use v_co_sub_m_index to calculate v offset in m direction
         g_mr, g_m1, g_m0, g_nr, g_n1, g_n0 = ctrl.get_subgroups()
         assert g_m1 == 1
         # sub_m0_offset = ((i_c_m0 >> int(math.log2(g_m0))) << self.ctm.t_m0()) | (i_c_m0 & (g_m0 - 1))
@@ -274,7 +272,6 @@ class igemm_coalescing_store_t(mc_base_t):
 
     def init_co_sub_n_index(self, v_co_sub_n_index, v_tid, v_tmp2):
         ctrl = self.ctrl
-        # need use v_co_sub_n_index to calculate v offset in n direction
         g_mr, g_m1, g_m0, g_nr, g_n1, g_n0 = ctrl.get_subgroups()
         assert g_m1 == 1
         l_mr = ctrl.ctm.t_mr() // g_mr
@@ -304,11 +301,8 @@ class igemm_coalescing_store_t(mc_base_t):
         l_m0 = ctrl.ctm.t_m0() // g_m0
         no_s_out_offset = s_out_offset is None
 
-        # mc, vec_count, vec_byte, vec_stride, sst_base=0):
         inst_sst = inst_ds_write2_likely_t(self.mc, 2, ctrl.ctm.t_n0() * data_byte, ctrl.ctm.n_n_total() * data_byte // 2)
-        # mc, vec_count, vec_byte, vec_stride, sld_base = 0):
         inst_sld = inst_ds_read2_likely_t(self.mc, 2, ctrl.vector_write_out * data_byte, ctrl.block_size * ctrl.vector_write_out * data_byte)
-        # self, vdata, vaddr, srsrc, soffset, offset):
         inst_gst = inst_buffer_store_t(ctrl.vector_write_out * data_byte)
 
         s_out_offset_itr = sym_t(s_tmp4(0))
@@ -389,7 +383,6 @@ class igemm_coalescing_store_t(mc_base_t):
                         i_issue_list = issue_list[i_issues:]
                         i_issue_cnt = utility_flatten_list_accumulate(i_issue_list) if len(i_issue_list) != 0 else 0
                         self._emit(f"s_waitcnt lgkmcnt({i_issue_cnt})")
-                    # vdata, vaddr, srsrc, soffset, offset
                     self._emit(inst_gst(v_c(c_group_start_index + i_gst*ctrl.vector_write_out), v_out_offset, s_p_out, s_out_offset_itr(), 0))
                     if i_gst != (ctrl.get_num_dword_per_group() // ctrl.vector_write_out) - 1:
                         if s_gemm_m0_stride is not None:
@@ -399,7 +392,6 @@ class igemm_coalescing_store_t(mc_base_t):
                             if ctrl.gemm_m_order == IGEMM_COALESCING_GEMM_M_ORDER_M0_M1:
                                 if i_m0 > i_m0_start:
                                     i_m0_start = i_m0
-                                    # m0 accumulate
                                     self._emit(f"s_mul_i32 s[{s_tmp4(2)}], {i_m0}, s[{s_gemm_m0_stride}]")
                                     self._emit(f"s_add_u32 s[{s_out_offset_itr()}], s[{s_tmp4(2)}], s[{s_tmp4(3)}]")
                                 else:
@@ -407,7 +399,6 @@ class igemm_coalescing_store_t(mc_base_t):
                             else:
                                 if i_m1 > i_m1_start:
                                     i_m1_start = i_m1
-                                    # m1 accumllate
                                     self._emit(f"s_mul_i32 s[{s_tmp4(3)}], {i_m1}, s[{s_gemm_m1_stride}]")
                                     self._emit(f"s_add_u32 s[{s_out_offset_itr()}], s[{s_tmp4(2)}], s[{s_tmp4(3)}]")
                                 else:
@@ -924,7 +915,6 @@ class igemm_coalescing_store_xdlops_t(mc_base_t):
             from functools import reduce
             return reduce(lambda a, b: a*b, x, 1)
         ctrl = self.ctrl
-        # need use v_co_sub_m_index to calculate v offset in m direction
         g_mr, g_ms, g_mw, g_mb, g_mt = ctrl.get_subgroups()
         l_mr, l_ms, l_mw, l_mb, l_mt = ctrl.get_subgroup_length()
         n_mc = ctrl.cxm.lanegroup_m_per_cluster()       # this iteration is among different thread
@@ -1096,7 +1086,6 @@ class igemm_coalescing_store_xdlops_t(mc_base_t):
         in n dimension, always have one thread per column
         '''
         ctrl = self.ctrl
-        # need use v_co_sub_n_index to calculate v offset in n direction
 
         with self._deferred_context():
             self._emit(f"; init_co_sub_n_index xdlops")
@@ -1442,7 +1431,6 @@ class igemm_coalescing_store_xdlops_t(mc_base_t):
                                 i_issue_list = current_issue_list[i_issues:]
                                 i_issue_cnt = utility_flatten_list_accumulate(i_issue_list) if len(i_issue_list) != 0 else 0
                                 self._emit(f"s_waitcnt lgkmcnt({i_issue_cnt})")
-                        # vdata, vaddr, srsrc, soffset, offset
                         if not ctrl.feat_co_m_flag_check and (s_k is not None):
                             self._emit(f"v_cmp_gt_u32 vcc, s[{s_k()}], v[{v_tmp0()}]")
                             self._emit(f"s_and_saveexec_b64 s[{s_tmp6(4)}:{s_tmp6(5)}], vcc")
@@ -1470,7 +1458,6 @@ class igemm_coalescing_store_xdlops_t(mc_base_t):
                 if ctrl.feat_vgpr_collapse:
                     agpr_per_store_group = ctrl.cxm.total_acc_c() // ctrl.coalescing_groups
                     assert ctrl.get_vgpr_usage() == ((agpr_per_store_group + split_sld_groups - 1) // split_sld_groups), f"vgpr_usage:{ctrl.get_vgpr_usage()}, agpr_per_store_group:{agpr_per_store_group}, split_sld_groups:{split_sld_groups}"
-            # do some assert
             agpr_consume_list.sort()
             assert agpr_consume_list == [x for x in range(ctrl.cxm.total_acc_c())], f"agpr_consume_list:{agpr_consume_list}"
             #if agpr_consume_list != [x for x in range(ctrl.cxm.total_acc_c())]:

@@ -225,13 +225,13 @@ class igemm_coalescing_store_dotx_t(mc_base_t):
 
         g_mr, g_mt = ctrl.get_subgroups()
         l_mr, l_mt = ctrl.get_subgroup_length()
-        n_mc = ctrl.cdm.lanegroup_m_per_cluster()       # this is among different thread
-        n_ml = ctrl.cdm.lanegroup_m_per_wave()          # this is among different thread
-        n_mv = ctrl.cdm.waves_per_m()                   # this is among different thread
+        n_mc = ctrl.cdm.lanegroup_m_per_cluster()
+        n_ml = ctrl.cdm.lanegroup_m_per_wave()
+        n_mv = ctrl.cdm.waves_per_m()
 
-        n_nc = ctrl.cdm.lanegroup_n_per_cluster()       # this is among different thread
-        n_nl = ctrl.cdm.lanegroup_n_per_wave()          # this is among different thread
-        n_nv = ctrl.cdm.waves_per_n()                   # this is among different thread
+        n_nc = ctrl.cdm.lanegroup_n_per_cluster()
+        n_nl = ctrl.cdm.lanegroup_n_per_wave()
+        n_nv = ctrl.cdm.waves_per_n()
 
         sst_vec, sld_vec, smem_trans = self.get_smem_co_vector_size()
         assert l_mt % sst_vec == 0
@@ -666,13 +666,13 @@ class igemm_coalescing_store_dotx_t(mc_base_t):
 
         g_mr, g_mt = ctrl.get_subgroups()
         l_mr, l_mt = ctrl.get_subgroup_length()
-        n_mc = ctrl.cdm.lanegroup_m_per_cluster()       # this is among different thread
-        n_ml = ctrl.cdm.lanegroup_m_per_wave()          # this is among different thread
-        n_mv = ctrl.cdm.waves_per_m()                   # this is among different thread
+        n_mc = ctrl.cdm.lanegroup_m_per_cluster()
+        n_ml = ctrl.cdm.lanegroup_m_per_wave()
+        n_mv = ctrl.cdm.waves_per_m()
 
-        n_nc = ctrl.cdm.lanegroup_n_per_cluster()       # this is among different thread
-        n_nl = ctrl.cdm.lanegroup_n_per_wave()          # this is among different thread
-        n_nv = ctrl.cdm.waves_per_n()                   # this is among different thread
+        n_nc = ctrl.cdm.lanegroup_n_per_cluster()
+        n_nl = ctrl.cdm.lanegroup_n_per_wave()
+        n_nv = ctrl.cdm.waves_per_n()
 
         no_s_out_offset = s_out_offset is None
 
@@ -902,7 +902,6 @@ class igemm_coalescing_store_dotx_t(mc_base_t):
                                 i_issue_list = current_issue_list[i_issues:]
                                 i_issue_cnt = utility_flatten_list_accumulate(i_issue_list) if len(i_issue_list) != 0 else 0
                                 self._emit(f"s_waitcnt lgkmcnt({i_issue_cnt})")
-                        # vdata, vaddr, srsrc, soffset, offset
                         if not ctrl.feat_co_m_flag_check and (s_gemm_m_num is not None):
                             #self._emit(f"v_cmp_gt_u32 vcc, s[{s_gemm_m_num()}], v[{v_tmp0()}]")
                             self._emit(v_cmp_gt_u32(s_gemm_m_num(), v_tmp0()))

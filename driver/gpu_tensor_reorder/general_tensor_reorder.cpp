@@ -232,7 +232,6 @@ inline __device__ void general_4d_reorder_1p(T* dst,
     {
         for (uint32_t k = 0; k < 1; k++)
         {
-                        //unroll k         block          thread
             src_index = k*dim_total*256 + dim_id * 256 + threadIdx.x;
             if(src_index < pixel_total){
                 i_src[0] = magic_div_u32(src_index,                                                   magic_stride0, shift_stride0);
@@ -289,7 +288,6 @@ inline __device__ void general_4d_reorder_2p(T* dst,
     {
         for (uint32_t k = 0; k < 2; k++)
         {
-                        //unroll k         block          thread
             src_index = k*dim_total*256 + dim_id * 256 + threadIdx.x;
             if(src_index < pixel_total){
                 i_src[0] = magic_div_u32(src_index,                                                   magic_stride0, shift_stride0);
@@ -346,7 +344,6 @@ inline __device__ void general_4d_reorder_4p(T* dst,
     {
         for (uint32_t k = 0; k < 4; k++)
         {
-                        //unroll k         block          thread
             src_index = k*dim_total*256 + dim_id * 256 + threadIdx.x;
             if(src_index < pixel_total){
                 i_src[0] = magic_div_u32(src_index,                                                   magic_stride0, shift_stride0);
@@ -403,7 +400,6 @@ inline __device__ void general_4d_reorder_8p(T* dst,
     {
         for (uint32_t k = 0; k < 8; k++)
         {
-                        //unroll k         block          thread
             src_index = k*dim_total*256 + dim_id * 256 + threadIdx.x;
             if(src_index < pixel_total){
                 i_src[0] = magic_div_u32(src_index,                                                   magic_stride0, shift_stride0);
@@ -460,7 +456,6 @@ inline __device__ void general_4d_reorder_16p(T* dst,
     {
         for (uint32_t k = 0; k < 16; k++)
         {
-                        //unroll k         block          thread
             src_index = k*dim_total*256 + dim_id * 256 + threadIdx.x;
             if(src_index < pixel_total){
                 i_src[0] = magic_div_u32(src_index,                                                   magic_stride0, shift_stride0);

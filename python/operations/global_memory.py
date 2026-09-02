@@ -224,10 +224,10 @@ GLOBAL_PTN_D1_K = (1 << 2) << 4
 
 class ctrl_2d_global_load_t(object):
     def __init__(self):
-        self.length_d0 = 1           # if d0 is 1, it is indeed 1d access
+        self.length_d0 = 1
         self.length_d1 = 1
         self.vector_d1 = 1
-        self.precision = 'fp32'      # 'fp32', 'fp16', ...
+        self.precision = 'fp32'
         self.src_order = 0           # 0-d0xd1, 1-d1xd0
         self.dst_order = 0           # 0-d0xd1, 1-d1xd0
         self.use_flag = 0
@@ -439,7 +439,6 @@ class macro_igemm_2d_global_load_precache_soffset_t(macro_base_t):
                     if i_d0 == 1 and i_d1 == 0:
                         continue
 
-                    # start to emit init
                     if i_d0 == 0:
                         self._emit(f"s_mul_i32 s[{s_offset}+{i_soffset}], {i_d1}, s[{s_stride_d1}]")
                     elif i_d0 == 1:
@@ -793,7 +792,6 @@ class macro_igemm_2d_global_load_precache_offset_t(macro_base_t):
                     if i_d0 == 1 and i_d1 == 0:
                         continue
 
-                    # start to emit init
                     if i_d0 == 0:
                         self._emit(f"s_mul_i32 s[{s_offset}+{i_soffset}], {i_d1}, s[{s_stride_d1}]")
                     elif i_d0 == 1:
@@ -1049,5 +1047,4 @@ class macro_igemm_write_4d_strided_t(macro_base_t):
         emit_write4d_strided()
 
     def get_issues(self):
-        # write out is ignored
         return 0

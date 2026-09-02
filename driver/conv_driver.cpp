@@ -235,7 +235,19 @@ static inline double get_theoritical_gpu_gflops(int sclk_mhz, driverDataType_t d
     //     fp_factor = 4;
     // }
 
-    if(gcn_arch == 908 || gcn_arch == 910 || gcn_arch == 950 || gcn_arch == 942 || gcn_arch == 941 || gcn_arch == 940){
+    // COR-005 (2026-09-02): gfx1250 was silently falling through to the generic/
+    // xdlops-era default of num_simd = 4*16 = 64 lanes/CU set at this function's top,
+    // because it wasn't in this arch list -- unlike fp_factor just above (lines 190-232),
+    // which already special-cases gcn_arch == 1250. rocminfo/hipDeviceProperties on the
+    // real gfx1250 part report "SIMDs per CU: 4" with a wave32 (32-lane) SIMD width, i.e.
+    // 4*32 = 128 base FMA lanes/CU -- the SAME physical shape as the CDNA parts already
+    // listed here, not the RDNA/gfx10-era 4*16 default (that default predates gfx1250 and
+    // assumed the WGP-doubled CU counting gfx1250 explicitly opts out of above, line 182).
+    // Silently using 64 instead of 128 halved the computed peak, which combined with
+    // fp16/bf16's fp_factor=8 was reporting impossible >100% efficiency on real fp32
+    // kernels and understating the true fp16 peak (60.41% of a too-low peak, rather than
+    // the correct, much smaller percentage of the true, doubled peak).
+    if(gcn_arch == 908 || gcn_arch == 910 || gcn_arch == 950 || gcn_arch == 942 || gcn_arch == 941 || gcn_arch == 940 || gcn_arch == 1250){
         num_simd = 4 * 32 ; // 4x miSIMD, 32x mac unit
     }
 
@@ -469,11 +481,8 @@ void launch_conv_driver(driver_t * driver, const args_t *conv_args, const std::v
                 {result_t result; result.return_code = -2; return result;}
         }
         if(silent_not_applicable_level0){
-            // direction
             if(direction != current_tunable->direction)
                 {result_t result; result.return_code = -2; return result;}
-
-            // layout
             if(in_layout == "NCHW"){
                 if(current_tunable->tensor_layout != "nchw")
                     {result_t result; result.return_code = -2; return result;}
@@ -528,7 +537,6 @@ void launch_conv_driver(driver_t * driver, const args_t *conv_args, const std::v
             return result;
         }
         else{
-            //skip
             return result_t{};
         }
 
@@ -629,7 +637,6 @@ void launch_conv_driver(driver_t * driver, const args_t *conv_args, const std::v
     }
 
     if(p_bcsv){
-        //          time tflops efficiency kernel
         fprintf(p_bcsv, "%.3f,%.3f,%.2f%%,%s,",
             fastest_result.duration_ms, fastest_result.gflops/1000, fastest_result.efficiency, fastest_result.kernel_name.c_str());
         std::string conv_cmd = log_cmd(conv_args, driver_data_type, direction);
@@ -673,6 +680,28 @@ int main(int argc, char **argv) {
         return 0;
     }
     // printf("tunables:%d, hsaco:%s\n", tunables.size(), hsaco);
+
+    // COR-004 (2026-09-02): everything below this point (is_wmma_f16_acc,
+    // is_wmma_bf16_acc, is_wmma_atomic_pack_bf16, and every buffer-allocation/
+    // verification decision derived from them further down in main()/
+    // launch_conv_driver) reads ONLY tunables[0]'s accumulate-width flags and applies
+    // that single choice to every kernel in the vector -- a combined/master config file
+    // that mixed e.g. a wmma_acc_f16 section with a plain fp32-accumulate section of the
+    // same direction/precision would silently size and verify every OTHER tunable's
+    // buffers against tunables[0]'s width instead of its own, corrupting results without
+    // any diagnostic. Only meaningful for WMMA (XDLOPS/DLOPS/MAC never read these flags).
+    if(tunables[0].fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA){
+        for(size_t i = 1; i < tunables.size(); i++){
+            assert(tunables[i].fma_type != IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA ||
+                   (tunables[i].wmma_acc_f16 == tunables[0].wmma_acc_f16 &&
+                    tunables[i].wmma_acc_bf16 == tunables[0].wmma_acc_bf16 &&
+                    tunables[i].atomic_pack_bf16 == tunables[0].atomic_pack_bf16) &&
+                   "all WMMA tunables in one config must share the same accumulate-width "
+                   "flags (wmma_acc_f16/wmma_acc_bf16/atomic_pack_bf16) as tunables[0] -- "
+                   "see COR-004: the driver's buffer sizing/verification below only reads "
+                   "tunables[0]'s choice and applies it to every kernel in the vector");
+        }
+    }
 
     // The gfx1250 WMMA milestone kernels always accumulate/store the D operand at full
     // width (fp32, or int32 for int8 -- see e.g. igemm_fwd_gtc_wmma_nhwc_t's docstring)
@@ -763,12 +792,11 @@ int main(int argc, char **argv) {
 
     //assert(in_layout == out_layout && in_layout == fil_layout); // currently only support all layout is the same
     assert(in_layout == out_layout); 
-    assert(in_layout == "NCHW" || in_layout == "NHWC" || in_layout == "NCHWC"); // currently only support these layout
+    assert(in_layout == "NCHW" || in_layout == "NHWC" || in_layout == "NCHWC");
     assert((in_layout == "NCHW" && tunables[0].tensor_layout == "nchw") || 
            (in_layout == "NHWC" && tunables[0].tensor_layout == "nhwc") ||
-           (in_layout == "NCHWC" && tunables[0].tensor_layout.compare(0, 5, "nchwc") == 0));  // check pairs
+           (in_layout == "NCHWC" && tunables[0].tensor_layout.compare(0, 5, "nchwc") == 0));
 
-    // init host side
     float *host_input = (float *)malloc(static_cast<size_t>(n) * c * hi * wi * sizeof(float));
     float *host_weight = (float *)malloc(static_cast<size_t>(k) * c * y * x * sizeof(float));
     float *host_output = (float *)malloc(static_cast<size_t>(n) * k * ho * wo * sizeof(float));
@@ -814,10 +842,8 @@ int main(int argc, char **argv) {
 
     int need_verify = conv_args.get_int("verify");
     if(p_bcsv){
-        //               N   C   H   W   K   Y   X   P   Q   U   V   L   J   G
         fprintf(p_bcsv, "%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,",
                          n,  c, hi, wi,  k,  y,  x, pad_h, pad_w, stride_h, stride_w, dilation_h, dilation_w, ngroups);
-        //               GFLOP
         fprintf(p_bcsv, "%.2f,", get_theoritical_conv_flop(&conv_args)/1e9);
         fflush(p_bcsv);
     }
@@ -825,7 +851,6 @@ int main(int argc, char **argv) {
     if(driver_data_type == driverInt8 || driver_data_type == driverInt4)
         igemm_rand_int = 1;
 
-    // launch tensor cast module
     hipModule_t module_tensor_cast;
     std::string hsaco_tensor_cast = env_get_str("IGEMM_TENSOR_CAST_HSACO", IGEMM_TENSOR_CAST_HSACO);
     HIP_CALL(hipModuleLoad(&module_tensor_cast, hsaco_tensor_cast.c_str()));
@@ -833,38 +858,35 @@ int main(int argc, char **argv) {
     if (need_fwd){
         int fastest_id = -1;
         void *device_output_to_host = NULL;
+        // gen rand -- always initialize inputs, even when not verifying (-V 0): WMMA is
+        // measured ~2x faster on all-zero operands than on random data (COR-002), so
+        // leaving inputs uninitialized under -V 0 silently invalidates timing results.
+        if(!igemm_rand_int){
+            gen_rand_vector<float, float>(host_input, static_cast<size_t>(n) * c * hi * wi, 0.0, 1.0);
+            gen_rand_vector<float, float>(host_weight, static_cast<size_t>(k) * c * y * x, -0.5, 0.5);
+        }else{
+            gen_rand_vector<float, int>(host_input, static_cast<size_t>(n) * c * hi * wi, 1, 1);
+            gen_rand_vector<float, int>(host_weight, static_cast<size_t>(k) * c * y * x, 1, 1);
+        }
+        if(driver_data_type == driverHalf){
+            tensor_copy<float16, float>(static_cast<float16*>(host_input_dtype), host_input, static_cast<size_t>(n) * c * hi * wi);
+            tensor_copy<float16, float>(static_cast<float16*>(host_weight_dtype), host_weight, static_cast<size_t>(k) * c * y * x);
+        }
+        else if(driver_data_type == driverBFloat16){
+            tensor_copy<bfloat16, float>(static_cast<bfloat16*>(host_input_dtype), host_input, static_cast<size_t>(n) * c * hi * wi);
+            tensor_copy<bfloat16, float>(static_cast<bfloat16*>(host_weight_dtype), host_weight, static_cast<size_t>(k) * c * y * x);
+        }
+        else if(driver_data_type == driverInt8){
+            tensor_copy<int8_t, float>(static_cast<int8_t*>(host_input_dtype), host_input, static_cast<size_t>(n) * c * hi * wi);
+            tensor_copy<int8_t, float>(static_cast<int8_t*>(host_weight_dtype), host_weight, static_cast<size_t>(k) * c * y * x);
+        }
+        else if(driver_data_type == driverInt4)
+        {
+            tensor_copy<int4x2_t, float>(static_cast<int4x2_t*>(host_input_dtype), host_input, static_cast<size_t>(n) * c * hi * wi);
+            tensor_copy<int4x2_t, float>(static_cast<int4x2_t*>(host_weight_dtype), host_weight, static_cast<size_t>(k) * c * y * x);
+        }
+
         if (need_verify) {
-            // gen rand
-            if(!igemm_rand_int){
-                gen_rand_vector<float, float>(host_input, static_cast<size_t>(n) * c * hi * wi, 0.0, 1.0);
-                gen_rand_vector<float, float>(host_weight, static_cast<size_t>(k) * c * y * x, -0.5, 0.5);
-            }else{
-                gen_rand_vector<float, int>(host_input, static_cast<size_t>(n) * c * hi * wi, 1, 1);
-                gen_rand_vector<float, int>(host_weight, static_cast<size_t>(k) * c * y * x, 1, 1);
-            }
-
-            //gen_rand_vector<float, int>(host_input, static_cast<size_t>(n) * c * hi * wi, -5, 5);
-            //gen_rand_vector<float, int>(host_weight, static_cast<size_t>(k) * c * y * x, -5, 5);
-            //gen_rand_vector<float, int>(host_input, static_cast<size_t>(n) * c * hi * wi, 1, 1);
-            //gen_rand_vector<float, int>(host_weight, static_cast<size_t>(k) * c * y * x, 1, 1);
-            if(driver_data_type == driverHalf){
-                tensor_copy<float16, float>(static_cast<float16*>(host_input_dtype), host_input, static_cast<size_t>(n) * c * hi * wi);
-                tensor_copy<float16, float>(static_cast<float16*>(host_weight_dtype), host_weight, static_cast<size_t>(k) * c * y * x);
-            }
-            else if(driver_data_type == driverBFloat16){
-                tensor_copy<bfloat16, float>(static_cast<bfloat16*>(host_input_dtype), host_input, static_cast<size_t>(n) * c * hi * wi);
-                tensor_copy<bfloat16, float>(static_cast<bfloat16*>(host_weight_dtype), host_weight, static_cast<size_t>(k) * c * y * x);
-            }
-            else if(driver_data_type == driverInt8){
-                tensor_copy<int8_t, float>(static_cast<int8_t*>(host_input_dtype), host_input, static_cast<size_t>(n) * c * hi * wi);
-                tensor_copy<int8_t, float>(static_cast<int8_t*>(host_weight_dtype), host_weight, static_cast<size_t>(k) * c * y * x);
-            }
-            else if(driver_data_type == driverInt4)
-            {
-                tensor_copy<int4x2_t, float>(static_cast<int4x2_t*>(host_input_dtype), host_input, static_cast<size_t>(n) * c * hi * wi);
-                tensor_copy<int4x2_t, float>(static_cast<int4x2_t*>(host_weight_dtype), host_weight, static_cast<size_t>(k) * c * y * x);
-            }
-
 #ifdef USE_GPU_NAIVE_CONV
             HIP_CALL(hipMemcpy(device_input, host_input,
                        static_cast<size_t>(n) * c * hi * wi * sizeof(float), hipMemcpyHostToDevice));
@@ -1102,33 +1124,33 @@ int main(int argc, char **argv) {
         result_t fastest_result_bwd;
         fastest_result_bwd.duration_ms = FLT_MAX;
         int fastest_id = -1;
+        // gen rand -- always initialize inputs, even when not verifying (-V 0): WMMA is
+        // measured ~2x faster on all-zero operands than on random data (COR-002), so
+        // leaving inputs uninitialized under -V 0 silently invalidates timing results.
+        if(!igemm_rand_int){
+            gen_rand_vector<float, float>(host_output, static_cast<size_t>(n) * k * ho * wo, 0.0, 1.0);
+            gen_rand_vector<float, float>(host_weight, static_cast<size_t>(k) * c * y * x, -0.5, 0.5);
+        }
+        else{
+            gen_rand_vector<float, int>(host_output, static_cast<size_t>(n) * k * ho * wo, -5, 5);
+            gen_rand_vector<float, int>(host_weight, static_cast<size_t>(k) * c * y * x, -5, 5);
+        }
+        gen_rand_vector<float, float>(host_input, static_cast<size_t>(n) * c * hi * wi, 999999., 9999999.);  // manually poison input value to a very large number
+
+        if(driver_data_type == driverHalf){
+            tensor_copy<float16, float>(static_cast<float16*>(host_output_dtype), host_output, static_cast<size_t>(n) * k * ho * wo);
+            tensor_copy<float16, float>(static_cast<float16*>(host_weight_dtype), host_weight, static_cast<size_t>(k) * c * y * x);
+        }
+        else if(driver_data_type == driverBFloat16){
+            tensor_copy<bfloat16, float>(static_cast<bfloat16*>(host_output_dtype), host_output, static_cast<size_t>(n) * k * ho * wo);
+            tensor_copy<bfloat16, float>(static_cast<bfloat16*>(host_weight_dtype), host_weight, static_cast<size_t>(k) * c * y * x);
+        }
+        else if(driver_data_type == driverInt8){
+            tensor_copy<int8_t, float>(static_cast<int8_t*>(host_output_dtype), host_output, static_cast<size_t>(n) * k * ho * wo);
+            tensor_copy<int8_t, float>(static_cast<int8_t*>(host_weight_dtype), host_weight, static_cast<size_t>(k) * c * y * x);
+        }
+
         if (need_verify) {
-            // gen rand
-            if(!igemm_rand_int){
-                gen_rand_vector<float, float>(host_output, static_cast<size_t>(n) * k * ho * wo, 0.0, 1.0);
-                gen_rand_vector<float, float>(host_weight, static_cast<size_t>(k) * c * y * x, -0.5, 0.5);
-            }
-            else{
-                gen_rand_vector<float, int>(host_output, static_cast<size_t>(n) * k * ho * wo, -5, 5);
-                gen_rand_vector<float, int>(host_weight, static_cast<size_t>(k) * c * y * x, -5, 5);
-            }
-            gen_rand_vector<float, float>(host_input, static_cast<size_t>(n) * c * hi * wi, 999999., 9999999.);  // manually input value to a very large number
-            // gen_rand_vector<float, int>(host_output, static_cast<size_t>(n) * k * ho * wo,1, 1);
-            // gen_rand_vector<float, int>(host_weight, static_cast<size_t>(k) * c * y * x, 1, 1);
-
-            if(driver_data_type == driverHalf){
-                tensor_copy<float16, float>(static_cast<float16*>(host_output_dtype), host_output, static_cast<size_t>(n) * k * ho * wo);
-                tensor_copy<float16, float>(static_cast<float16*>(host_weight_dtype), host_weight, static_cast<size_t>(k) * c * y * x);
-            }
-            else if(driver_data_type == driverBFloat16){
-                tensor_copy<bfloat16, float>(static_cast<bfloat16*>(host_output_dtype), host_output, static_cast<size_t>(n) * k * ho * wo);
-                tensor_copy<bfloat16, float>(static_cast<bfloat16*>(host_weight_dtype), host_weight, static_cast<size_t>(k) * c * y * x);
-            }
-            else if(driver_data_type == driverInt8){
-                tensor_copy<int8_t, float>(static_cast<int8_t*>(host_output_dtype), host_output, static_cast<size_t>(n) * k * ho * wo);
-                tensor_copy<int8_t, float>(static_cast<int8_t*>(host_weight_dtype), host_weight, static_cast<size_t>(k) * c * y * x);
-            }
-
 #ifdef USE_GPU_NAIVE_CONV
             HIP_CALL(hipMemcpy(device_output, host_output,
                        static_cast<size_t>(n) * k * ho * wo * sizeof(float), hipMemcpyHostToDevice));
@@ -1274,32 +1296,30 @@ int main(int argc, char **argv) {
     if (need_wrw){
         void *device_weight_to_host = NULL;
 
-        // begin wrw
+        // gen rand -- always initialize inputs, even when not verifying (-V 0): WMMA is
+        // measured ~2x faster on all-zero operands than on random data (COR-002), so
+        // leaving inputs uninitialized under -V 0 silently invalidates timing results.
+        if(!igemm_rand_int){
+            gen_rand_vector<float, float>(host_input, static_cast<size_t>(n) * c * hi * wi, 0.0, 1.0);
+            gen_rand_vector<float, float>(host_output, static_cast<size_t>(n) * k * ho * wo, -0.5, 0.5);
+        }else{
+            gen_rand_vector<float, int>(host_input, static_cast<size_t>(n) * c * hi * wi, -5, 5);
+            gen_rand_vector<float, int>(host_output, static_cast<size_t>(n) * k * ho * wo, -5, 5);
+        }
+        if(driver_data_type == driverHalf){
+            tensor_copy<float16, float>(static_cast<float16*>(host_input_dtype), host_input, static_cast<size_t>(n) * c * hi * wi);
+            tensor_copy<float16, float>(static_cast<float16*>(host_output_dtype), host_output, static_cast<size_t>(n) * k * ho * wo);
+        }
+        else if(driver_data_type == driverBFloat16){
+            tensor_copy<bfloat16, float>(static_cast<bfloat16*>(host_input_dtype), host_input, static_cast<size_t>(n) * c * hi * wi);
+            tensor_copy<bfloat16, float>(static_cast<bfloat16*>(host_output_dtype), host_output, static_cast<size_t>(n) * k * ho * wo);
+        }
+        else if(driver_data_type == driverInt8){
+            tensor_copy<int8_t, float>(static_cast<int8_t*>(host_input_dtype), host_input, static_cast<size_t>(n) * c * hi * wi);
+            tensor_copy<int8_t, float>(static_cast<int8_t*>(host_output_dtype), host_output, static_cast<size_t>(n) * k * ho * wo);
+        }
+
         if (need_verify) {
-            // gen rand
-            if(!igemm_rand_int){
-                gen_rand_vector<float, float>(host_input, static_cast<size_t>(n) * c * hi * wi, 0.0, 1.0);
-                gen_rand_vector<float, float>(host_output, static_cast<size_t>(n) * k * ho * wo, -0.5, 0.5);
-            }else{
-                gen_rand_vector<float, int>(host_input, static_cast<size_t>(n) * c * hi * wi, -5, 5);
-                gen_rand_vector<float, int>(host_output, static_cast<size_t>(n) * k * ho * wo, -5, 5);
-            }
-            //gen_rand_vector<float, int>(host_input, static_cast<size_t>(n) * c * hi * wi, 1, 1);
-            //gen_rand_vector<float, int>(host_output, static_cast<size_t>(n) * k * ho * wo, 1, 1);
-            //gen_rand_vector<float, int>(host_input, static_cast<size_t>(n) * c * hi * wi, -1, 1);
-            //gen_rand_vector<float, int>(host_output, static_cast<size_t>(n) * k * ho * wo, -1, 1);
-            if(driver_data_type == driverHalf){
-                tensor_copy<float16, float>(static_cast<float16*>(host_input_dtype), host_input, static_cast<size_t>(n) * c * hi * wi);
-                tensor_copy<float16, float>(static_cast<float16*>(host_output_dtype), host_output, static_cast<size_t>(n) * k * ho * wo);
-            }
-            else if(driver_data_type == driverBFloat16){
-                tensor_copy<bfloat16, float>(static_cast<bfloat16*>(host_input_dtype), host_input, static_cast<size_t>(n) * c * hi * wi);
-                tensor_copy<bfloat16, float>(static_cast<bfloat16*>(host_output_dtype), host_output, static_cast<size_t>(n) * k * ho * wo);
-            }
-            else if(driver_data_type == driverInt8){
-                tensor_copy<int8_t, float>(static_cast<int8_t*>(host_input_dtype), host_input, static_cast<size_t>(n) * c * hi * wi);
-                tensor_copy<int8_t, float>(static_cast<int8_t*>(host_output_dtype), host_output, static_cast<size_t>(n) * k * ho * wo);
-            }
 #ifdef USE_GPU_NAIVE_CONV
             HIP_CALL(hipMemcpy(device_input, host_input,
                        static_cast<size_t>(n) * c * hi * wi * sizeof(float), hipMemcpyHostToDevice));

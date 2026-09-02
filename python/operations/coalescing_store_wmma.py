@@ -153,10 +153,11 @@ class ctrl_coalescing_store_wmma_t(object):
         # docs/gfx1250_wmma_layout.md's Phase 52/53). 1 = reuse a small,
         # tile-size-INVARIANT LDS region across `wave_repeat_m` sequential groups
         # instead -- the same principle XDLOPS's coalescing_store.py already uses
-        # (`coalescing_groups`), adapted to WMMA's simpler addressing. Mutually
-        # exclusive with wmma_m_tail/wmma_n_tail/wmma_acc_f16/bf16acc (masking/packed-
-        # layout interaction not audited this pass, see igemm_base.py) and with
-        # gemm_k_global_split (this flag only touches the non-atomic branch).
+        # (`coalescing_groups`), adapted to WMMA's simpler addressing. wmma_acc_f16/
+        # bf16acc IS supported (Phase 53 correction). wmma_m_tail/wmma_n_tail composed
+        # in Phase 68 (2026-09-02, PERF-002) -- see _emit_chunked_non_atomic_store's
+        # docstring. Mutually exclusive with gemm_k_global_split (this flag only
+        # touches the non-atomic branch).
         self.wmma_epilogue_chunked = 0
 
         # Phase 54 (VGPR-MSB): shared vgpr_msb_tracker_t instance (None = mechanism
@@ -189,7 +190,8 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
     def _emit_chunked_non_atomic_store(self, ctrl, cxm, inst_wmma, v_c, v_gemm_im, v_gemm_in,
             v_tid, v_gather, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1,
             s_block_m_off, s_block_n_off, vwo, macro_tile_n, elem_bytes, elem_byte_shift,
-            ds_read_inst, gst_inst, v_gather_range, pad, padded_stride, log2_n, v_chunked_col):
+            ds_read_inst, gst_inst, v_gather_range, pad, padded_stride, log2_n, v_chunked_col,
+            s_gemm_m=None, v_tmp3=None, s_gemm_n=None, v_tmp4=None, s_tmp2=None):
         '''
         Phase 53: chunked epilogue. Reuses one small, tile-size-INVARIANT LDS region
         across `wave_repeat_m` sequential groups instead of staging the whole macro-tile
@@ -244,6 +246,17 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         lane_sub) is rederived fresh each pass from `v_tid`, so no other new register is
         required; `v_tmp1`/`v_tmp2`/`v_gather` keep their existing per-group/per-pass
         scratch roles.
+
+        Phase 68 (2026-09-02, PERF-002): wmma_m_tail/wmma_n_tail masking, mirroring the
+        unchunked gather phase's guards (see __call__'s docstring for s_gemm_m/v_tmp3 and
+        s_gemm_n/v_tmp4's roles) -- adapted to this method's "recompute everything fresh
+        from v_tid every pass" discipline: v_tmp3 (this pass's absolute row) is captured
+        from `v_gather` right before it's overwritten by the row*stride multiply, instead
+        of being carried/advanced across passes like the unchunked path does (nothing here
+        survives across passes except v_chunked_col/v_tmp1, so there is nothing to advance
+        incorrectly). v_tmp4 (n_tail's remaining-columns state) IS pass-invariant, same as
+        unchunked, since v_chunked_col itself never changes -- computed once, before the
+        group loop, right after v_chunked_col.
         '''
         wave_tile_m = cxm.wave_tile_m
         wave_repeat_m = cxm.wave_repeat_m
@@ -286,6 +299,12 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         self._emit(f"v_lshlrev_b32 v[{v_tmp1}], {utility_log2(vwo)}, v[{v_tid}]   ; tid*{vwo}")
         self._emit(f"v_and_b32 v[{v_chunked_col}], {macro_tile_n - 1}, v[{v_tmp1}]   ; col (tile-local)")
         self._emit(f"v_add_u32 v[{v_chunked_col}], s[{s_block_n_off}], v[{v_chunked_col}]   ; + block_n_off -> global col (persistent for the whole method)")
+        if ctrl.wmma_n_tail:
+            # Phase 68: pass-invariant (v_chunked_col never changes) -- see this
+            # method's docstring. Same "remaining" idiom as the unchunked gather phase.
+            self._emit(f"v_sub_i32 v[{v_tmp4}], s[{s_gemm_n}], v[{v_chunked_col}]   ; wmma_n_tail: remaining = gemm_n - col")
+            if vwo > 1 and not ctrl.wmma_acc_f16:
+                self._emit(f"s_and_b32 s[{s_tmp2}], s[{s_gemm_n}], {vwo - 1}   ; wmma_n_tail: gemm_n % {vwo}")
         self._emit(f"s_wait_dscnt 0x0")
         self._emit(f"s_barrier_signal -1")
         self._emit(f"s_barrier_wait -1   ; main loop's own LDS traffic must retire before group 0 reuses this LDS region")
@@ -454,13 +473,47 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                 if i_rm != 0:
                     self._emit(f"v_or_b32 v[{v_gather}], {i_rm * wave_tile_m}, v[{v_gather}]   ; | (i_rm<<log2(wave_tile_m)) -- true row (tile-local, full macro_tile_m range)")
                 self._emit(f"v_add_u32 v[{v_gather}], s[{s_block_m_off}], v[{v_gather}]   ; + block_m_off -> global row")
+                if ctrl.wmma_m_tail:
+                    # Phase 68: capture the absolute row NOW, before the mul below turns
+                    # v_gather into a row*stride product -- see this method's docstring.
+                    self._emit(f"v_mov_b32 v[{v_tmp3}], v[{v_gather}]   ; wmma_m_tail: absolute row, pass {it}")
                 self._emit(f"v_mul_lo_u32 v[{v_gather}], s[{s_gemm_m_stride}], v[{v_gather}]")
                 self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_chunked_col}], v[{v_gather}]   ; + global col")
                 self._emit(f"v_lshlrev_b32 v[{v_tmp2}], {elem_byte_shift}, v[{v_tmp2}]   ; global memory byte address, pass {it}")
 
                 self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * row_step_per_pass_g * padded_stride * elem_bytes}")
                 self._emit(f"s_wait_dscnt 0x0")
-                self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
+                if ctrl.wmma_n_tail and vwo > 1 and not ctrl.wmma_acc_f16:
+                    # Phase 68: same Phase-51 fast(exact-multiple)/slow(per-element) split
+                    # as the unchunked gather -- a single vwo-wide EXEC mask can't
+                    # correctly handle gemm_n falling strictly inside one lane's group.
+                    self._label_counter += 1
+                    label_slow = f"L_cstore_{id(self)}_{self._label_counter}_chunked_ntail_slow"
+                    label_done = f"L_cstore_{id(self)}_{self._label_counter}_chunked_ntail_done"
+                    self._emit(f"s_cmp_eq_u32 s[{s_tmp2}], 0")
+                    self._emit(f"s_cbranch_scc0 {label_slow}   ; Phase 68: gemm_n % {vwo} != 0 this pass -> per-element masking")
+                    if ctrl.wmma_m_tail:
+                        self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (fast path)")
+                    self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n (fast path)")
+                    self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
+                    self._emit(f"s_mov_b32 exec_lo, -1")
+                    self._emit(f"s_branch {label_done}")
+                    self._emit_front(f"{label_slow}:")
+                    for i in range(vwo):
+                        if ctrl.wmma_m_tail:
+                            self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (elem {i})")
+                        self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], {i}   ; wmma_n_tail: col+{i} < real gemm_n")
+                        self._emit(f"global_store_dword v[{v_tmp2}], v[{v_gather}+{i}], s[{s_p_out}:{s_p_out}+1] offset:{i * elem_bytes}")
+                        self._emit(f"s_mov_b32 exec_lo, -1")
+                    self._emit_front(f"{label_done}:")
+                else:
+                    if ctrl.wmma_m_tail:
+                        self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
+                    if ctrl.wmma_n_tail:
+                        self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n")
+                    self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
+                    if ctrl.wmma_m_tail or ctrl.wmma_n_tail:
+                        self._emit(f"s_mov_b32 exec_lo, -1")
             self._emit_empty_line()
 
     def __call__(self, v_c, v_gemm_im, v_gemm_in, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1, v_tid=None, v_gather=None, s_block_m_off=None, s_block_n_off=None, s_gemm_m=None, v_tmp3=None, s_gemm_n=None, v_tmp4=None, s_tmp2=None, v_chunked_col=None):
@@ -691,11 +744,13 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                 if ctrl.wmma_epilogue_chunked:
                     # Phase 53: wmma_acc_f16/bf16acc IS supported (needed to make a bigger
                     # tile's accumulator fit gfx1250's real 256-VGPR/wave ceiling at all --
-                    # see docs/gfx1250_wmma_layout.md's Phase 53 correction) -- only
-                    # wmma_m_tail/wmma_n_tail remain excluded (masking interaction with
-                    # per-group chunking not audited this pass).
-                    assert not ctrl.wmma_m_tail and not ctrl.wmma_n_tail, \
-                        "wmma_epilogue_chunked is not yet combined with wmma_m_tail/wmma_n_tail, see docs/gfx1250_wmma_layout.md's Phase 53"
+                    # see docs/gfx1250_wmma_layout.md's Phase 53 correction).
+                    # Phase 68 (2026-09-02, PERF-002): wmma_m_tail/wmma_n_tail masking is
+                    # wired into _emit_chunked_non_atomic_store's gather loop below (see
+                    # that method's tail-masking block) -- no restriction here anymore.
+                    # (num_passes/row_step_per_pass etc. below are unchunked-only -- the
+                    # chunked method computes its own per-group equivalents internally.)
+                    pass
                 else:
                     total_elements = macro_tile_m * macro_tile_n
                     elements_per_thread = total_elements // ctrl.block_size
@@ -747,7 +802,8 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                     self._emit_chunked_non_atomic_store(ctrl, cxm, inst_wmma, v_c, v_gemm_im, v_gemm_in,
                         v_tid, v_gather, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1,
                         s_block_m_off, s_block_n_off, vwo, macro_tile_n, elem_bytes, elem_byte_shift,
-                        ds_read_inst, gst_inst, v_gather_range, pad, padded_stride, log2_n, v_chunked_col)
+                        ds_read_inst, gst_inst, v_gather_range, pad, padded_stride, log2_n, v_chunked_col,
+                        s_gemm_m=s_gemm_m, v_tmp3=v_tmp3, s_gemm_n=s_gemm_n, v_tmp4=v_tmp4, s_tmp2=s_tmp2)
                 else:
 
                     if ctrl.vgpr_msb_tracker is not None:

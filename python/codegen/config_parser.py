@@ -74,7 +74,7 @@ class config_parser_t(object):
         self.config_file = config_file
 
     def parse(self):
-        # return a list of section, each section is key-value pair
+
         def is_empty(line):
             if len(line) == 0:
                 return True
@@ -215,11 +215,10 @@ class config_parser_t(object):
                     tok[i] = tok[i].strip()
                     key_value_pair = tok[i].split('=')
                     k, v = key_value_pair[0].strip(), key_value_pair[1].strip()
-                    vv = parse_value(v)     # safe to recursively call here, to better create a value type
+                    vv = parse_value(v)
                     some_dict[k[1:-1]] = vv
                 return some_dict
 
-            # finaly return string
             return value
 
         config_content = config_content_t()

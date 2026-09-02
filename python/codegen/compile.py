@@ -197,7 +197,7 @@ class compile_host_t(object):
             if type(self.host_cpp) is str:
                 cmd += [self.host_cpp]
             elif type(self.host_cpp) is list:
-                cmd += self.host_cpp     # for multiple files
+                cmd += self.host_cpp
             else:
                 assert False
             if not IGEMM_HOST_USE_HIPCC:
@@ -223,7 +223,7 @@ class compile_host_t(object):
             if type(self.host_cpp) is str:
                 cmd += [self.host_cpp]
             elif type(self.host_cpp) is list:
-                cmd += self.host_cpp     # for multiple files
+                cmd += self.host_cpp
             else:
                 assert False
             cmd += ['-L/opt/rocm/hcc/lib', '-L/opt/rocm/lib', '-L/opt/rocm/lib64', '-Wl,-rpath=/opt/rocm/hcc/lib:/opt/rocm/lib',

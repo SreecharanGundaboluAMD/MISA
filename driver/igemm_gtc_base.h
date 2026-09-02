@@ -98,8 +98,8 @@ static inline size_t get_data_byte(driverDataType_t dtype)
 }
 
 typedef enum {
-    driver_mode_normal      = 0,    // bench all solutions
-    driver_mode_heuristic   = 1,    // find suitable heuristic
+    driver_mode_normal      = 0,
+    driver_mode_heuristic   = 1,
 } driver_mode_t;
 
 typedef struct {
@@ -267,6 +267,14 @@ typedef struct {
     // ignorant of), so folded into the kernel name from the start -- see this project's
     // own direct_store postmortem right above for why that specific omission was costly.
     int ds_load_tr_b = 0;
+    // Phase 68 (2026-09-02): mirrors igemm_base.py's wmma_epilogue_chunked/
+    // wmma_acc_high_bank tunables (Python-side names, python/igemm/igemm_base.py's
+    // igemm_gtc_tunable_parameter_t.__init__) -- both change the epilogue's generated
+    // code (chunked LDS staging / v_c in a second VGPR bank) and must be folded into
+    // the kernel name (see igemm_gtc_encode_kernel_name below) for the usual
+    // hipModuleGetFunction-lookup reason. Default 0, unused for every other fma_type.
+    int wmma_epilogue_chunked = 0;
+    int wmma_acc_high_bank = 0;
     // Default-member-initialized (unlike the int fields above, which zero-init safely via
     // aggregate-init anyway) so a default-constructed igemm_gtc_tunable_t{} -- e.g.
     // driver_mode_heuristic's still-unimplemented heuristic_select_kernel() stub -- doesn't
@@ -353,6 +361,8 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.epilogue_lds_pad           = sec.count("epilogue_lds_pad") > 0 ? sec.at("epilogue_lds_pad").get_int() : 0;
                 tunable.direct_store               = sec.count("direct_store") > 0 ? sec.at("direct_store").get_int() : 0;
                 tunable.ds_load_tr_b                = ds_load_tr_b_specified ? sec.at("ds_load_tr_b").get_int() : 0;
+                tunable.wmma_epilogue_chunked       = sec.count("wmma_epilogue_chunked") > 0 ? sec.at("wmma_epilogue_chunked").get_int() : 0;
+                tunable.wmma_acc_high_bank          = sec.count("wmma_acc_high_bank") > 0 ? sec.at("wmma_acc_high_bank").get_int() : 0;
                 tunable.atomic_scope               = sec.count("atomic_scope") > 0 ? sec.at("atomic_scope").get_string() : "SCOPE_SYS";
             }
             else{
@@ -597,6 +607,11 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += std::string("_direct");
         if(tunable->ds_load_tr_b)
             kernel_name += std::string("_dstrb");
+        // Phase 68 (2026-09-02): mirrors igemm_base.py's identical extension -- must stay in sync.
+        if(tunable->wmma_epilogue_chunked)
+            kernel_name += std::string("_chunked");
+        if(tunable->wmma_acc_high_bank)
+            kernel_name += std::string("_hibank");
         if(tunable->local_prefetch_num != 1)
             kernel_name += std::string("_lp") + std::to_string(tunable->local_prefetch_num);
         if(tunable->atomic_scope != "SCOPE_SYS")
@@ -663,7 +678,6 @@ static inline float igemm_launch_kernel(hipFunction_t kernel_func, void* args, s
         float d = igemm_launch_kernel_single(kernel_func, args, arg_size, grid_size, block_size);
         duration_list.push_back(d);
     }
-    // remove min and max from list, then do average
     auto imin = std::min_element(begin(duration_list), end(duration_list));
     duration_list.erase(imin);
     auto imax = std::max_element(begin(duration_list), end(duration_list));
@@ -731,7 +745,6 @@ static inline float igemm_launch_kernels(const std::vector<igemm_launch_kernel_t
         duration_list.push_back(d);
     }
     if(repeat > 2){
-        // remove min and max from list, then do average
         auto imin = std::min_element(begin(duration_list), end(duration_list));
         duration_list.erase(imin);
         auto imax = std::max_element(begin(duration_list), end(duration_list));
@@ -948,28 +961,28 @@ public:
         int forw = arg->get_int("forw");
 
         size_t workspace_size = 0;
-        if(forw & 1) // forward ws size
+        if(forw & 1)
         {
             if(tunable->precision == "fp16" && tunable->gemm_k_global_split == 1 && tunable->vector_store == 1)
                 workspace_size = static_cast<size_t>(n) * k * ho * wo;
             else if(tunable->precision == "bf16" && tunable->gemm_k_global_split == 1)
                 workspace_size = static_cast<size_t>(n) * k * ho * wo;
         }
-        else if(forw & 2) // backward data ws size
+        else if(forw & 2)
         {
             if(tunable->precision == "fp16" && tunable->gemm_k_global_split == 1 && tunable->vector_store == 1)
                 workspace_size = static_cast<size_t>(n) * c * hi * wi;
             else if(tunable->precision == "bf16" && tunable->gemm_k_global_split == 1)
                 workspace_size = static_cast<size_t>(n) * c * hi * wi;
         }
-        else if(forw & 4) // backward weights ws size
+        else if(forw & 4)
         {
             if(tunable->precision == "fp16" && tunable->gemm_k_global_split == 1 && (tunable->tensor_b_thread_lengths[3] == 1 || tunable->vector_store == 1))
                 workspace_size = static_cast<size_t>(group) * (k / group) * (c / group) * y * x;
             else if(tunable->precision == "bf16" && tunable->gemm_k_global_split == 1)
                 workspace_size = static_cast<size_t>(group) * (k / group) * (c / group) * y * x;
         }
-        else if(forw == 0) // all dirs
+        else if(forw == 0)
         {
             std::cout << "not support direction" << std::endl;
             assert(false);

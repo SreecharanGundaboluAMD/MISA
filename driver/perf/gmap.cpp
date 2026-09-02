@@ -115,7 +115,6 @@ class linear_tensor_t{
 public:
     linear_tensor_t(std::initializer_list<index_t> _dims):dims(_dims){}
 
-    // get nd indices from a linear index
     std::vector<index_t> get(index_t linear_index) const
     {
         std::vector<index_t> nd_index(dims.size(), (index_t)0);
@@ -130,7 +129,6 @@ public:
 
         return nd_index;
     }
-    // get offset from nd indices
     index_t offset(std::initializer_list<index_t> indices) const
     {
         assert(indices.size() == dims.size());
@@ -146,7 +144,6 @@ public:
         return len;
     }
 
-    // nd range check
     bool range_check(std::initializer_list<index_t> indices) const
     {
         assert(indices.size() == dims.size());
@@ -235,7 +232,6 @@ void gmap_serialize_and_valid(const args_t *conv_args,
                               linear_tensor_t &tensor_inp, linear_tensor_t &tensor_wei, linear_tensor_t &tensor_out,
                               FILE *fp_inp, FILE *fp_wei, FILE *fp_out)
 {
-    // serialize block request
     for(auto itr_ibr = inp_block_req.begin(); itr_ibr != inp_block_req.end(); itr_ibr++)
         serialize_block_req(&(*itr_ibr), fp_inp, &record_inp);
     
@@ -245,7 +241,6 @@ void gmap_serialize_and_valid(const args_t *conv_args,
     for(auto itr_ibr = out_block_req.begin(); itr_ibr != out_block_req.end(); itr_ibr++)
         serialize_block_req(&(*itr_ibr), fp_out, &record_out);
 
-    // valid all record
     std::vector<bool> valid_hi, valid_wi;
     std::tie(valid_hi, valid_wi) = gmap_get_input_access_map(conv_args);
     for(auto it = record_inp.begin(); it != record_inp.end(); it++){
@@ -618,7 +613,7 @@ void gmap_dump_bwd_nhwc(const args_t *conv_args, const igemm_gtc_tunable_t * tun
     };
 
     for(index_t bid = 0; bid < grid_size; bid++){
-        auto cur_block_position = block_mapping.get(bid);   // position of this block in ndim space
+        auto cur_block_position = block_mapping.get(bid);
         auto cur_gks     = cur_block_position[0];
         auto cur_gemm_id = cur_block_position[1];
         auto cur_group   = cur_block_position[2];
@@ -913,7 +908,7 @@ void gmap_dump_fwd_nhwc(const args_t *conv_args, const igemm_gtc_tunable_t * tun
     };
 
     for(index_t bid = 0; bid < grid_size; bid++){
-        auto cur_block_position = block_mapping.get(bid);   // position of this block in ndim space
+        auto cur_block_position = block_mapping.get(bid);
         auto cur_gks    = cur_block_position[0];
         auto cur_group  = cur_block_position[1];
         auto cur_gemm_m = cur_block_position[2] * gemm_m_per_block;
@@ -950,7 +945,6 @@ void gmap_dump_banner(const args_t *conv_args, const igemm_gtc_tunable_t * tunab
     std::string precision = tunable->precision;
     index_t data_byte = utility_string_to_data_byte(tunable->precision);
 
-    // input
     fprintf(fp_inp, "[inp] %s, %s, ", tunable->tensor_layout.c_str(), tunable->precision.c_str());
     if(tunable->tensor_layout == "nchw")
         fprintf(fp_inp, "n:%zu, c:%zu, h:%zu, w:%zu, g:%zu", n, c, hi, wi, group);
@@ -958,7 +952,6 @@ void gmap_dump_banner(const args_t *conv_args, const igemm_gtc_tunable_t * tunab
         fprintf(fp_inp, "n:%zu, h:%zu, w:%zu, c:%zu, g:%zu", n, hi, wi, c, group);
     fprintf(fp_inp, "\n");
 
-    // wei
     fprintf(fp_wei, "[wei] %s, %s, ", tunable->tensor_layout.c_str(), tunable->precision.c_str());
     if(tunable->tensor_layout == "nchw")
         fprintf(fp_wei, "k:%zu, c:%zu, y:%zu, x:%zu, g:%zu", k, c, y, x, group);
@@ -966,7 +959,6 @@ void gmap_dump_banner(const args_t *conv_args, const igemm_gtc_tunable_t * tunab
         fprintf(fp_wei, "k:%zu, y:%zu, x:%zu, c:%zu, g:%zu", k, y, x, c, group);
     fprintf(fp_wei, "\n");
 
-    // out
     fprintf(fp_out, "[out] %s, %s, ", tunable->tensor_layout.c_str(), tunable->precision.c_str());
     if(tunable->tensor_layout == "nchw")
         fprintf(fp_out, "n:%zu, k:%zu, h:%zu, w:%zu, g:%zu", n, k, ho, wo, group);

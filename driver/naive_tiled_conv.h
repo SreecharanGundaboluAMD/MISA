@@ -51,29 +51,25 @@ void naive_2d_tiled_conv_iterator(
 
     assert((tile_w <= wo) && (tile_h <= ho));
 
-    // spatial-slice size of output
     size_t tmp_sps_ho = ho - (i_tile_h * tile_h);
     size_t sps_ho = tmp_sps_ho < tile_h ? tmp_sps_ho : tile_h;
     size_t tmp_sps_wo = wo - (i_tile_w * tile_w);
     size_t sps_wo = tmp_sps_wo < tile_w ? tmp_sps_wo : tile_w;
 
-    // start idx along h/w of current tile
     size_t i_tho = i_tile_h * tile_h;
     size_t i_two = i_tile_w * tile_w;
     size_t i_thi = sy * i_tho - py;
     size_t i_twi = sx * i_two - px;
 
-    // spatial-slice size of input, need further modify
     size_t sps_hi = (sps_ho - 1) * sy + 1 + dy * (fy - 1);
     size_t sps_wi = (sps_wo - 1) * sx + 1 + dx * (fx - 1);
 
     size_t tmp_sps_end_hi = sps_hi + i_thi;
     size_t tmp_sps_end_wi = sps_wi + i_twi;
 
-    size_t sps_py = 0;  // left pad for each sec
-    size_t sps_px = 0;  // left pad for each sec
+    size_t sps_py = 0;
+    size_t sps_px = 0;
 
-    // modify input spatial-slice size according to left pad
     if(tmp_sps_end_hi < sps_hi){
         sps_py = sps_hi - tmp_sps_end_hi;
         sps_hi = tmp_sps_end_hi;
@@ -84,14 +80,12 @@ void naive_2d_tiled_conv_iterator(
         sps_wi = tmp_sps_end_wi;
     }
 
-    // modify input spatial-slice size according to right pad
     if(tmp_sps_end_hi > h)
         sps_hi -= tmp_sps_end_hi - h;
 
     if(tmp_sps_end_wi > w)
         sps_wi -= tmp_sps_end_wi - w;
 
-    // tile index should start from 0
     if(i_thi < 0 || i_thi >= h)
         i_thi = 0;
     if(i_twi < 0 || i_twi >= w)
@@ -99,7 +93,6 @@ void naive_2d_tiled_conv_iterator(
 
     // printf("tile_h:%lu, tile_w:%lu, sps_hi:%lu, sps_wi:%lu, sps_ho:%lu, sps_wo:%lu\n", tile_h, tile_w, sps_hi, sps_wi, sps_ho, sps_wo); fflush(stdout);
 
-    // accumulate offset of each tile, and parse to tiled_conv
     p_src_t tile_src = src + i_thi * w + i_twi;
     p_dst_t tile_dst = dst + i_tho * wo + i_two;
 

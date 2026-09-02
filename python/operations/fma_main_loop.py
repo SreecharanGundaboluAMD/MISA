@@ -173,7 +173,6 @@ class fma_main_loop_t(mc_base_t):
 
         v_fma = macro_v_fma_mxn_t(self.mc, thread_sub_m, thread_sub_n, thread_n)
 
-        # start emit
         self._emit(f"; start FMA loop, {thread_m}x{thread_n} thread tile with {thread_sub_m}x{thread_sub_n} sub-tile")
         self._emit(f"s_waitcnt vmcnt({f_gld_a.get_issues()})")
 
@@ -203,7 +202,7 @@ class fma_main_loop_t(mc_base_t):
         self._emit(f_gld_a())
         self._emit_empty_line()
 
-        # Label: start of fma body
+        # fma body start
         self._emit_front(f"{label_fma_body}:")
         self._emit(f"; do fma accumulate with unroll {unroll_k}")
         self._emit(f_sld_a(v_a(), v_sld_a_os(), lds_base_m))
@@ -219,18 +218,15 @@ class fma_main_loop_t(mc_base_t):
             self._emit(v_fma(v_c(), v_a(), v_b()))
             #self._emit_empty_line()
 
-            # 2nd fma
             self._emit(f's_waitcnt lgkmcnt(1)')
             self._emit(v_fma(v_c(thread_sub_n), v_a(), v_b(thread_sub_n)))
             #self._emit_empty_line()
 
-            # 3rd fma
             self._emit(f_sld_a(v_a(), v_sld_a_os(), f'{lds_base_m}+(.itr_k+1)*{lds_width_m}'))
             self._emit(f's_waitcnt lgkmcnt(1)')
             self._emit(v_fma(v_c(thread_sub_m * thread_n), v_a(thread_sub_m), v_b()))
             #self._emit_empty_line()
 
-            # 4th fma
             self._emit(f_sld_b(v_b(), v_sld_b_os(), f'{lds_base_n}+(.itr_k+1)*{lds_width_n}'))
             self._emit(v_fma(v_c(thread_sub_m * thread_n + thread_sub_n), v_a(thread_sub_m), v_b(thread_sub_n)))
             self._emit_empty_line()
@@ -251,7 +247,6 @@ class fma_main_loop_t(mc_base_t):
         self._emit(v_fma(v_c(), v_a(), v_b()))
         #self._emit_empty_line()
 
-        # 2nd fma
         self._emit(f"s_waitcnt lgkmcnt(1)")
         self._emit(v_fma(v_c(thread_sub_n), v_a(), v_b(thread_sub_n)))
         #self._emit_empty_line()
@@ -270,7 +265,6 @@ class fma_main_loop_t(mc_base_t):
         self._emit(f_move_slice_window_b())
         self._emit(f_move_slice_window_a())
 
-        # 3rd fma
         self._emit(f"s_waitcnt lgkmcnt({f_sst_a.get_issues() + f_sst_b.get_issues()})")
         self._emit(v_fma(v_c(thread_sub_m * thread_n), v_a(thread_sub_m), v_b()))
         #self._emit_empty_line()
@@ -285,18 +279,17 @@ class fma_main_loop_t(mc_base_t):
         self._emit(f_gld_b())
         self._emit(f_gld_a())
 
-        # 4th fma
         self._emit(v_fma(v_c(thread_sub_m*thread_n+thread_sub_n), v_a(thread_sub_m), v_b(thread_sub_n)))
         self._emit_empty_line()
         self._emit(f"s_branch {label_fma_body}")
 
-        # Label: finishing of fma body
+        # fma body end
         self._emit_front(f"{label_fma_finishing}:")
         self._emit(f"s_waitcnt lgkmcnt({f_sst_a.get_issues() + f_sst_a.get_issues()})")
         self._emit(v_fma(v_c(thread_sub_m*thread_n), v_a(thread_sub_m), v_b()))
         self._emit(v_fma(v_c(thread_sub_m*thread_n+thread_sub_n), v_a(thread_sub_m), v_b(thread_sub_n)))
 
-        # Label: end of fma body
+        # fma body end
         self._emit_front(f"{label_fma_end}:")
         self._emit("s_waitcnt lgkmcnt(0)")
         self._emit("s_barrier")
@@ -314,18 +307,15 @@ class fma_main_loop_t(mc_base_t):
             self._emit(v_fma(v_c(), v_a(), v_b()))
             #self._emit_empty_line()
 
-            # 2nd fma
             self._emit('s_waitcnt lgkmcnt(1)')
             self._emit(v_fma(v_c(thread_sub_n), v_a(), v_b(thread_sub_n)))
             #self._emit_empty_line()
 
-            # 3rd fma
             self._emit(f_sld_a(v_a(), v_sld_a_os(), f'{lds_base_m}+(.itr_k+1)*{lds_width_m}'))
             self._emit('s_waitcnt lgkmcnt(1)')
             self._emit(v_fma(v_c(thread_sub_m*thread_n), v_a(thread_sub_m), v_b()))
             #self._emit_empty_line()
 
-            # 4th fma
             self._emit(f_sld_b(v_b(), v_sld_b_os(), f'{lds_base_n}+(.itr_k+1)*{lds_width_n}'))
             self._emit(v_fma(v_c(thread_sub_m*thread_n+thread_sub_n), v_a(thread_sub_m), v_b(thread_sub_n)))
             self._emit_empty_line()
@@ -342,16 +332,13 @@ class fma_main_loop_t(mc_base_t):
         self._emit(v_fma(v_c(), v_a(), v_b()))
         #self._emit_empty_line()
 
-        # 2nd fma
         self._emit('s_waitcnt lgkmcnt(1)')
         self._emit(v_fma(v_c(thread_sub_n), v_a(), v_b(thread_sub_n)))
         #self._emit_empty_line()
 
-        # 3rd fma
         self._emit('s_waitcnt lgkmcnt(0)')
         self._emit(v_fma(v_c(thread_sub_m*thread_n), v_a(thread_sub_m), v_b()))
         #self._emit_empty_line()
 
-        # 4th fma
         self._emit(v_fma(v_c(thread_sub_m*thread_n+thread_sub_n), v_a(thread_sub_m), v_b(thread_sub_n)))
         self._emit_empty_line()

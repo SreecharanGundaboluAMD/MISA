@@ -234,94 +234,94 @@ class ctrl_dotx_mapping_t(object):
     #     extra_k_pack = 1
                         #  mt_m,mt_n,lt_m,lt_n,ld_m,ld_n,lw_m,lw_n,  ws,lr_m,lr_n, inst_mfma
 ctrl_dotx_mapping_vop2 = [
-        ctrl_dotx_mapping_t(256, 128,   8,   8,   8,   1,   4,   2,   4,   2,   8, None),   # 256
-        ctrl_dotx_mapping_t(128, 256,   8,   8,   8,   1,   2,   4,   4,   2,   8, None),   # 256
+        ctrl_dotx_mapping_t(256, 128,   8,   8,   8,   1,   4,   2,   4,   2,   8, None),
+        ctrl_dotx_mapping_t(128, 256,   8,   8,   8,   1,   2,   4,   4,   2,   8, None),
 
-        ctrl_dotx_mapping_t(128, 224,   8,   8,   8,   1,   4,   2,   4,   2,   7, None),   # 256
-        ctrl_dotx_mapping_t(224, 128,   8,   8,   8,   1,   2,   4,   4,   7,   2, None),   # 256
+        ctrl_dotx_mapping_t(128, 224,   8,   8,   8,   1,   4,   2,   4,   2,   7, None),
+        ctrl_dotx_mapping_t(224, 128,   8,   8,   8,   1,   2,   4,   4,   7,   2, None),
 
-        ctrl_dotx_mapping_t(128, 192,   8,   8,   8,   1,   2,   4,   4,   2,   6, None),   # 256
-        ctrl_dotx_mapping_t(192, 128,   8,   8,   8,   1,   2,   4,   4,   3,   4, None),   # 256
+        ctrl_dotx_mapping_t(128, 192,   8,   8,   8,   1,   2,   4,   4,   2,   6, None),
+        ctrl_dotx_mapping_t(192, 128,   8,   8,   8,   1,   2,   4,   4,   3,   4, None),
 
-        ctrl_dotx_mapping_t( 64, 192,   8,   8,   8,   1,   2,   4,   4,   1,   6, None),   # 256
-        ctrl_dotx_mapping_t(192,  64,   8,   8,   8,   1,   2,   4,   4,   3,   2, None),   # 256
+        ctrl_dotx_mapping_t( 64, 192,   8,   8,   8,   1,   2,   4,   4,   1,   6, None),
+        ctrl_dotx_mapping_t(192,  64,   8,   8,   8,   1,   2,   4,   4,   3,   2, None),
 
-        ctrl_dotx_mapping_t(160, 128,   8,   8,   8,   1,   2,   4,   4,   5,   2, None),   # 256
-        ctrl_dotx_mapping_t(128, 160,   8,   8,   8,   1,   4,   2,   4,   2,   5, None),   # 256
+        ctrl_dotx_mapping_t(160, 128,   8,   8,   8,   1,   2,   4,   4,   5,   2, None),
+        ctrl_dotx_mapping_t(128, 160,   8,   8,   8,   1,   4,   2,   4,   2,   5, None),
 
-        ctrl_dotx_mapping_t(160,  64,   8,   8,   8,   1,   2,   4,   4,   5,   1, None),   # 256
-        ctrl_dotx_mapping_t( 64, 160,   8,   8,   8,   1,   4,   2,   4,   1,   5, None),   # 256
+        ctrl_dotx_mapping_t(160,  64,   8,   8,   8,   1,   2,   4,   4,   5,   1, None),
+        ctrl_dotx_mapping_t( 64, 160,   8,   8,   8,   1,   4,   2,   4,   1,   5, None),
 
-        ctrl_dotx_mapping_t(128, 128,   8,   8,   8,   1,   2,   4,   4,   2,   4, None),   # 256
-        ctrl_dotx_mapping_t(128, 128,   8,   8,   8,   1,   4,   2,   4,   2,   4, None),   # 256
+        ctrl_dotx_mapping_t(128, 128,   8,   8,   8,   1,   2,   4,   4,   2,   4, None),
+        ctrl_dotx_mapping_t(128, 128,   8,   8,   8,   1,   4,   2,   4,   2,   4, None),
 
-        ctrl_dotx_mapping_t(128,  96,   8,   8,   8,   1,   2,   2,   4,   4,   3, None),   # 256
-        ctrl_dotx_mapping_t( 96, 128,   8,   8,   8,   1,   2,   2,   4,   3,   4, None),   # 256
+        ctrl_dotx_mapping_t(128,  96,   8,   8,   8,   1,   2,   2,   4,   4,   3, None),
+        ctrl_dotx_mapping_t( 96, 128,   8,   8,   8,   1,   2,   2,   4,   3,   4, None),
 
-        ctrl_dotx_mapping_t(128,  96,   8,   8,   8,   1,   4,   2,   4,   2,   3, None),   # 256
-        ctrl_dotx_mapping_t( 96, 128,   8,   8,   8,   1,   4,   2,   4,   3,   2, None),   # 256
+        ctrl_dotx_mapping_t(128,  96,   8,   8,   8,   1,   4,   2,   4,   2,   3, None),
+        ctrl_dotx_mapping_t( 96, 128,   8,   8,   8,   1,   4,   2,   4,   3,   2, None),
 
-        ctrl_dotx_mapping_t(128,  64,   8,   8,   8,   1,   4,   2,   4,   2,   2, None),   # 256
-        ctrl_dotx_mapping_t( 64, 128,   8,   8,   8,   1,   2,   4,   4,   2,   2, None),   # 256
+        ctrl_dotx_mapping_t(128,  64,   8,   8,   8,   1,   4,   2,   4,   2,   2, None),
+        ctrl_dotx_mapping_t( 64, 128,   8,   8,   8,   1,   2,   4,   4,   2,   2, None),
 
-        ctrl_dotx_mapping_t(128,  32,   8,   8,   8,   1,   4,   1,   4,   2,   2, None),   # 128
-        ctrl_dotx_mapping_t( 32, 128,   8,   8,   8,   1,   1,   4,   4,   2,   2, None),   # 128
+        ctrl_dotx_mapping_t(128,  32,   8,   8,   8,   1,   4,   1,   4,   2,   2, None),
+        ctrl_dotx_mapping_t( 32, 128,   8,   8,   8,   1,   1,   4,   4,   2,   2, None),
 
-        ctrl_dotx_mapping_t( 96,  96,   8,   8,   8,   1,   2,   2,   4,   3,   3, None),   # 128
-        ctrl_dotx_mapping_t( 64,  64,   8,   8,   8,   1,   2,   2,   4,   2,   2, None),   # 128
+        ctrl_dotx_mapping_t( 96,  96,   8,   8,   8,   1,   2,   2,   4,   3,   3, None),
+        ctrl_dotx_mapping_t( 64,  64,   8,   8,   8,   1,   2,   2,   4,   2,   2, None),
 
-        ctrl_dotx_mapping_t( 64,  32,   8,   8,   8,   1,   4,   2,   1,   2,   2, None),   # 64
-        ctrl_dotx_mapping_t( 32,  64,   8,   8,   8,   1,   2,   4,   1,   2,   2, None),   # 64
+        ctrl_dotx_mapping_t( 64,  32,   8,   8,   8,   1,   4,   2,   1,   2,   2, None),
+        ctrl_dotx_mapping_t( 32,  64,   8,   8,   8,   1,   2,   4,   1,   2,   2, None),
 
-        ctrl_dotx_mapping_t( 64,  32,   8,   8,   8,   1,   2,   2,   2,   2,   2, None),   # 64
-        ctrl_dotx_mapping_t( 32,  64,   8,   8,   8,   1,   2,   2,   2,   2,   2, None),   # 64
+        ctrl_dotx_mapping_t( 64,  32,   8,   8,   8,   1,   2,   2,   2,   2,   2, None),
+        ctrl_dotx_mapping_t( 32,  64,   8,   8,   8,   1,   2,   2,   2,   2,   2, None),
 
         ctrl_dotx_mapping_t( 32,  32,   8,   8,   8,   1,   2,   2,   1,   2,   2, None),   # 32
     ]
 
                         #  mt_m,mt_n,lt_m,lt_n,ld_m,ld_n,lw_m,lw_n,  ws,lr_m,lr_n, inst_mfma
 ctrl_dotx_mapping_vop3p = [
-        ctrl_dotx_mapping_t(256, 128,   8,  16,   4,   4,   4,   2,   4,   2,   4, None),   # 256
-        ctrl_dotx_mapping_t(128, 256,   8,  16,   4,   4,   2,   4,   4,   2,   4, None),   # 256
+        ctrl_dotx_mapping_t(256, 128,   8,  16,   4,   4,   4,   2,   4,   2,   4, None),
+        ctrl_dotx_mapping_t(128, 256,   8,  16,   4,   4,   2,   4,   4,   2,   4, None),
 
-        ctrl_dotx_mapping_t(128, 224,   8,  16,   4,   4,   4,   2,   4,   1,   7, None),   # 256
-        ctrl_dotx_mapping_t(224, 128,   8,  16,   4,   4,   4,   2,   4,   7,   1, None),   # 256
+        ctrl_dotx_mapping_t(128, 224,   8,  16,   4,   4,   4,   2,   4,   1,   7, None),
+        ctrl_dotx_mapping_t(224, 128,   8,  16,   4,   4,   4,   2,   4,   7,   1, None),
 
-        ctrl_dotx_mapping_t(128, 192,   8,  16,   4,   4,   4,   2,   4,   2,   3, None),   # 256
-        ctrl_dotx_mapping_t(192, 128,   8,  16,   4,   4,   4,   2,   4,   3,   2, None),   # 256
+        ctrl_dotx_mapping_t(128, 192,   8,  16,   4,   4,   4,   2,   4,   2,   3, None),
+        ctrl_dotx_mapping_t(192, 128,   8,  16,   4,   4,   4,   2,   4,   3,   2, None),
 
-        ctrl_dotx_mapping_t( 64, 192,   8,  16,   4,   4,   2,   4,   4,   1,   3, None),   # 256
-        ctrl_dotx_mapping_t(192,  64,   8,  16,   4,   4,   4,   2,   4,   3,   1, None),   # 256
+        ctrl_dotx_mapping_t( 64, 192,   8,  16,   4,   4,   2,   4,   4,   1,   3, None),
+        ctrl_dotx_mapping_t(192,  64,   8,  16,   4,   4,   4,   2,   4,   3,   1, None),
 
-        ctrl_dotx_mapping_t(160, 128,   8,  16,   4,   4,   4,   2,   4,   5,   1, None),   # 256
-        ctrl_dotx_mapping_t(128, 160,   8,  16,   4,   4,   4,   2,   4,   1,   5, None),   # 256
+        ctrl_dotx_mapping_t(160, 128,   8,  16,   4,   4,   4,   2,   4,   5,   1, None),
+        ctrl_dotx_mapping_t(128, 160,   8,  16,   4,   4,   4,   2,   4,   1,   5, None),
 
-        ctrl_dotx_mapping_t(160,  64,   8,  16,   4,   4,   4,   1,   4,   5,   1, None),   # 128
-        ctrl_dotx_mapping_t( 64, 160,   8,  16,   4,   4,   2,   2,   4,   1,   5, None),   # 128
+        ctrl_dotx_mapping_t(160,  64,   8,  16,   4,   4,   4,   1,   4,   5,   1, None),
+        ctrl_dotx_mapping_t( 64, 160,   8,  16,   4,   4,   2,   2,   4,   1,   5, None),
 
-        ctrl_dotx_mapping_t(128, 128,   8,  16,   4,   4,   4,   2,   4,   2,   2, None),   # 256
+        ctrl_dotx_mapping_t(128, 128,   8,  16,   4,   4,   4,   2,   4,   2,   2, None),
 
-        ctrl_dotx_mapping_t(128,  96,   8,  16,   4,   4,   2,   2,   4,   2,   3, None),   # 128
-        ctrl_dotx_mapping_t( 96, 128,   8,  16,   4,   4,   2,   2,   4,   3,   2, None),   # 128
+        ctrl_dotx_mapping_t(128,  96,   8,  16,   4,   4,   2,   2,   4,   2,   3, None),
+        ctrl_dotx_mapping_t( 96, 128,   8,  16,   4,   4,   2,   2,   4,   3,   2, None),
 
-        ctrl_dotx_mapping_t(128,  96,   8,  16,   4,   4,   4,   2,   4,   1,   3, None),   # 256
-        ctrl_dotx_mapping_t( 96, 128,   8,  16,   4,   4,   4,   2,   4,   3,   1, None),   # 256
+        ctrl_dotx_mapping_t(128,  96,   8,  16,   4,   4,   4,   2,   4,   1,   3, None),
+        ctrl_dotx_mapping_t( 96, 128,   8,  16,   4,   4,   4,   2,   4,   3,   1, None),
 
-        ctrl_dotx_mapping_t(128,  64,   8,  16,   4,   4,   4,   1,   4,   2,   2, None),   # 128
-        ctrl_dotx_mapping_t( 64, 128,   8,  16,   4,   4,   2,   2,   4,   2,   2, None),   # 128
+        ctrl_dotx_mapping_t(128,  64,   8,  16,   4,   4,   4,   1,   4,   2,   2, None),
+        ctrl_dotx_mapping_t( 64, 128,   8,  16,   4,   4,   2,   2,   4,   2,   2, None),
 
-        ctrl_dotx_mapping_t(128,  64,   8,  16,   4,   4,   4,   2,   4,   2,   1, None),   # 256
-        ctrl_dotx_mapping_t( 64, 128,   8,  16,   4,   4,   2,   4,   4,   2,   1, None),   # 256
+        ctrl_dotx_mapping_t(128,  64,   8,  16,   4,   4,   4,   2,   4,   2,   1, None),
+        ctrl_dotx_mapping_t( 64, 128,   8,  16,   4,   4,   2,   4,   4,   2,   1, None),
 
-        ctrl_dotx_mapping_t(128,  32,   8,  16,   4,   4,   4,   1,   4,   2,   1, None),   # 128
-        ctrl_dotx_mapping_t( 32, 128,   8,  16,   4,   4,   2,   2,   4,   1,   2, None),   # 128
+        ctrl_dotx_mapping_t(128,  32,   8,  16,   4,   4,   4,   1,   4,   2,   1, None),
+        ctrl_dotx_mapping_t( 32, 128,   8,  16,   4,   4,   2,   2,   4,   1,   2, None),
 
-        ctrl_dotx_mapping_t( 96,  96,   8,  16,   4,   4,   2,   2,   2,   3,   3, None),   # 64
-        ctrl_dotx_mapping_t( 64,  64,   8,  16,   4,   4,   2,   2,   2,   2,   2, None),   # 64
-        ctrl_dotx_mapping_t( 64,  64,   8,  16,   4,   4,   2,   2,   4,   2,   1, None),   # 128
+        ctrl_dotx_mapping_t( 96,  96,   8,  16,   4,   4,   2,   2,   2,   3,   3, None),
+        ctrl_dotx_mapping_t( 64,  64,   8,  16,   4,   4,   2,   2,   2,   2,   2, None),
+        ctrl_dotx_mapping_t( 64,  64,   8,  16,   4,   4,   2,   2,   4,   2,   1, None),
 
-        ctrl_dotx_mapping_t( 64,  32,   8,  16,   4,   4,   2,   2,   2,   2,   1, None),   # 64
-        ctrl_dotx_mapping_t( 32,  64,   8,  16,   4,   4,   2,   2,   2,   1,   2, None),   # 64
+        ctrl_dotx_mapping_t( 64,  32,   8,  16,   4,   4,   2,   2,   2,   2,   1, None),
+        ctrl_dotx_mapping_t( 32,  64,   8,  16,   4,   4,   2,   2,   2,   1,   2, None),
 
         ctrl_dotx_mapping_t( 32,  32,   8,  16,   4,   4,   2,   2,   1,   2,   1, None),   # 32
     ]

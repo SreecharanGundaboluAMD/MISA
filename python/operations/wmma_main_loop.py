@@ -29,6 +29,24 @@ from ..codegen import *
 from .utility import *
 from .wmma_mapping import *
 
+def _ds_read_chunk_count(num_dwords):
+    '''
+    Phase 71 (PERF-004, 2026-09-02): mirrors the generator files' own
+    _emit_ds_read_chunked greedy chunking (largest ds_read_* instruction first --
+    b128=4 dwords, b64=2, b32=1) -- returns exactly how many separate DScnt-tracked
+    LDS-read instructions one shared_load_a/b call issues for a single
+    wave_repeat_m/n row of `num_dwords` VGPRs. Only meaningful for the "plain"
+    (ds_read_plain_a/b) shared_load technique; only used to derive
+    wmma_main_loop_t.emit()'s partial-wait schedule from the real, already-known
+    num_v_a/num_v_b widths -- never guessed.
+    '''
+    n = num_dwords
+    count = 0
+    while n > 0:
+        n -= 4 if n >= 4 else (2 if n >= 2 else 1)
+        count += 1
+    return count
+
 class ctrl_wmma_main_loop_t(object):
     '''
     Deliberately a single, correctness-first software pipeline schedule -- unlike
@@ -131,7 +149,6 @@ class ctrl_wmma_main_loop_t(object):
         # rationale/citation. Default False = today's exact byte-identical behavior.
         self.wmma_setprio                = False
 
-        # functor
         self.global_load_a_functor       = None
         self.global_load_b_functor       = None
         self.shared_store_a_functor      = None
@@ -164,7 +181,22 @@ class ctrl_wmma_main_loop_t(object):
         # bank from v_a/v_b -- see igemm_base.py's wmma_acc_high_bank docstring.
         self.vgpr_msb_tracker             = None
 
-        # symbol type
+        # Phase 71 (PERF-004, 2026-09-02): per-operand flag set by the generator ONLY
+        # for shared_load_a/b_functor implementations using the plain, untransposed
+        # ds_read_b128/64/32-chunked technique (_emit_ds_read_chunked), which issues no
+        # waits of its own -- e.g. fwd's A/B and bwd's A. The transposed pack/
+        # ds_load_tr16 techniques (bwd's B, wrw's A/B) already do their own internal
+        # wait-batching (Phase 63) and emit a different, precision-dependent
+        # instruction stream this main loop cannot safely reason about from the
+        # outside. Default False (opt-in) = today's exact byte-identical full-drain
+        # behavior. Used only to derive emit()'s pre_wait_first_row partial-wait
+        # schedule for emit_wmma_tile -- requires BOTH operands plain, since the
+        # schedule assumes every wave_repeat_m row of A's reads is issued (in program
+        # order) strictly before any of wave_repeat_n's B reads, true only when both
+        # functors use the plain technique.
+        self.ds_read_plain_a             = False
+        self.ds_read_plain_b             = False
+
         self.v_a                         = None
         self.v_b                         = None
         self.v_c                         = None
@@ -235,7 +267,32 @@ class wmma_main_loop_t(mc_base_t):
         v_sst_b_os, v_sld_b_os = ctrl.v_sst_b_os, ctrl.v_sld_b_os
         s_kitr, s_knum = ctrl.s_kitr, ctrl.s_knum
 
-        def emit_wmma_tile(slot=0):
+        # Phase 71 (PERF-004): see ds_read_plain_a/b's docstring above. When both
+        # operands use the plain chunked ds_read technique, derive exactly how many
+        # DScnt-tracked LDS-read instructions f_sld_a()/f_sld_b() issue per
+        # wave_repeat row -- from the real num_v_a/num_v_b widths, mirroring the
+        # generator files' own _emit_ds_read_chunked greedy chunking (b128=4
+        # dwords, b64=2, b32=1), not a guess.
+        partial_wait_ok = ctrl.ds_read_plain_a and ctrl.ds_read_plain_b
+        if partial_wait_ok:
+            a_reads_per_row = _ds_read_chunk_count(inst_wmma.num_v_a)
+            b_reads_per_row = _ds_read_chunk_count(inst_wmma.num_v_b)
+            total_ds_reads = wmma_m.wave_repeat_m * a_reads_per_row + wmma_m.wave_repeat_n * b_reads_per_row
+            def pre_wait_first_row(i_rm, i_rn):
+                # f_sld_a() issues ALL wave_repeat_m rows of A (in row order) before
+                # f_sld_b() issues any of B's wave_repeat_n rows -- so row i_rm=0's
+                # WMMA calls are the only ones that can ever be waiting on
+                # still-in-flight reads (by (i_rm,i_rn)=(0, wave_repeat_n-1) every
+                # read has necessarily completed, since DScnt-tracked reads of the
+                # same type complete strictly in issue order, ISA S5.7.1.4/6414).
+                if i_rm != 0:
+                    return None
+                needed = wmma_m.wave_repeat_m * a_reads_per_row + (i_rn + 1) * b_reads_per_row
+                return f"0x{total_ds_reads - needed:x}"
+        else:
+            pre_wait_first_row = None
+
+        def emit_wmma_tile(slot=0, pre_wait=None):
             self._emit(f"; wmma compute, {wmma_m.wave_repeat_m}x{wmma_m.wave_repeat_n} instruction issues")
             if ctrl.wmma_setprio:
                 # Phase 32: raise this wave's issue priority for the duration of the WMMA
@@ -267,6 +324,17 @@ class wmma_main_loop_t(mc_base_t):
             b_slot_off = slot * num_v_b_total
             for i_rm in range(wmma_m.wave_repeat_m):
                 for i_rn in range(wmma_m.wave_repeat_n):
+                    if pre_wait is not None:
+                        # Phase 71 (PERF-004): a smaller partial wait, interleaved with
+                        # this row's WMMA issues, in place of the single full
+                        # `s_wait_dscnt 0x0` the caller used to emit before this whole
+                        # burst -- lets the still-outstanding tail of this tile's
+                        # ds_reads keep completing in the background while row 0's
+                        # earlier columns are already computing on data that landed
+                        # sooner.
+                        w = pre_wait(i_rm, i_rn)
+                        if w is not None:
+                            self._emit(f"s_wait_dscnt {w}")
                     c_index = (i_rm * wmma_m.wave_repeat_n + i_rn) * inst_wmma.num_v_c
                     a_index = a_slot_off + i_rm * inst_wmma.num_v_a
                     b_index = b_slot_off + i_rn * inst_wmma.num_v_b
@@ -300,6 +368,22 @@ class wmma_main_loop_t(mc_base_t):
                 if msb_line:
                     self._emit(msb_line)
 
+        def emit_sld_wait_wmma(off_a, off_b):
+            # Phase 71 (PERF-004): self-contained shared_load + wait + compute unit for
+            # one K-substep. When partial_wait_ok, the wait is folded into
+            # emit_wmma_tile's per-row schedule instead of a single upfront full drain
+            # -- safe here specifically because this helper OWNS the entire sequence
+            # from issue to consumption (no other caller reads v_a/v_b in between), so
+            # there is no risk of some other call site relying on an implicit prior
+            # full wait that this skips.
+            self._emit(f_sld_a(v_a(), v_sld_a_os(), off_a))
+            self._emit(f_sld_b(v_b(), v_sld_b_os(), off_b))
+            if partial_wait_ok:
+                emit_wmma_tile(pre_wait=pre_wait_first_row)
+            else:
+                self._emit(f"s_wait_dscnt 0x0")
+                emit_wmma_tile()
+
         def emit_extra_substeps():
             # k-sub-step 0's shared_load+wmma is always emitted at its original position
             # (see below) so the pre-existing global-load-latency-hiding overlap is
@@ -310,10 +394,7 @@ class wmma_main_loop_t(mc_base_t):
             for ks in range(1, num_k_substeps):
                 off_a = ks * ctrl.k_substep_stride_bytes_a
                 off_b = ks * ctrl.k_substep_stride_bytes_b
-                self._emit(f_sld_a(v_a(), v_sld_a_os(), off_a))
-                self._emit(f_sld_b(v_b(), v_sld_b_os(), off_b))
-                self._emit(f"s_wait_dscnt 0x0")
-                emit_wmma_tile()
+                emit_sld_wait_wmma(off_a, off_b)
 
         def emit_extra_substeps_prefetched():
             '''
@@ -355,7 +436,7 @@ class wmma_main_loop_t(mc_base_t):
               - issues chunk ks's load (interleaved operands only)
               - shared_load+compute for substep ks
               - waits+stores chunk ks (interleaved operands only)
-            Non-interleaved operands: their chunk 0 load was issued by f_gld_a/b() (the bulk
+            Non-interleaved operands: their chunk 0 load was issued by f_gld_a/b (the bulk
             functor), and ALL remaining chunks are loaded+waited+stored via the bulk
             shared_store functor (f_sst_a/f_sst_b) right here, BEFORE any interleaved compute
             begins -- exactly the old _emit_sst_remaining_chunks path, preserving the
@@ -424,6 +505,34 @@ class wmma_main_loop_t(mc_base_t):
         any_tdm   = tdm_a or tdm_b
         any_old   = (not a_style_async) or (not b_style_async)
 
+        # Phase 70 (PERF-001): hoist the next tile's address-descriptor advance and
+        # global-load issue as early as possible in the iteration -- only when it's
+        # provably safe to do so without touching the barrier-mediated LDS write/read
+        # ordering invariant at all. See the docstring at this flag's use, below.
+        #
+        # HARDWARE CAVEAT (found empirically, then cross-referenced against this
+        # session's own docs/gfx1250_fp32_wmma_occupancy_race.md): hoisting alone is
+        # architecturally sound (proven correct on paper -- gld/move_slice_window touch
+        # neither LDS nor the barrier), but real-hardware testing at n128/c1024 showed a
+        # non-deterministic NRMS failure (varies run to run: 0.010-0.016 against an
+        # 0.0082 threshold) that disappeared entirely once single-buffered LDS was
+        # avoided. That doc already characterizes the exact mechanism: on gfx1250,
+        # `s_barrier_wait` does not reliably make the LAST LANE's LDS write visible to
+        # other waves by the time the barrier releases them, once enough workgroups are
+        # concurrently resident -- a real silicon race, not a logic bug (100% of
+        # mismatches there were exactly one iteration stale). That investigation found
+        # fp16/bf16 never reproduced it at up to ~50k workgroups on the OLD (fully
+        # serialized) schedule; this new, tighter-pipelined schedule evidently perturbs
+        # per-wave timing enough to expose the same latent race far earlier (reproduced
+        # at just 2 K-iterations / a handful of workgroups). Requiring double_buffer
+        # sidesteps it entirely, same as the fp32 fix already landed in this repo: with
+        # disjoint read/write LDS regions there is no barrier-mediated same-address
+        # reuse for the race to act on. This mirrors the existing lds_double_buffer=1
+        # mandate for fp32 (see that doc) -- single-buffered pipelining is not merely
+        # "unproven", it is empirically unsafe on this hardware, so it is not offered as
+        # an option here.
+        can_hoist = (not a_style_async) and (not b_style_async) and (not interleave_a) and (not interleave_b) and double_buffer
+
         # Phase 13: an operand on the async path already issued its first tile's data
         # straight into LDS (global_load_async_to_lds_b128, no VGPR staging, no separate
         # store step) -- nothing to wait on or store here for it; that wait happens at
@@ -466,77 +575,153 @@ class wmma_main_loop_t(mc_base_t):
         self._emit(f"s_barrier_wait -1")
         self._emit_empty_line()
 
-        self._emit(f_sld_a(v_a(), v_sld_a_os(), 0))
-        self._emit(f_sld_b(v_b(), v_sld_b_os(), 0))
-        self._emit(f"s_wait_dscnt 0x0")
-        self._emit_empty_line()
+        if can_hoist:
+            # Decide up front whether another tile remains, THEN advance the next
+            # tile's address descriptors and issue its global load -- BEFORE this
+            # tile's own shared_load/compute -- so the load's latency gets the
+            # entire LDS-read + WMMA-compute window to hide behind, instead of only
+            # the compute sliver the original (legacy, see the `else` branch below)
+            # schedule gave it. This is safe without any change to the LDS
+            # write/read ordering invariant:
+            #  (1) neither move_slice_window nor issuing a global load touches LDS
+            #      at all -- they only advance global-memory address registers and
+            #      stage fetched data into the private v_gld_a/b VGPRs -- so
+            #      reordering them earlier is completely orthogonal to the
+            #      barrier-mediated LDS ordering above.
+            #  (2) the PREVIOUS iteration's shared_store (which last wrote
+            #      v_gld_a/b's source data into LDS) has already been fully
+            #      drained by the s_wait_dscnt/barrier just above -- exactly the
+            #      same guarantee the original, later call site already relied on
+            #      -- so overwriting v_gld_a/b with a freshly-issued load here is
+            #      exactly as safe as it was at the old position; only the TIMING
+            #      moves, not the ordering guarantee it depends on.
+            #  (3) the LDS *store* of this newly-loaded tile is untouched: it still
+            #      only happens after s_wait_loadcnt drains the load, at the very
+            #      end of the iteration, immediately before the branch back to this
+            #      same barrier -- preserving the single/double-buffered
+            #      write-after-read safety exactly as before.
+            # Gated off (can_hoist above) for async/TDM operands, whose "load" IS
+            # the LDS write and must stay deferred to the very end (Phase 13's
+            # cross-wave visibility argument), and for interleave, which has its
+            # own hand-tuned chunk-level schedule that this leaves untouched.
+            self._emit(f"s_sub_i32 s[{s_kitr()}], s[{s_kitr()}], {ctrl.unroll_k}")
+            self._emit(f"s_cmp_gt_i32 s[{s_kitr()}], 0")
+            self._emit(f"s_cbranch_scc0 {label_body}_last")
+            self._emit_empty_line()
 
-        self._emit(f"s_sub_i32 s[{s_kitr()}], s[{s_kitr()}], {ctrl.unroll_k}")
-        self._emit(f"s_cmp_gt_i32 s[{s_kitr()}], 0")
-        self._emit(f"s_cbranch_scc0 {label_body}_last")
-        self._emit_empty_line()
-
-        if any_tdm:
-            # Phase 31: decremented exactly ONCE per iteration here (not inside
-            # move_slice_window_a/b_functor themselves, which both run every iteration --
-            # decrementing in either of those would double-count) -- both A's and B's
-            # descriptor rebuild below read this same post-decrement value.
-            self._emit(f"s_sub_i32 s[{ctrl.s_tdm_k_remain()}], s[{ctrl.s_tdm_k_remain()}], {ctrl.unroll_k}   ; Phase 31: remaining valid K for the tile about to be issued")
-        self._emit(f_move_slice_window_a())
-        self._emit(f_move_slice_window_b())
-        if interleave_a or interleave_b:
-            # Phase 15: chunk 0 issued exactly as the non-interleaved path does; substep 0's
-            # compute happens next, then emit_mixed_substeps() takes over chunk 0's
-            # wait+store AND every remaining chunk/substep, interleaved (per-operand).
-            # Non-interleaved operands still issue their bulk global_load here too (their
-            # bulk shared_store is handled inside emit_mixed_substeps).
+            self._emit(f_move_slice_window_a())
+            self._emit(f_move_slice_window_b())
             self._emit(f_gld_a())
             self._emit(f_gld_b())
             self._emit_empty_line()
-            emit_wmma_tile()
-            emit_mixed_substeps()
-            self._emit_empty_line()
-        else:
-            if not a_style_async:
-                self._emit(f_gld_a())
-            if not b_style_async:
-                self._emit(f_gld_b())
+
+            if prefetch:
+                self._emit(f_sld_a(v_a(), v_sld_a_os(), 0))
+                self._emit(f_sld_b(v_b(), v_sld_b_os(), 0))
+                self._emit(f"s_wait_dscnt 0x0")
+                self._emit_empty_line()
+                emit_extra_substeps_prefetched()
+            else:
+                emit_sld_wait_wmma(0, 0)
+                emit_extra_substeps()
             self._emit_empty_line()
 
+            self._emit(f"s_wait_loadcnt 0x0")
+            self._emit(f_sst_a())
+            self._emit(f_sst_b())
+
+            if double_buffer:
+                emit_buffer_switch()
+            self._emit(f"s_branch {label_body}")
+            self._emit_empty_line()
+
+            self._emit_front(f"{label_body}_last:")
+            if prefetch:
+                self._emit(f_sld_a(v_a(), v_sld_a_os(), 0))
+                self._emit(f_sld_b(v_b(), v_sld_b_os(), 0))
+                self._emit(f"s_wait_dscnt 0x0")
+                self._emit_empty_line()
+                emit_extra_substeps_prefetched()
+            else:
+                emit_sld_wait_wmma(0, 0)
+                emit_extra_substeps()
+            self._emit_empty_line()
+        else:
+            # ---- legacy schedule: byte-identical to the pre-Phase-70 code, kept for
+            # async/TDM-direct-to-LDS operands and main-loop interleaving -- see
+            # can_hoist's docstring above for why these stay on the original, more
+            # conservative timing. ----
+            self._emit(f_sld_a(v_a(), v_sld_a_os(), 0))
+            self._emit(f_sld_b(v_b(), v_sld_b_os(), 0))
+            self._emit(f"s_wait_dscnt 0x0")
+            self._emit_empty_line()
+
+            self._emit(f"s_sub_i32 s[{s_kitr()}], s[{s_kitr()}], {ctrl.unroll_k}")
+            self._emit(f"s_cmp_gt_i32 s[{s_kitr()}], 0")
+            self._emit(f"s_cbranch_scc0 {label_body}_last")
+            self._emit_empty_line()
+
+            if any_tdm:
+                # Phase 31: decremented exactly ONCE per iteration here (not inside
+                # move_slice_window_a/b_functor themselves, which both run every iteration --
+                # decrementing in either of those would double-count) -- both A's and B's
+                # descriptor rebuild below read this same post-decrement value.
+                self._emit(f"s_sub_i32 s[{ctrl.s_tdm_k_remain()}], s[{ctrl.s_tdm_k_remain()}], {ctrl.unroll_k}   ; Phase 31: remaining valid K for the tile about to be issued")
+            self._emit(f_move_slice_window_a())
+            self._emit(f_move_slice_window_b())
+            if interleave_a or interleave_b:
+                # Phase 15: chunk 0 issued exactly as the non-interleaved path does; substep 0's
+                # compute happens next, then emit_mixed_substeps() takes over chunk 0's
+                # wait+store AND every remaining chunk/substep, interleaved (per-operand).
+                # Non-interleaved operands still issue their bulk global_load here too (their
+                # bulk shared_store is handled inside emit_mixed_substeps).
+                self._emit(f_gld_a())
+                self._emit(f_gld_b())
+                self._emit_empty_line()
+                emit_wmma_tile()
+                emit_mixed_substeps()
+                self._emit_empty_line()
+            else:
+                if not a_style_async:
+                    self._emit(f_gld_a())
+                if not b_style_async:
+                    self._emit(f_gld_b())
+                self._emit_empty_line()
+
+                if prefetch:
+                    emit_extra_substeps_prefetched()
+                else:
+                    emit_wmma_tile()
+                    emit_extra_substeps()
+                self._emit_empty_line()
+
+                # Phase 13: an async operand's NEXT-tile load-to-LDS is issued only now, after
+                # this tile's ds_reads (f_sld_a/f_sld_b above) are fully consumed -- the async
+                # load IS the LDS write, so (unlike the old design's chunk-0 early-issue trick)
+                # there is no safe-to-start-early sub-step to preserve; deferring ALL of it is
+                # what keeps the cross-wave LDS-write-visibility invariant from Phase 9 intact.
+                # An old-path operand keeps its usual s_wait_loadcnt + deferred store.
+                if any_old:
+                    self._emit(f"s_wait_loadcnt 0x0")
+                    if not a_style_async:
+                        self._emit(f_sst_a())
+                    if not b_style_async:
+                        self._emit(f_sst_b())
+                if a_style_async:
+                    self._emit(f_gld_a())
+                if b_style_async:
+                    self._emit(f_gld_b())
+            if double_buffer:
+                emit_buffer_switch()
+            self._emit(f"s_branch {label_body}")
+            self._emit_empty_line()
+
+            self._emit_front(f"{label_body}_last:")
             if prefetch:
                 emit_extra_substeps_prefetched()
             else:
                 emit_wmma_tile()
                 emit_extra_substeps()
             self._emit_empty_line()
-
-            # Phase 13: an async operand's NEXT-tile load-to-LDS is issued only now, after
-            # this tile's ds_reads (f_sld_a/f_sld_b above) are fully consumed -- the async
-            # load IS the LDS write, so (unlike the old design's chunk-0 early-issue trick)
-            # there is no safe-to-start-early sub-step to preserve; deferring ALL of it is
-            # what keeps the cross-wave LDS-write-visibility invariant from Phase 9 intact.
-            # An old-path operand keeps its usual s_wait_loadcnt + deferred store.
-            if any_old:
-                self._emit(f"s_wait_loadcnt 0x0")
-                if not a_style_async:
-                    self._emit(f_sst_a())
-                if not b_style_async:
-                    self._emit(f_sst_b())
-            if a_style_async:
-                self._emit(f_gld_a())
-            if b_style_async:
-                self._emit(f_gld_b())
-        if double_buffer:
-            emit_buffer_switch()
-        self._emit(f"s_branch {label_body}")
-        self._emit_empty_line()
-
-        self._emit_front(f"{label_body}_last:")
-        if prefetch:
-            emit_extra_substeps_prefetched()
-        else:
-            emit_wmma_tile()
-            emit_extra_substeps()
-        self._emit_empty_line()
 
         self._emit_front(f"{label_end}:")

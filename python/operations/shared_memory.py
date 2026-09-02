@@ -123,7 +123,6 @@ class amdgpu_swap_sequencer_t(object):
                         continue
                     #print('to find:{}'.format(target_indice))
                     (tr, tc) = locate_indice(indice_2d, target_indice, r)
-                    # swap and record indice
                     indice_2d[tr][tc] = origin_indice
                     indice_2d[r][c] = target_indice
                     #print('swapper:{}'.format(indice_2d))
@@ -815,9 +814,9 @@ class ctrl_2d_shared_store_t(object):
         self.length_d1 = 1
         self.vector_d1 = 1
         # self.offset_d1 = 0      # base offset
-        self.stride_d0 = 1        # stride
+        self.stride_d0 = 1
         self.stride_d1 = 1         # if have stride_d1, then each d1 may have stride
-        self.precision = 'fp32'      # 'fp32', 'fp16', ...
+        self.precision = 'fp32'
         self.src_order = 0  # 0-d0,d1, 1-d1,d0
         self.need_transpose = 1
         self.v_tmp = None   # used when order is 1 and consider shuffle
@@ -963,9 +962,9 @@ class ctrl_3d_shared_store_t(object):
         self.vector_dp = 1
         self.length_dv = 1
         self.vector_dv = 1
-        self.stride_d0 = 1        # stride
+        self.stride_d0 = 1
         self.stride_d1 = 1         # if have stride_d1, then each d1 may have stride
-        self.precision = 'fp32'      # 'fp32', 'fp16', ...
+        self.precision = 'fp32'
         self.src_order = 0  # 0-d0,d1, 1-d1,d0
         self.need_transpose = 1
         self.v_tmp = None   # used when order is 1 and consider shuffle
@@ -1013,9 +1012,7 @@ class macro_igemm_3d_shared_store_t(macro_base_t):
         num_dv = ctrl.length_dv // ctrl.vector_dv
         assert not(num_dp > 1 and num_dv > 1)
         if ctrl.length_d0 == 1 or ctrl.length_d1 == 1:
-            # this is indeed a 2d case.
             if ctrl.length_d0 == 1 and ctrl.length_d1 == 1:
-                # further, 1d case
                 for i_p in range(num_dp):
                     self._emit(ds_write(f'{self.v_sst_os()}', f'{self.v_src()}+{i_p*vgpr_per_vector}', i_p * ctrl.vector_dp * data_byte))
                     issue_cnt += ds_write.get_issues()

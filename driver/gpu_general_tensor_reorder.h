@@ -408,7 +408,6 @@ static struct {
 
 } the_reorder_gpu_handle;
 
-//reorder kernel
 static inline void gpu_tensor_reorder_init(const char * hsaco){
     static int inited = 0;
     if(!inited){
@@ -847,7 +846,6 @@ struct reorder_kernel_select_t{
 template<typename dst_order>
 struct reorder_kernel_select_t<4, dst_order>{
     static hipFunction_t get(const transpose_kernel_param_t * kparam){
-        //(0, ...)
         if(dst_order::at(0)==0 && dst_order::at(1)==1 && dst_order::at(2)==3 && dst_order::at(3)==2){
             if(kparam->tile_x == 1)        return the_reorder_gpu_handle.kernel_general_4d_reorder_1p_dword_r0132;
             else if(kparam->tile_x == 2)   return the_reorder_gpu_handle.kernel_general_4d_reorder_2p_dword_r0132;
@@ -883,7 +881,6 @@ struct reorder_kernel_select_t<4, dst_order>{
             else if(kparam->tile_x == 8)   return the_reorder_gpu_handle.kernel_general_4d_reorder_8p_dword_r0321;
             else if(kparam->tile_x ==16)  return the_reorder_gpu_handle.kernel_general_4d_reorder_16p_dword_r0321; 
         }
-        //(1,...)
         else if(dst_order::at(0)==1 && dst_order::at(1)==0 && dst_order::at(2)==2 && dst_order::at(3)==3){
             if(kparam->tile_x == 1)        return the_reorder_gpu_handle.kernel_general_4d_reorder_1p_dword_r1023;
             else if(kparam->tile_x == 2)   return the_reorder_gpu_handle.kernel_general_4d_reorder_2p_dword_r1023;
@@ -926,7 +923,6 @@ struct reorder_kernel_select_t<4, dst_order>{
             else if(kparam->tile_x == 8)   return the_reorder_gpu_handle.kernel_general_4d_reorder_8p_dword_r1320;
             else if(kparam->tile_x ==16)  return the_reorder_gpu_handle.kernel_general_4d_reorder_16p_dword_r1320; 
         }
-        //(2,...)
         else if(dst_order::at(0)==2 && dst_order::at(1)==0 && dst_order::at(2)==1 && dst_order::at(3)==3){
             if(kparam->tile_x == 1)        return the_reorder_gpu_handle.kernel_general_4d_reorder_1p_dword_r2013;
             else if(kparam->tile_x == 2)   return the_reorder_gpu_handle.kernel_general_4d_reorder_2p_dword_r2013;
@@ -969,7 +965,6 @@ struct reorder_kernel_select_t<4, dst_order>{
             else if(kparam->tile_x == 8)   return the_reorder_gpu_handle.kernel_general_4d_reorder_8p_dword_r2310;
             else if(kparam->tile_x ==16)  return the_reorder_gpu_handle.kernel_general_4d_reorder_16p_dword_r2310;  
         }
-        //(3,...)
         else if(dst_order::at(0)==3 && dst_order::at(1)==0 && dst_order::at(2)==1 && dst_order::at(3)==2){
             if(kparam->tile_x == 1)        return the_reorder_gpu_handle.kernel_general_4d_reorder_1p_dword_r3012;
             else if(kparam->tile_x == 2)   return the_reorder_gpu_handle.kernel_general_4d_reorder_2p_dword_r3012;
@@ -1019,7 +1014,6 @@ struct reorder_kernel_select_t<4, dst_order>{
 template<typename dst_order>
 struct reorder_kernel_select_t<2, dst_order>{
     static hipFunction_t get(const transpose_kernel_param_t * kparam){
-        //(0, ...)
         if(dst_order::at(0)==0 && dst_order::at(1)==1 && dst_order::at(2)==3 && dst_order::at(3)==2){
             if(kparam->tile_x == 1)        return the_reorder_gpu_handle.kernel_general_4d_reorder_1p_half_r0132;
             else if(kparam->tile_x == 2)   return the_reorder_gpu_handle.kernel_general_4d_reorder_2p_half_r0132;
@@ -1055,7 +1049,6 @@ struct reorder_kernel_select_t<2, dst_order>{
             else if(kparam->tile_x == 8)   return the_reorder_gpu_handle.kernel_general_4d_reorder_8p_half_r0321;
             else if(kparam->tile_x ==16)  return the_reorder_gpu_handle.kernel_general_4d_reorder_16p_half_r0321; 
         }
-        //(1,...)
         else if(dst_order::at(0)==1 && dst_order::at(1)==0 && dst_order::at(2)==2 && dst_order::at(3)==3){
             if(kparam->tile_x == 1)        return the_reorder_gpu_handle.kernel_general_4d_reorder_1p_half_r1023;
             else if(kparam->tile_x == 2)   return the_reorder_gpu_handle.kernel_general_4d_reorder_2p_half_r1023;
@@ -1098,7 +1091,6 @@ struct reorder_kernel_select_t<2, dst_order>{
             else if(kparam->tile_x == 8)   return the_reorder_gpu_handle.kernel_general_4d_reorder_8p_half_r1320;
             else if(kparam->tile_x ==16)  return the_reorder_gpu_handle.kernel_general_4d_reorder_16p_half_r1320; 
         }
-        //(2,...)
         else if(dst_order::at(0)==2 && dst_order::at(1)==0 && dst_order::at(2)==1 && dst_order::at(3)==3){
             if(kparam->tile_x == 1)        return the_reorder_gpu_handle.kernel_general_4d_reorder_1p_half_r2013;
             else if(kparam->tile_x == 2)   return the_reorder_gpu_handle.kernel_general_4d_reorder_2p_half_r2013;
@@ -1141,7 +1133,6 @@ struct reorder_kernel_select_t<2, dst_order>{
             else if(kparam->tile_x == 8)   return the_reorder_gpu_handle.kernel_general_4d_reorder_8p_half_r2310;
             else if(kparam->tile_x ==16)  return the_reorder_gpu_handle.kernel_general_4d_reorder_16p_half_r2310;  
         }
-        //(3,...)
         else if(dst_order::at(0)==3 && dst_order::at(1)==0 && dst_order::at(2)==1 && dst_order::at(3)==2){
             if(kparam->tile_x == 1)        return the_reorder_gpu_handle.kernel_general_4d_reorder_1p_half_r3012;
             else if(kparam->tile_x == 2)   return the_reorder_gpu_handle.kernel_general_4d_reorder_2p_half_r3012;
@@ -1191,7 +1182,6 @@ struct reorder_kernel_select_t<2, dst_order>{
 template<typename dst_order>
 struct reorder_kernel_select_t<1, dst_order>{
     static hipFunction_t get(const transpose_kernel_param_t * kparam){
-        //(0, ...)
         if(dst_order::at(0)==0 && dst_order::at(1)==1 && dst_order::at(2)==3 && dst_order::at(3)==2){
             if(kparam->tile_x == 1)        return the_reorder_gpu_handle.kernel_general_4d_reorder_1p_byte_r0132;
             else if(kparam->tile_x == 2)   return the_reorder_gpu_handle.kernel_general_4d_reorder_2p_byte_r0132;
@@ -1227,7 +1217,6 @@ struct reorder_kernel_select_t<1, dst_order>{
             else if(kparam->tile_x == 8)   return the_reorder_gpu_handle.kernel_general_4d_reorder_8p_byte_r0321;
             else if(kparam->tile_x ==16)  return the_reorder_gpu_handle.kernel_general_4d_reorder_16p_byte_r0321; 
         }
-        //(1,...)
         else if(dst_order::at(0)==1 && dst_order::at(1)==0 && dst_order::at(2)==2 && dst_order::at(3)==3){
             if(kparam->tile_x == 1)        return the_reorder_gpu_handle.kernel_general_4d_reorder_1p_byte_r1023;
             else if(kparam->tile_x == 2)   return the_reorder_gpu_handle.kernel_general_4d_reorder_2p_byte_r1023;
@@ -1270,7 +1259,6 @@ struct reorder_kernel_select_t<1, dst_order>{
             else if(kparam->tile_x == 8)   return the_reorder_gpu_handle.kernel_general_4d_reorder_8p_byte_r1320;
             else if(kparam->tile_x ==16)  return the_reorder_gpu_handle.kernel_general_4d_reorder_16p_byte_r1320; 
         }
-        //(2,...)
         else if(dst_order::at(0)==2 && dst_order::at(1)==0 && dst_order::at(2)==1 && dst_order::at(3)==3){
             if(kparam->tile_x == 1)        return the_reorder_gpu_handle.kernel_general_4d_reorder_1p_byte_r2013;
             else if(kparam->tile_x == 2)   return the_reorder_gpu_handle.kernel_general_4d_reorder_2p_byte_r2013;
@@ -1313,7 +1301,6 @@ struct reorder_kernel_select_t<1, dst_order>{
             else if(kparam->tile_x == 8)   return the_reorder_gpu_handle.kernel_general_4d_reorder_8p_byte_r2310;
             else if(kparam->tile_x ==16)  return the_reorder_gpu_handle.kernel_general_4d_reorder_16p_byte_r2310;  
         }
-        //(3,...)
         else if(dst_order::at(0)==3 && dst_order::at(1)==0 && dst_order::at(2)==1 && dst_order::at(3)==2){
             if(kparam->tile_x == 1)        return the_reorder_gpu_handle.kernel_general_4d_reorder_1p_byte_r3012;
             else if(kparam->tile_x == 2)   return the_reorder_gpu_handle.kernel_general_4d_reorder_2p_byte_r3012;
@@ -1384,7 +1371,6 @@ void gpu_general_tensor_reorder(T * dst, T * src, uint32_t batch, uint32_t chann
     magic_div_u32_t magic_stride0 = magic_div_u32_gen(channel * height * width);
     magic_div_u32_t magic_stride1 = magic_div_u32_gen(height * width);
     magic_div_u32_t magic_stride2 = magic_div_u32_gen(width);
-    //loop over
     hipFunction_t kernel = reorder_kernel_select_t<sizeof(T), dst_order>::get(kparam);
 
     reorder_kernel_t karg;

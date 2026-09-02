@@ -238,7 +238,7 @@ class mc_deferred_emit_t(object):
     print to string buffer and manage indent
     '''
     def __init__(self, upper_emitter):
-        self.indent = upper_emitter.indent  # manage the indent here
+        self.indent = upper_emitter.indent
         self.buffer = ''
         self.is_first_line = True
     def emit(self, s):

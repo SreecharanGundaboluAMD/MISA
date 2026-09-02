@@ -84,7 +84,6 @@ class tensor_descriptor(object):
         return lengths[idx]
 
     def get_dims(self):
-        # upper dims, or visible dims
         last_upper_ids = self.upper_ids[-1]
         # print(*self.upper_ids[-1])
         return len(tensor_util_flattern(last_upper_ids))
@@ -128,7 +127,6 @@ class trans_tuple(object):
         return self.content[idx]
 
     def flattern(self):
-        # return a list of flatterned item
         flat_content = list()
         for x in self.content:
             if type(x) == list:

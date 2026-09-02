@@ -312,7 +312,7 @@ class dotx_core_loop_for_loop(dotx_core_loop_node):
         wait_sst_node = dotx_core_loop_node("wait sst node", wait_all_lgkm, barrier)
         
         
-        # sst a/b double buffer switch
+        # double buffer switch
         sst_buffer_switch_b = dotx_core_loop_expr(self.mc, "sst a buffer switch", f"v_xor_b32 v[{v_sst_b_os()}], {hex(lds_single_size)}, v[{v_sst_b_os()}] ; switch double buffer b store")
         sst_buffer_switch_a = dotx_core_loop_expr(self.mc, "sst a buffer switch", f"v_xor_b32 v[{v_sst_a_os()}], {hex(lds_single_size)}, v[{v_sst_a_os()}] ; switch double buffer a store")
         sst_buffer_switch_node = dotx_core_loop_node("sst buffer switch node", sst_buffer_switch_b, sst_buffer_switch_a)
@@ -350,7 +350,6 @@ class dotx_core_loop_for_loop(dotx_core_loop_node):
         self.append_new_node(wait_lgkmcnt, stack, "last n dotx")
         
         for i_rm in range(dotx_m.lanegroup_repeat_m - 1):
-            # compute index for three matrice
             i_rn = dotx_m.lanegroup_repeat_n - 1
             c_index = i_rm * c_thread_n + i_rn * c_per_inst
             a_index = (i_rm % local_prefetch_num_m) * local_buffer_m
@@ -390,7 +389,6 @@ class dotx_core_loop_for_loop(dotx_core_loop_node):
         wait_lgkmcnt = dotx_core_loop_expr(self.mc, f"wait for all sld", f's_waitcnt lgkmcnt({f_sst_a.get_issues() + f_sst_b.get_issues()})')
         self.append_new_node(wait_lgkmcnt, stack, "last n dotx in finish branch")
         for i_rm in range(dotx_m.lanegroup_repeat_m):
-            # compute index for three matrice
             i_rn = dotx_m.lanegroup_repeat_n - 1
             c_index = i_rm * c_thread_n + i_rn * c_per_inst
             a_index = (i_rm % local_prefetch_num_m) * local_buffer_m
@@ -510,7 +508,6 @@ class dotx_core_loop_for_loop(dotx_core_loop_node):
                     ds_waitcnt.push_new_vgpr(v_b(((i_k * dotx_m.lanegroup_repeat_n + i_rn - 1) % local_prefetch_num)* local_buffer_n), v_b_wait_index)
                     self.append_new_node(sld_b, stack, "after prefetch b")
                 for i_rm in range(dotx_m.lanegroup_repeat_m):
-                    # compute index for three matrice
                     c_index = i_rm * c_thread_n + i_rn * c_per_inst
                     a_index = (i_rm % local_prefetch_num_m) * local_buffer_m
                     b_index = ((i_k * dotx_m.lanegroup_repeat_n + i_rn) % local_prefetch_num) * local_buffer_n 
@@ -547,7 +544,6 @@ class dotx_core_loop_for_loop(dotx_core_loop_node):
                 self.append_new_node(sld_b, stack, "after prefetch b")
             
             for i_rm in range(repeat_m):
-                # compute index for three matrice
                 c_index = i_rm * c_thread_n + i_rn * c_per_inst
                 a_index = (i_rm % local_prefetch_num_m) * local_buffer_m
                 b_index = (((unroll_k - 1) * dotx_m.lanegroup_repeat_n + i_rn) % local_prefetch_num) * local_buffer_n 
@@ -646,12 +642,11 @@ class dotx_core_loop_graph():
         end_check_before_msw = dotx_core_loop_node("end_check_before_msw", node_before_for_loop, check_loop_end_node)
         base_node.first = dotx_core_loop_node("sst a/b before core loop1", end_check_before_msw, msw_a_b)
         
-        # sst a/b double buffer switch
+        # double buffer switch
         sst_buffer_switch_b = dotx_core_loop_expr(self.mc, "sst a buffer switch", f"v_xor_b32 v[{v_sst_b_os()}], {hex(lds_single_size)}, v[{v_sst_b_os()}] ; switch double buffer b store")
         sst_buffer_switch_a = dotx_core_loop_expr(self.mc, "sst a buffer switch", f"v_xor_b32 v[{v_sst_a_os()}], {hex(lds_single_size)}, v[{v_sst_a_os()}] ; switch double buffer a store")
         sst_buffer_switch_node = dotx_core_loop_node("sst buffer switch node", sst_buffer_switch_b, sst_buffer_switch_a)
         
-        # first barrier and waitcnt
         wait_all_lgkm = dotx_core_loop_expr(self.mc, "wait all lds", f"s_waitcnt lgkmcnt(0)")
         barrier = dotx_core_loop_expr(self.mc, "barrier", f"s_barrier")
         wait_sst_node = dotx_core_loop_node("wait sst node", wait_all_lgkm, barrier)
@@ -662,7 +657,6 @@ class dotx_core_loop_graph():
         else:
             wait_node = wait_sst_node
             
-        # global load before loop
         global_load_a_b = dotx_core_loop_node("global load a/b", gld_a, gld_b)
         
         # node with init loop var
@@ -672,7 +666,6 @@ class dotx_core_loop_graph():
         base_node.second.second.first = global_load_a_b
         base_node.second.second.second = base_for_loop
         
-        # last unroll k
         # dotx_core_loop_node("loop body with label", dotx_core_loop_expr(self.mc, "loop end label", label_fma_end+':'), loop_body)
         
         base_node = self.add_node_comment(base_node, f"; start FMA loop")

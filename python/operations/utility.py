@@ -731,7 +731,6 @@ class utility_dict_with_default_t(object):
             return self.d[key]
         return default_value
 
-# compute next power of 2
 def utility_next_pow2(n):
     if n == 0:
         return 1
@@ -754,7 +753,6 @@ def utility_log2(v):
     return int(math.log2(v))
 
 def utility_get_epack_length(precision):
-        # GetEPackLength
         epack = 1
         if precision == AMDGPU_PRECISION_FP16:
             # todo: xdlops check

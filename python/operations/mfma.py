@@ -89,7 +89,7 @@ class inst_mfma_t(object):
             return  f"{mfma_inst} a[{reg_d}], v[{reg_a}], v[{reg_b}], a[{reg_c}] {cbsz_str} {abid_str} {blgp_str}"
 
     def get_nop_count_mfma_acc_raw(self):
-        # in unit of passes, aka 4 cycle
+# in passes (4 cycles each)
         return (self.cycle // 4) + 2
 
 

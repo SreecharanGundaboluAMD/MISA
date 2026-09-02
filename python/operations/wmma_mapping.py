@@ -327,6 +327,11 @@ ctrl_wmma_mapping_table = {
         # (see igemm_fwd_gtc_wmma_nhwc.py). B needs no flag/masking (weight is never OOB), so
         # this mirror was materially simpler to implement than the 128x64 entry's A-side work.
         ctrl_wmma_mapping_t(64,  128, 16, 16, 2, 4, 4, v_wmma_f32_16x16x32_f16),
+        # 256x256/256x128: mechanical port of the 'bf16' entries below -- identical
+        # tiling, only the WMMA instruction differs. Requires wmma_acc_high_bank=1
+        # (VGPR-MSB) and wmma_epilogue_chunked=1, same as bf16.
+        ctrl_wmma_mapping_t(256, 256, 16, 16, 8, 4, 8, v_wmma_f32_16x16x32_f16),
+        ctrl_wmma_mapping_t(256, 128, 16, 16, 4, 8, 4, v_wmma_f32_16x16x32_f16),
     ],
     # Phase 24 (F16-accumulate WMMA): separate table key (not a field on ctrl_wmma_mapping_t)
     # so the existing f32-accumulate 'fp16' entries stay byte-identical -- the caller
@@ -386,6 +391,26 @@ ctrl_wmma_mapping_table = {
         # docs/gfx1250_wmma_vgpr_msb_wip_status.md's Phase 54 fix.
         ctrl_wmma_mapping_t(256, 256, 16, 16, 8, 4, 8, v_wmma_f32_16x16x32_bf16),
         ctrl_wmma_mapping_t(256, 128, 16, 16, 4, 8, 4, v_wmma_f32_16x16x32_bf16),
+        # 256x128, Phase 69 (2026-09-02, item #6): a SECOND, DIFFERENT 256x128 entry --
+        # 8 waves (not 4) with wave_repeat_m=4/wave_repeat_n=4 (not 8/4). block_size=256
+        # here is > gemm_n_per_block(128), the INVERSE of the row above's block_size(128)
+        # == gemm_n_per_block. total_acc_c = wave_repeat_m*wave_repeat_n*8 = 128 -- HALF
+        # the row above's 256, so this one does NOT need wmma_acc_high_bank at all (fits
+        # the plain 0-255 VGPR range directly). The tradeoff: gemm_n_per_block(128) <
+        # block_size(256) means block_size does not divide gemm_m/n_per_block the way
+        # every other row's row_repeat_a/b mechanism assumes -- instead TWO threads must
+        # cooperate on the SAME output column, each loading half of gemm_k_per_block (a
+        # NEW mechanism, col_split_b, see igemm_fwd_gtc_wmma_nhwc.py's __init__/
+        # _emit_lds_offset_setup/emit_kernel_prologue's B address setup, and the matching
+        # config's tensor_b_cluster_lengths=[1,2,1,128] encoding the 2-way split). Still
+        # requires wmma_epilogue_chunked=1 (a 256x128 tile's one-shot epilogue LDS is
+        # 256*128*4=131072 bytes regardless of accumulator width, over the 64KB ceiling)
+        # but NOT wmma_acc_high_bank. fwd-only so far (col_split_b is currently only
+        # wired in igemm_fwd_gtc_wmma_nhwc.py); bwd/wrw would need the same B-side
+        # plumbing ported before this row is reachable there. Hardware-validated
+        # (bf16, fwd, exact-divisibility only -- no tail/interleave/double-buffer
+        # support yet, see the col_split_b asserts in igemm_fwd_gtc_wmma_nhwc.py).
+        ctrl_wmma_mapping_t(256, 128, 16, 16, 8, 4, 4, v_wmma_f32_16x16x32_bf16),
     ],
     # Phase 27 (BF16-accumulate WMMA): mirrors 'fp16_f16acc' above exactly -- same tile shapes
     # as 'bf16', just v_wmma_bf16_16x16x32_bf16 instead of v_wmma_f32_16x16x32_bf16.
@@ -409,6 +434,17 @@ ctrl_wmma_mapping_table = {
         # Asymmetric shapes (2026-08-25): mechanical port, see fp16/bf16's entries above.
         ctrl_wmma_mapping_t(128, 64,  16, 16, 2, 4, 4, v_wmma_i32_16x16x64_iu8),
         ctrl_wmma_mapping_t(64,  128, 16, 16, 2, 4, 4, v_wmma_i32_16x16x64_iu8),
+        # 256x256/256x128 (2026-09-02, PERF-003 extension): mechanical port of the 'bf16'
+        # entries above -- v_wmma_i32_16x16x64_iu8 has num_v_c=8, identical to
+        # v_wmma_f32_16x16x32_bf16's accumulator width (only num_v_a/num_v_b and K differ,
+        # and those are already fully parameterized via inst_wmma), so total_acc_c works out
+        # to the same 256 VGPRs/wave that bf16's 256x256/256x128 rows already fit under
+        # wmma_acc_high_bank's <=256 ceiling (igemm_base.py ~line 952). Requires
+        # wmma_acc_high_bank=1 and wmma_epilogue_chunked=1, same as bf16 -- neither assert
+        # (igemm_base.py lines 774-813) is precision-gated, only direction/tail/atomic-split
+        # gated, so int8 passes them unchanged.
+        ctrl_wmma_mapping_t(256, 256, 16, 16, 8, 4, 8, v_wmma_i32_16x16x64_iu8),
+        ctrl_wmma_mapping_t(256, 128, 16, 16, 4, 8, 4, v_wmma_i32_16x16x64_iu8),
     ],
     # fp32: K=4 (much shorter than the others), num_v_a=num_v_b=2 (not 8 -- no packing at all,
     # 1 fp32/dword, unlike fp16's 2/dword or int8's 4/dword). D operand (num_v_c=8) carries
@@ -424,6 +460,17 @@ ctrl_wmma_mapping_table = {
         # Asymmetric shapes (2026-08-25): mechanical port, see fp16/bf16's entries above.
         ctrl_wmma_mapping_t(128, 64,  16, 16, 2, 4, 4, v_wmma_f32_16x16x4_f32),
         ctrl_wmma_mapping_t(64,  128, 16, 16, 2, 4, 4, v_wmma_f32_16x16x4_f32),
+        # 256x256/256x128 (2026-09-02, PERF-003 extension): mechanical port of the 'bf16'
+        # entries above -- v_wmma_f32_16x16x4_f32 has num_v_c=8, identical to
+        # v_wmma_f32_16x16x32_bf16's accumulator width (only num_v_a/num_v_b=2 and K=4
+        # differ, and those are already fully parameterized via inst_wmma), so total_acc_c
+        # works out to the same 256 VGPRs/wave that bf16's 256x256/256x128 rows already fit
+        # under wmma_acc_high_bank's <=256 ceiling (igemm_base.py ~line 952). Requires
+        # wmma_acc_high_bank=1 and wmma_epilogue_chunked=1, same as bf16 -- neither assert
+        # (igemm_base.py lines 774-813) is precision-gated, only direction/tail/atomic-split
+        # gated, so fp32 passes them unchanged.
+        ctrl_wmma_mapping_t(256, 256, 16, 16, 8, 4, 8, v_wmma_f32_16x16x4_f32),
+        ctrl_wmma_mapping_t(256, 128, 16, 16, 4, 8, 4, v_wmma_f32_16x16x4_f32),
     ],
 }
 

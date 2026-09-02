@@ -192,7 +192,7 @@ class dotx_main_loop_t_0(mc_base_t):
         self._emit(f_gld_b())
         self._emit_empty_line()
 
-        # Label: start of fma body
+        # fma body start
         self._emit_front(f"{label_fma_body}:")
         self._emit(f"; do fma accumulate with unroll {unroll_k}")
         self._emit(f_sld_b(v_b(), v_sld_b_os(), lds_base_n))
@@ -210,7 +210,6 @@ class dotx_main_loop_t_0(mc_base_t):
         with self._indent_context():
             for i_rn in range(dotx_m.lanegroup_repeat_n):
                 for i_rm in range(dotx_m.lanegroup_repeat_m):
-                    # compute index for three matrice
                     c_index = i_rm * thread_n + i_rn * 8
                     a_index = (i_rm % local_prefetch_num) * local_buffer_m
                     b_index = (i_rn % local_prefetch_num) * local_buffer_n 
@@ -248,7 +247,6 @@ class dotx_main_loop_t_0(mc_base_t):
 
         for i_rn in range(dotx_m.lanegroup_repeat_n - 1):
             for i_rm in range(dotx_m.lanegroup_repeat_m):
-                # compute index for three matrice
                 c_index = i_rm * thread_n + i_rn * 8
                 a_index = (i_rm % local_prefetch_num) * local_buffer_m
                 b_index = (i_rn % local_prefetch_num) * local_buffer_n 
@@ -285,7 +283,6 @@ class dotx_main_loop_t_0(mc_base_t):
         # last repeat n dotx loop
         self._emit(f"s_waitcnt lgkmcnt({f_sst_a.get_issues() + f_sst_b.get_issues()})")
         for i_rm in range(dotx_m.lanegroup_repeat_m - 1):
-            # compute index for three matrice
             i_rn = dotx_m.lanegroup_repeat_n - 1
             c_index = i_rm * thread_n + i_rn * 8
             a_index = (i_rm % local_prefetch_num) * local_buffer_m
@@ -317,18 +314,17 @@ class dotx_main_loop_t_0(mc_base_t):
 
         assert dotx_m.lanegroup_repeat_m <= local_prefetch_num, f"do not support the cases whose repeat m num is greater than local prefetch num"
 
-        # Label: finishing of fma body
+        # fma body end
         self._emit_front(f"{label_fma_finishing}:")
         self._emit(f"s_waitcnt lgkmcnt({f_sst_a.get_issues() + f_sst_a.get_issues()})")
         for i_rm in range(dotx_m.lanegroup_repeat_m):
-            # compute index for three matrice
             i_rn = dotx_m.lanegroup_repeat_n - 1
             c_index = i_rm * thread_n + i_rn * 8
             a_index = (i_rm % local_prefetch_num) * local_buffer_m
             b_index = (i_rn % local_prefetch_num) * local_buffer_n 
             self._emit(v_dotx_k(v_c(c_index), v_a(a_index), v_b(b_index)))
 
-        # Label: end of fma body
+        # fma body end
         self._emit_front(f"{label_fma_end}:")
         self._emit("s_waitcnt lgkmcnt(0)")
         self._emit("s_barrier")
@@ -348,7 +344,6 @@ class dotx_main_loop_t_0(mc_base_t):
         with self._indent_context():
             for i_rn in range(dotx_m.lanegroup_repeat_n):
                 for i_rm in range(dotx_m.lanegroup_repeat_m):
-                    # compute index for three matrice
                     c_index = i_rm * thread_n + i_rn * 8
                     a_index = (i_rm % local_prefetch_num) * local_buffer_m
                     b_index = (i_rn % local_prefetch_num) * local_buffer_n 
@@ -386,7 +381,6 @@ class dotx_main_loop_t_0(mc_base_t):
 
         for i_rn in range(dotx_m.lanegroup_repeat_n):
             for i_rm in range(dotx_m.lanegroup_repeat_m):
-                # compute index for three matrice
                 c_index = i_rm * thread_n + i_rn * 8
                 a_index = (i_rm % local_prefetch_num) * local_buffer_m
                 b_index = (i_rn % local_prefetch_num) * local_buffer_n 

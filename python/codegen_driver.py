@@ -48,7 +48,6 @@ class codegen_driver_t(mc_base_t):
         if tunable_dicts[0]['direction'] == 'fwd':
             for tdd in tunable_dicts:
                 assert tdd['direction'] == 'fwd'
-            # gtc fwd
             if 'wmma_tile_m' in tunable_dicts[0]:
                 kernel_list.extend([igemm_fwd_gtc_wmma_nhwc_t(mc_asm_printer_t(mc.emitter, mc.arch_config), igemm_gtc_tunable_parameter_t(td)) for td in tunable_dicts])
             elif 'tensor_layout' in tunable_dicts[0] and tunable_dicts[0]['tensor_layout'] == 'nhwc':
@@ -61,7 +60,6 @@ class codegen_driver_t(mc_base_t):
         elif tunable_dicts[0]['direction'] == 'bwd':
             for tdd in tunable_dicts:
                 assert tdd['direction'] == 'bwd'
-            # gtc bwd
             if 'wmma_tile_m' in tunable_dicts[0]:
                 kernel_list.extend([igemm_bwd_gtc_wmma_nhwc_t(mc_asm_printer_t(mc.emitter, mc.arch_config), igemm_gtc_tunable_parameter_t(td)) for td in tunable_dicts])
             elif 'tensor_layout' in tunable_dicts[0] and tunable_dicts[0]['tensor_layout'] == 'nhwc':
@@ -74,7 +72,6 @@ class codegen_driver_t(mc_base_t):
         elif tunable_dicts[0]['direction'] == 'wrw':
             for tdd in tunable_dicts:
                 assert tdd['direction'] == 'wrw'
-            # gtc wrw
             if 'wmma_tile_m' in tunable_dicts[0]:
                 kernel_list.extend([igemm_wrw_gtc_wmma_nhwc_t(mc_asm_printer_t(mc.emitter, mc.arch_config), igemm_gtc_tunable_parameter_t(td)) for td in tunable_dicts])
             elif 'tensor_layout' in tunable_dicts[0] and tunable_dicts[0]['tensor_layout'] == 'nhwc':
@@ -123,7 +120,6 @@ class codegen_driver_t(mc_base_t):
             k_multiplier *= 2
 
     def emit_global_macro(self):
-        # emit global macro, independent of tunable
         macro_int_div_vv_t(self.mc).emit()
         macro_int_div_vs_t(self.mc).emit()
         macro_int_div_ss_t(self.mc).emit()
@@ -170,7 +166,6 @@ class codegen_driver_t(mc_base_t):
             inst_buffer_atomic_add_emit_with_macro(self.mc)
 
     def emit_global_macro_per_s_file(self, mc):
-        # emit global macro, independent of tunable
         if self.tunable_dicts[0]['direction'] == 'wrw':
             macro_int_div_vv_t(mc).emit()
             macro_int_div_vs_t(mc).emit()
@@ -245,7 +240,6 @@ class codegen_driver_t(mc_base_t):
         emit_kernel_per_s = options["split_kernel"]
         emit_kernel_per_inc = IGEMM_EMIT_KERNEL_PER_INC_FILE if not emit_kernel_per_s else False
 
-        # emit the kernel
         #emit_v4r1_dynamic_kernel(self.mc, self.tunable_dicts)
         if emit_kernel_per_inc or emit_kernel_per_s:
             origin_emitter = self.mc.emitter

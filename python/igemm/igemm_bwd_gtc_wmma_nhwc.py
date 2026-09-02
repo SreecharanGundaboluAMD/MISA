@@ -535,7 +535,10 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         # once, not the full gemm_m_per_block.
         epilogue_m_rows = (self.wmma_mapping.ctrl.wave_tile_m * self.wmma_mapping.ctrl.waves_per_m()) \
             if self.tunable.wmma_epilogue_chunked else self.tunable.gemm_m_per_block
-        epilogue_lds_bytes = 0 if self.tunable.gemm_k_global_split else \
+        # PERF-007 (2026-09-02): see igemm_fwd_gtc_wmma_nhwc.py's identical comment --
+        # direct_store (Phase 59) skips the LDS-reshuffle epilogue entirely, so it needs
+        # zero epilogue LDS just like gemm_k_global_split's atomic path.
+        epilogue_lds_bytes = 0 if (self.tunable.gemm_k_global_split or self.tunable.direct_store) else \
             epilogue_m_rows * (self.tunable.gemm_n_per_block + epilogue_pad) * epilogue_elem_bytes
         # Phase 23: the 128x128 tile is already exactly at the 64KB/workgroup hardware limit
         # with ZERO headroom (Phase 21) -- padding pushes it over (128*132*4 = 67584 > 65536).
@@ -1746,6 +1749,12 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.interleave_b = False
         ctrl.wmma_setprio = self.tunable.wmma_setprio
         ctrl.vgpr_msb_tracker = self.vgpr_msb_tracker
+        # Phase 71 (PERF-004): A (untransposed) uses the plain ds_read_b128-chunked
+        # shared_load technique; B (transposed) uses the pack/wait-batched technique
+        # (shared_load_b_functor above) -- not eligible, both operands must be plain
+        # for wmma_main_loop.py's partial-wait schedule to safely apply.
+        ctrl.ds_read_plain_a = True
+        ctrl.ds_read_plain_b = False
         # Phase 1 (k-sub-loop): A (grad_output/input, untransposed) advances K-contiguous
         # bytes; B (weight, TRANSPOSED -- [K rows][N cols] in LDS) advances whole K-rows,
         # i.e. inst_wmma.k * row_pitch (row_pitch = gemm_n_per_block*data_byte), matching

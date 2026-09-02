@@ -297,7 +297,7 @@ static inline args_t create_conv_args(int argc, char *argv[]) {
 static inline int find_vector_c_from_base_arg(const std::string& base_arg)
 {
     if(base_arg.compare(0, 4, "conv") == 0){
-        auto found_vec = base_arg.find("x");       // we are looking for the "x" character
+        auto found_vec = base_arg.find("x");
         if(found_vec != std::string::npos){
             std::string vec_str = base_arg.substr(found_vec + 1);
             int vector_c = std::stoi( vec_str );    // TODO: try...catch...
