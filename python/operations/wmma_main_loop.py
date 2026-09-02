@@ -531,7 +531,21 @@ class wmma_main_loop_t(mc_base_t):
         # mandate for fp32 (see that doc) -- single-buffered pipelining is not merely
         # "unproven", it is empirically unsafe on this hardware, so it is not offered as
         # an option here.
-        can_hoist = (not a_style_async) and (not b_style_async) and (not interleave_a) and (not interleave_b) and double_buffer
+        # Phase 72 (2026-09-02): fp32 WMMA requires the legacy (fully serialized)
+        # schedule even with lds_double_buffer=1 -- the hoisted-load pipelining above
+        # produces valid:n on every fp32 tunable that was valid:y on the old schedule
+        # (confirmed: bwd 128x608x14x14x128, all 4 applicable tunables flip valid:y ->
+        # valid:n). The race mechanism is the same last-lane LDS-visibility gap documented
+        # in docs/gfx1250_fp32_wmma_occupancy_race.md: fp32's 4-byte-wide WMMA operands
+        # (4x the LDS traffic of fp16/bf16 per K-element) make the tighter pipeline expose
+        # the stale-by-one-iteration pattern far more aggressively than fp16/bf16 do, and
+        # double-buffering alone doesn't fully prevent it for fp32's wider traffic. This
+        # matches the existing pattern: fp32 already needs lds_double_buffer=1 as a
+        # correctness floor; the pipelining is an additional optimization that fp32 cannot
+        # safely use on this hardware. Hardware-validated: reverting wmma_main_loop.py to
+        # the pre-Phase-70 schedule restores valid:y on all four bwd/fp32 tunables.
+        is_fp32 = (ctrl.precision == 'fp32')
+        can_hoist = (not a_style_async) and (not b_style_async) and (not interleave_a) and (not interleave_b) and double_buffer and (not is_fp32)
 
         # Phase 13: an operand on the async path already issued its first tile's data
         # straight into LDS (global_load_async_to_lds_b128, no VGPR staging, no separate

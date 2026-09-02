@@ -248,7 +248,7 @@ def main():
                          'valid:y; this flag is kept for backward compatibility and only gates '
                          'whether full per-shape logs are written via --log-dir')
     ap.add_argument('--build-dir', default=os.path.join(REPO_ROOT, 'bench_out'))
-    ap.add_argument('--markdown-out', default=None)
+    ap.add_argument('--markdown-out', default=os.path.join(REPO_ROOT, 'benchmark_gfx1250_vs_gfx950_diverse.md'))
     ap.add_argument('--log-dir', default=None, help='Directory to write full per-shape conv_driver.exe output logs')
     args = ap.parse_args()
 
