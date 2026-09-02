@@ -1160,7 +1160,26 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self.emit_kernel_fma_main_loop()
         self._emit_empty_line()
 
+        # ---- Phase 5e regression fix (found 2026-09-02): commit 78af72c ("Port
+        # saddr_global_load from fwd to bwd and wrw") accidentally deleted this
+        # branch-back-and-increment sequence while editing the neighboring
+        # _emit_gld_chunk_load signature -- silently truncating the runtime tap loop to
+        # ALWAYS execute exactly once (iy=0,ix=0), for every tile/config, since Phase 5e
+        # first introduced it. 1x1 filters were unaffected (their only tap IS (0,0)), which
+        # is why this went unnoticed until a y>1/x>1 filter (e.g. 3x3) surfaced it as
+        # valid:n -- every tap beyond the first silently never ran, so v_c only ever
+        # accumulated 1/(y*x) of the true reduction. Restored verbatim from
+        # igemm_fwd_gtc_wmma_nhwc_t's/igemm_wrw_gtc_wmma_nhwc_t's still-intact identical
+        # sequence (mirrors _emit_tap_gather's own use of s.s_x()/s.s_y() as the tap
+        # counts).
         self._emit(f"s_add_u32 s[{s.s_ix()}], s[{s.s_ix()}], 1")
+        self._emit(f"s_cmp_lt_u32 s[{s.s_ix()}], s[{s.s_x()}]")
+        self._emit(f"s_cbranch_scc1 {label_tap_x}")
+        self._emit(f"s_add_u32 s[{s.s_iy()}], s[{s.s_iy()}], 1")
+        self._emit(f"s_cmp_lt_u32 s[{s.s_iy()}], s[{s.s_y()}]")
+        self._emit(f"s_cbranch_scc1 {label_tap_y}")
+        self._emit_empty_line()
+
     def _emit_gld_chunk_load(self, v_gld, v_addr, chunk_idx, v_flag=None, saddr=None):
         ''' Phase 1 (k-sub-loop): issues (does not wait) ONE inst_wmma.k-wide chunk's
         global load into the small, reused v_gld buffer.
