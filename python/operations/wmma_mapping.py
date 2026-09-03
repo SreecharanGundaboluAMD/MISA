@@ -91,7 +91,15 @@ class igemm_wmma_mapping_t(mc_base_t):
         mc_base_t.__init__(self, mc)
         assert type(ctrl) is ctrl_wmma_mapping_t
         self.ctrl = ctrl
-
+    def _emit_mul_or_shift(self, v_dst, multiplier, v_src, comment=''):
+        ''' B2 (lds_row_pad): emit v_lshlrev_b32 for power-of-2 multipliers (byte-identical
+        to the original utility_log2+v_lshlrev_b32 pattern), v_mul_lo_u32 otherwise -- needed
+        because lds_row_pad makes row_pitch_bytes (and half_k*row_pitch_bytes) non-power-of-2. '''
+        import math
+        if multiplier > 0 and (multiplier & (multiplier - 1)) == 0:
+            self._emit(f"v_lshlrev_b32 v[{v_dst}], {int(math.log2(multiplier))}, v[{v_src}]  ; {comment}")
+        else:
+            self._emit(f"v_mul_lo_u32 v[{v_dst}], {multiplier}, v[{v_src}]  ; {comment}")
     def get_gemm_index_for_src_matrix(self, v_gemm_in, v_gemm_im, v_thread_id, v_tmp2, **options):
         '''
         compute this thread's (im, ik) / (in, ik) position for reading the A / B operand
@@ -174,7 +182,7 @@ class igemm_wmma_mapping_t(mc_base_t):
             # layout's "upper vs lower 16 lanes" split always covers half of K regardless of
             # how many k-values a lane's vgprs cover per half. See docs/gfx1250_wmma_layout.md.
             half_k = ctrl.inst_wmma.k // 2
-            self._emit(f"v_lshlrev_b32 v[{v_tmp2}], {utility_log2(half_k * row_pitch_bytes)}, v[{v_tmp2}]  ; k_half * {half_k} * row_pitch_bytes")
+            self._emit_mul_or_shift(v_tmp2, half_k * row_pitch_bytes, v_tmp2, f"k_half * {half_k} * row_pitch_bytes")
             self._emit(f"v_add_u32 v[{v_byte_offset}], v[{v_tmp2}], v[{v_byte_offset}]")
             self._emit_empty_line()
         return self._get_deferred()
@@ -227,7 +235,7 @@ class igemm_wmma_mapping_t(mc_base_t):
             self._emit(f"v_lshrrev_b32 v[{v_tmp2}], 4, v[{v_thread_id}]             ; lane / 16")
             self._emit(f"v_and_b32 v[{v_tmp2}], 1, v[{v_tmp2}]                     ; k_half (0/1)")
             self._emit(f"v_lshl_or_b32 v[{v_byte_offset}], v[{v_tmp2}], {utility_log2(half_k)}, v[{v_byte_offset}]   ; | k_half*{half_k}")
-            self._emit(f"v_lshlrev_b32 v[{v_byte_offset}], {utility_log2(row_pitch_bytes)}, v[{v_byte_offset}]       ; * {row_pitch_bytes} row_pitch_bytes")
+            self._emit_mul_or_shift(v_byte_offset, row_pitch_bytes, v_byte_offset, f"* {row_pitch_bytes} row_pitch_bytes")
             # colbase term: ((lane%16) & ~7) [+ wave-offset if waves_per_side>1] * elem_bytes
             self._emit(f"v_and_b32 v[{v_tmp2}], 15, v[{v_thread_id}]               ; lane % 16")
             self._emit(f"v_and_b32 v[{v_tmp2}], -8, v[{v_tmp2}]                    ; & ~7 -> colbase (0 or 8)")

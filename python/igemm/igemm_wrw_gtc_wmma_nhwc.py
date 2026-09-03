@@ -241,23 +241,13 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
 
         # A-region (grad_output) and B-region (input): both natural [GEMM_K rows][M or N
-        # contiguous] tiles -- same total byte size either way (32*128*databyte).
+        # contiguous] tiles. B2 (lds_row_pad): padded row_pitch used when lds_row_pad > 0
+        # (overwritten below after bytes_per_row is derived).
         self.lds_a_size = tunable.gemm_k_per_block * tunable.gemm_m_per_block * self.data_byte
         self.lds_b_size = tunable.gemm_k_per_block * tunable.gemm_n_per_block * self.data_byte
-        # Phase 2 (double-buffering): see igemm_fwd_gtc_wmma_nhwc_t's identically-named
-        # fields for the full rationale. NOTE: wrw's A+B are BOTH transposed (read-and-
-        # pack scratch reuse), so unlike fwd/bwd's A, wrw's functors do NOT gain the
-        # early-store optimization from double buffering -- see global_load_a/b_functor.
-        # This still needs to be wired up correctly so the buffer-switch bookkeeping in
-        # wmma_main_loop.py addresses LDS correctly whenever a wrw _dbuf config is built.
-        self.lds_single_size = igemm_next_pow2(self.lds_a_size + self.lds_b_size)
+        # Phase 2 (double-buffering): lds_single_size computed below (after B2 padding
+        # overwrites lds_a_size/lds_b_size with padded values).
         self.lds_buffer_num  = 2 if tunable.lds_double_buffer else 1
-        # Phase 58 (wrw_streamk): a dedicated 4-byte LDS slot for the persistent loop's
-        # tile-claim broadcast (lane 0 writes the atomic result, s_barrier, every lane
-        # reads it back) -- placed right after the A/B staging LDS so it never collides
-        # with it. gemm_k_global_split's own epilogue uses zero LDS (see
-        # get_kernel_code's epilogue_lds_bytes), so this is the only extra LDS this mode needs.
-        self.streamk_lds_off = self.lds_single_size * self.lds_buffer_num
 
         # gemm_k_per_block*data_byte happens to equal 64 bytes for fp16/bf16/int8 (32*2, 32*2,
         # 64*1), but fp32 forces gemm_k_per_block=4 (matching inst_wmma.k), giving 4*4=16 --
@@ -273,6 +263,47 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self.chunk_num_dwordx4 = inst_wmma_k_bytes // 16
         self.chunk_num_dwords  = inst_wmma_k_bytes // 4
         self.num_k_chunks      = self.num_dwordx4 // self.chunk_num_dwordx4
+
+        # B2 (lds_row_pad): LDS row stride padding for wrw. BOTH A and B are TRANSPOSED,
+        # so v_sst_os itself uses the transposed formula: tid*bytes_per_row +
+        # (tid // threads_per_krow) * lds_row_pad. No separate VGPR needed (both operands
+        # share the same store offset, same as the un-padded case). bytes_per_row stays the
+        # GLOBAL stride for move_slice_window.
+        assert tunable.lds_row_pad % 16 == 0, \
+            f"lds_row_pad({tunable.lds_row_pad}) must be a multiple of 16 for 16-byte-aligned ds_read/write_b128"
+        if tunable.lds_row_pad > 0:
+            import math
+            row_pitch_a_dwords = (tunable.gemm_m_per_block * self.data_byte + tunable.lds_row_pad) // 4
+            assert math.gcd(row_pitch_a_dwords, 64) == 4, \
+                f"lds_row_pad({tunable.lds_row_pad}): gcd(A row_pitch_dwords={row_pitch_a_dwords}, 64)={math.gcd(row_pitch_a_dwords, 64)} must be 4 (conflict-free)"
+            row_pitch_b_dwords = (tunable.gemm_n_per_block * self.data_byte + tunable.lds_row_pad) // 4
+            assert math.gcd(row_pitch_b_dwords, 64) == 4, \
+                f"lds_row_pad({tunable.lds_row_pad}): gcd(B row_pitch_dwords={row_pitch_b_dwords}, 64)={math.gcd(row_pitch_b_dwords, 64)} must be 4 (conflict-free)"
+        self.lds_row_pitch_a = tunable.gemm_m_per_block * self.data_byte + tunable.lds_row_pad
+        self.lds_row_pitch_b = tunable.gemm_n_per_block * self.data_byte + tunable.lds_row_pad
+        self.threads_per_krow_a = (tunable.gemm_m_per_block * self.data_byte) // self.bytes_per_row
+        self.threads_per_krow_b = (tunable.gemm_n_per_block * self.data_byte) // self.bytes_per_row
+        assert self.threads_per_krow_a == self.threads_per_krow_b, \
+            f"threads_per_krow_a({self.threads_per_krow_a}) must equal threads_per_krow_b({self.threads_per_krow_b}) for wrw (both operands transposed, shared v_sst_os)"
+        self.threads_per_krow = self.threads_per_krow_a
+        assert self.threads_per_krow > 0 and (self.threads_per_krow & (self.threads_per_krow - 1)) == 0, \
+            f"threads_per_krow({self.threads_per_krow}) must be > 0 and a power of 2"
+        # Overwrite LDS sizes with padded row_pitch
+        self.lds_a_size = tunable.gemm_k_per_block * self.lds_row_pitch_a
+        self.lds_b_size = tunable.gemm_k_per_block * self.lds_row_pitch_b
+        # Phase 2 (double-buffering): see igemm_fwd_gtc_wmma_nhwc_t's identically-named
+        # fields for the full rationale. NOTE: wrw's A+B are BOTH transposed (read-and-
+        # pack scratch reuse), so unlike fwd/bwd's A, wrw's functors do NOT gain the
+        # early-store optimization from double buffering -- see global_load_a/b_functor.
+        # This still needs to be wired up correctly so the buffer-switch bookkeeping in
+        # wmma_main_loop.py addresses LDS correctly whenever a wrw _dbuf config is built.
+        self.lds_single_size = igemm_next_pow2(self.lds_a_size + self.lds_b_size)
+        # Phase 58 (wrw_streamk): a dedicated 4-byte LDS slot for the persistent loop's
+        # tile-claim broadcast (lane 0 writes the atomic result, s_barrier, every lane
+        # reads it back) -- placed right after the A/B staging LDS so it never collides
+        # with it. gemm_k_global_split's own epilogue uses zero LDS (see
+        # get_kernel_code's epilogue_lds_bytes), so this is the only extra LDS this mode needs.
+        self.streamk_lds_off = self.lds_single_size * self.lds_buffer_num
 
         # Phase 45 (TDM global load, wrw): both A and B are "128-wide tiles" sharing the
         # same num_col_groups formula (GEMM_K is the row axis for BOTH operands here,
@@ -703,38 +734,40 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ''' See igemm_fwd_gtc_wmma_nhwc_t's identically-named method for the full
         rationale (recompute, not save/restore, to avoid needing new VGPRs). '''
         v = self.vgpr
-        # ---- fixed per-thread shared-memory store offset: this thread owns byte-chunk
-        # tid*bytes_per_row ---- (both A's and B's (row_local,col_group) gemm_k_per_block-
-        # element chunk land at the same linear tid position, see class docstring)
-        # row_stride redesign: bytes_per_row (=gemm_k_per_block*data_byte) is no longer
-        # guaranteed a power of 2 (e.g. K=96 with a 32-wide tile) -- v_mul_lo_u32 by the
-        # compile-time constant works for both cases, unlike the v_lshlrev_b32/utility_log2
-        # this replaced (which asserted on K=96).
-        self._emit(f"v_mul_lo_u32 v[{v.v_sst_os()}], {self.bytes_per_row}, v[{v.v_tid()}]   ; tid*{self.bytes_per_row} bytes")
+        # ---- fixed per-thread shared-memory store offset ----
+        # B2 (lds_row_pad): BOTH A and B are TRANSPOSED, so v_sst_os uses the transposed
+        # formula: tid*bytes_per_row + (tid // threads_per_krow) * lds_row_pad.
+        # When lds_row_pad == 0, this is tid*bytes_per_row (byte-identical to before).
+        if self.tunable.lds_row_pad > 0:
+            self._emit(f"v_mul_lo_u32 v[{v.v_sst_os()}], {self.bytes_per_row}, v[{v.v_tid()}]  ; tid*{self.bytes_per_row}")
+            self._emit(f"v_lshrrev_b32 v[{v.v_tmp()}], {utility_log2(self.threads_per_krow)}, v[{v.v_tid()}]  ; tid // threads_per_krow")
+            self._emit(f"v_mul_lo_u32 v[{v.v_tmp()}], {self.tunable.lds_row_pad}, v[{v.v_tmp()}]  ; * lds_row_pad")
+            self._emit(f"v_add_u32 v[{v.v_sst_os()}], v[{v.v_tmp()}], v[{v.v_sst_os()}]  ; transposed store offset")
+        else:
+            self._emit(f"v_mul_lo_u32 v[{v.v_sst_os()}], {self.bytes_per_row}, v[{v.v_tid()}]   ; tid*{self.bytes_per_row} bytes")
         self._emit_empty_line()
 
         # ---- shared-memory load offset for A (TRANSPOSED -- grad_output is [K][M] in LDS) ----
-        # row_pitch_bytes = gemm_m_per_block * databyte (128 * databyte); A's region starts at
-        # byte 0 within the shared LDS tile (no lds_a_size-style base needed, unlike B below).
+        # row_pitch_bytes = lds_row_pitch_a (padded)
         # Phase 64: ds_load_tr_b uses a different per-lane address formula (hardware
         # transpose-load) -- see wmma_mapping.py's
         # get_gemm_index_for_src_matrix_transposed_ds_tr16 docstring.
         if self.tunable.ds_load_tr_b:
             self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix_transposed_ds_tr16(v.v_sld_a_os(), v.v_tid(), v.v_tmp(),
-                    self.tunable.gemm_m_per_block * self.data_byte, self.data_byte, 'm'))
+                    self.lds_row_pitch_a, self.data_byte, 'm'))
         else:
             self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix_transposed(v.v_sld_a_os(), v.v_tid(), v.v_tmp(),
-                    self.tunable.gemm_m_per_block * self.data_byte, self.data_byte, 'm'))
+                    self.lds_row_pitch_a, self.data_byte, 'm'))
         self._emit_empty_line()
 
         # ---- shared-memory load offset for B (TRANSPOSED -- input is [K][N] in LDS) ----
-        # row_pitch_bytes = gemm_n_per_block * databyte (128 * databyte)
+        # row_pitch_bytes = lds_row_pitch_b (padded)
         if self.tunable.ds_load_tr_b:
             self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix_transposed_ds_tr16(v.v_sld_b_os(), v.v_tid(), v.v_tmp(),
-                    self.tunable.gemm_n_per_block * self.data_byte, self.data_byte, 'n'))
+                    self.lds_row_pitch_b, self.data_byte, 'n'))
         else:
             self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix_transposed(v.v_sld_b_os(), v.v_tid(), v.v_tmp(),
-                    self.tunable.gemm_n_per_block * self.data_byte, self.data_byte, 'n'))
+                    self.lds_row_pitch_b, self.data_byte, 'n'))
         self._emit_empty_line()
 
     def _emit_tdm_descriptor_setup_a(self):
@@ -1461,7 +1494,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         offset). row_stride==1 always resolves row_offset=0, byte-identical to before. '''
         if self.row_stride > 1:
             row_offset, sub_chunk = divmod(chunk_idx, self.chunks_per_row)
-            row_pitch_bytes = self.tunable.gemm_m_per_block * self.data_byte
+            row_pitch_bytes = self.lds_row_pitch_a
         else:
             row_offset, sub_chunk = 0, chunk_idx
             row_pitch_bytes = 0
@@ -1684,7 +1717,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 num_v_a = outer.wmma_mapping.ctrl.inst_wmma.num_v_a
                 num_v_a_total = outer.tunable.wmma_repeat_m * num_v_a   # Phase 22: one local_prefetch_num slot's worth
                 slot_off = slot * num_v_a_total
-                row_pitch = outer.tunable.gemm_m_per_block * outer.data_byte
+                row_pitch = outer.lds_row_pitch_a
                 if outer.tunable.ds_load_tr_b:
                     # Phase 64: native ds_load_tr16_b128 replaces the entire manual
                     # read+pack loop below -- see bwd's shared_load_b_functor (Phase 63)
@@ -1758,7 +1791,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 num_v_b = outer.wmma_mapping.ctrl.inst_wmma.num_v_b
                 num_v_b_total = outer.tunable.wmma_repeat_n * num_v_b   # Phase 22: one local_prefetch_num slot's worth
                 slot_off = slot * num_v_b_total
-                row_pitch = outer.tunable.gemm_n_per_block * outer.data_byte
+                row_pitch = outer.lds_row_pitch_b
                 if outer.tunable.ds_load_tr_b:
                     # Phase 64: native ds_load_tr16_b128, identical to bwd's Phase 63
                     # (see igemm_bwd_gtc_wmma_nhwc.py's shared_load_b_functor).
@@ -1954,8 +1987,8 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # advancing inst_wmma.k whole K-rows, i.e. inst_wmma.k * row_pitch, matching each
         # shared_load_a/b_functor's own row_pitch computation.
         inst_wmma_k = self.wmma_mapping.ctrl.inst_wmma.k
-        ctrl.k_substep_stride_bytes_a    = inst_wmma_k * (self.tunable.gemm_m_per_block * self.data_byte)
-        ctrl.k_substep_stride_bytes_b    = inst_wmma_k * (self.tunable.gemm_n_per_block * self.data_byte)
+        ctrl.k_substep_stride_bytes_a    = inst_wmma_k * self.lds_row_pitch_a
+        ctrl.k_substep_stride_bytes_b    = inst_wmma_k * self.lds_row_pitch_b
         ctrl.global_load_a_functor       = self.global_load_a_functor()
         ctrl.global_load_b_functor       = self.global_load_b_functor()
         ctrl.shared_store_a_functor      = self.shared_store_a_functor()

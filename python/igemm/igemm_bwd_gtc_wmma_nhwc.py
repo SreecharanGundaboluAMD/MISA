@@ -252,12 +252,34 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self.chunk_num_dwordx4 = self.inst_wmma_k_bytes // 16
         self.chunk_num_dwords  = self.inst_wmma_k_bytes // 4
         self.num_k_chunks      = self.num_dwordx4 // self.chunk_num_dwordx4
+        # B2 (lds_row_pad): LDS row stride padding for bwd. A (untransposed) uses
+        # lds_bytes_per_row = bytes_per_row + lds_row_pad (same as fwd B2). B (TRANSPOSED)
+        # uses lds_row_pitch_b = gemm_n_per_block*data_byte + lds_row_pad, with a transposed
+        # store offset computed on-the-fly in shared_store_b_functor from v_sst_os (no extra
+        # VGPR needed -- bwd is at the 256-VGPR/wave limit). bytes_per_row stays the GLOBAL stride.
+        assert tunable.lds_row_pad % 16 == 0, \
+            f"lds_row_pad({tunable.lds_row_pad}) must be a multiple of 16 for 16-byte-aligned ds_read/write_b128"
+        if tunable.lds_row_pad > 0:
+            import math
+            stride_dwords_a = (self.bytes_per_row + tunable.lds_row_pad) // 4
+            assert math.gcd(stride_dwords_a, 64) == 4, \
+                f"lds_row_pad({tunable.lds_row_pad}): gcd(A stride_dwords={stride_dwords_a}, 64)={math.gcd(stride_dwords_a, 64)} must be 4 (conflict-free)"
+            row_pitch_b_dwords = (tunable.gemm_n_per_block * self.data_byte + tunable.lds_row_pad) // 4
+            assert math.gcd(row_pitch_b_dwords, 64) == 4, \
+                f"lds_row_pad({tunable.lds_row_pad}): gcd(B row_pitch_dwords={row_pitch_b_dwords}, 64)={math.gcd(row_pitch_b_dwords, 64)} must be 4 (conflict-free)"
+        self.lds_bytes_per_row = self.bytes_per_row + tunable.lds_row_pad
+        self.lds_row_pitch_b = tunable.gemm_n_per_block * self.data_byte + tunable.lds_row_pad
+        self.threads_per_krow_b = (tunable.gemm_n_per_block * self.data_byte) // self.bytes_per_row
+        assert self.threads_per_krow_b > 0, \
+            f"threads_per_krow_b({self.threads_per_krow_b}) must be > 0"
+        assert (self.threads_per_krow_b & (self.threads_per_krow_b - 1)) == 0, \
+            f"threads_per_krow_b({self.threads_per_krow_b}) must be a power of 2"
 
-        # A-region (grad_output): natural [GEMM_M][GEMM_K] tile, same shape as fwd's A/B.
-        self.lds_a_size = tunable.gemm_m_per_block * tunable.gemm_k_per_block * self.data_byte
-        # B-region (weight): natural [GEMM_K][GEMM_N] tile -- same total byte size (32*128*databyte
-        # either way), just a transposed interpretation of the same linear LDS layout.
-        self.lds_b_size = tunable.gemm_k_per_block * tunable.gemm_n_per_block * self.data_byte
+        # A-region (grad_output): natural [GEMM_M][GEMM_K] tile, padded A stride.
+        self.lds_a_size = tunable.gemm_m_per_block * self.lds_bytes_per_row
+        # B-region (weight): natural [GEMM_K][GEMM_N] tile -- transposed interpretation,
+        # padded transposed row_pitch.
+        self.lds_b_size = tunable.gemm_k_per_block * self.lds_row_pitch_b
         # Phase 2 (double-buffering): see igemm_fwd_gtc_wmma_nhwc_t's identically-named
         # fields for the full rationale.
         self.lds_single_size = igemm_next_pow2(self.lds_a_size + self.lds_b_size)
@@ -448,7 +470,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                 # global_load_b_functor call (s_kitr changes every K-loop iteration).
                 self.v_b_row_local  = sym_t('v_b_row_local'  , vseq(1))
                 self.v_flag_b_ktail = sym_t('v_flag_b_ktail' , vseq(1))
-            self.v_sst_os      = sym_t('v_sst_os'      , vseq(1))    # shared store offset (same for A/B region)
+            self.v_sst_os      = sym_t('v_sst_os'      , vseq(1))    # shared store offset (A region; B too when lds_row_pad==0)
             self.v_sld_a_os    = sym_t('v_sld_a_os'    , vseq(1))
             self.v_sld_b_os    = sym_t('v_sld_b_os'    , vseq(1))    # transposed byte offset (see get_gemm_index_for_src_matrix_transposed)
             self.v_gemm_im     = sym_t('v_gemm_im'     , vseq(1))
@@ -601,8 +623,12 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         # tid*bytes_per_row ---- (A: row tid's full gemm_k_per_block-element row; B:
         # (row_local,col_group)'s gemm_k_per_block-element chunk -- the linear tid-order
         # enumeration happens to coincide exactly for both, see class docstring)
-        self._emit(f"v_lshlrev_b32 v[{v.v_sst_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_tid()}]   ; tid*{self.bytes_per_row} bytes")
-        self._emit_empty_line()
+        # ---- fixed per-thread shared-memory store offset ----
+        # A (untransposed): tid * lds_bytes_per_row (padded A stride, same as fwd B2)
+        self._emit(f"v_mul_lo_u32 v[{v.v_sst_os()}], {self.lds_bytes_per_row}, v[{v.v_tid()}]   ; tid*{self.lds_bytes_per_row} bytes (A LDS row stride)")
+        # B2 (lds_row_pad > 0): B's transposed store offset is computed on-the-fly in
+        # shared_store_b_functor from v_sst_os (no persistent VGPR needed -- bwd is at the
+        # 256-VGPR/wave limit). Formula: v_sst_os_b = v_sst_os - (tid % threads_per_krow) * lds_row_pad
 
         # ---- shared-memory load offset for A (untransposed, same as fwd) ----
         # this call also computes a "gemm_in" (column) side-output that bwd's A-only path
@@ -613,21 +639,21 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"v_lshrrev_b32 v[{v.v_tmp()}], 4, v[{v.v_tid()}]")
         self._emit(f"v_and_b32 v[{v.v_tmp()}], 1, v[{v.v_tmp()}]")
         self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.inst_wmma_k_bytes // 2)}, v[{v.v_tmp()}]      ; k_half * {self.inst_wmma_k_bytes // 2} bytes")
-        self._emit(f"v_lshlrev_b32 v[{v.v_sld_a_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_sld_a_os()}]  ; row * {self.bytes_per_row} byte row-stride")
+        self._emit(f"v_mul_lo_u32 v[{v.v_sld_a_os()}], {self.lds_bytes_per_row}, v[{v.v_sld_a_os()}]  ; row * {self.lds_bytes_per_row} byte LDS row-stride")
         self._emit(f"v_add_u32 v[{v.v_sld_a_os()}], v[{v.v_tmp()}], v[{v.v_sld_a_os()}]")
         self._emit_empty_line()
 
         # ---- shared-memory load offset for B (TRANSPOSED -- weight is [K][N] in LDS) ----
-        # row_pitch_bytes = gemm_n_per_block * databyte (128 * databyte)
+        # row_pitch_bytes = lds_row_pitch_b (padded transposed row_pitch)
         # Phase 63: ds_load_tr_b uses a different per-lane address formula (hardware
         # transpose-load, not the manual read+pack loop) -- see wmma_mapping.py's
         # get_gemm_index_for_src_matrix_transposed_ds_tr16 docstring.
         if self.tunable.ds_load_tr_b:
             self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix_transposed_ds_tr16(v.v_sld_b_os(), v.v_tid(), v.v_tmp(),
-                    self.tunable.gemm_n_per_block * self.data_byte, self.data_byte, 'n'))
+                    self.lds_row_pitch_b, self.data_byte, 'n'))
         else:
             self._emit(self.wmma_mapping.get_gemm_index_for_src_matrix_transposed(v.v_sld_b_os(), v.v_tid(), v.v_tmp(),
-                    self.tunable.gemm_n_per_block * self.data_byte, self.data_byte, 'n'))
+                    self.lds_row_pitch_b, self.data_byte, 'n'))
         self._emit_empty_line()
 
     def _emit_tdm_descriptor_setup_a(self):
@@ -1457,7 +1483,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                     for i in range(1, outer.row_repeat_a):
                         row_addr = lambda idx=0, i=i: v.v_addr_a(i * 2 + idx)
                         row_flag = lambda i=i: v.v_flag(i)
-                        row_off  = i * outer.tunable.block_size * outer.bytes_per_row
+                        row_off  = i * outer.tunable.block_size * outer.lds_bytes_per_row
                         outer._emit_sst_all_chunks(v.v_gld_a, row_addr, v.v_sst_os, row_off, v_flag=row_flag)
                 return outer._get_deferred()
             def get_issues(self):
@@ -1484,10 +1510,22 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                         n_tail = (f"v[{v.v_n_valid_base()}]", _skip)
                     v_b_addr = v.v_off_b if outer.tunable.saddr_global_load else v.v_addr_b
                     s_b_saddr = s.s_p_wei if outer.tunable.saddr_global_load else None
-                    if outer.num_k_chunks == 1:
-                        outer._emit_sst_remaining_chunks(v.v_gld_b, v_b_addr, v.v_sst_os, outer.lds_a_size, v_flag=None, tail_mask=n_tail, saddr=s_b_saddr)
+                    if outer.tunable.lds_row_pad > 0:
+                        # B2: compute B's transposed store offset on-the-fly (no persistent
+                        # VGPR -- bwd is at the 256-VGPR/wave limit).
+                        # v_sst_os_b = tid*bytes_per_row + (tid // threads_per_krow) * lds_row_pad
+                        # Use v_tmp(3) as scratch (safe: not live across this store call).
+                        outer._emit(f"v_mul_lo_u32 v[{v.v_tmp(3)}], {outer.bytes_per_row}, v[{v.v_tid()}]  ; tid*{outer.bytes_per_row}")
+                        outer._emit(f"v_lshrrev_b32 v[{v.v_tmp(2)}], {utility_log2(outer.threads_per_krow_b)}, v[{v.v_tid()}]  ; tid // threads_per_krow")
+                        outer._emit(f"v_mul_lo_u32 v[{v.v_tmp(2)}], {outer.tunable.lds_row_pad}, v[{v.v_tmp(2)}]  ; * lds_row_pad")
+                        outer._emit(f"v_add_u32 v[{v.v_tmp(3)}], v[{v.v_tmp(2)}], v[{v.v_tmp(3)}]  ; B transposed store offset")
+                        v_b_sst_os = lambda: v.v_tmp(3)
                     else:
-                        outer._emit_sst_all_chunks(v.v_gld_b, v_b_addr, v.v_sst_os, outer.lds_a_size, v_flag=None, tail_mask=n_tail, saddr=s_b_saddr)
+                        v_b_sst_os = v.v_sst_os
+                    if outer.num_k_chunks == 1:
+                        outer._emit_sst_remaining_chunks(v.v_gld_b, v_b_addr, v_b_sst_os, outer.lds_a_size, v_flag=None, tail_mask=n_tail, saddr=s_b_saddr)
+                    else:
+                        outer._emit_sst_all_chunks(v.v_gld_b, v_b_addr, v_b_sst_os, outer.lds_a_size, v_flag=None, tail_mask=n_tail, saddr=s_b_saddr)
                 return outer._get_deferred()
             def get_issues(self):
                 return outer.chunk_num_dwordx4
@@ -1550,7 +1588,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         outer = self
         num_v_a = outer.wmma_mapping.ctrl.inst_wmma.num_v_a
         num_v_a_total = outer.tunable.wmma_repeat_m * num_v_a   # Phase 22: one local_prefetch_num slot's worth
-        step_bytes = outer.tunable.wmma_tile_m * outer.bytes_per_row   # was hardcoded 1024
+        step_bytes = outer.tunable.wmma_tile_m * outer.lds_bytes_per_row   # was hardcoded 1024
         class functor_t:
             def __call__(self, v_dst, v_os, extra_off, slot=0):
                 v = outer.vgpr
@@ -1592,7 +1630,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                 num_v_b = outer.wmma_mapping.ctrl.inst_wmma.num_v_b
                 num_v_b_total = outer.tunable.wmma_repeat_n * num_v_b   # Phase 22: one local_prefetch_num slot's worth
                 slot_off = slot * num_v_b_total
-                row_pitch = outer.tunable.gemm_n_per_block * outer.data_byte
+                row_pitch = outer.lds_row_pitch_b
                 if outer.tunable.ds_load_tr_b:
                     # Phase 63: native ds_load_tr16_b128 replaces the entire manual
                     # read+pack loop below -- 2 calls per wave_repeat_n step (one per
@@ -1776,11 +1814,11 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.ds_read_plain_b = False
         # Phase 1 (k-sub-loop): A (grad_output/input, untransposed) advances K-contiguous
         # bytes; B (weight, TRANSPOSED -- [K rows][N cols] in LDS) advances whole K-rows,
-        # i.e. inst_wmma.k * row_pitch (row_pitch = gemm_n_per_block*data_byte), matching
+        # i.e. inst_wmma.k * row_pitch (row_pitch = lds_row_pitch_b, padded), matching
         # shared_load_b_functor's own row_pitch computation.
         inst_wmma_k = self.wmma_mapping.ctrl.inst_wmma.k
         ctrl.k_substep_stride_bytes_a    = inst_wmma_k * self.data_byte
-        ctrl.k_substep_stride_bytes_b    = inst_wmma_k * (self.tunable.gemm_n_per_block * self.data_byte)
+        ctrl.k_substep_stride_bytes_b    = inst_wmma_k * self.lds_row_pitch_b
         ctrl.global_load_a_functor       = self.global_load_a_functor()
         ctrl.global_load_b_functor       = self.global_load_b_functor()
         ctrl.shared_store_a_functor      = self.shared_store_a_functor()
