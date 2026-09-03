@@ -267,6 +267,11 @@ typedef struct {
     // ignorant of), so folded into the kernel name from the start -- see this project's
     // own direct_store postmortem right above for why that specific omission was costly.
     int ds_load_tr_b = 0;
+    // lds_row_pad: mirrors igemm_base.py's lds_row_pad -- bytes of padding added to
+    // each LDS row in the main-loop A/B tile to break bank conflicts (perf report
+    // 2026-09-02 OPT-1/Phase B). Default 0. Folded into kernel name as "_ldsrp" so
+    // padded and unpadded variants of the same tile shape can coexist in one config.
+    int lds_row_pad = 0;
     // Phase 68 (2026-09-02): mirrors igemm_base.py's wmma_epilogue_chunked/
     // wmma_acc_high_bank tunables (Python-side names, python/igemm/igemm_base.py's
     // igemm_gtc_tunable_parameter_t.__init__) -- both change the epilogue's generated
@@ -361,6 +366,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.epilogue_lds_pad           = sec.count("epilogue_lds_pad") > 0 ? sec.at("epilogue_lds_pad").get_int() : 0;
                 tunable.direct_store               = sec.count("direct_store") > 0 ? sec.at("direct_store").get_int() : 0;
                 tunable.ds_load_tr_b                = ds_load_tr_b_specified ? sec.at("ds_load_tr_b").get_int() : 0;
+                tunable.lds_row_pad                = sec.count("lds_row_pad") > 0 ? sec.at("lds_row_pad").get_int() : 0;
                 tunable.wmma_epilogue_chunked       = sec.count("wmma_epilogue_chunked") > 0 ? sec.at("wmma_epilogue_chunked").get_int() : 0;
                 tunable.wmma_acc_high_bank          = sec.count("wmma_acc_high_bank") > 0 ? sec.at("wmma_acc_high_bank").get_int() : 0;
                 tunable.atomic_scope               = sec.count("atomic_scope") > 0 ? sec.at("atomic_scope").get_string() : "SCOPE_SYS";
@@ -607,6 +613,8 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += std::string("_direct");
         if(tunable->ds_load_tr_b)
             kernel_name += std::string("_dstrb");
+        if(tunable->lds_row_pad)
+            kernel_name += std::string("_ldsrp");
         // Phase 68 (2026-09-02): mirrors igemm_base.py's identical extension -- must stay in sync.
         if(tunable->wmma_epilogue_chunked)
             kernel_name += std::string("_chunked");

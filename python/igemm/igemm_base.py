@@ -383,6 +383,15 @@ class igemm_gtc_tunable_parameter_t(object):
             # puts every row of a given column in the same LDS bank). Only affects the
             # non-atomic (fwd/bwd/non-split-wrw) epilogue branch.
             self.epilogue_lds_pad                = utility_dict_with_default_t(tunable_dict)('epilogue_lds_pad', 0)
+            # lds_row_pad: bytes of padding added to each LDS row in the main-loop A/B
+            # tile (NOT the epilogue -- see epilogue_lds_pad above). The default 64 B row
+            # stride aliases 32 lanes onto 4 of 64 LDS bank groups; +16 B makes the stride
+            # 80 B (gcd(20,64)==4, conflict-free). Measured +9-27% on 1x1 shapes (perf
+            # report 2026-09-02 OPT-1/Phase B). Must be a multiple of 16 and produce
+            # gcd(stride_dwords, 64)==4. Default 0 (unpadded, every existing config
+            # unaffected). Only affects the main-loop LDS layout, NOT the global stride
+            # (bytes_per_row stays the global stride for move_slice_window).
+            self.lds_row_pad                    = utility_dict_with_default_t(tunable_dict)('lds_row_pad', 0)
         else:
             assert False
 
@@ -1518,6 +1527,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_direct"
         if tunable.ds_load_tr_b:
             kernel_name += "_dstrb"
+        if tunable.lds_row_pad:
+            kernel_name += "_ldsrp"
         # Phase 68 (2026-09-02): wmma_epilogue_chunked/wmma_acc_high_bank (see this
         # tunable's own definitions above) change the epilogue's generated code (chunked
         # LDS staging, v_c living in a second VGPR bank respectively) just like every
