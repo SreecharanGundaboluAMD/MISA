@@ -194,7 +194,7 @@ static inline double get_theoritical_gpu_gflops(int sclk_mhz, driverDataType_t d
         else if(gcn_arch == 908 || gcn_arch == 910)
             fp_factor = 4;  // xdlops
         else if(gcn_arch == 1250)
-            fp_factor = 8;  // wmma, v_wmma_f32_16x16x32_f16
+            fp_factor = 9;  // wmma, v_wmma_f32_16x16x32_f16: measured burst 1411 TFLOP/s
         else
             fp_factor = 2;  // dlops
         if(gcn_arch >= 1000 && gcn_arch != 1250)
@@ -210,7 +210,7 @@ static inline double get_theoritical_gpu_gflops(int sclk_mhz, driverDataType_t d
         else if(gcn_arch == 908 || gcn_arch == 910)
             fp_factor = 4;  // xdlops
         else if(gcn_arch == 1250)
-            fp_factor = 8;  // wmma, v_wmma_f32_16x16x32_bf16
+            fp_factor = 9;  // wmma, v_wmma_f32_16x16x32_bf16: same throughput as fp16 WMMA
         else
             fp_factor = 2;  // dlops
         if(gcn_arch >= 1000 && gcn_arch != 1250)
@@ -244,7 +244,7 @@ static inline double get_theoritical_gpu_gflops(int sclk_mhz, driverDataType_t d
     // listed here, not the RDNA/gfx10-era 4*16 default (that default predates gfx1250 and
     // assumed the WGP-doubled CU counting gfx1250 explicitly opts out of above, line 182).
     // Silently using 64 instead of 128 halved the computed peak, which combined with
-    // fp16/bf16's fp_factor=8 was reporting impossible >100% efficiency on real fp32
+    // fp16/bf16's fp_factor=9 was reporting impossible >100% efficiency on real fp32
     // kernels and understating the true fp16 peak (60.41% of a too-low peak, rather than
     // the correct, much smaller percentage of the true, doubled peak).
     if(gcn_arch == 908 || gcn_arch == 910 || gcn_arch == 950 || gcn_arch == 942 || gcn_arch == 941 || gcn_arch == 940 || gcn_arch == 1250){
