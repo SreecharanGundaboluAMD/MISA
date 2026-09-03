@@ -791,6 +791,27 @@ public:
             // group is folded into grid_y, decoded on-device -- see igemm_fwd_gtc_driver.h's
             // identical WMMA branch for the rationale.
             size_t grid_y = static_cast<size_t>(group) * utility_integer_divide_ceil(gemm_n, tunable->gemm_n_per_block);
+            // W-1 (perf report 2026-09-02): wrw's GEMM is M=K/group, N=C/group, GEMM_K=N*Ho*Wo
+            // -- a small-MN, enormous-K GEMM. Without gemm_k_global_split the grid is just
+            // grid_x*grid_y, which can be far smaller than the CU count (e.g. 16 WGs on 256
+            // CUs = 6% utilization for a 512x512 64x64-tile shape). The default wrw configs
+            // now set gemm_k_global_split=1; this warning catches any non-gsplit tunable
+            // that would starve the GPU, so a stale config or a hand-edited debug tunable
+            // doesn't silently regress to single-digit TFLOP/s. Uses dev_prop directly
+            // (not this->num_cu, which is doubled for gfx10+ and would fire spuriously).
+            if (!tunable->gemm_k_global_split) {
+                hipDeviceProp_t _dev_prop;
+                hipDevice_t _dev;
+                HIP_CALL(hipGetDevice(&_dev));
+                HIP_CALL(hipGetDeviceProperties(&_dev_prop, _dev));
+                size_t base_grid = grid_x * grid_y;
+                if (base_grid < static_cast<size_t>(_dev_prop.multiProcessorCount)) {
+                    printf("[wrw] WARNING: gemm_k_global_split=0 with grid=%zu (< %d CUs); "
+                           "grid starvation will cause severe underutilization. "
+                           "Set gemm_k_global_split=1 in the config.\n",
+                           base_grid, _dev_prop.multiProcessorCount);
+                }
+            }
 
             // gemm_k_global_split: split the reduction axis across grid.z, atomically
             // accumulating partial sums (see igemm_wrw_gtc_wmma_nhwc.py / docs/
