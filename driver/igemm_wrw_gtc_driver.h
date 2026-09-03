@@ -108,13 +108,12 @@ typedef struct {
                                 // Phase 58 (wrw_streamk): reused as "total shard count" for
                                 // the persistent loop's in-range test (same meaning, offset
                                 // 96 either way -- see get_kernel_args()'s Phase 58 note).
-    int   _streamk_pad;        // Phase 58: this struct is `packed` (no compiler-inserted
-                                // padding) -- without an explicit 4-byte filler here,
-                                // p_streamk_counter would land at byte offset 100 (NOT
-                                // 8-aligned), but the device emits `s_load_dwordx2` for it
-                                // (get_kernel_args() declares it at offset 104). Only present
-                                // when wrw_streamk is set device-side; host always carries it
-                                // (same "always present" convention as every other field here).
+    int   _streamk_pad;        // Originally padding to align p_streamk_counter to 8 bytes.
+                                // Now repurposed to carry streamk_persistent_grid_z (the
+                                // launched grid.z) for the static shard-index computation:
+                                // tile_idx = bz + iter * persistent_grid_z. Host always
+                                // carries it regardless of wrw_streamk (same "always
+                                // present" convention as every other field here).
     void *p_streamk_counter;   // Phase 58: pointer to a host-zeroed grid_x*grid_y*4-byte
                                 // int32 workspace, one atomic-claim counter per output tile.
                                 // Only present/read when wrw_streamk is set.
@@ -1147,6 +1146,7 @@ public:
                 karg.gemm_k_per_wg = (num_k_blocks / total_shards) * tunable->gemm_k_per_block;
                 karg.gemm_k_tail = 0;                              // asserted not wmma_k_tail
                 karg.gemm_k_num_splits = total_shards;
+                karg._streamk_pad = streamk_persistent_grid_z;  // repurposed: persistent grid.z for static shard indexing
                 karg.p_streamk_counter = p_streamk_counter;
                 karg.streamk_max_iters = max_iters;
                 karg.streamk_grid_y = static_cast<int>(grid_y);
@@ -1156,7 +1156,6 @@ public:
                               << " grid_z=" << streamk_persistent_grid_z
                               << " max_iters=" << max_iters
                               << " gemm_k_per_wg=" << karg.gemm_k_per_wg
-                              << " p_streamk_counter=" << karg.p_streamk_counter
                               << " grid_x=" << grid_x << " grid_y=" << grid_y
                               << std::endl;
                 }

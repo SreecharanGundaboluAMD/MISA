@@ -433,9 +433,17 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 # Phase 58: gemm_k_num_splits here means "total shard count" (reused,
                 # mutually exclusive with the wmma_k_tail branch above -- see igemm_base.py's
                 # assert). p_streamk_counter/streamk_max_iters/streamk_grid_y are the new
-                # kernargs; s_streamk_tile_idx is the currently-claimed shard index (replaces
-                # s_bz's role for address derivation); s_streamk_iter is the persistent loop's
-                # own bounded counter.
+                # assert). streamk_max_iters/streamk_grid_y are the new kernargs;
+                # s_streamk_tile_idx is the current shard index (replaces s_bz's role
+                # for address derivation); s_streamk_iter is the persistent loop's own
+                # bounded counter. s_streamk_persistent_grid_z is the launched grid.z
+                # (number of persistent workgroups per output tile), used to stride
+                # the shard index across loop iterations: tile_idx = bz + iter * grid_z.
+                # Replaces the original atomic-claim mechanism, which was unreliable on
+                # gfx1250 (global_atomic_add_u32 return value + LDS broadcast + barrier
+                # sequence produced wrong results on 2-wave workgroups and under high
+                # concurrency -- see fix rationale below). CK's stream-K uses the same
+                # static partitioning approach (no atomics for claim).
                 self.s_gemm_k_num_splits   = sym_t('s_gemm_k_num_splits'   , sseq(1))
                 self.s_streamk_counter_ptr = sym_t('s_streamk_counter_ptr' , sseq(2, 2))
                 self.s_streamk_max_iters   = sym_t('s_streamk_max_iters'   , sseq(1))
@@ -443,6 +451,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 self.s_streamk_tile_idx    = sym_t('s_streamk_tile_idx'    , sseq(1))
                 self.s_streamk_iter        = sym_t('s_streamk_iter'        , sseq(1))
                 self.s_streamk_addr        = sym_t('s_streamk_addr'        , sseq(2, 2))
+                self.s_streamk_persistent_grid_z = sym_t('s_streamk_persistent_grid_z', sseq(1))
             if outer.tunable.tdm_global_load:
                 # Phase 45: TDM descriptors for A (grad_output) and B (input) -- both
                 # operands are "128-wide tiles" here (GEMM_K is the row axis for BOTH),
@@ -909,6 +918,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"s_load_dword s[{s.s_gemm_k_num_splits()}], s[{s.s_ka()}:{s.s_ka(1)}], 96")
         if self.tunable.wrw_streamk:
             self._emit(f"s_load_dword s[{s.s_gemm_k_num_splits()}], s[{s.s_ka()}:{s.s_ka(1)}], 96   ; Phase 58: total shard count")
+            self._emit(f"s_load_dword s[{s.s_streamk_persistent_grid_z()}], s[{s.s_ka()}:{s.s_ka(1)}], 100   ; persistent grid.z (repurposed _streamk_pad)")
             self._emit(f"s_load_dwordx2 s[{s.s_streamk_counter_ptr()}:{s.s_streamk_counter_ptr(1)}], s[{s.s_ka()}:{s.s_ka(1)}], 104")
             self._emit(f"s_load_dword s[{s.s_streamk_max_iters()}], s[{s.s_ka()}:{s.s_ka(1)}], 112")
             self._emit(f"s_load_dword s[{s.s_streamk_grid_y()}], s[{s.s_ka()}:{s.s_ka(1)}], 116")
@@ -2042,40 +2052,23 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_mov_b32 s[{s.s_ix()}], 0")
         label_loop = f"L_{self.name()}_streamk_loop"
         label_skip = f"L_{self.name()}_streamk_skip"
-
         self._emit(f"s_mov_b32 s[{s.s_streamk_iter()}], 0")
         self._emit_front(f"{label_loop}:")
-
-        # ---- claim the next shard index. Only flat-tid==0 issues the atomic (EXEC-masked,
-        # not a per-wave check -- v_tid is the flat 0..127 thread id, so this is exactly one
-        # lane across the whole 4-wave workgroup); the result is broadcast to every lane via
-        # an LDS round-trip + a REAL cross-wave barrier (this kernel is always block_size
-        # 128 / 4-wave -- see docs/gfx1250_streamk_design.md's note on why rocKE's
-        # single-wave ds_bpermute broadcast doesn't apply here and an actual barrier is
-        # required and cannot be elided by a compiler that never exists in this hand-
-        # assembled pipeline in the first place). gfx1250's VOPC "x" form takes no explicit
-        # exec destination (implicit); the atomic uses the SADDR form (s_streamk_addr) with
-        # a VOFFSET of 0 (v_streamk_zero) and needs an explicit th:TH_ATOMIC_RETURN to get a
-        # return value at all -- both confirmed via llvm-mc against this exact ISA. gfx1250
-        # has no plain s_barrier -- it's always the split s_barrier_signal/s_barrier_wait
-        # form (see docs/claude_persistent_memory_notes.md's ISA quirks). ----
-        self._emit(f"; Phase 58: claim next K-shard index (only flat tid==0 issues the atomic)")
-        self._emit(f"v_cmpx_eq_u32 0, v[{v.v_tid()}]")
-        self._emit(f"global_atomic_add_u32 v[{v.v_streamk_claim()}], v[{v.v_streamk_zero()}], v[{v.v_streamk_one()}], s[{s.s_streamk_addr()}:{s.s_streamk_addr(1)}] scope:SCOPE_SYS th:TH_ATOMIC_RETURN")
-        self._emit(f"s_wait_loadcnt 0x0")
-        self._emit(f"ds_write_b32 v[{v.v_streamk_zero()}], v[{v.v_streamk_claim()}] offset:{self.streamk_lds_off}")
-        self._emit(f"s_mov_b32 exec_lo, -1")
-        self._emit(f"s_wait_dscnt 0x0   ; the ds_write must retire before the barrier releases other waves to read it")
-        self._emit(f"s_barrier_signal -1")
-        self._emit(f"s_barrier_wait -1")
-        self._emit(f"ds_read_b32 v[{v.v_streamk_claim()}], v[{v.v_streamk_zero()}] offset:{self.streamk_lds_off}")
-        self._emit(f"s_wait_dscnt 0x0")
-        self._emit(f"s_barrier_signal -1   ; ensure every lane has read before the next iteration can reuse this LDS slot")
-        self._emit(f"s_barrier_wait -1")
-        self._emit(f"v_readfirstlane_b32 s[{s.s_streamk_tile_idx()}], v[{v.v_streamk_claim()}]")
+        # ---- compute this iteration's shard index statically: tile_idx = bz + iter * persistent_grid_z.
+        # This replaces the original atomic-claim mechanism (global_atomic_add_u32 + LDS broadcast +
+        # double-barrier), which produced wrong results on gfx1250: the atomic return value's
+        # availability after s_wait_loadcnt 0x0 was not reliably visible to the LDS write (ds_write_b32)
+        # that broadcast it to other waves, despite the ISA spec stating loadcnt covers atomic-with-return.
+        # The race manifested as wrong shard indices on 2-wave (64x64) workgroups consistently and on
+        # 4-wave (128x128) workgroups under high concurrency. CK's stream-K (composable_kernel) uses
+        # the same static partitioning approach -- no atomics for claim -- confirmed at
+        # projects/composablekernel/include/ck_tile/ops/gemm/kernel/streamk_gemm/. ----
+        self._emit(f"; compute shard index: tile_idx = bz + iter * persistent_grid_z (static, no atomic)")
+        self._emit(f"s_mul_i32 s[{s.s_tmp()}], s[{s.s_streamk_iter()}], s[{s.s_streamk_persistent_grid_z()}]")
+        self._emit(f"s_add_u32 s[{s.s_streamk_tile_idx()}], s[{s.s_bz()}], s[{s.s_tmp()}]")
         self._emit_empty_line()
 
-        self._emit(f"s_cmp_lt_u32 s[{s.s_streamk_tile_idx()}], s[{s.s_gemm_k_num_splits()}]   ; in_range: did we claim a real shard?")
+        self._emit(f"s_cmp_lt_u32 s[{s.s_streamk_tile_idx()}], s[{s.s_gemm_k_num_splits()}]   ; in_range: is this a real shard?")
         self._emit(f"s_cbranch_scc0 {label_skip}")
         self._emit_empty_line()
 
