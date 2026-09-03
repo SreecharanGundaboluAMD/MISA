@@ -47,6 +47,16 @@ FORW_FLAG = {'fwd': 1, 'bwd': 2, 'wrw': 4}
 # 'gsplit' automatically for bwd/fwd (see GSPLIT_CANDIDATE in main()) -- split-K
 # wasn't available when most of these rows were first characterized, so it's
 # always worth trying as a second candidate, not just when a row explicitly says so.
+# NOTE (perf report 2026-09-02 OPT-3): the _all master config
+# (igemm_{dir}_gtc_gfx1250_nhwc_bf16_all.config) is the recommended primary config
+# for benchmarking -- it carries every validated tunable combination (all 4
+# lds_double_buffer/direct_store variants, all tail mechanisms, gsplit, etc.), so
+# the driver's fastest-tunable search always picks the best per shape. The narrow
+# configs below (base/mtail/ntail/etc.) are kept for codegen debugging and
+# backward compatibility; they are always tried as additional candidates alongside
+# 'master' (the _all config) in candidates_for() below. For quick-start and any
+# new benchmarking, use the _all config directly:
+#   python3 igemm_codegen.py config/igemm_fwd_gtc_gfx1250_nhwc_bf16_all.config
 CONFIG_FILES = {
     ('fwd', 'base'):   'config/igemm_fwd_gtc_gfx1250_nhwc_bf16.config',
     ('fwd', 'mtail'):  'config/igemm_fwd_gtc_gfx1250_nhwc_bf16_mtail.config',

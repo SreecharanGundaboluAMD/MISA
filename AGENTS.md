@@ -75,7 +75,7 @@ Runtime:  ./conv_driver.exe <mode> -n .. -c .. -H .. -W .. -k .. -y .. -x .. ...
 ### Build a kernel + driver (flat mode — the gfx1250 path)
 
 ```bash
-python3 igemm_codegen.py config/igemm_fwd_gtc_gfx1250_nhwc_fp16_direct.config
+python3 igemm_codegen.py config/igemm_fwd_gtc_gfx1250_nhwc_fp16_all.config
 # optional: -d <out_dir>  (default 'out'), -s (split-kernel: one .s per kernel)
 python3 igemm_codegen.py -d /tmp/my_out config/igemm_wrw_gtc_gfx1250_nhwc_bf16_all.config
 ```
@@ -202,7 +202,7 @@ Custom INI parser (`python/codegen/config_parser.py`), **not** Python's `configp
 | `driver/igemm_gtc_base.h` | `igemm_gtc_tunable_t` (C++ tunable), `igemm_driver_base_t` (abstract base), `igemm_launch_kernels` |
 | `driver/igemm_{fwd,bwd,wrw}_gtc_driver.h` | Per-direction driver subclasses: block/grid/run |
 | `driver/args.h` | MIOpenDriver-style CLI arg parser (`args_t`) |
-| `config/igemm_fwd_gtc_gfx1250_nhwc_fp16_direct.config` | Canonical minimal gfx1250 WMMA flat config (two sections: 128x128x32 + 64x64x32) |
+| `config/igemm_fwd_gtc_gfx1250_nhwc_fp16_all.config` | Master gfx1250 WMMA flat config (union of all validated fp16 fwd tunable combinations; use this for benchmarking and quick-start — the narrow `_direct` config picks the wrong `lds_double_buffer`/`direct_store` combo on large 1×1 shapes, see `docs/gfx1250_wmma_perf_report_2026-09-02.md` OPT-3) |
 | `driver/ENVIRONMENT.md` | Full env-var reference for `conv_driver.exe` |
 | `docs/gfx1250_wmma_layout.md` | **Master reference** (368KB): empirically-verified WMMA register layout + full phase-by-phase dev history (Phases 1–61+) |
 | `docs/gfx1250_fp32_wmma_occupancy_race.md` | **Known issue, mechanism characterized.** fp32 WMMA (`v_wmma_f32_16x16x4_f32`) silently corrupts output at high occupancy unless `lds_double_buffer=1` — root cause traced to a standalone repro showing `s_barrier_wait` doesn't reliably fence a wave's *last lane's* LDS write — see Known Issues below and `docs/gfx1250_fp32_wmma_race_repro/` |
