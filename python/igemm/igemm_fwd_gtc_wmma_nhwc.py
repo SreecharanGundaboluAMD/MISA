@@ -350,7 +350,22 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # coincidence (gemm_k_per_block is forced to 4, matching inst_wmma.k, so
         # 4*4=16 bytes, not 64) -- every one of those literals is now derived from
         # `self.bytes_per_row` instead, see their call sites below.
-        self.bytes_per_row = tunable.gemm_k_per_block * self.data_byte   # per-thread A/B row width
+        self.bytes_per_row = tunable.gemm_k_per_block * self.data_byte   # per-thread A/B row width (GLOBAL stride)
+        # B2 (perf report OPT-1): LDS row stride = global stride + padding. The padding
+        # breaks bank conflicts (64 B stride aliases 32 lanes onto 4 bank groups; 80 B is
+        # conflict-free). Used ONLY on the LDS side (store/load offsets, LDS allocation).
+        # bytes_per_row stays the GLOBAL stride for move_slice_window. lds_row_pad must be
+        # a multiple of 16 and produce gcd(stride_dwords, 64)==4.
+        assert tunable.lds_row_pad % 16 == 0, \
+            f"lds_row_pad({tunable.lds_row_pad}) must be a multiple of 16 for 16-byte-aligned ds_read/write_b128"
+        if tunable.lds_row_pad > 0:
+            import math
+            stride_dwords = (self.bytes_per_row + tunable.lds_row_pad) // 4
+            assert math.gcd(stride_dwords, 64) == 4, \
+                f"lds_row_pad({tunable.lds_row_pad}): gcd(stride_dwords={stride_dwords}, 64)={math.gcd(stride_dwords, 64)} must be 4 (conflict-free)"
+            assert self.col_split_b <= 1, \
+                "lds_row_pad and col_split_b>1 are not yet tested together -- deferred follow-up"
+        self.lds_bytes_per_row = self.bytes_per_row + tunable.lds_row_pad
         self.num_dwordx4   = self.bytes_per_row // 16   # global_load/shared_store loop bound (was hardcoded 4)
         self.num_dwords    = self.bytes_per_row // 4    # v_gld_a/b zero-init loop bound (was hardcoded 16)
         # Phase 1 (k-sub-loop): the WMMA "k_half" wave-split (lane>>4) only ever applies
@@ -374,8 +389,8 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         assert self.num_k_chunks % self.col_split_b == 0, \
             f"num_k_chunks({self.num_k_chunks}) must be a multiple of col_split_b({self.col_split_b})"
         self.num_k_chunks_b    = self.num_k_chunks // self.col_split_b
-        self.lds_a_size = tunable.gemm_m_per_block * tunable.gemm_k_per_block * self.data_byte
-        self.lds_b_size = tunable.gemm_n_per_block * tunable.gemm_k_per_block * self.data_byte
+        self.lds_a_size = tunable.gemm_m_per_block * self.lds_bytes_per_row
+        self.lds_b_size = tunable.gemm_n_per_block * self.lds_bytes_per_row
         # Phase 2 (double-buffering): lds_single_size must be a power of 2 for the
         # v_xor_b32 ping-pong switch (wmma_main_loop.py) to correctly alternate between
         # exactly two adjacent buffers -- same rounding igemm_base.py's XDLOPS/DLOPS
@@ -789,7 +804,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # ---- fixed per-thread shared-memory store offset: this thread owns row `tid` ----
         # bytes_per_row (=gemm_k_per_block*data_byte) is 64 for fp16/bf16/int8, but 16 for
         # fp32 (gemm_k_per_block forced to 4) -- see class docstring / self.bytes_per_row.
-        self._emit(f"v_lshlrev_b32 v[{v.v_sst_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_tid()}]   ; tid*{self.bytes_per_row} bytes")
+        self._emit(f"v_mul_lo_u32 v[{v.v_sst_os()}], {self.lds_bytes_per_row}, v[{v.v_tid()}]   ; tid*{self.lds_bytes_per_row} bytes (LDS row stride)")
         if self.col_split_b > 1:
             # Phase 69 (2026-09-02, item #6): B's row is n_idx-addressed, not tid-addressed
             # -- n_idx = tid % gemm_n_per_block, k_group = tid // gemm_n_per_block (both
@@ -816,9 +831,9 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"v_lshrrev_b32 v[{v.v_tmp()}], 4, v[{v.v_tid()}]")
         self._emit(f"v_and_b32 v[{v.v_tmp()}], 1, v[{v.v_tmp()}]")
         self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.inst_wmma_k_bytes // 2)}, v[{v.v_tmp()}]      ; k_half * {self.inst_wmma_k_bytes // 2} bytes")
-        self._emit(f"v_lshlrev_b32 v[{v.v_sld_a_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_sld_a_os()}]  ; row * {self.bytes_per_row} byte row-stride")
+        self._emit(f"v_mul_lo_u32 v[{v.v_sld_a_os()}], {self.lds_bytes_per_row}, v[{v.v_sld_a_os()}]  ; row * {self.lds_bytes_per_row} byte LDS row-stride")
         self._emit(f"v_add_u32 v[{v.v_sld_a_os()}], v[{v.v_tmp()}], v[{v.v_sld_a_os()}]")
-        self._emit(f"v_lshlrev_b32 v[{v.v_sld_b_os()}], {utility_log2(self.bytes_per_row)}, v[{v.v_sld_b_os()}]")
+        self._emit(f"v_mul_lo_u32 v[{v.v_sld_b_os()}], {self.lds_bytes_per_row}, v[{v.v_sld_b_os()}]  ; row * {self.lds_bytes_per_row} byte LDS row-stride")
         self._emit(f"v_add_u32 v[{v.v_sld_b_os()}], v[{v.v_tmp()}], v[{v.v_sld_b_os()}]")
         self._emit_empty_line()
 
@@ -1742,7 +1757,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                     for i in range(1, outer.row_repeat_a):
                         row_addr = lambda idx=0, i=i: v.v_addr_a(i * 2 + idx)
                         row_flag = lambda i=i: v.v_flag(i)
-                        row_off  = i * outer.tunable.block_size * outer.bytes_per_row
+                        row_off  = i * outer.tunable.block_size * outer.lds_bytes_per_row
                         outer._emit_sst_all_chunks_row(v.v_gld_a, row_addr, v.v_sst_os, row_off, v_flag=row_flag)
                 return outer._get_deferred()
             def get_issues(self):
@@ -1780,7 +1795,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                         outer._emit_sst_remaining_chunks(v.v_gld_b, v.v_addr_b, sst_os_b, outer.lds_a_size, v_flag=(v.v_flag_b if outer.tunable.wmma_n_tail else None), tail_mask=k_tail, num_chunks=outer.num_k_chunks_b)
                     for i in range(1, outer.row_repeat_b):
                         row_addr = lambda idx=0, i=i: v.v_addr_b(i * 2 + idx)
-                        row_off  = outer.lds_a_size + i * outer.tunable.block_size * outer.bytes_per_row
+                        row_off  = outer.lds_a_size + i * outer.tunable.block_size * outer.lds_bytes_per_row
                         # rows 1..row_repeat_b-1 have no flag of their own (row_repeat_b==1 is
                         # asserted in __init__ whenever wmma_n_tail is set -- see there).
                         outer._emit_sst_all_chunks_row(v.v_gld_b, row_addr, v.v_sst_os, row_off, v_flag=None)
@@ -1865,7 +1880,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         outer = self
         num_v_a = outer.wmma_mapping.ctrl.inst_wmma.num_v_a
         num_v_a_total = outer.tunable.wmma_repeat_m * num_v_a   # Phase 22: one local_prefetch_num slot's worth
-        step_bytes = outer.tunable.wmma_tile_m * outer.bytes_per_row   # was hardcoded 1024
+        step_bytes = outer.tunable.wmma_tile_m * outer.lds_bytes_per_row   # was hardcoded 1024
         class functor_t:
             def __call__(self, v_dst, v_os, extra_off, slot=0):
                 v = outer.vgpr
@@ -1881,7 +1896,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         outer = self
         num_v_b = outer.wmma_mapping.ctrl.inst_wmma.num_v_b
         num_v_b_total = outer.tunable.wmma_repeat_n * num_v_b   # Phase 22: one local_prefetch_num slot's worth
-        step_bytes = outer.tunable.wmma_tile_n * outer.bytes_per_row   # was hardcoded 1024
+        step_bytes = outer.tunable.wmma_tile_n * outer.lds_bytes_per_row   # was hardcoded 1024
         class functor_t:
             def __call__(self, v_dst, v_os, extra_off, slot=0):
                 v = outer.vgpr
