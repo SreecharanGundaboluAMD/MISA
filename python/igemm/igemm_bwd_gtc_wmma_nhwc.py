@@ -903,6 +903,28 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             emit_vopd_paired_zero_init(self._emit, v.v_zero, 4)
             self._emit_empty_line()
 
+        if self.tunable.wg_swizzle:
+            G = self.tunable.wg_swizzle
+            self._swizzle_label = getattr(self, '_swizzle_label', 0) + 1
+            skip_label = f"L_{self.name()}_swizzle_skip_{self._swizzle_label}"
+            self._emit(f"; E-4: workgroup swizzle (group width {G}) -- guarded: skip if grid dims not multiples of {G}")
+            self._emit(f"s_add_u32 s[{s.s_tmp(0)}], s[{s.s_gemm_m()}], {self.tunable.gemm_m_per_block - 1}")
+            self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {utility_log2(self.tunable.gemm_m_per_block)}   ; grid_x")
+            self._emit(f"s_and_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {G - 1}   ; grid_x % G")
+            self._emit(f"s_cbranch_scc0 {skip_label}   ; grid_x not multiple of {G} -- skip swizzle")
+            self._emit(f"s_add_u32 s[{s.s_tmp(0)}], s[{s.s_gemm_n()}], {self.tunable.gemm_n_per_block - 1}")
+            self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {utility_log2(self.tunable.gemm_n_per_block)}   ; grid_n")
+            self._emit(f"s_and_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {G - 1}   ; grid_n % G")
+            self._emit(f"s_cbranch_scc0 {skip_label}   ; grid_n not multiple of {G} -- skip swizzle")
+            self._emit(f"s_and_b32 s[{s.s_tmp(0)}], s[{s.s_bx()}], {G - 1}   ; bx_low")
+            self._emit(f"s_and_b32 s[{s.s_tmp(1)}], s[{s.s_by()}], {G - 1}   ; by_low")
+            self._emit(f"s_and_b32 s[{s.s_tmp(2)}], s[{s.s_bx()}], 0x{0xffffffff & ~(G - 1):x}   ; bx_high")
+            self._emit(f"s_and_b32 s[{s.s_tmp(3)}], s[{s.s_by()}], 0x{0xffffffff & ~(G - 1):x}   ; by_high")
+            self._emit(f"s_or_b32 s[{s.s_bx()}], s[{s.s_tmp(2)}], s[{s.s_tmp(1)}]   ; bx' = bx_high | by_low")
+            self._emit(f"s_or_b32 s[{s.s_by()}], s[{s.s_tmp(3)}], s[{s.s_tmp(0)}]   ; by' = by_high | bx_low")
+            self._emit_front(f"{skip_label}:")
+            self._emit_empty_line()
+
         self._emit(f"s_lshl_b32 s[{s.s_block_m_off()}], s[{s.s_bx()}], {utility_log2(self.tunable.gemm_m_per_block)}   ; *gemm_m_per_block")
         self._emit(f"s_lshl_b32 s[{s.s_block_n_off()}], s[{s.s_by()}], {utility_log2(self.tunable.gemm_n_per_block)}   ; *gemm_n_per_block")
         if self.tunable.gemm_k_global_split:

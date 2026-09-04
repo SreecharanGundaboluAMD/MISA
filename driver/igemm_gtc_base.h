@@ -159,6 +159,14 @@ typedef struct {
     int gemm_k_global_split;
     int merge_e;
     int vector_c;
+    // E-4: workgroup swizzle for L2 locality -- mirrors igemm_base.py's wg_swizzle.
+    // 0 = off (identity, every existing config unaffected). When set to a power-of-2
+    // group width G (4, 8, 16, ...), the kernel prologue swaps the low log2(G) bits of
+    // s_bx/s_by so consecutive workgroups in dispatch order alternate between different
+    // N-blocks, improving L2 temporal locality for the weight tile across the M sweep.
+    // Folded into the kernel name as "_sw{G}" for the usual hipModuleGetFunction-lookup
+    // reason -- must stay in sync with igemm_base.py's igemm_gtc_encode_kernel_name.
+    int wg_swizzle = 0;
     // gfx1250 WMMA-only optional mechanisms (Phase 13/15) -- default 0, unused/ignored for
     // every other fma_type. Must be folded into igemm_gtc_encode_kernel_name below (mirroring
     // igemm_base.py's igemm_gtc_encode_kernel_name) so the C++ driver's name computation
@@ -418,6 +426,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
             tunable.gemm_k_global_split      = sec.count("gemm_k_global_split") > 0 ? sec.at("gemm_k_global_split").get_int() : 0;
             tunable.merge_e                  = sec.count("merge_e") > 0 ? sec.at("merge_e").get_int() : 0;
             tunable.vector_c                 = sec.count("vector_c") > 0 ? sec.at("vector_c").get_int() : 1;
+            tunable.wg_swizzle              = sec.count("wg_swizzle") > 0 ? sec.at("wg_swizzle").get_int() : 0;
             tunables.push_back(tunable);
         }
     }
@@ -651,6 +660,8 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
         kernel_name += std::string("_vs") + std::to_string(vector_store);
     if(gemm_k_global_split > 0)
         kernel_name += std::string("_gkgs");
+    if(tunable->wg_swizzle > 0)
+        kernel_name += std::string("_sw") + std::to_string(tunable->wg_swizzle);
     return kernel_name;
 }
 

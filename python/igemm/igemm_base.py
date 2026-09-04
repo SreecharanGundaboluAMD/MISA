@@ -449,6 +449,15 @@ class igemm_gtc_tunable_parameter_t(object):
         self.vector_c                           = utility_dict_with_default_t(tunable_dict)('vector_c', 1)
         self.wavefront_size                     = utility_dict_with_default_t(tunable_dict)('wavefront_size', 64)
         self.cumode                             = utility_dict_with_default_t(tunable_dict)('cumode', 0)
+        # E-4: workgroup swizzle for L2 locality. 0 = off (identity, every existing
+        # config unaffected). When set to a power-of-2 group width G (4, 8, 16, ...),
+        # the kernel prologue swaps the low log2(G) bits of s_bx/s_by so consecutive
+        # workgroups in dispatch order alternate between different N-blocks, improving
+        # L2 temporal locality for the weight tile across the M sweep. Applied to
+        # fwd/bwd/wrw. Folded into the kernel name as "_sw{G}".
+        self.wg_swizzle                          = utility_dict_with_default_t(tunable_dict)('wg_swizzle', 0)
+        assert self.wg_swizzle == 0 or igemm_is_pow2(self.wg_swizzle), \
+            f"wg_swizzle must be 0 or a power of 2, got {self.wg_swizzle}"
 
         assert type(self.tensor_a_thread_lengths) is list and type(self.tensor_a_cluster_lengths) is list
         assert type(self.tensor_b_thread_lengths) is list and type(self.tensor_b_cluster_lengths) is list
@@ -1582,6 +1591,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
 
     if tunable.gemm_k_global_split:
         kernel_name += "_gkgs"
+    if tunable.wg_swizzle:
+        kernel_name += f"_sw{tunable.wg_swizzle}"
 
     return kernel_name
 
