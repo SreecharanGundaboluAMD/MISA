@@ -432,8 +432,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             if outer.tunable.wrw_streamk:
                 # Phase 58: gemm_k_num_splits here means "total shard count" (reused,
                 # mutually exclusive with the wmma_k_tail branch above -- see igemm_base.py's
-                # assert). p_streamk_counter/streamk_max_iters/streamk_grid_y are the new
-                # assert). streamk_max_iters/streamk_grid_y are the new kernargs;
+                # assert). streamk_max_iters is the persistent loop's bound (a kernarg);
                 # s_streamk_tile_idx is the current shard index (replaces s_bz's role
                 # for address derivation); s_streamk_iter is the persistent loop's own
                 # bounded counter. s_streamk_persistent_grid_z is the launched grid.z
@@ -445,12 +444,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 # concurrency -- see fix rationale below). CK's stream-K uses the same
                 # static partitioning approach (no atomics for claim).
                 self.s_gemm_k_num_splits   = sym_t('s_gemm_k_num_splits'   , sseq(1))
-                self.s_streamk_counter_ptr = sym_t('s_streamk_counter_ptr' , sseq(2, 2))
                 self.s_streamk_max_iters   = sym_t('s_streamk_max_iters'   , sseq(1))
-                self.s_streamk_grid_y      = sym_t('s_streamk_grid_y'      , sseq(1))
                 self.s_streamk_tile_idx    = sym_t('s_streamk_tile_idx'    , sseq(1))
                 self.s_streamk_iter        = sym_t('s_streamk_iter'        , sseq(1))
-                self.s_streamk_addr        = sym_t('s_streamk_addr'        , sseq(2, 2))
                 self.s_streamk_persistent_grid_z = sym_t('s_streamk_persistent_grid_z', sseq(1))
             if outer.tunable.tdm_global_load:
                 # Phase 45: TDM descriptors for A (grad_output) and B (input) -- both
@@ -590,25 +586,6 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 # byte-index operand (formerly v_pk_idx, removed).
                 self.v_pk_partner = sym_t('v_pk_partner' , vseq(1))
                 self.v_pk_packed  = sym_t('v_pk_packed'  , vseq(1))
-            if outer.tunable.wrw_streamk:
-                # Phase 58: persistent-loop tile-claim scratch. The atomic uses the SADDR
-                # form (s_streamk_addr, an SGPR pair -- see emit_kernel_streamk_loop), not a
-                # VADDR pair, so no dedicated VGPR address register is needed here (VGPR
-                # budget for this tile shape is already tight -- an earlier VADDR-pair
-                # version overflowed past register 255). v_streamk_one is a constant 1 (the
-                # atomic's increment operand, also doubles as its required VOFFSET=0... no,
-                # see v_streamk_zero for that); v_streamk_claim holds the atomic's returned
-                # pre-increment value, then (after the LDS broadcast round-trip) every lane's
-                # copy of the SAME claimed shard index.
-                self.v_streamk_one   = sym_t('v_streamk_one'   , vseq(1))
-                self.v_streamk_claim = sym_t('v_streamk_claim' , vseq(1))
-                # Dedicated always-zero VGPR: doubles as (a) the atomic's required VOFFSET
-                # (must be 0 -- the real address is entirely in SADDR) and (b)
-                # ds_write_b32/ds_read_b32's per-lane address (every lane must target the
-                # SAME LDS word for the broadcast to work; the actual LDS byte position is
-                # the instruction's `offset:` immediate instead -- see
-                # emit_kernel_streamk_loop).
-                self.v_streamk_zero  = sym_t('v_streamk_zero'  , vseq(1))
             self.v_end         = sym_t('v_end'         , vseq())
 
         def emit(self):
@@ -919,9 +896,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         if self.tunable.wrw_streamk:
             self._emit(f"s_load_dword s[{s.s_gemm_k_num_splits()}], s[{s.s_ka()}:{s.s_ka(1)}], 96   ; Phase 58: total shard count")
             self._emit(f"s_load_dword s[{s.s_streamk_persistent_grid_z()}], s[{s.s_ka()}:{s.s_ka(1)}], 100   ; persistent grid.z (repurposed _streamk_pad)")
-            self._emit(f"s_load_dwordx2 s[{s.s_streamk_counter_ptr()}:{s.s_streamk_counter_ptr(1)}], s[{s.s_ka()}:{s.s_ka(1)}], 104")
             self._emit(f"s_load_dword s[{s.s_streamk_max_iters()}], s[{s.s_ka()}:{s.s_ka(1)}], 112")
-            self._emit(f"s_load_dword s[{s.s_streamk_grid_y()}], s[{s.s_ka()}:{s.s_ka(1)}], 116")
         # Phase 60 (Magic Division): load magic multipliers + packed shift from kernargs
         self._emit(f"s_load_dwordx2 s[{s.s_magic_ho_wo()}:{s.s_magic_ho_wo(1)}], s[{s.s_ka()}:{s.s_ka(1)}], 120")
         self._emit(f"s_load_dword s[{s.s_shift_pack()}], s[{s.s_ka()}:{s.s_ka(1)}], 128")
@@ -960,21 +935,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # has actually landed. shift_pack layout: [7:0] = ho_wo shift, [15:8] = wo shift.
         self._emit(f"s_and_b32 s[{s.s_shift_ho_wo()}], s[{s.s_shift_pack()}], 0xff")
         self._emit(f"s_lshr_b32 s[{s.s_shift_wo()}], s[{s.s_shift_pack()}], 8")
-        if self.tunable.wrw_streamk:
-            # Phase 58: s_gemm_k_wg_off is NOT computed here -- unlike the static-shard
-            # design, this workgroup's shard index isn't known until the persistent loop
-            # claims one (see emit_kernel_streamk_loop). s_bz is decoded above but otherwise
-            # unused in this mode (it's just "which of the small persistent pool", not a
-            # shard index). What CAN be computed once here (constant for the kernel's
-            # lifetime): this tile's counter address = counter_ptr + (bx*grid_y + by)*4.
-            self._emit(f"s_mul_i32 s[{s.s_tmp()}], s[{s.s_bx()}], s[{s.s_streamk_grid_y()}]")
-            self._emit(f"s_add_u32 s[{s.s_tmp()}], s[{s.s_tmp()}], s[{s.s_by()}]")
-            self._emit(f"s_lshl_b32 s[{s.s_tmp()}], s[{s.s_tmp()}], 2   ; *4 bytes")
-            self._emit(f"s_add_u32 s[{s.s_streamk_addr()}], s[{s.s_streamk_counter_ptr()}], s[{s.s_tmp()}]")
-            self._emit(f"s_addc_u32 s[{s.s_streamk_addr(1)}], s[{s.s_streamk_counter_ptr(1)}], 0")
-            self._emit(f"v_mov_b32 v[{v.v_streamk_one()}], 1")
-            self._emit(f"v_mov_b32 v[{v.v_streamk_zero()}], 0")
-        elif self.tunable.gemm_k_global_split:
+        if self.tunable.gemm_k_global_split:
             self._emit(f"s_mul_i32 s[{s.s_gemm_k_wg_off()}], s[{s.s_bz()}], s[{s.s_gemm_k_per_wg()}]   ; this workgroup's K-slice base")
         self._emit_empty_line()
 
