@@ -126,6 +126,7 @@ typedef struct {
     uint32_t magic_ho_wo;    // magic for ho_wo
     uint32_t magic_wo;       // magic for wo
     uint32_t shift_pack;     // packed shifts: ho_wo[7:0], wo[15:8]
+    int   ho;                // W-6: ho = ho_wo/wo, needed by the incremental gather's ho-wrap
 } __attribute__((packed)) igemm_wrw_gtc_wmma_nhwc_karg_t;
 
 static void dump_wrw_karg(igemm_wrw_gtc_karg_t * karg){
@@ -913,6 +914,7 @@ public:
                 karg.magic_ho_wo = mdiv_ho_wo.magic;
                 karg.magic_wo    = mdiv_wo.magic;
                 karg.shift_pack  = magic_div_u32_pack_shift(mdiv_ho_wo.shift, mdiv_wo.shift, 0, 0);
+                karg.ho          = ho;
             }
             size_t karg_size = sizeof(karg);
 

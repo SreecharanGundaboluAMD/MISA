@@ -944,6 +944,15 @@ class igemm_gtc_tunable_parameter_t(object):
             # addresses, run the main loop, atomic-epilogue-store) -- generalizing this to
             # real multi-tap (y*x>1) filters is future work, not attempted here.
             self.wrw_streamk = utility_dict_with_default_t(tunable_dict)('wrw_streamk', 0)
+            # W-6: strength-reduce wrw's per-iteration B-gather (move_slice_window_b) to an
+            # incremental index update. Maintains persistent wo_idx/ho_idx/n_idx VGPRs that
+            # advance by gemm_k_per_block each iteration instead of re-dividing k_abs every
+            # time. First iteration (s_k_block_off=None, from the tap loop) still does the full
+            # magic div/rem to seed the persistent indices; subsequent iterations
+            # (move_slice_window_b_functor) use add + conditional-wrap loop. Only for
+            # row_stride==1, non-TDM (tdm_global_load bypasses the gather entirely). Folded
+            # into kernel name as "_wig" for the usual hipModuleGetFunction-lookup reason.
+            self.wrw_incremental_gather = utility_dict_with_default_t(tunable_dict)('wrw_incremental_gather', 0)
             if self.wrw_streamk:
                 assert self.gemm_k_global_split, \
                     "wrw_streamk builds on top of the atomic (gemm_k_global_split) epilogue -- set gemm_k_global_split=1 too"
@@ -1495,6 +1504,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_stagger"
         if tunable.wrw_streamk:
             kernel_name += "_streamk"
+        if tunable.wrw_incremental_gather:
+            kernel_name += "_wig"
         # Extends Phase 16's fold above to the M/N/K-tail EXEC-mask/fine-grained-mask
         # mechanisms (Phases 25/26b/35/36/38) -- these were pure masking additions with no
         # buffer-layout change, so folding them was skipped originally (every existing

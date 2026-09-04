@@ -376,6 +376,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             # stride/pad kernarg fields (Phase 5c) -- for B's (n,ho,wo)->(hi,wi) gather.
             self.s_ho_wo       = sym_t('s_ho_wo'       , sseq(1))    # = ho*wo, divisor for (n, ho*wo) decomposition
             self.s_wo          = sym_t('s_wo'          , sseq(1))    # divisor for (ho_idx, wo_idx) decomposition
+            self.s_ho          = sym_t('s_ho'          , sseq(1))    # W-6: ho = ho_wo/wo, for incremental gather's ho-wrap check
             self.s_stride_h    = sym_t('s_stride_h'    , sseq(1))
             self.s_stride_w    = sym_t('s_stride_w'    , sseq(1))
             self.s_pad_h       = sym_t('s_pad_h'       , sseq(1))
@@ -586,6 +587,13 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 # byte-index operand (formerly v_pk_idx, removed).
                 self.v_pk_partner = sym_t('v_pk_partner' , vseq(1))
                 self.v_pk_packed  = sym_t('v_pk_packed'  , vseq(1))
+            if outer.tunable.wrw_incremental_gather and outer.row_stride == 1:
+                # W-6: persistent per-thread indices for the incremental B-gather. Seeded by
+                # the first gather (full div/rem), then add+conditional-wrap each iteration.
+                # Only allocated for row_stride==1 (row_stride>1 keeps the full re-compute).
+                self.v_inc_wo_idx = sym_t('v_inc_wo_idx', vseq(1))
+                self.v_inc_ho_idx = sym_t('v_inc_ho_idx', vseq(1))
+                self.v_inc_n_idx  = sym_t('v_inc_n_idx' , vseq(1))
             self.v_end         = sym_t('v_end'         , vseq())
 
         def emit(self):
@@ -651,6 +659,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         kas.append(amdgpu_kernel_arg_t('magic_ho_wo', 4, 120, 'by_value', 'u32'))
         kas.append(amdgpu_kernel_arg_t('magic_wo',    4, 124, 'by_value', 'u32'))
         kas.append(amdgpu_kernel_arg_t('shift_pack',  4, 128, 'by_value', 'u32'))
+        kas.append(amdgpu_kernel_arg_t('ho',          4, 132, 'by_value', 'i32'))
         return kas
 
     def get_kernel_code(self):
@@ -900,6 +909,8 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # Phase 60 (Magic Division): load magic multipliers + packed shift from kernargs
         self._emit(f"s_load_dwordx2 s[{s.s_magic_ho_wo()}:{s.s_magic_ho_wo(1)}], s[{s.s_ka()}:{s.s_ka(1)}], 120")
         self._emit(f"s_load_dword s[{s.s_shift_pack()}], s[{s.s_ka()}:{s.s_ka(1)}], 128")
+        if self.tunable.wrw_incremental_gather and self.row_stride == 1:
+            self._emit(f"s_load_dword s[{s.s_ho()}], s[{s.s_ka()}:{s.s_ka(1)}], 132   ; W-6: ho = ho_wo/wo, for incremental gather's ho-wrap")
         self._emit(f"v_mov_b32 v[{v.v_tid()}], v0")
         if self.tunable.tdm_global_load:
             # Phase 45: mirrors fwd/bwd's identical Phase 29/42 computation -- this wave's
@@ -1303,7 +1314,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_cbranch_scc1 {label_tap_y}")
         self._emit_empty_line()
 
-    def _emit_b_gather(self, s_k_block_off):
+    def _emit_b_gather(self, s_k_block_off, is_incremental=False):
         '''
         Computes this thread's absolute K-index (k_block_off + row_local, where row_local is
         the persistent per-thread constant computed in the prologue), decomposes it into
@@ -1317,20 +1328,30 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         live (Phase 5f's tap bias), so no special-casing is needed for either call site to
         pick up whichever tap is currently active.
 
+        W-6 (wrw_incremental_gather): when is_incremental is True and wrw_incremental_gather
+        is set and row_stride==1, the per-iteration gather skips the magic div/rem and instead
+        incrementally updates persistent v_inc_wo_idx/v_inc_ho_idx/v_inc_n_idx VGPRs. The
+        first call (s_k_block_off=None, is_incremental=False) seeds those VGPRs after doing
+        the full division. Subsequent calls (is_incremental=True) use add + conditional-wrap.
+
         row_stride redesign: when row_stride>1, this thread owns row_stride consecutive
         absolute K-positions (v_row_local is the first, i.e. row_offset=0); the whole
         gather is repeated once per owned row into that row's own v_flag(row_offset)/
         v_addr_b(2*row_offset:2*row_offset+1) slot. row_stride==1 is a single iteration,
         byte-identical to before.
         '''
+        use_incremental = is_incremental and self.tunable.wrw_incremental_gather and self.row_stride == 1
         for row_offset in range(self.row_stride):
-            self._emit_b_gather_one_row(s_k_block_off, row_offset)
+            self._emit_b_gather_one_row(s_k_block_off, row_offset, use_incremental)
 
-    def _emit_b_gather_one_row(self, s_k_block_off, row_offset):
+    def _emit_b_gather_one_row(self, s_k_block_off, row_offset, use_incremental=False):
         s = self.sgpr
         v = self.vgpr
         m_mdiv_rem_vs = macro_mdiv_u32_rem_vs_t(self.mc)
         row_note = f" + row_offset({row_offset})" if row_offset else ""
+        if use_incremental:
+            self._emit_b_gather_incremental(s_k_block_off, row_offset)
+            return
         if s_k_block_off is not None:
             self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], s[{s_k_block_off}], v[{v.v_row_local()}]   ; k_abs (within this workgroup's K-slice){row_note}")
         else:
@@ -1361,6 +1382,13 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"; v_gtc_tmp(1)=hw_idx (rem), v_gtc_tmp(2)=n_idx (quo)")
         self._emit(m_mdiv_rem_vs(v.v_gtc_tmp(3), v.v_gtc_tmp(4), v.v_gtc_tmp(1), s.s_magic_wo(), s.s_shift_wo(), s.s_wo(), v.v_tmp()))
         self._emit(f"; v_gtc_tmp(3)=wo_idx (rem), v_gtc_tmp(4)=ho_idx (quo)")
+        if self.tunable.wrw_incremental_gather and self.row_stride == 1:
+            # W-6: seed the persistent incremental indices from this first full division.
+            # Subsequent iterations (move_slice_window_b) use _emit_b_gather_incremental
+            # which skips the div/rem entirely and just add+conditional-wraps these.
+            self._emit(f"v_mov_b32 v[{v.v_inc_wo_idx()}], v[{v.v_gtc_tmp(3)}]   ; seed v_inc_wo_idx")
+            self._emit(f"v_mov_b32 v[{v.v_inc_ho_idx()}], v[{v.v_gtc_tmp(4)}]   ; seed v_inc_ho_idx")
+            self._emit(f"v_mov_b32 v[{v.v_inc_n_idx()}], v[{v.v_gtc_tmp(2)}]   ; seed v_inc_n_idx")
         self._emit_empty_line()
 
         self._emit(f"; hi_idx = ho_idx*stride_h - pad_h + iy*dilation_h ; wi_idx symmetric (Phase 5f tap bias)")
@@ -1407,6 +1435,95 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         if self.tunable.saddr_global_load:
             # Phase 61: byte OFFSET only -- s_p_wei passed separately as SADDR.
             # row_stride==1 asserted when saddr is on, so row_offset is always 0.
+            self._emit(f"v_mov_b32 v[{v.v_off_b()}], v[{v.v_gtc_tmp(0)}]   ; v_off_b = row_idx * b_n_total * databyte + v_b_col_off")
+        else:
+            self._emit(f"v_mov_b32 v[{v.v_addr_b(2 * row_offset + 1)}], s[{s.s_p_wei(1)}]")
+            self._emit(f"v_add_co_u32 v[{v.v_addr_b(2 * row_offset)}], vcc_lo, s[{s.s_p_wei()}], v[{v.v_gtc_tmp(0)}]")
+            self._emit(f"v_add_co_ci_u32 v[{v.v_addr_b(2 * row_offset + 1)}], vcc_lo, 0, v[{v.v_addr_b(2 * row_offset + 1)}], vcc_lo")
+
+    def _emit_b_gather_incremental(self, s_k_block_off, row_offset):
+        ''' W-6: incremental update of persistent wo_idx/ho_idx/n_idx VGPRs, skipping the
+        magic div/rem. Called from _emit_b_gather_one_row for SUBSEQUENT iterations (not the
+        first -- the first seeds v_inc_* via the full division path). '''
+        s = self.sgpr
+        v = self.vgpr
+        kpb = self.tunable.gemm_k_per_block
+        # k_abs for k-tail check only (no division needed): k_block_off + v_row_local [+ gemm_k_wg_off]
+        if s_k_block_off is not None:
+            self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], s[{s_k_block_off}], v[{v.v_row_local()}]   ; k_abs (for k-tail check only){(' + row_offset({})'.format(row_offset) if row_offset else '')}")
+        else:
+            self._emit(f"v_mov_b32 v[{v.v_gtc_tmp(0)}], v[{v.v_row_local()}]   ; k_abs (for k-tail check only, k_block_off=0)")
+        if row_offset:
+            self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], {row_offset}   ; += row_offset")
+        if self.tunable.gemm_k_global_split:
+            self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], s[{s.s_gemm_k_wg_off()}]   ; += this workgroup's K-slice base")
+        if self.tunable.wmma_k_tail:
+            self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_gemm_k()}], v[{v.v_gtc_tmp(0)}]")
+            self._emit(f"v_cndmask_b32 v[{v.v_flag_b_ktail()}], 0, 1, vcc_lo   ; wmma_k_tail: k_abs < real gemm_k")
+        self._emit_empty_line()
+        # ---- incremental update: wo_idx += kpb, re-divide by wo, conditional ho-wrap ----
+        # Saves the ho_wo division (the more expensive one). The wo division is still needed
+        # to get the carry into ho. The ho-wrap uses v_cmp_lt_u32 (same pattern as baseline's
+        # v_cmp_gt_u32) with v_cndmask_b32 for per-lane conditional subtract.
+        m_mdiv_rem_vs_inc = macro_mdiv_u32_rem_vs_t(self.mc)
+        self._emit(f"; W-6: incremental index update (wo div/rem + conditional ho-wrap)")
+        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], {kpb}, v[{v.v_inc_wo_idx()}]   ; new_hw = wo_idx + {kpb}")
+        self._emit(m_mdiv_rem_vs_inc(v.v_gtc_tmp(1), v.v_gtc_tmp(2), v.v_gtc_tmp(0), s.s_magic_wo(), s.s_shift_wo(), s.s_wo(), v.v_tmp()))
+        self._emit(f"; v_gtc_tmp(1)=new_wo_idx (rem), v_gtc_tmp(2)=wo_carry (quo)")
+        self._emit(f"v_mov_b32 v[{v.v_inc_wo_idx()}], v[{v.v_gtc_tmp(1)}]   ; wo_idx = new_wo")
+        self._emit(f"v_add_u32 v[{v.v_inc_ho_idx()}], v[{v.v_inc_ho_idx()}], v[{v.v_gtc_tmp(2)}]   ; ho_idx += carry")
+        self._emit_empty_line()
+        # ho wrap: v_cndmask_b32 per-lane conditional
+        # v_cmp_lt_u32 vcc_lo, s[ho], v[ho_idx]: vcc=1 when ho < ho_idx (wrap)
+        # v_cndmask_b32 dst, src0, src1, vcc: dst=src0 when vcc=0, dst=src1 when vcc=1
+        self._emit(f"; ho wrap: v_cndmask conditional subtract")
+        self._emit(f"v_cmp_lt_u32 vcc_lo, s[{s.s_ho()}], v[{v.v_inc_ho_idx()}]   ; ho < ho_idx (wrap)?")
+        self._emit(f"v_sub_u32 v[{v.v_gtc_tmp(3)}], v[{v.v_inc_ho_idx()}], s[{s.s_ho()}]   ; ho_idx - ho")
+        self._emit(f"v_cndmask_b32 v[{v.v_inc_ho_idx()}], v[{v.v_inc_ho_idx()}], v[{v.v_gtc_tmp(3)}], vcc_lo   ; (wrap) ? ho_idx-ho : ho_idx")
+        self._emit(f"v_cndmask_b32 v[{v.v_gtc_tmp(4)}], 0, 1, vcc_lo   ; n_carry = (wrap) ? 1 : 0")
+        self._emit(f"v_add_u32 v[{v.v_inc_n_idx()}], v[{v.v_inc_n_idx()}], v[{v.v_gtc_tmp(4)}]")
+        # second ho wrap
+        self._emit(f"v_cmp_lt_u32 vcc_lo, s[{s.s_ho()}], v[{v.v_inc_ho_idx()}]   ; still wrap?")
+        self._emit(f"v_sub_u32 v[{v.v_gtc_tmp(3)}], v[{v.v_inc_ho_idx()}], s[{s.s_ho()}]")
+        self._emit(f"v_cndmask_b32 v[{v.v_inc_ho_idx()}], v[{v.v_inc_ho_idx()}], v[{v.v_gtc_tmp(3)}], vcc_lo")
+        self._emit(f"v_cndmask_b32 v[{v.v_gtc_tmp(4)}], 0, 1, vcc_lo")
+        self._emit(f"v_add_u32 v[{v.v_inc_n_idx()}], v[{v.v_inc_n_idx()}], v[{v.v_gtc_tmp(4)}]")
+        self._emit_empty_line()
+        # ---- compute hi_idx, wi_idx from updated indices (same mul/add, no division) ----
+        self._emit(f"; hi_idx = ho_idx*stride_h - pad_h + iy*dilation_h ; wi_idx symmetric")
+        self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_iy()}], s[{s.s_dilation_h()}]")
+        self._emit(f"s_sub_i32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], s[{s.s_pad_h()}]   ; iy*dilation_h - pad_h")
+        self._emit(f"s_mul_i32 s[{s.s_tmp(3)}], s[{s.s_ix()}], s[{s.s_dilation_w()}]")
+        self._emit(f"s_sub_i32 s[{s.s_tmp(3)}], s[{s.s_tmp(3)}], s[{s.s_pad_w()}]   ; ix*dilation_w - pad_w")
+        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(4)}], s[{s.s_stride_h()}], v[{v.v_inc_ho_idx()}]")
+        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(4)}], v[{v.v_gtc_tmp(4)}], s[{s.s_tmp(2)}]   ; hi_idx")
+        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(3)}], s[{s.s_stride_w()}], v[{v.v_inc_wo_idx()}]")
+        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(3)}], v[{v.v_gtc_tmp(3)}], s[{s.s_tmp(3)}]   ; wi_idx")
+        self._emit_empty_line()
+        # ---- v_flag (same bounds check, using updated hi_idx/wi_idx) ----
+        self._emit(f"; v_flag({row_offset}) = 1 iff (hi_idx, wi_idx) in [0,hi)x[0,wi)")
+        self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_hi()}], v[{v.v_gtc_tmp(4)}]")
+        self._emit(f"v_cndmask_b32 v[{v.v_flag(row_offset)}], 0, 1, vcc_lo")
+        self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_wi()}], v[{v.v_gtc_tmp(3)}]")
+        self._emit(f"v_cndmask_b32 v[{v.v_flag(row_offset)}], 0, v[{v.v_flag(row_offset)}], vcc_lo")
+        if self.tunable.wmma_n_tail and self.row_stride == 1:
+            self._emit(f"v_and_b32 v[{v.v_flag(row_offset)}], v[{v.v_flag(row_offset)}], v[{v.v_flag_b_ntail()}]   ; wmma_n_tail")
+        if self.tunable.wmma_k_tail:
+            self._emit(f"v_and_b32 v[{v.v_flag(row_offset)}], v[{v.v_flag(row_offset)}], v[{v.v_flag_b_ktail()}]   ; wmma_k_tail")
+        self._emit_empty_line()
+        # ---- row_idx = n_idx*(hi*wi) + hi_idx*wi + wi_idx (using updated indices) ----
+        self._emit(f"; row_idx = n_idx*(hi*wi) + hi_idx*wi + wi_idx")
+        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_hi_wi()}], v[{v.v_inc_n_idx()}]")
+        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(2)}], s[{s.s_wi()}], v[{v.v_gtc_tmp(4)}]")
+        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(2)}]")
+        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(3)}]")
+        self._emit_empty_line()
+        # ---- v_addr_b (same as non-incremental, using row_idx from v_gtc_tmp(0)) ----
+        self._emit(f"; v_addr_b({row_offset}) = p_wei + row_idx * b_n_total * databyte + v_b_col_off")
+        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(0)}], s[{s.s_b_n_total()}], v[{v.v_gtc_tmp(0)}]   ; row_idx * b_n_total")
+        self._emit(f"v_lshlrev_b32 v[{v.v_gtc_tmp(0)}], {utility_log2(self.data_byte)}, v[{v.v_gtc_tmp(0)}]")
+        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], v[{v.v_gtc_tmp(0)}], v[{v.v_b_col_off()}]")
+        if self.tunable.saddr_global_load:
             self._emit(f"v_mov_b32 v[{v.v_off_b()}], v[{v.v_gtc_tmp(0)}]   ; v_off_b = row_idx * b_n_total * databyte + v_b_col_off")
         else:
             self._emit(f"v_mov_b32 v[{v.v_addr_b(2 * row_offset + 1)}], s[{s.s_p_wei(1)}]")
@@ -1928,7 +2045,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                         outer._emit_front(f"{skip_label}:")
                     else:
                         outer._emit(f"s_sub_i32 s[{s.s_tmp()}], s[{s.s_knum()}], s[{s.s_kitr()}]   ; k_block_off")
-                        outer._emit_b_gather(s.s_tmp())
+                        outer._emit_b_gather(s.s_tmp(), is_incremental=True)
                 return outer._get_deferred()
         return functor_t()
 

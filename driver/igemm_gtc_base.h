@@ -238,6 +238,10 @@ typedef struct {
     // (small constant grid.z + a claimed-shard counter workspace, instead of grid.z ==
     // the chosen split count) -- folded into the kernel name like every other flag above.
     int wrw_streamk;
+    // W-6: mirrors igemm_base.py's wrw_incremental_gather -- strength-reduces wrw's
+    // per-iteration B-gather to an incremental index update (persistent wo_idx/ho_idx/
+    // n_idx VGPRs). Only for row_stride==1, non-TDM. Folded into kernel name as "_wig".
+    int wrw_incremental_gather = 0;
     // Master-config phase (new): local_prefetch_num/atomic_scope/epilogue_lds_pad were
     // "purely internal-codegen choices" the driver never needed to know about, by the
     // ORIGINAL design -- true only as long as no two config sections of the SAME tile shape
@@ -362,6 +366,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.wrw_reduction_kernel       = sec.count("wrw_reduction_kernel") > 0 ? sec.at("wrw_reduction_kernel").get_int() : 0;
                 tunable.gsplit_stagger              = sec.count("gsplit_stagger") > 0 ? sec.at("gsplit_stagger").get_int() : 0;
                 tunable.wrw_streamk                 = sec.count("wrw_streamk") > 0 ? sec.at("wrw_streamk").get_int() : 0;
+                tunable.wrw_incremental_gather    = sec.count("wrw_incremental_gather") > 0 ? sec.at("wrw_incremental_gather").get_int() : 0;
                 tunable.local_prefetch_num         = sec.count("local_prefetch_num") > 0 ? sec.at("local_prefetch_num").get_int() : 1;
                 tunable.epilogue_lds_pad           = sec.count("epilogue_lds_pad") > 0 ? sec.at("epilogue_lds_pad").get_int() : 0;
                 tunable.direct_store               = sec.count("direct_store") > 0 ? sec.at("direct_store").get_int() : 0;
@@ -599,6 +604,8 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += std::string("_stagger");
         if(tunable->wrw_streamk)
             kernel_name += std::string("_streamk");
+        if(tunable->wrw_incremental_gather)
+            kernel_name += std::string("_wig");
         // mirrors igemm_base.py's identical extension -- must stay in sync.
         if(tunable->wmma_m_tail)
             kernel_name += std::string("_mtail");
