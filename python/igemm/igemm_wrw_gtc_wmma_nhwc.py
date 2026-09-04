@@ -590,9 +590,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             if outer.tunable.wrw_incremental_gather and outer.row_stride == 1:
                 # W-6: persistent per-thread indices for the incremental B-gather. Seeded by
                 # the first gather (full div/rem), then add+conditional-wrap each iteration.
+                # v_inc_hw_idx = ho_idx*wo + wo_idx (the hw remainder), maintained incrementally.
+                # v_inc_n_idx = n_idx (the ho_wo quotient), maintained incrementally.
                 # Only allocated for row_stride==1 (row_stride>1 keeps the full re-compute).
-                self.v_inc_wo_idx = sym_t('v_inc_wo_idx', vseq(1))
-                self.v_inc_ho_idx = sym_t('v_inc_ho_idx', vseq(1))
+                self.v_inc_hw_idx = sym_t('v_inc_hw_idx', vseq(1))
                 self.v_inc_n_idx  = sym_t('v_inc_n_idx' , vseq(1))
             self.v_end         = sym_t('v_end'         , vseq())
 
@@ -1384,10 +1385,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"; v_gtc_tmp(3)=wo_idx (rem), v_gtc_tmp(4)=ho_idx (quo)")
         if self.tunable.wrw_incremental_gather and self.row_stride == 1:
             # W-6: seed the persistent incremental indices from this first full division.
-            # Subsequent iterations (move_slice_window_b) use _emit_b_gather_incremental
-            # which skips the div/rem entirely and just add+conditional-wraps these.
-            self._emit(f"v_mov_b32 v[{v.v_inc_wo_idx()}], v[{v.v_gtc_tmp(3)}]   ; seed v_inc_wo_idx")
-            self._emit(f"v_mov_b32 v[{v.v_inc_ho_idx()}], v[{v.v_gtc_tmp(4)}]   ; seed v_inc_ho_idx")
+            # v_inc_hw_idx = hw_idx (the ho_wo remainder, = ho_idx*wo + wo_idx)
+            # v_inc_n_idx = n_idx (the ho_wo quotient)
+            self._emit(f"v_mov_b32 v[{v.v_inc_hw_idx()}], v[{v.v_gtc_tmp(1)}]   ; seed v_inc_hw_idx (= hw_idx)")
             self._emit(f"v_mov_b32 v[{v.v_inc_n_idx()}], v[{v.v_gtc_tmp(2)}]   ; seed v_inc_n_idx")
         self._emit_empty_line()
 
@@ -1442,12 +1442,14 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"v_add_co_ci_u32 v[{v.v_addr_b(2 * row_offset + 1)}], vcc_lo, 0, v[{v.v_addr_b(2 * row_offset + 1)}], vcc_lo")
 
     def _emit_b_gather_incremental(self, s_k_block_off, row_offset):
-        ''' W-6: incremental update of persistent wo_idx/ho_idx/n_idx VGPRs, skipping the
-        magic div/rem. Called from _emit_b_gather_one_row for SUBSEQUENT iterations (not the
-        first -- the first seeds v_inc_* via the full division path). '''
+        ''' W-6: incremental update of persistent hw_idx/n_idx VGPRs. Eliminates the ho_wo
+        division entirely (n_idx maintained incrementally). The wo division is kept (same
+        magic div/rem as baseline). The hw_idx wrap (when hw_idx >= ho_wo) uses the same
+        v_cmp_gt_u32 + v_cndmask_b32 pattern as the baseline's bounds check. '''
         s = self.sgpr
         v = self.vgpr
         kpb = self.tunable.gemm_k_per_block
+        m_mdiv_rem_vs = macro_mdiv_u32_rem_vs_t(self.mc)
         # k_abs for k-tail check only (no division needed): k_block_off + v_row_local [+ gemm_k_wg_off]
         if s_k_block_off is not None:
             self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], s[{s_k_block_off}], v[{v.v_row_local()}]   ; k_abs (for k-tail check only){(' + row_offset({})'.format(row_offset) if row_offset else '')}")
@@ -1461,43 +1463,35 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_gemm_k()}], v[{v.v_gtc_tmp(0)}]")
             self._emit(f"v_cndmask_b32 v[{v.v_flag_b_ktail()}], 0, 1, vcc_lo   ; wmma_k_tail: k_abs < real gemm_k")
         self._emit_empty_line()
-        # ---- incremental update: wo_idx += kpb, re-divide by wo, conditional ho-wrap ----
-        # Saves the ho_wo division (the more expensive one). The wo division is still needed
-        # to get the carry into ho. The ho-wrap uses v_cmp_lt_u32 (same pattern as baseline's
-        # v_cmp_gt_u32) with v_cndmask_b32 for per-lane conditional subtract.
-        m_mdiv_rem_vs_inc = macro_mdiv_u32_rem_vs_t(self.mc)
-        self._emit(f"; W-6: incremental index update (wo div/rem + conditional ho-wrap)")
-        self._emit(f"v_add_u32 v[{v.v_gtc_tmp(0)}], {kpb}, v[{v.v_inc_wo_idx()}]   ; new_hw = wo_idx + {kpb}")
-        self._emit(m_mdiv_rem_vs_inc(v.v_gtc_tmp(1), v.v_gtc_tmp(2), v.v_gtc_tmp(0), s.s_magic_wo(), s.s_shift_wo(), s.s_wo(), v.v_tmp()))
-        self._emit(f"; v_gtc_tmp(1)=new_wo_idx (rem), v_gtc_tmp(2)=wo_carry (quo)")
-        self._emit(f"v_mov_b32 v[{v.v_inc_wo_idx()}], v[{v.v_gtc_tmp(1)}]   ; wo_idx = new_wo")
-        self._emit(f"v_add_u32 v[{v.v_inc_ho_idx()}], v[{v.v_inc_ho_idx()}], v[{v.v_gtc_tmp(2)}]   ; ho_idx += carry")
-        self._emit_empty_line()
-        # ho wrap: v_cndmask_b32 per-lane conditional
-        # v_cmp_lt_u32 vcc_lo, s[ho], v[ho_idx]: vcc=1 when ho < ho_idx (wrap)
+        # ---- incremental hw_idx update: hw_idx += kpb, conditional wrap by ho_wo ----
+        # v_inc_hw_idx = ho_idx*wo + wo_idx (the ho_wo remainder), maintained incrementally.
+        # When hw_idx >= ho_wo, subtract ho_wo and increment n_idx (rare: once per ho_wo/kpb iters).
+        # Uses v_cmp_gt_u32 (SGPR first, same as baseline's bounds check) + v_cndmask_b32.
+        self._emit(f"; W-6: incremental hw_idx update (hw_idx += {kpb}, conditional wrap by ho_wo)")
+        self._emit(f"v_add_u32 v[{v.v_inc_hw_idx()}], {kpb}, v[{v.v_inc_hw_idx()}]   ; hw_idx += {kpb}")
+        # hw_idx wrap: v_cmp_gt_u32 vcc_lo, s[ho_wo], v[hw_idx] → vcc=1 if ho_wo > hw_idx (no wrap)
+        self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_ho_wo()}], v[{v.v_inc_hw_idx()}]   ; ho_wo > hw_idx (no wrap)?")
+        self._emit(f"v_sub_u32 v[{v.v_gtc_tmp(3)}], v[{v.v_inc_hw_idx()}], s[{s.s_ho_wo()}]   ; hw_idx - ho_wo (for wrap)")
         # v_cndmask_b32 dst, src0, src1, vcc: dst=src0 when vcc=0, dst=src1 when vcc=1
-        self._emit(f"; ho wrap: v_cndmask conditional subtract")
-        self._emit(f"v_cmp_lt_u32 vcc_lo, s[{s.s_ho()}], v[{v.v_inc_ho_idx()}]   ; ho < ho_idx (wrap)?")
-        self._emit(f"v_sub_u32 v[{v.v_gtc_tmp(3)}], v[{v.v_inc_ho_idx()}], s[{s.s_ho()}]   ; ho_idx - ho")
-        self._emit(f"v_cndmask_b32 v[{v.v_inc_ho_idx()}], v[{v.v_inc_ho_idx()}], v[{v.v_gtc_tmp(3)}], vcc_lo   ; (wrap) ? ho_idx-ho : ho_idx")
-        self._emit(f"v_cndmask_b32 v[{v.v_gtc_tmp(4)}], 0, 1, vcc_lo   ; n_carry = (wrap) ? 1 : 0")
-        self._emit(f"v_add_u32 v[{v.v_inc_n_idx()}], v[{v.v_inc_n_idx()}], v[{v.v_gtc_tmp(4)}]")
-        # second ho wrap
-        self._emit(f"v_cmp_lt_u32 vcc_lo, s[{s.s_ho()}], v[{v.v_inc_ho_idx()}]   ; still wrap?")
-        self._emit(f"v_sub_u32 v[{v.v_gtc_tmp(3)}], v[{v.v_inc_ho_idx()}], s[{s.s_ho()}]")
-        self._emit(f"v_cndmask_b32 v[{v.v_inc_ho_idx()}], v[{v.v_inc_ho_idx()}], v[{v.v_gtc_tmp(3)}], vcc_lo")
-        self._emit(f"v_cndmask_b32 v[{v.v_gtc_tmp(4)}], 0, 1, vcc_lo")
-        self._emit(f"v_add_u32 v[{v.v_inc_n_idx()}], v[{v.v_inc_n_idx()}], v[{v.v_gtc_tmp(4)}]")
+        # vcc=1 (no wrap): src1 = hw_idx (keep). vcc=0 (wrap): src0 = hw_idx - ho_wo.
+        self._emit(f"v_cndmask_b32 v[{v.v_inc_hw_idx()}], v[{v.v_gtc_tmp(3)}], v[{v.v_inc_hw_idx()}], vcc_lo   ; hw_idx = (no wrap) ? hw_idx : hw_idx-ho_wo")
+        # n_carry: vcc=1 (no wrap) → 0, vcc=0 (wrap) → 1
+        self._emit(f"v_cndmask_b32 v[{v.v_gtc_tmp(4)}], 1, 0, vcc_lo   ; n_carry = (wrap) ? 1 : 0")
+        self._emit(f"v_add_u32 v[{v.v_inc_n_idx()}], v[{v.v_inc_n_idx()}], v[{v.v_gtc_tmp(4)}]   ; n_idx += n_carry")
         self._emit_empty_line()
-        # ---- compute hi_idx, wi_idx from updated indices (same mul/add, no division) ----
+        # ---- wo div/rem from hw_idx (SAME magic div/rem as baseline's second division) ----
+        self._emit(m_mdiv_rem_vs(v.v_gtc_tmp(3), v.v_gtc_tmp(4), v.v_inc_hw_idx(), s.s_magic_wo(), s.s_shift_wo(), s.s_wo(), v.v_tmp()))
+        self._emit(f"; v_gtc_tmp(3)=wo_idx (rem), v_gtc_tmp(4)=ho_idx (quo)")
+        self._emit_empty_line()
+        # ---- compute hi_idx, wi_idx from ho_idx/wo_idx (same mul/add as baseline) ----
         self._emit(f"; hi_idx = ho_idx*stride_h - pad_h + iy*dilation_h ; wi_idx symmetric")
         self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_iy()}], s[{s.s_dilation_h()}]")
         self._emit(f"s_sub_i32 s[{s.s_tmp(2)}], s[{s.s_tmp(2)}], s[{s.s_pad_h()}]   ; iy*dilation_h - pad_h")
         self._emit(f"s_mul_i32 s[{s.s_tmp(3)}], s[{s.s_ix()}], s[{s.s_dilation_w()}]")
         self._emit(f"s_sub_i32 s[{s.s_tmp(3)}], s[{s.s_tmp(3)}], s[{s.s_pad_w()}]   ; ix*dilation_w - pad_w")
-        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(4)}], s[{s.s_stride_h()}], v[{v.v_inc_ho_idx()}]")
+        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(4)}], s[{s.s_stride_h()}], v[{v.v_gtc_tmp(4)}]")
         self._emit(f"v_add_u32 v[{v.v_gtc_tmp(4)}], v[{v.v_gtc_tmp(4)}], s[{s.s_tmp(2)}]   ; hi_idx")
-        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(3)}], s[{s.s_stride_w()}], v[{v.v_inc_wo_idx()}]")
+        self._emit(f"v_mul_lo_u32 v[{v.v_gtc_tmp(3)}], s[{s.s_stride_w()}], v[{v.v_gtc_tmp(3)}]")
         self._emit(f"v_add_u32 v[{v.v_gtc_tmp(3)}], v[{v.v_gtc_tmp(3)}], s[{s.s_tmp(3)}]   ; wi_idx")
         self._emit_empty_line()
         # ---- v_flag (same bounds check, using updated hi_idx/wi_idx) ----
