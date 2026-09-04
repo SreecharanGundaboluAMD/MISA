@@ -389,16 +389,16 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
             tunable.direction                = sec.at("direction").get_string();
             tunable.precision                = sec.at("precision").get_string();
             // Phase 67: mirror igemm_base.py's default-on promotion of ds_load_tr_b for
-            // every bwd/wrw fp16/bf16 config (excl. wrw_streamk, not yet validated in
-            // combination -- see igemm_base.py's comment). Computed here, not inline
-            // with the other WMMA fields above, because it needs direction/precision,
-            // which aren't parsed yet at that point. MUST stay in sync with the Python
-            // default or hipModuleGetFunction silently fails to find the kernel
+            // every bwd/wrw fp16/bf16 config. The wrw_streamk exclusion was removed after
+            // W-5 validation (ds_load_tr_b=1 + wrw_streamk=1 verified valid:y across
+            // 6 independent runs on 2 shapes). Computed here, not inline with the other
+            // WMMA fields above, because it needs direction/precision, which aren't
+            // parsed yet at that point. MUST stay in sync with the Python default or
+            // hipModuleGetFunction silently fails to find the kernel
             // (kernel-naming desync -- see the gfx1250_kernel_naming_sync_bug memory).
             if(tunable.fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA && !ds_load_tr_b_specified){
                 tunable.ds_load_tr_b = (tunable.direction == "bwd" || tunable.direction == "wrw") &&
-                                       (tunable.precision == "fp16" || tunable.precision == "bf16") &&
-                                       !tunable.wrw_streamk ? 1 : 0;
+                                       (tunable.precision == "fp16" || tunable.precision == "bf16") ? 1 : 0;
             }
             tunable.nxb                      = sec.at("nxb").get_int();
             tunable.nxe                      = sec.at("nxe").get_int();

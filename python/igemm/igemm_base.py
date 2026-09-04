@@ -893,14 +893,15 @@ class igemm_gtc_tunable_parameter_t(object):
             # with zero regression; the only two failures found (wrw's k2x/gemm_k_per_block=64
             # `interleave`/`k2x_dbuf` sections) reproduce identically with ds_load_tr_b=0,
             # confirmed via A/B against the unmodified config -- a pre-existing k2x bug,
-            # unrelated to this change. `wrw_streamk` is excluded from the default (checked
-            # via the raw tunable_dict, not self.wrw_streamk, since that field is parsed
-            # later in __init__) -- stream-K's history of faulting tunables (see the
-            # benchmark-script-validn-trap finding) makes it the one combination not
-            # exercised here; a config can still explicitly opt out (or into, for fwd/fp32/
-            # int8 it stays a no-op) by setting ds_load_tr_b explicitly.
-            _dstrb_default = 1 if (self.direction in ('bwd', 'wrw') and self.precision in ('fp16', 'bf16')
-                                    and not tunable_dict.get('wrw_streamk', 0)) else 0
+            # unrelated to this change.
+            #
+            # The `wrw_streamk` exclusion from the default (originally excluded because
+            # stream-K had a history of faulting tunables) was removed after W-5 validation:
+            # ds_load_tr_b=1 + wrw_streamk=1 verified valid:y across 3 independent runs on
+            # both a medium shape (128x1024x17x17x1024) and a large shape
+            # (256x2048x14x14x2048). A config can still explicitly set
+            # ds_load_tr_b=0 to opt out of the hardware transpose-load path.
+            _dstrb_default = 1 if (self.direction in ('bwd', 'wrw') and self.precision in ('fp16', 'bf16')) else 0
             self.ds_load_tr_b = utility_dict_with_default_t(tunable_dict)('ds_load_tr_b', _dstrb_default)
             if self.ds_load_tr_b:
                 assert self.direction in ('bwd', 'wrw'), "ds_load_tr_b is bwd/wrw only (Phase 63/64) -- fwd's operands aren't LDS-transposed to begin with"
