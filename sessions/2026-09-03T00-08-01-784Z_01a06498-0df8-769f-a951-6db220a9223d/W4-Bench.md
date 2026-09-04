@@ -1,0 +1,1 @@
+Let me look at existing configs to understand the exact format, and check how the driver/codegen works.Now I understand the format. Let me check how to build and run, and find the hsaco path.
