@@ -719,7 +719,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         epilogue_pad = 4 if self.tunable.epilogue_lds_pad else 0
         # Phase 24: f16acc's epilogue stages genuinely 2-byte-per-element LDS data (see
         # coalescing_store_wmma.py's scatter), half the f32 case's footprint.
-        epilogue_elem_bytes = 2 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16) else 4
+        epilogue_elem_bytes = 2 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16 or self.tunable.wmma_fp16_output) else 4
         # Phase 49: the atomic (gemm_k_global_split) epilogue never touches LDS at all (no
         # reshuffle needed for a scalar atomic-add-per-element store) -- mirrors wrw/bwd's
         # identical gating. Phase 53: the chunked epilogue only ever needs

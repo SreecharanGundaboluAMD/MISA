@@ -712,8 +712,11 @@ class igemm_gtc_tunable_parameter_t(object):
             if self.wmma_fp16_output:
                 assert self.precision in ('fp16', 'bf16'), \
                     f"wmma_fp16_output=1 is only valid for fp16/bf16 precision (got precision={self.precision})"
-                assert self.direct_store, \
-                    "wmma_fp16_output=1 requires direct_store=1 (packed fp16 output is only implemented for the direct_store epilogue path)"
+                # C2: wmma_fp16_output now also works without direct_store -- the
+                # non-atomic LDS-reshuffle path converts f32->fp16 at scatter time
+                # (v_cvt_f16_f32 + ds_write_b16) and uses the same 2-byte gather/store
+                # path as wmma_acc_f16. direct_store is still required for the C1 path
+                # (v_permlane_xor_b32 + v_cvt_pk_f16_f32 + global_store_dword).
                 assert not self.gemm_k_global_split, \
                     "wmma_fp16_output=1 and gemm_k_global_split are mutually exclusive -- no packed-fp16 atomic-add on this ISA"
                 assert not self.wmma_acc_f16 and not self.wmma_acc_bf16, \

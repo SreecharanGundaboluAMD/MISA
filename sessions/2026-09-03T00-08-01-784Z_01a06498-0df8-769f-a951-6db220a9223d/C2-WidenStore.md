@@ -1,0 +1,83 @@
+I'll start by understanding the existing code structure. Let me read the key sections of the coalescing store file.The line numbers in the file don't match what the task description says. Let me find the actual content by searching for key patterns.Now let me read the full dispatch section and the non-atomic path more carefully to understand the scatter loop in detail.The structural summary keeps collapsing. Let me read with explicit line ranges.Now let me read the gather section and also look at the direct_store path for C1's fp16 conversion pattern.Now I have a thorough understanding of the code. Let me also check how `wmma_fp16_output` is validated/asserted in `igemm_base.py` to understand the constraints I need to lift.Let me check how `s_gemm_m_stride` is set up in the fwd kernel, and understand the output element byte shift.Let me understand the `vector_write_out` field and how it's configured.Let me check the VGPR MSB tracker and understand if it's active for the test config.Now let me check the `tunable_is_valid` function to understand what constraints exist.Let me check the C++ side for `_f16o` kernel name parsing, and also look at the `v_cvt_f16_f32` instruction availability.Good. I can see `v_cvt_f16_f32` is used elsewhere in the codebase. For bf16, there should be `v_cvt_bf16_f32`. Let me also check the `_f16o` kernel name suffix and how the LDS size is computed for `wmma_fp16_output` (the LDS is only allocated for the non-atomic, non-direct_store path, so I need to include `wmma_fp16_output` in the LDS size calc too).
+
+Now let me look at the LDS size computation in `get_kernel_code`:I now have a thorough understanding of the code. Let me implement the changes. The approach per the user's instruction:
+
+1. Use `is_2byte = ctrl.wmma_acc_f16 or ctrl.wmma_fp16_output` for element sizing
+2. In the scatter loop, convert f32→fp16 via `v_cvt_f16_f32` (or bf16 via `v_cvt_bf16_f32`) into `v_gather` scratch, then `ds_write_b16`
+3. The gather/store path is identical to `wmma_acc_f16`
+
+Let me start with the edits:Good. Now let me update the comment on the `wmma_fp16_output` field definition and the ctrl field. Let me also update the ctrl comment in `coalescing_store_wmma.py`:Now let me update the elem_bytes/instruction selection at lines 796-803. Let me re-read the current state:Now I need to update the scatter loop. Let me re-read it with the current line numbers:Now I need to modify the scatter loop. The key issue is:
+- `wmma_acc_f16`: uses `row_step = 2` (packed 2 rows per register), `ds_write_b16` + `ds_write_b16_d16_hi`
+- f32: uses `row_step = 1`, `ds_write_b32`
+- `wmma_fp16_output`: the accumulator is f32 (one row per register, `row_step = 1`), but output is fp16 (2 bytes/elem). Need `v_cvt_f16_f32` + `ds_write_b16`.
+
+For `wmma_fp16_output`, `row_step` should be 1 (same as f32, since the accumulator is f32 with one row per VGPR). The scatter needs to convert each f32 to fp16 and write via `ds_write_b16`.
+
+I need a scratch VGPR for the conversion result. Looking at the gather section, `v_gather` is used as scratch but only after the barrier. During scatter, `v_gather` is free. Let me check — actually, looking more carefully at the code, `v_gather` is used in the gather section AFTER the barrier. During the scatter section, it's not used. So I can use `v_gather` as scratch for the conversion.
+
+But wait — with `vgpr_msb_tracker`, I need to be careful. The `v_cvt_f16_f32` is a VOP1 instruction — only `dst` matters for MSB. And `ds_write_b16` uses `v_gather` as src0 (data) and `v_tmp1` as src1 (address). Let me think about the MSB tracking...
+
+Actually, looking at the existing code, the `ds_write_b16` already has `v_c` as the data operand (src1 slot per the comment on line 887). For `wmma_fp16_output`, I'd write the converted fp16 into `v_gather` and then use that as the data operand for `ds_write_b16`. The MSB tracking for `v_cvt_f16_f32` writing to `v_gather` — `v_gather` is a bank-0 register, and `v_cvt_f16_f32` is VOP1 (dst is the output). The existing code already ensures src1=1 for the ds_write block. The `v_cvt_f16_f32` reads `v_c` (src0) and writes `v_gather` (dst) — src0 should be at bank 0.
+
+Actually, let me re-examine. The MSB tracker manages which bank VGPRs are read from. `v_cvt_f16_f32 v[v_gather], v[v_c+N]` — dst=v_gather (bank 0), src0=v_c+N (bank 0 normally, but if vgpr_msb_tracker is active, v_c is in bank 1). Hmm, but looking at the existing f32 path, `ds_write_b32 v[v_tmp1], v[v_c+N]` reads v_c+N at src1=1 (bank 1), and that works correctly. So for the fp16 path, `v_cvt_f16_f32 v[v_gather], v[v_c+N]` reads v_c+N as src0. I need to ensure src0 is at the right bank.
+
+Actually, let me look more carefully at the vgpr_msb_tracker pattern. The comment at line 886-888 says "v_c is the DATA operand of ds_write_b16/b16_d16_hi/b32 below (VDS -> src1 slot)". So when MSB is active, v_c is in bank 1 and src1 is set to 1 to read it. For `v_cvt_f16_f32`, v_c would be src0, not src1. So I'd need src0=1 instead. This is getting complex.
+
+Let me check if the test config will even have `vgpr_msb_tracker` active. Looking at the fwd kernel: `self.vgpr_msb_tracker = vgpr_msb_tracker_t() if tunable.wmma_acc_high_bank else None`. The test config doesn't include `wmma_acc_high_bank`, so the tracker will be None. For now, let me handle the non-MSB case correctly and add a guard for the MSB case.
+
+Actually, let me look at whether `wmma_acc_high_bank` can be combined with `wmma_fp16_output`. Since `wmma_fp16_output` is mutually exclusive with `wmma_acc_f16` (which is what `wmma_acc_high_bank` is designed for), but `wmma_acc_high_bank` itself is a separate flag... Let me check:`wmma_acc_high_bank` is not mutually exclusive with `wmma_fp16_output` in the current assertions. However, combining them would be complex (MSB tracking for the conversion). For now, let me add an assertion that `wmma_fp16_output` on the non-atomic path requires `wmma_acc_high_bank` to be off (since the MSB tracking for the v_cvt instruction isn't wired). Actually, let me think about this differently — if `wmma_acc_high_bank` is set, `v_c` lives in bank 1. The `v_cvt_f16_f32` instruction reads `v_c` as src0. For MSB, src0 would need to be bank 1. But the existing ds_write_b32 path reads `v_c` at src1=1. So the conversion instruction would need src0=1.
+
+This is getting complex. Let me add a simple assertion for now and handle the MSB case later if needed. Let me also check whether `wmma_acc_high_bank` is commonly combined with non-atomic configs:OK. For the MSB case with `wmma_fp16_output` on the non-atomic path, I need the `v_cvt_f16_f32` instruction to read `v_c` from bank 1 (src0=1). The existing code sets src1=1 for the ds_write block. But `v_cvt_f16_f32` uses src0, not src1. Let me think about this more carefully...
+
+Actually, looking at the code flow: the MSB tracker's `ensure(src1=1)` is called right before the ds_write block (line 889). This sets src1 to bank 1 so that `ds_write_b32 v[v_tmp1], v[v_c+N]` reads v_c from bank 1 (VDS format: src0=address, src1=data). 
+
+For `wmma_fp16_output`, I'd emit:
+1. `v_cvt_f16_f32 v[v_gather], v[v_c+N]` — VOP1: dst=v_gather, src0=v_c+N. Needs src0=1 to read v_c from bank 1.
+2. `ds_write_b16 v[v_tmp1], v[v_gather]` — VDS: src0=v_tmp1 (address), src1=v_gather (data). v_gather is bank 0, so src1=0.
+
+So the MSB flow would be: ensure(src0=1) for the cvt, then ensure(src0=0, src1=0) for the ds_write. This is different from the existing wmma_acc_f16 flow which does ds_write_b16 with v_c as data (src1=1).
+
+This is complex but doable. However, for now let me add an assertion against the combination and focus on getting the non-MSB path working. Let me add the assertion in the dispatch:Now let me add the assertion for `wmma_fp16_output` + `vgpr_msb_tracker` not being compatible yet, and also handle the `wmma_n_tail` condition which currently checks `not ctrl.wmma_acc_f16`:Wait, `is_2byte` is defined later (around line 802). But I'm using it at line 760. Let me check:I see the problem — `is_2byte` is defined at line 818, but I'm using it at line 760. I need to move the `is_2byte` definition up. Let me restructure: move `is_2byte` definition before the `wmma_n_tail` check.Hmm, I see the old comment text is still there. Let me read the area to see the full state:I need to fix the duplicate `is_2byte` definition and clean up the comment. Let me remove the stale comment at lines 760-761 and the duplicate `is_2byte` at line 820:Now remove the duplicate `is_2byte` definition at the later location:Good. Now let me update the scatter loop. Let me re-read it with current line numbers:Now I need to modify the scatter loop to handle `wmma_fp16_output`. The key changes:
+1. `row_step` should be 1 for `wmma_fp16_output` (f32 accumulator, one row per VGPR — same as f32)
+2. In the inner loop, when `wmma_fp16_output` is set, convert f32→fp16 and write via `ds_write_b16`
+
+For the conversion, I need a scratch VGPR. `v_gather` is available during scatter (it's only used after the barrier in the gather section). I'll use `v_gather` as the conversion scratch.
+
+The conversion instruction for fp16 is `v_cvt_f16_f32` and for bf16 is `v_cvt_bf16_f32`. Let me check what precision info is available:Good — `ctrl.precision` is available and the direct_store path already uses it to pick between fp16 and bf16 conversion. Now let me implement the scatter loop changes:Now I need to update the gather section. The gather section has conditions that check `ctrl.wmma_acc_f16` — I need to update those to use `is_2byte`. Let me re-read the gather section:I see two places in the gather section that check `ctrl.wmma_acc_f16`:
+1. Line 1009: `if vwo > 1 and not ctrl.wmma_acc_f16:` — Phase 51 n_tail condition
+2. Line 1034: `if ctrl.wmma_n_tail and vwo > 1 and not ctrl.wmma_acc_f16:` — Phase 51 pass loop condition
+
+These need to use `not is_2byte` instead. Let me also check the comment at line 1055-1058 which mentions the limitation. Let me update both:Now I also need to update the comment at line 1055-1058 about the wmma_acc_f16 limitation. Let me read that:The comment mentions "Not yet extended to wmma_acc_f16/bf16acc's packed-2-elements-per-register layout" — this is still true (the slow path's per-element `global_store_dword` uses `elem_bytes` offsets which would be wrong for 2-byte elements). The condition `not is_2byte` already excludes both `wmma_acc_f16` and `wmma_fp16_output` from this path, so the comment is still accurate. No change needed.
+
+Now I need to update the LDS size computation in the fwd kernel to include `wmma_fp16_output`:Now let me also check the bwd and wrw generators for the same pattern:I should update bwd and wrw too for consistency. Let me do that:Now I also need to check the chunked non-atomic store path (`_emit_chunked_non_atomic_store`) — it has similar `wmma_acc_f16` checks. Let me check:The chunked path also has `wmma_acc_f16` checks. However, the chunked path is only used when `wmma_epilogue_chunked` is set. For now, `wmma_fp16_output` + `wmma_epilogue_chunked` is not a target combination — the test config doesn't use chunked. But I should still handle it for correctness. Let me check if `wmma_fp16_output` + `wmma_epilogue_chunked` is asserted against anywhere:`wmma_epilogue_chunked` is not asserted against `wmma_fp16_output`. For now, let me add an assertion in the dispatch to prevent the combination (the chunked path's scatter loop would need the same v_cvt_f16_f32 + ds_write_b16 treatment):The edit broke the syntax — I replaced the wrong line. Let me read and fix:I see — the `PUT 773.=774:` replaced the assertion message line and the `if ctrl.wmma_epilogue_chunked:` line. I need to fix this. The original line 773 was the continuation of the assert message, and line 774 was `if ctrl.wmma_epilogue_chunked:`. Let me fix:Good, that looks correct now. Let me verify the file parses:Now let me also check the other modified files parse:All files parse. Now let me create the test config and build. First, let me check how the codegen works:Now let me create the test config. The config needs to NOT have `direct_store = 1` and NOT have `gemm_k_global_split = 1`:Build succeeded with no errors. Now let me check what was generated and build the conv_driver:The conv_driver.exe is already there. Let me verify the generated assembly has the expected instructions:Hmm, no matches. Let me check what's in the assembly file:The .s file is just macros. The actual kernel code is in the .inc file. Let me check there:320 matches. Let me see the specific instructions:The assembly has:
+- 128 `v_cvt_f16_f32` (f32→fp16 conversion, one per accumulator element)
+- 128 `ds_write_b16` (scatter to LDS)
+- 32 `global_store_dwordx2` (vectorized stores — 4x fewer than C1's 128 `global_store_dword`)
+- 32 `ds_read_b64` (gather reads)
+
+This confirms the C2 path is working as expected. With vwo=4 and 2-byte elements:
+- `ds_read_b64` reads 8 bytes = 4 fp16 elements
+- `global_store_dwordx2` stores 8 bytes = 4 fp16 elements
+
+Now let me run correctness tests. Let me run the 3 shapes × 3 independent runs:Correctness passes. Let me run the remaining 2 runs for shape 1, and start shape 2:Shape 1 all 3 runs pass with valid:y. Now shape 2 and 3:Both pass. Let me run the remaining runs for shapes 2 and 3:All 9 correctness runs pass (3 shapes × 3 runs each), all `valid:y`. Now let me build the baseline (f32 output, no wmma_fp16_output) and C1 (wmma_fp16_output + direct_store) configs for benchmarking comparison.Both built. Now let me run all 3 shapes × 3 runs for baseline and C1. Let me script this efficiently:The baseline benchmark is still running. Let me wait for it:Baseline done. Now let me run C1 benchmarks:All benchmarks complete. Let me now compute the averages and write the findings document.There's an issue — I mixed up the C2 results for shapes 2 and 3. Let me re-check. Looking at the C2 runs:
+
+- C2 Shape 1: 594.838, 594.847, 595.660 — correct
+- C2 Shape 2 runs came in pairs: `120.241` and then `120.921, 121.877` — wait, let me look at the original C2 runs more carefully.
+
+The first C2 run for shape 2 was `0.027ms, 120.241 TFLOP/s` — but that was actually shape 2 (n=128, c=1024, H=17, W=17, k=1024). The cost was 0.027ms. But the baseline for the same shape was 0.159ms = 489 TFLOP/s. Something is wrong.
+
+Wait — 0.027ms is way too fast for that shape. Let me check if there's a mixup. Looking at the C2 shape 2 run: the command was `-n 128 -c 1024 -H 17 -W 17 -k 1024`. The result was `cost:0.027ms, tflops:120.241`. But the baseline same shape was `cost:0.159ms, tflops:489.220`. 
+
+The TFLOP/s calculation: for shape 2, flops = 2 * 128 * 1024 * 17 * 17 * 1024 * 1 * 1 = 2 * 128 * 1024 * 289 * 1024 = 77.4 GFLOP. At 0.027ms, that's 77.4e9 / 0.027e-3 = 2.87e15 = 2867 TFLOP/s. But the driver reports 120 TFLOP/s. Something doesn't add up.
+
+Actually wait — let me look at the actual C2 runs more carefully. The first C2 run was:
+- Shape 1: `cost:0.708ms, tflops:594.838` ✓
+- Shape 2 run 1: `cost:0.027ms, tflops:120.241` — this seems wrong
+
+But then shape 2 runs 2 and 3: `cost:0.027ms, tflops:120.921` and `cost:0.027ms, tflops:121.877`.
+
+And shape 3: `cost:0.162ms, tflops:477.823` — but baseline shape 3 was `cost:0.042ms, tflops:78.028`.
+
+So C2's shape 2 and shape 3 results are swapped compared to baseline! Let me check if I actually ran them in the right order. Let me re-run C2 shapes 2 and 3 explicitly to verify:Now the results are correct! The previous C2 runs for shapes 2 and 3 were indeed swapped. Let me re-run C2 for shapes 2 and 3 properly, 3 times each:Now I also need to re-check the baseline shape 3. The baseline shape 3 was `cost:0.042ms, tflops:78.028` — but C2 shape 3 is `cost:0.027ms, tflops:118.478`. C2 is actually faster for shape 3! Let me also check — the baseline shape 3 had c=32, k=128, but for fp16 precision, gemm_k = c*y*x = 32*1*1 = 32. And gemm_k_per_block = 32. So gemm_k/gemm_k_per_block = 1, which is fine. gemm_m = 128*56*56 = 401408, gemm_n = k = 128.
+
+Wait, but the baseline's `valid:y` for shape 3 with `cost:0.042ms` and 78 TFLOP/s. And C2's `cost:0.027ms` and 118 TFLOP/s. That's a significant speedup. Let me compute properly:Let me re-run all 3 configs across all 3 shapes fresh, sequentially to avoid contention issues.Good. Now C1:Now C2:All data collected. Let me compute the averages:Excellent results. Now let me write the findings document and commit.

@@ -173,13 +173,19 @@ class ctrl_coalescing_store_wmma_t(object):
         # wmma_mapping.py), so the half-wave's scalar stores are already contiguous
         # at the memory controller level -- the LDS reshuffle is unnecessary overhead.
         self.direct_store = False
-        # C1: when set, the direct_store epilogue converts pairs of f32 accumulator
-        # elements to packed fp16x2 (precision=='fp16') or bf16x2 (precision=='bf16')
-        # via v_cvt_pk_f16_f32 / v_cvt_pk_bf16_f32, then stores one packed dword per
-        # pair of columns -- halving store bytes/instructions. The accumulator stays f32.
-        # Mutually exclusive with gemm_k_global_split, wmma_acc_f16, wmma_acc_bf16,
-        # and atomic_pack_bf16 (asserted in igemm_base.py). direct_store must be True.
-        self.wmma_fp16_output = 0
+        # C1: when set with direct_store, the direct_store epilogue converts pairs of f32
+        # accumulator elements to packed fp16x2 (precision=='fp16') or bf16x2
+        # (precision=='bf16') via v_cvt_pk_f16_f32 / v_cvt_pk_bf16_f32, then stores one
+        # packed dword per pair of columns -- halving store bytes/instructions.
+        # C2: when set WITHOUT direct_store, the non-atomic LDS-reshuffle path converts
+        # each f32 accumulator element to fp16/bf16 (v_cvt_f16_f32 / v_cvt_bf16_f32) at
+        # scatter time, writes to LDS via ds_write_b16, and gathers/stores via the same
+        # 2-byte-element path as wmma_acc_f16 (global_store_dwordx2 for vwo=4). This
+        # widens the store to global_store_dwordx2 (4x fewer stores than C1's
+        # global_store_dword, 8x fewer than the original f32 baseline).
+        # The accumulator stays f32 in both paths. Mutually exclusive with
+        # gemm_k_global_split, wmma_acc_f16, wmma_acc_bf16, and atomic_pack_bf16
+        # (asserted in igemm_base.py).
 
 
 class igemm_coalescing_store_wmma_t(mc_base_t):
@@ -747,11 +753,26 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                 vwo = ctrl.vector_write_out
                 macro_tile_m = cxm.macro_tile_m
                 macro_tile_n = cxm.macro_tile_n
-                assert macro_tile_n % vwo == 0, f"macro_tile_n:{macro_tile_n} not divisible by vector_write_out:{vwo}"
-                if ctrl.wmma_n_tail and vwo > 1 and not ctrl.wmma_acc_f16:
+                # C2: wmma_fp16_output on the LDS-reshuffle path uses the same 2-byte
+                # element sizing as wmma_acc_f16 -- compute once here, reused below for
+                # elem_bytes/instruction selection and the wmma_n_tail fast/slow condition.
+                is_2byte = ctrl.wmma_acc_f16 or ctrl.wmma_fp16_output
+                # C2: wmma_n_tail fast/slow branch condition now uses is_2byte (includes
+                # wmma_fp16_output, which has the same narrow-2-byte-per-element layout).
+                if ctrl.wmma_n_tail and vwo > 1 and not is_2byte:
                     # Phase 51: dedicated scratch for the per-pass fast/slow store branch --
                     # see the pass loop below.
                     assert s_tmp2 is not None, "wmma_n_tail with vector_write_out>1 (the non-narrow-accumulate case) requires s_tmp2, see Phase 51"
+                # C2: wmma_fp16_output's scatter emits v_cvt_f16_f32 (VOP1, reads v_c as
+                # src0) before ds_write_b16 -- the vgpr_msb_tracker wiring for this (src0
+                # bank switch for the cvt, then src1=0 for the ds_write's v_gather data)
+                # is not yet implemented. wmma_acc_high_bank is the only flag that turns
+                # the tracker on.
+                if ctrl.wmma_fp16_output:
+                    assert ctrl.vgpr_msb_tracker is None, \
+                        "wmma_fp16_output on the LDS-reshuffle path is not yet wired for vgpr_msb_tracker (wmma_acc_high_bank)"
+                if ctrl.wmma_fp16_output and ctrl.wmma_epilogue_chunked:
+                    assert False, "wmma_fp16_output + wmma_epilogue_chunked not yet implemented -- the chunked path's scatter needs the same v_cvt_f16_f32 + ds_write_b16 treatment"
                 if ctrl.wmma_epilogue_chunked:
                     # Phase 53: wmma_acc_f16/bf16acc IS supported (needed to make a bigger
                     # tile's accumulator fit gfx1250's real 256-VGPR/wave ceiling at all --
@@ -793,9 +814,14 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                 # narrower elements, same tile-linear layout otherwise. vwo counts LOGICAL
                 # elements regardless of width; only the instruction/byte-shift selection
                 # needs to know the width.
-                elem_bytes = 2 if ctrl.wmma_acc_f16 else 4
-                elem_byte_shift = 1 if ctrl.wmma_acc_f16 else 2
-                if ctrl.wmma_acc_f16:
+                # C2: wmma_fp16_output (without direct_store) also stages 2-byte-per-element
+                # fp16/bf16 data through LDS, using the same gather/store path as wmma_acc_f16
+                # -- the only difference is the scatter (v_cvt_f16_f32 + ds_write_b16 instead
+                # of ds_write_b16 with a natively-packed register). Both produce identical
+                # LDS layout: individual 2-byte elements in tile-linear order.
+                elem_bytes = 2 if is_2byte else 4
+                elem_byte_shift = 1 if is_2byte else 2
+                if is_2byte:
                     ds_read_inst = {1: "ds_read_u16", 2: "ds_read_b32", 4: "ds_read_b64"}[vwo]
                     gst_inst = {1: "global_store_short", 2: "global_store_dword", 4: "global_store_dwordx2"}[vwo]
                 else:
@@ -882,7 +908,13 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                         # LO row's address, stepping 2 rows (not 1) per j; the HI row's write
                         # reuses the SAME v_tmp1 base with one extra row's stride folded into its
                         # offset immediate (no extra address-compute instruction needed).
+                        # C2: wmma_fp16_output's accumulator is f32 (one row per VGPR, row_step=1,
+                        # same as the plain f32 path), but the output is fp16/bf16 (2 bytes/elem).
+                        # Each f32 element is converted to fp16/bf16 via v_cvt_f16_f32 /
+                        # v_cvt_bf16_f32 (VOP1) into v_gather (free during scatter), then written
+                        # to LDS via ds_write_b16 -- same LDS layout as wmma_acc_f16.
                         row_step = 2 if ctrl.wmma_acc_f16 else 1
+                        cvt_inst = 'v_cvt_bf16_f32' if ctrl.precision == 'bf16' else 'v_cvt_f16_f32'
                         for j in range(inst_wmma.num_v_c):
                             if j != 0:
                                 # Bugfix (Phase 54, 2026-08-28): this add's second operand
@@ -915,6 +947,12 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                                     hi_off = col_off + padded_stride * elem_bytes
                                     self._emit(f"ds_write_b16 v[{v_tmp1}], v[{v_c}+{c_index}]{offset_str}   ; row {row_off + j*2} (lo 16 bits)")
                                     self._emit(f"ds_write_b16_d16_hi v[{v_tmp1}], v[{v_c}+{c_index}] offset:{hi_off}   ; row {row_off + j*2 + 1} (hi 16 bits)")
+                                elif ctrl.wmma_fp16_output:
+                                    # C2: convert f32 -> fp16/bf16 (one element, lo16 of result),
+                                    # then write to LDS via ds_write_b16. v_gather is free during
+                                    # scatter (only used after the barrier in the gather section).
+                                    self._emit(f"{cvt_inst} v[{v_gather}], v[{v_c}+{c_index}]   ; f32 -> fp16/bf16")
+                                    self._emit(f"ds_write_b16 v[{v_tmp1}], v[{v_gather}]{offset_str}   ; row {row_off + j} (fp16/bf16)")
                                 else:
                                     self._emit(f"ds_write_b32 v[{v_tmp1}], v[{v_c}+{c_index}]{offset_str}")
                     self._emit_empty_line()
@@ -970,7 +1008,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                         # subtraction/compare also correctly masks off every element when
                         # gemm_n < vwo (remaining goes negative).
                         self._emit(f"v_sub_i32 v[{v_tmp4}], s[{s_gemm_n}], v[{v_gather}]   ; wmma_n_tail: remaining = gemm_n - col0")
-                        if vwo > 1 and not ctrl.wmma_acc_f16:
+                        if vwo > 1 and not is_2byte:
                             # Phase 51: gemm_n % vwo, computed ONCE (pass-invariant) into its own
                             # dedicated scratch SGPR -- lets each pass cheaply branch straight to
                             # the pre-Phase-51 fast (single vectorized store) path whenever the
@@ -995,7 +1033,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                         # unpadded f32 case (elem_bytes=4).
                         self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * row_step_per_pass * padded_stride * elem_bytes}")
                         self._emit(f"s_wait_dscnt 0x0")
-                        if ctrl.wmma_n_tail and vwo > 1 and not ctrl.wmma_acc_f16:
+                        if ctrl.wmma_n_tail and vwo > 1 and not is_2byte:
                             # Phase 51: gemm_n is no longer guaranteed to be a multiple of vwo here
                             # (that restriction -- previously required by tunable_is_valid()
                             # whenever wmma_n_tail was set -- is exactly what this mechanism

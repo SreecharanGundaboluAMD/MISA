@@ -677,7 +677,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         epilogue_pad = 4 if self.tunable.epilogue_lds_pad else 0
         # Phase 24: f16acc's epilogue stages genuinely 2-byte-per-element LDS data (see
         # coalescing_store_wmma.py's scatter), half the f32 case's footprint.
-        epilogue_elem_bytes = 2 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16) else 4
+        epilogue_elem_bytes = 2 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16 or self.tunable.wmma_fp16_output) else 4
         # PERF-007 (2026-09-02): see igemm_fwd_gtc_wmma_nhwc.py's identical comment --
         # direct_store (Phase 59) skips the LDS-reshuffle epilogue entirely, so it needs
         # zero epilogue LDS just like gemm_k_global_split's atomic path.
