@@ -682,22 +682,25 @@ int main(int argc, char **argv) {
     // printf("tunables:%d, hsaco:%s\n", tunables.size(), hsaco);
 
     // COR-004 (2026-09-02): everything below this point (is_wmma_f16_acc,
-    // is_wmma_bf16_acc, is_wmma_atomic_pack_bf16, and every buffer-allocation/
-    // verification decision derived from them further down in main()/
-    // launch_conv_driver) reads ONLY tunables[0]'s accumulate-width flags and applies
-    // that single choice to every kernel in the vector -- a combined/master config file
-    // that mixed e.g. a wmma_acc_f16 section with a plain fp32-accumulate section of the
-    // same direction/precision would silently size and verify every OTHER tunable's
-    // buffers against tunables[0]'s width instead of its own, corrupting results without
-    // any diagnostic. Only meaningful for WMMA (XDLOPS/DLOPS/MAC never read these flags).
+    // is_wmma_bf16_acc, is_wmma_atomic_pack_bf16, is_wmma_fp16_output, and every
+    // buffer-allocation/verification decision derived from them further down in main()/
+    // launch_conv_driver) reads ONLY tunables[0]'s accumulate-width/output-width flags
+    // and applies that single choice to every kernel in the vector -- a combined/master
+    // config file that mixed e.g. a wmma_acc_f16 section with a plain fp32-accumulate
+    // section of the same direction/precision would silently size and verify every OTHER
+    // tunable's buffers against tunables[0]'s width instead of its own, corrupting results
+    // without any diagnostic. Only meaningful for WMMA (XDLOPS/DLOPS/MAC never read these
+    // flags).
     if(tunables[0].fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA){
         for(size_t i = 1; i < tunables.size(); i++){
             assert(tunables[i].fma_type != IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA ||
                    (tunables[i].wmma_acc_f16 == tunables[0].wmma_acc_f16 &&
                     tunables[i].wmma_acc_bf16 == tunables[0].wmma_acc_bf16 &&
-                    tunables[i].atomic_pack_bf16 == tunables[0].atomic_pack_bf16) &&
-                   "all WMMA tunables in one config must share the same accumulate-width "
-                   "flags (wmma_acc_f16/wmma_acc_bf16/atomic_pack_bf16) as tunables[0] -- "
+                    tunables[i].atomic_pack_bf16 == tunables[0].atomic_pack_bf16 &&
+                    tunables[i].wmma_fp16_output == tunables[0].wmma_fp16_output) &&
+                   "all WMMA tunables in one config must share the same accumulate-width/"
+                   "output-width flags (wmma_acc_f16/wmma_acc_bf16/atomic_pack_bf16/"
+                   "wmma_fp16_output) as tunables[0] -- "
                    "see COR-004: the driver's buffer sizing/verification below only reads "
                    "tunables[0]'s choice and applies it to every kernel in the vector");
         }
@@ -727,6 +730,11 @@ int main(int argc, char **argv) {
     // kernel writes grad_weight directly at bf16 width, no fp32 workspace), just gated to
     // atomic_pack_bf16 instead of an accumulate-precision tunable.
     bool is_wmma_atomic_pack_bf16 = is_wmma && tunables[0].atomic_pack_bf16 != 0;
+    // C1: wmma_fp16_output converts f32 accumulator to packed fp16x2/bf16x2 in the
+    // direct_store epilogue -- same 2-byte-native-output-buffer situation as
+    // is_wmma_f16_acc/is_wmma_bf16_acc above, just a different mechanism (the
+    // accumulator stays f32, only the store narrows). Gated to wmma_fp16_output.
+    bool is_wmma_fp16_output = is_wmma && tunables[0].wmma_fp16_output != 0;
 
     hipModule_t module;
 #ifndef IGEMM_SPLIT_KERNEL
@@ -828,7 +836,7 @@ int main(int argc, char **argv) {
     // -- e.g. a pure fp32 build defines none of them, and previously (a Phase 24 regression,
     // caught by this branch's own byte-identical-assembly regression sweep) those lambdas
     // failed to compile with "use of undeclared identifier 'dtype_alloc_byte'".
-    size_t dtype_alloc_byte = (is_wmma_f16_acc || is_wmma_bf16_acc || is_wmma_atomic_pack_bf16) ? data_byte : (is_wmma ? sizeof(float) : data_byte);
+    size_t dtype_alloc_byte = (is_wmma_f16_acc || is_wmma_bf16_acc || is_wmma_atomic_pack_bf16 || is_wmma_fp16_output) ? data_byte : (is_wmma ? sizeof(float) : data_byte);
 #if defined(USE_HALF) || defined(USE_INT8) || defined(USE_BF16) || defined(USE_INT4)
     host_input_dtype  = malloc(n * c * hi * wi * dtype_alloc_byte);
     host_weight_dtype = malloc(k * c * y * x * dtype_alloc_byte);
@@ -1041,13 +1049,12 @@ int main(int argc, char **argv) {
                                    hipMemcpyDeviceToHost));
                     is_valid = valid_vector<float>(host_output, static_cast<float*>(device_output_to_host),
                                             static_cast<size_t>(n) * k * ho * wo, nrms);
-                }else if(is_wmma_f16_acc){
-                    // Phase 24: device_output_dtype holds the WMMA kernel's genuinely
-                    // 2-byte/element (packed-then-unpacked, see coalescing_store_wmma.py)
-                    // fp16 output -- expand it to fp32 via the new tensor_cast kernel
-                    // (reusing device_output, free by this point -- its data was already
-                    // copied out to host_output for the reference comparison above) so the
-                    // existing valid_vector<float> comparison logic runs unchanged.
+                }else if(is_wmma_f16_acc || (is_wmma_fp16_output && driver_data_type == driverHalf)){
+                    // Phase 24 / C1: device_output_dtype holds the WMMA kernel's genuinely
+                    // 2-byte/element fp16 output (wmma_acc_f16 packs in the WMMA instruction,
+                    // wmma_fp16_output packs in the epilogue store -- same buffer width either
+                    // way) -- expand it to fp32 via the tensor_cast kernel so the existing
+                    // valid_vector<float> comparison logic runs unchanged.
                     hipFunction_t f16acc_cast_func;
                     HIP_CALL(hipModuleGetFunction(&f16acc_cast_func, module_tensor_cast, "tensor_cast_fp32_fp16acc_1d"));
                     tensor_cast_karg_t karg_f16acc_cast;
@@ -1061,8 +1068,8 @@ int main(int argc, char **argv) {
                                    hipMemcpyDeviceToHost));
                     is_valid = valid_vector<float>(host_output, static_cast<float*>(device_output_to_host),
                                             static_cast<size_t>(n) * k * ho * wo, nrms);
-                }else if(is_wmma_bf16_acc){
-                    // Phase 27: bf16 analog of the is_wmma_f16_acc branch above.
+                }else if(is_wmma_bf16_acc || (is_wmma_fp16_output && driver_data_type == driverBFloat16)){
+                    // Phase 27 / C1: bf16 analog of the fp16 branch above.
                     hipFunction_t bf16acc_cast_func;
                     HIP_CALL(hipModuleGetFunction(&bf16acc_cast_func, module_tensor_cast, "tensor_cast_fp32_bf16acc_1d"));
                     tensor_cast_karg_t karg_bf16acc_cast;
@@ -1224,8 +1231,8 @@ int main(int argc, char **argv) {
                                     hipMemcpyDeviceToHost));
                     is_valid = valid_vector<float>(host_input, static_cast<float*>(device_input_to_host),
                                                 static_cast<size_t>(n) * c * hi * wi, nrms);
-                } else if(is_wmma_f16_acc){
-                    // Phase 24: see the equivalent fwd comment near is_wmma_f16_acc.
+                } else if(is_wmma_f16_acc || (is_wmma_fp16_output && driver_data_type == driverHalf)){
+                    // Phase 24 / C1: see the equivalent fwd comment.
                     hipFunction_t f16acc_cast_func;
                     HIP_CALL(hipModuleGetFunction(&f16acc_cast_func, module_tensor_cast, "tensor_cast_fp32_fp16acc_1d"));
                     tensor_cast_karg_t karg_f16acc_cast;
@@ -1239,8 +1246,8 @@ int main(int argc, char **argv) {
                                     hipMemcpyDeviceToHost));
                     is_valid = valid_vector<float>(host_input, static_cast<float*>(device_input_to_host),
                                                 static_cast<size_t>(n) * c * hi * wi, nrms);
-                } else if(is_wmma_bf16_acc){
-                    // Phase 27: bf16 analog of the is_wmma_f16_acc branch above.
+                } else if(is_wmma_bf16_acc || (is_wmma_fp16_output && driver_data_type == driverBFloat16)){
+                    // Phase 27 / C1: bf16 analog of the fp16 branch above.
                     hipFunction_t bf16acc_cast_func;
                     HIP_CALL(hipModuleGetFunction(&bf16acc_cast_func, module_tensor_cast, "tensor_cast_fp32_bf16acc_1d"));
                     tensor_cast_karg_t karg_bf16acc_cast;
@@ -1417,8 +1424,8 @@ int main(int argc, char **argv) {
                                    hipMemcpyDeviceToHost));
                     is_valid = valid_vector<float>(host_weight, static_cast<float*>(device_weight_to_host),
                                     static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x, nrms);
-                }else if(is_wmma_f16_acc){
-                    // Phase 24: see the equivalent fwd comment near is_wmma_f16_acc.
+                }else if(is_wmma_f16_acc || (is_wmma_fp16_output && driver_data_type == driverHalf)){
+                    // Phase 24 / C1: see the equivalent fwd comment.
                     hipFunction_t f16acc_cast_func;
                     HIP_CALL(hipModuleGetFunction(&f16acc_cast_func, module_tensor_cast, "tensor_cast_fp32_fp16acc_1d"));
                     tensor_cast_karg_t karg_f16acc_cast;
@@ -1432,8 +1439,8 @@ int main(int argc, char **argv) {
                                    hipMemcpyDeviceToHost));
                     is_valid = valid_vector<float>(host_weight, static_cast<float*>(device_weight_to_host),
                                         static_cast<size_t>(ngroups) * (k / ngroups) * (c / ngroups) * y * x, nrms);
-                }else if(is_wmma_bf16_acc){
-                    // Phase 27: bf16 analog of the is_wmma_f16_acc branch above.
+                }else if(is_wmma_bf16_acc || (is_wmma_fp16_output && driver_data_type == driverBFloat16)){
+                    // Phase 27 / C1: bf16 analog of the fp16 branch above.
                     hipFunction_t bf16acc_cast_func;
                     HIP_CALL(hipModuleGetFunction(&bf16acc_cast_func, module_tensor_cast, "tensor_cast_fp32_bf16acc_1d"));
                     tensor_cast_karg_t karg_bf16acc_cast;

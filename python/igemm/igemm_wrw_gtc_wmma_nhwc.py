@@ -232,6 +232,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # actual behavior is precision-agnostic (2-byte-packed accumulator), so both tunables
         # funnel into it.
         ctrl_coalescing_store_wmma.wmma_acc_f16 = tunable.wmma_acc_f16 or tunable.wmma_acc_bf16
+        ctrl_coalescing_store_wmma.wmma_fp16_output = tunable.wmma_fp16_output
         ctrl_coalescing_store_wmma.atomic_pack_bf16 = tunable.atomic_pack_bf16
         # Phase 35: wire wrw's M/N-tail into the epilogue (fwd/bwd already do this).
         ctrl_coalescing_store_wmma.wmma_m_tail = tunable.wmma_m_tail
@@ -587,6 +588,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 # byte-index operand (formerly v_pk_idx, removed).
                 self.v_pk_partner = sym_t('v_pk_partner' , vseq(1))
                 self.v_pk_packed  = sym_t('v_pk_packed'  , vseq(1))
+            if outer.tunable.wmma_fp16_output:
+                # C1: scratch for direct_store epilogue's cross-lane exchange + packed result.
+                self.v_fp16o_partner = sym_t('v_fp16o_partner', vseq(1))
+                self.v_fp16o_packed  = sym_t('v_fp16o_packed', vseq(1))
             if outer.tunable.wrw_incremental_gather and outer.row_stride == 1:
                 # W-6: persistent per-thread indices for the incremental B-gather. Seeded by
                 # the first gather (full div/rem), then add+conditional-wrap each iteration.
@@ -1070,7 +1075,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # mechanism (packed-atomic epilogue, not a packed-accumulator VGPR layout) --
         # found via a real hardware miscompare on group>1 (g=1 has a zero group offset
         # regardless of this shift's value, masking the bug entirely).
-        out_elem_byte_shift_group = 1 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16 or self.tunable.atomic_pack_bf16) else 2
+        out_elem_byte_shift_group = 1 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16 or self.tunable.atomic_pack_bf16 or self.tunable.wmma_fp16_output) else 2
         self._emit(f"; output (grad_weight): group offset = group_idx * gemm_m * wei_row_c elements")
         self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group_idx()}], s[{s.s_gemm_m()}]")
         self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_wei_row_c()}]")
@@ -1297,7 +1302,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # element width to 2 bytes, so this must shift by 1, not 2, in that case.
         # atomic_pack_bf16 (Phase 34) is the same 2-byte-native case for a different reason
         # (packed-atomic epilogue writes bf16 directly) -- see out_elem_byte_shift_group above.
-        out_elem_byte_shift = 1 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16 or self.tunable.atomic_pack_bf16) else 2
+        out_elem_byte_shift = 1 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16 or self.tunable.atomic_pack_bf16 or self.tunable.wmma_fp16_output) else 2
         self._emit(f"; s_p_out_tap = p_out + (iy*x+ix)*gemm_n*{1 << out_elem_byte_shift} bytes (WMMA D-operand is")
         self._emit(f"; fp32/int32 (4B) normally, or fp16 (2B) under wmma_acc_f16 -- see coalescing_store_wmma.py)")
         self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_iy()}], s[{s.s_x()}]")
@@ -1319,8 +1324,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         else:
             self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(),
                     s.s_block_m_off(), s.s_block_n_off(),
-                    s.s_gemm_m.label if self.tunable.wmma_m_tail else None, v.v_m_tail_row() if self.tunable.wmma_m_tail else None,
-                    s.s_gemm_n.label if self.tunable.wmma_n_tail else None, v.v_n_tail_col() if self.tunable.wmma_n_tail else None,
+                    s.s_gemm_m.label if self.tunable.wmma_m_tail else None,
+                    v.v_fp16o_partner() if self.tunable.wmma_fp16_output else (v.v_m_tail_row() if self.tunable.wmma_m_tail else None),
+                    s.s_gemm_n.label if self.tunable.wmma_n_tail else None,
+                    v.v_fp16o_packed() if self.tunable.wmma_fp16_output else (v.v_n_tail_col() if self.tunable.wmma_n_tail else None),
                     # Phase 66: always passed now (not just under wmma_n_tail) --
                     # direct_store's outer-loop address hoist reuses this scratch
                     # SGPR too; mutually exclusive with the LDS-reshuffle path's own
@@ -2237,8 +2244,10 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         # atomic path). ----
         self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out_tap.label, s.s_wei_row_c.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(),
                 s.s_block_m_off(), s.s_block_n_off(),
-                s.s_gemm_m.label if self.tunable.wmma_m_tail else None, v.v_m_tail_row() if self.tunable.wmma_m_tail else None,
-                s.s_gemm_n.label if self.tunable.wmma_n_tail else None, v.v_n_tail_col() if self.tunable.wmma_n_tail else None,
+                s.s_gemm_m.label if self.tunable.wmma_m_tail else None,
+                v.v_fp16o_partner() if self.tunable.wmma_fp16_output else (v.v_m_tail_row() if self.tunable.wmma_m_tail else None),
+                s.s_gemm_n.label if self.tunable.wmma_n_tail else None,
+                v.v_fp16o_packed() if self.tunable.wmma_fp16_output else (v.v_n_tail_col() if self.tunable.wmma_n_tail else None),
                 # Phase 66: always passed now (not just under wmma_n_tail) --
                 # direct_store's outer-loop address hoist reuses this scratch SGPR
                 # too; mutually exclusive with the LDS-reshuffle path's own use of

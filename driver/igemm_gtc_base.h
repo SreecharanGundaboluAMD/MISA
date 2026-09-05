@@ -292,6 +292,13 @@ typedef struct {
     // hipModuleGetFunction-lookup reason. Default 0, unused for every other fma_type.
     int wmma_epilogue_chunked = 0;
     int wmma_acc_high_bank = 0;
+    // C1: mirrors igemm_base.py's wmma_fp16_output -- converts f32 accumulator to packed
+    // fp16x2/bf16x2 in the direct_store epilogue, halving store bytes. Changes the output
+    // buffer's native width from fp32 to fp16/bf16 (2 bytes), so the driver's
+    // dtype_alloc_byte override and verification path must know about it (same category
+    // as wmma_acc_f16/wmma_acc_bf16/atomic_pack_bf16 above). Folded into the kernel name
+    // as "_f16o" for the usual hipModuleGetFunction-lookup reason. Default 0.
+    int wmma_fp16_output = 0;
     // Default-member-initialized (unlike the int fields above, which zero-init safely via
     // aggregate-init anyway) so a default-constructed igemm_gtc_tunable_t{} -- e.g.
     // driver_mode_heuristic's still-unimplemented heuristic_select_kernel() stub -- doesn't
@@ -382,6 +389,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.lds_row_pad                = sec.count("lds_row_pad") > 0 ? sec.at("lds_row_pad").get_int() : 0;
                 tunable.wmma_epilogue_chunked       = sec.count("wmma_epilogue_chunked") > 0 ? sec.at("wmma_epilogue_chunked").get_int() : 0;
                 tunable.wmma_acc_high_bank          = sec.count("wmma_acc_high_bank") > 0 ? sec.at("wmma_acc_high_bank").get_int() : 0;
+                tunable.wmma_fp16_output           = sec.count("wmma_fp16_output") > 0 ? sec.at("wmma_fp16_output").get_int() : 0;
                 tunable.atomic_scope               = sec.count("atomic_scope") > 0 ? sec.at("atomic_scope").get_string() : "SCOPE_SYS";
             }
             else{
@@ -627,6 +635,8 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += std::string("_ldspad");
         if(tunable->direct_store)
             kernel_name += std::string("_direct");
+        if(tunable->wmma_fp16_output)
+            kernel_name += std::string("_f16o");
         if(tunable->ds_load_tr_b)
             kernel_name += std::string("_dstrb");
         if(tunable->lds_row_pad)

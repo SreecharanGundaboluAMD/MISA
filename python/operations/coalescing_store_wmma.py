@@ -173,6 +173,13 @@ class ctrl_coalescing_store_wmma_t(object):
         # wmma_mapping.py), so the half-wave's scalar stores are already contiguous
         # at the memory controller level -- the LDS reshuffle is unnecessary overhead.
         self.direct_store = False
+        # C1: when set, the direct_store epilogue converts pairs of f32 accumulator
+        # elements to packed fp16x2 (precision=='fp16') or bf16x2 (precision=='bf16')
+        # via v_cvt_pk_f16_f32 / v_cvt_pk_bf16_f32, then stores one packed dword per
+        # pair of columns -- halving store bytes/instructions. The accumulator stays f32.
+        # Mutually exclusive with gemm_k_global_split, wmma_acc_f16, wmma_acc_bf16,
+        # and atomic_pack_bf16 (asserted in igemm_base.py). direct_store must be True.
+        self.wmma_fp16_output = 0
 
 
 class igemm_coalescing_store_wmma_t(mc_base_t):
@@ -727,9 +734,13 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                 # reused here to hold the precomputed inter-i_rm-block row-address gap
                 # stride -- see _emit_direct_store's docstring.
                 assert s_tmp2 is not None, "direct_store's outer-loop address hoist (Phase 66) needs a second scratch SGPR"
+                if ctrl.wmma_fp16_output:
+                    assert v_tid is not None, "wmma_fp16_output's direct_store path needs v_tid for the even/odd lane EXEC-mask guard"
+                    assert not ctrl.wmma_m_tail and not ctrl.wmma_n_tail, \
+                        "wmma_fp16_output and wmma_m_tail/wmma_n_tail are mutually exclusive for now -- both need the same v_tmp3/v_tmp4 scratch slots"
                 self._emit_direct_store(ctrl, cxm, inst_wmma, v_c, v_gemm_im, v_gemm_in,
                     s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1,
-                    s_gemm_m, v_tmp3, s_gemm_n, v_tmp4, s_tmp2)
+                    s_gemm_m, v_tmp3, s_gemm_n, v_tmp4, s_tmp2, v_tid=v_tid if ctrl.wmma_fp16_output else None)
             else:
                 # ---- non-atomic: LDS-reshuffle coalescing store ----
                 assert v_tid is not None and v_gather is not None and s_block_m_off is not None and s_block_n_off is not None
@@ -1053,7 +1064,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         return self._get_deferred()
     def _emit_direct_store(self, ctrl, cxm, inst_wmma, v_c, v_gemm_im, v_gemm_in,
         s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1,
-        s_gemm_m, v_tmp3, s_gemm_n, v_tmp4, s_row_gap=None):
+        s_gemm_m, v_tmp3, s_gemm_n, v_tmp4, s_row_gap=None, v_tid=None):
         '''
         Phase 59: direct per-lane global_store_dword epilogue, no LDS reshuffle.
         16 consecutive lanes cover 16 consecutive columns (lane%16 -> column per
@@ -1063,6 +1074,17 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         exactly (same cur/nxt ping-pong, same row*stride+col formula, same tail
         masking) — only the store opcode differs: global_store_dword instead of
         global_atomic_add_f32. See docs/gfx1250_direct_store_plan.md.
+
+        C1 (wmma_fp16_output): when ctrl.wmma_fp16_output is set, the f32 accumulator
+        elements are converted to packed fp16x2/bf16x2 before storing. Each pair of
+        adjacent columns (lane L and lane L^1) is packed via v_permlane_xor_b32 +
+        v_cvt_pk_f16_f32 (fp16) or v_cvt_pk_bf16_f32 (bf16), and only even lanes
+        issue the global_store_dword -- halving store instructions and output bytes.
+        This mirrors the atomic_pack_bf16 path's exchange/pack pattern exactly, just
+        with a plain store instead of an atomic. The byte stride and address shift
+        halve (2 bytes/elem instead of 4). v_tmp3/v_tmp4 are reused as cross-lane
+        exchange scratch (mutually exclusive with wmma_m_tail/wmma_n_tail), v_tid
+        is required for the even/odd EXEC-mask guard.
 
         Phase 66: the outer i_rm loop used to recompute `row*stride+col` from
         scratch every iteration even though consecutive i_rm blocks are separated
@@ -1103,9 +1125,16 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         not exercised by anything wired up today, kept as a safety fallback,
         not a currently-reachable path).
         '''
-        self._emit(f"; wmma direct per-lane store epilogue (no LDS reshuffle), "
+        fp16o = ctrl.wmma_fp16_output
+        # C1: fp16/bf16 output = 2 bytes/elem; f32 output = 4 bytes/elem.
+        # Byte shift: 1 for 2-byte, 2 for 4-byte. Col stride multiplier: 2 or 4.
+        byte_shift = 1 if fp16o else 2
+        col_stride_mul = 2 if fp16o else 4
+        cvt_inst = 'v_cvt_pk_bf16_f32' if ctrl.precision == 'bf16' else 'v_cvt_pk_f16_f32'
+        epilogue_label = "packed fp16/bf16 " if fp16o else ""
+        self._emit(f"; wmma direct per-lane {epilogue_label}store epilogue (no LDS reshuffle), "
                    f"{cxm.wave_repeat_m}x{cxm.wave_repeat_n} tiles, {inst_wmma.num_v_c} rows/tile")
-        self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], 2   ; row-to-row byte stride")
+        self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], {byte_shift}   ; row-to-row byte stride ({2 * col_stride_mul} bytes/elem)")
         gap_rows = cxm.wave_tile_m - inst_wmma.num_v_c + 1
         # Phase 66: hoist is only well-defined when num_v_c is even (see the docstring
         # above for exactly which register ends up holding the needed value) -- true
@@ -1136,24 +1165,37 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                     self._emit(f"v_mov_b32 v[{v_tmp3}], v[{cur}]   ; wmma_m_tail: absolute row (row {row_off}, j=0)")
                 self._emit(f"v_mul_lo_u32 v[{cur}], s[{s_gemm_m_stride}], v[{cur}]")
                 self._emit(f"v_add_u32 v[{cur}], v[{v_gemm_in}], v[{cur}]")
-                self._emit(f"v_lshlrev_b32 v[{cur}], 2, v[{cur}]  ; byte address, row {row_off}, col 0")
+                self._emit(f"v_lshlrev_b32 v[{cur}], {byte_shift}, v[{cur}]  ; byte address, row {row_off}, col 0")
             for j in range(inst_wmma.num_v_c):
                 if j != inst_wmma.num_v_c - 1:
                     self._emit(f"v_add_u32 v[{nxt}], v[{cur}], s[{s_tmp1}]   ; precompute row {row_off + j + 1} address")
                 for i_rn in range(cxm.wave_repeat_n):
                     c_index = (i_rm * cxm.wave_repeat_n + i_rn) * inst_wmma.num_v_c + j
-                    col_off = i_rn * cxm.wave_tile_n * 4
+                    col_off = i_rn * cxm.wave_tile_n * col_stride_mul
                     offset_str = f" offset:{col_off}" if col_off != 0 else ""
-                    masked = ctrl.wmma_m_tail or ctrl.wmma_n_tail
-                    if ctrl.wmma_m_tail:
-                        self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
-                    if ctrl.wmma_n_tail:
-                        col_val = i_rn * cxm.wave_tile_n
-                        self._emit(f"v_add_u32 v[{v_tmp4}], {col_val}, v[{v_gemm_in}]" if col_val != 0 else f"v_mov_b32 v[{v_tmp4}], v[{v_gemm_in}]")
-                        self._emit(f"v_cmpx_gt_u32 s[{s_gemm_n}], v[{v_tmp4}]   ; wmma_n_tail: col < real gemm_n")
-                    self._emit(f"global_store_dword v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str}")
-                    if masked:
-                        self._emit(f"s_mov_b32 exec_lo, -1")
+                    if fp16o:
+                        # C1: pack pairs of f32 accumulator elements into fp16x2/bf16x2.
+                        # Same exchange/pack pattern as atomic_pack_bf16 (lines 639-647):
+                        # v_permlane_xor_b32 gets partner lane's value (lane XOR 1),
+                        # v_cvt_pk_f16/bf16_f32 packs (own, partner) into one dword,
+                        # only even lanes store (their column is the pair's lower col).
+                        self._emit(f"v_permlane_xor_b32 v[{v_tmp3}], v[{v_c}+{c_index}], 1, 32   ; partner lane = this lane XOR 1")
+                        self._emit(f"{cvt_inst} v[{v_tmp4}], v[{v_c}+{c_index}], v[{v_tmp3}]   ; lo16=this lane's col, hi16=partner's")
+                        self._emit(f"v_and_b32 v[{v_tmp3}], 1, v[{v_tid}]")
+                        self._emit(f"v_cmpx_eq_u32 0, v[{v_tmp3}]   ; EXEC = (this lane is even)")
+                        self._emit(f"global_store_dword v[{cur}], v[{v_tmp4}], s[{s_p_out}:{s_p_out}+1]{offset_str}")
+                        self._emit(f"s_mov_b32 exec_lo, -1   ; restore full EXEC for the next iteration's exchange")
+                    else:
+                        masked = ctrl.wmma_m_tail or ctrl.wmma_n_tail
+                        if ctrl.wmma_m_tail:
+                            self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
+                        if ctrl.wmma_n_tail:
+                            col_val = i_rn * cxm.wave_tile_n
+                            self._emit(f"v_add_u32 v[{v_tmp4}], {col_val}, v[{v_gemm_in}]" if col_val != 0 else f"v_mov_b32 v[{v_tmp4}], v[{v_gemm_in}]")
+                            self._emit(f"v_cmpx_gt_u32 s[{s_gemm_n}], v[{v_tmp4}]   ; wmma_n_tail: col < real gemm_n")
+                        self._emit(f"global_store_dword v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str}")
+                        if masked:
+                            self._emit(f"s_mov_b32 exec_lo, -1")
                 cur, nxt = nxt, cur
                 if ctrl.wmma_m_tail and j != inst_wmma.num_v_c - 1:
                     self._emit(f"v_add_u32 v[{v_tmp3}], 1, v[{v_tmp3}]   ; wmma_m_tail: advance to row {row_off + j + 1}")

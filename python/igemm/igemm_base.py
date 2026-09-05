@@ -697,6 +697,29 @@ class igemm_gtc_tunable_parameter_t(object):
             # FlyDSL and MISA's own coalescing_store_wmma.py docstring confirm this adjacency.
             # Only applies to the non-atomic (non-split-K) epilogue path.
             self.direct_store = utility_dict_with_default_t(tunable_dict)('direct_store', 0)
+            # C1 (fp16/bf16 output from f32 accumulator): optional, defaults to 0 (today's
+            # f32-output behavior, every existing config unaffected). When 1, the epilogue's
+            # direct_store path converts pairs of f32 accumulator elements into packed
+            # fp16x2 (precision=='fp16') or bf16x2 (precision=='bf16') via v_cvt_pk_f16_f32
+            # / v_cvt_pk_bf16_f32, then stores one packed dword per pair of columns -- halving
+            # store bytes and store instructions vs writing f32 output. The accumulator stays
+            # f32 (unlike wmma_acc_f16 which changes the WMMA instruction itself); only the
+            # output store narrows. Only valid for fp16/bf16 precision (not fp32/int8), only
+            # with direct_store=1 (not gemm_k_global_split -- no packed-fp16 atomic-add on
+            # this ISA), and mutually exclusive with wmma_acc_f16/wmma_acc_bf16 (which already
+            # produce 2-byte output natively) and atomic_pack_bf16 (which already packs).
+            self.wmma_fp16_output = utility_dict_with_default_t(tunable_dict)('wmma_fp16_output', 0)
+            if self.wmma_fp16_output:
+                assert self.precision in ('fp16', 'bf16'), \
+                    f"wmma_fp16_output=1 is only valid for fp16/bf16 precision (got precision={self.precision})"
+                assert self.direct_store, \
+                    "wmma_fp16_output=1 requires direct_store=1 (packed fp16 output is only implemented for the direct_store epilogue path)"
+                assert not self.gemm_k_global_split, \
+                    "wmma_fp16_output=1 and gemm_k_global_split are mutually exclusive -- no packed-fp16 atomic-add on this ISA"
+                assert not self.wmma_acc_f16 and not self.wmma_acc_bf16, \
+                    "wmma_fp16_output and wmma_acc_f16/wmma_acc_bf16 are mutually exclusive -- the latter already produce 2-byte output natively"
+                assert not self.atomic_pack_bf16, \
+                    "wmma_fp16_output and atomic_pack_bf16 are mutually exclusive -- the latter already packs"
             # Phase 59: Phase 4 perf A/B across 5 fwd shapes showed direct_store is 1.07-1.25x
             # faster than LDS-reshuffle on all tested shapes (n=8,c=128,H=30,W=40,k=128/512,
             # n=4,c=256,H=56,W=56,k=256) with zero regressions — strong evidence for the
@@ -1546,6 +1569,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_ldspad"
         if tunable.direct_store:
             kernel_name += "_direct"
+        if tunable.wmma_fp16_output:
+            kernel_name += "_f16o"
         if tunable.ds_load_tr_b:
             kernel_name += "_dstrb"
         if tunable.lds_row_pad:

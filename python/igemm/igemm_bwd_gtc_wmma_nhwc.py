@@ -205,6 +205,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         # actual behavior is precision-agnostic (2-byte-packed accumulator), so both tunables
         # funnel into it.
         ctrl_coalescing_store_wmma.wmma_acc_f16 = tunable.wmma_acc_f16 or tunable.wmma_acc_bf16
+        ctrl_coalescing_store_wmma.wmma_fp16_output = tunable.wmma_fp16_output
         ctrl_coalescing_store_wmma.wmma_m_tail = tunable.wmma_m_tail
         ctrl_coalescing_store_wmma.wmma_n_tail = tunable.wmma_n_tail
         # Phase 48: switches the shared epilogue from its direct (LDS-reshuffle) store path
@@ -461,6 +462,10 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                 self.v_n_tail_col      = sym_t('v_n_tail_col'      , vseq(1))
                 self.v_b_col_start_abs = sym_t('v_b_col_start_abs' , vseq(1))
                 self.v_n_valid_base    = sym_t('v_n_valid_base'    , vseq(1))
+            if outer.tunable.wmma_fp16_output:
+                # C1: scratch for direct_store epilogue's cross-lane exchange + packed result.
+                self.v_fp16o_partner = sym_t('v_fp16o_partner', vseq(1))
+                self.v_fp16o_packed  = sym_t('v_fp16o_packed', vseq(1))
             if outer.tunable.wmma_k_tail:
                 # K-tail (A's hard fine-grained mask + B's easy per-lane EXEC flag -- see
                 # __init__'s docstring). v_b_row_local is a kernel-lifetime constant
@@ -873,7 +878,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         # Phase 24: shift must follow the D-operand's real width (4 bytes normally, 2 under
         # wmma_acc_f16) -- see the identical bug found and fixed in wrw's per-tap output
         # offset (igemm_wrw_gtc_wmma_nhwc.py's emit_kernel_tap_loop).
-        out_elem_byte_shift = 1 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16) else 2
+        out_elem_byte_shift = 1 if (self.tunable.wmma_acc_f16 or self.tunable.wmma_acc_bf16 or self.tunable.wmma_fp16_output) else 2
         self._emit(f"; output (grad_input): group offset = group_idx * gemm_n elements (D-operand is fp32/int32 (4B) normally, fp16 (2B) under wmma_acc_f16)")
         self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_group_idx()}], s[{s.s_gemm_n()}]")
         self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {out_elem_byte_shift}")
@@ -1889,8 +1894,10 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         # s_out_c_total (=gemm_n*group) is grad_input's TOTAL row stride (NOT K_out, and not
         # just the per-group gemm_n either once group>1 -- see class docstring's Phase 7 note).
         self._emit(self.coalescing_store(v.v_c.label, v.v_gemm_im(), v.v_gemm_in(), s.s_p_out.label, s.s_out_c_total.label, v.v_addr_out(), v.v_addr_out(1), s.s_tmp(), v.v_tid(), v.v_c(), s.s_block_m_off(), s.s_block_n_off(),
-                    s.s_gemm_m.label if self.tunable.wmma_m_tail else None, v.v_m_tail_row() if self.tunable.wmma_m_tail else None,
-                    s.s_gemm_n.label if self.tunable.wmma_n_tail else None, v.v_n_tail_col() if self.tunable.wmma_n_tail else None,
+                    s.s_gemm_m.label if self.tunable.wmma_m_tail else None,
+                    v.v_fp16o_partner() if self.tunable.wmma_fp16_output else (v.v_m_tail_row() if self.tunable.wmma_m_tail else None),
+                    s.s_gemm_n.label if self.tunable.wmma_n_tail else None,
+                    v.v_fp16o_packed() if self.tunable.wmma_fp16_output else (v.v_n_tail_col() if self.tunable.wmma_n_tail else None),
                     # Phase 66: always passed now (not just under wmma_n_tail) --
                     # direct_store's outer-loop address hoist reuses this scratch SGPR
                     # too; the two uses are mutually exclusive (direct_store vs.
