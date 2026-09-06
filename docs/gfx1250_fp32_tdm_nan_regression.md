@@ -135,10 +135,10 @@ $ IGEMM_RUN_ONLY_KERNEL=igemm_fwd_gtcw_nhwc_fp32_bx0_ex0_bt128x128x4_wt16x16_wr4
 # Expected (bug present): "invalid float ..., pred:-nan"
 ```
 
-## Separate, unrelated finding discovered while checking this bug's breadth
+## Separate, unrelated finding discovered while checking this bug's breadth — RESOLVED
 
-`config/igemm_wrw_gtc_gfx1250_nhwc_fp32_all.config` **fails to build at all** — not a TDM or
-`-nan` issue, a kernel-name collision:
+**Status: FIXED.** `config/igemm_wrw_gtc_gfx1250_nhwc_fp32_all.config` was failing to build
+entirely — not a TDM or `-nan` issue, a kernel-name collision:
 
 ```
 $ python3 igemm_codegen.py config/igemm_wrw_gtc_gfx1250_nhwc_fp32_all.config -d /tmp/x
@@ -146,11 +146,50 @@ error: symbol 'igemm_wrw_gtcw_..._bt128x128x4_..._dbuf_gkgs.kd' is already defin
 error: symbol 'igemm_wrw_gtcw_..._bt64x64x4_..._dbuf_gkgs' is already defined
 ```
 
-Two distinct tunable sections (128x128 and 64x64 tiles, both `gemm_k_per_block=4`) mangle to
-kernel names that collide — the tile dimensions aren't folded into the `_dbuf_gkgs` name the
-way every other suffix combination is. This means **the wrw fp32 master config is entirely
-unbuildable today**, independent of the TDM bug above. Not investigated further (out of
-scope for this discovery pass) — flagged here so it isn't lost. Likely fix location:
-`igemm_gtc_encode_kernel_name` in `python/igemm/igemm_base.py` (fp16/bf16 don't hit this
-because their corresponding sections apparently differ in some other name-affecting field
-that fp32's don't — not yet identified which).
+### Root cause
+
+`script/build_gfx1250_master_configs.py`'s `normalize()` dedup function stripped
+comment/blank lines from each `[igemm_wrw_gtc]` section and joined the surviving
+`key = value` lines **in their original file order** — then compared that joined string
+verbatim. It did NOT canonicalize by key. Two source config files —
+`config/igemm_wrw_gtc_gfx1250_nhwc_fp32.config` (the default shipped config, which has
+`gemm_k_global_split = 1` after a long explanatory comment block added by commit `16bbbfa`'s
+COR-001 repair) and `config/igemm_wrw_gtc_gfx1250_nhwc_fp32_gsplit.config` (a standalone
+gsplit-focused narrow config, where `gemm_k_global_split = 1` sits adjacent to
+`lds_double_buffer = 1`) — both define a 128x128 section and a 64x64 section with
+**identical key=value pairs** but with `gemm_k_global_split` and `lds_double_buffer` in
+**swapped line order**. The dedup saw them as textually different and kept both; both parse
+to the same tunable dict and emit the same kernel name, and the assembler rejected the
+duplicate symbol.
+
+This key-order divergence does NOT exist between fp16's equivalent pair
+(`igemm_wrw_gtc_gfx1250_nhwc_fp16.config` vs `..._fp16_gsplit.config`) —
+`gemm_k_global_split = 1` sits at the same relative position in both, so fp16's dedup
+correctly caught the duplicate. Only fp32 was affected.
+
+The original hypothesis (tile dimensions not folded into `_dbuf_gkgs` name) was wrong —
+the kernel name encodes `bt128x128x4` / `bt64x64x4` correctly; the collision was two
+identical sections both surviving into the union.
+
+### Fix
+
+Changed `normalize()` in `script/build_gfx1250_master_configs.py` to parse each surviving
+`key = value` line into a dict (split on first `=`, strip both sides) and compare sections
+by their **key-sorted** representation (`'k = v'` for `k` in `sorted(kv)`), not the raw
+file-ordered join. Value strings are compared as-is after stripping — list/spacing
+formatting differences are not part of this bug and are left for a separate fix if they
+ever surface.
+
+### Verification
+
+- The rebuilt wrw fp32 master went from 33 → 31 tunable sections (2 duplicate
+  `gemm_k_global_split` sections removed). `python3 igemm_codegen.py
+  config/igemm_wrw_gtc_gfx1250_nhwc_fp32_all.config -d /tmp/x` now builds with zero errors.
+  Each `_dbuf_gkgs` kernel label (both 128x128 and 64x64) appears exactly once in the
+  generated `.inc` files (was 2).
+- All other 11 master configs are byte-identical to their committed versions after rebuild
+  (`git diff` shows only `igemm_wrw_gtc_gfx1250_nhwc_fp32_all.config` and the script change).
+- Hardware-validated on real gfx1250 silicon, `-V 1`, shape `n128 c1024 17x17 k1024 1x1`,
+  `-F 4` (wrw): both `_dbuf_gkgs` kernels (128x128 and 64x64) are `valid:y`. Five other
+  wrw fp32 kernels (`_dbuf`, `_dbuf_direct`, `_dbuf_ktail_gkgs`, `_dbuf_streamk_gkgs`,
+  `_dbuf_ktail_gkgs` 128x128) spot-checked `valid:y` — no regression from the dedup change.

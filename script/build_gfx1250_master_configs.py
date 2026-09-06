@@ -82,15 +82,26 @@ def parse_config_file(path):
 
 
 def normalize(body_lines):
-    """Normalize a section body for dedup comparison -- strip pure-comment/blank lines and
-    surrounding whitespace, keep only the actual key=value content lines."""
-    keep = []
+    """Normalize a section body for dedup comparison -- strip pure-comment/blank lines,
+    parse each surviving key=value line into a dict (split on first '=', strip both sides),
+    and compare sections by their key-sorted representation.
+
+    Key-order canonicalization is necessary because two source .config files may contain
+    the same set of key=value pairs but with the keys listed in a different order (e.g.
+    gemm_k_global_split and lds_double_buffer swapped between fp32.config and
+    fp32_gsplit.config). Without canonicalization the dedup treats them as distinct,
+    both survive into the union, and both emit the same kernel name -- causing an
+    assembler 'symbol already defined' error. Value strings are compared as-is (after
+    stripping whitespace) since list/spacing formatting differences are not part of this
+    bug; if they become one, a value-side canonicalization can be added separately."""
+    kv = {}
     for l in body_lines:
         s = l.strip()
         if not s or s.startswith('#'):
             continue
-        keep.append(s)
-    return '\n'.join(keep)
+        key, _, val = s.partition('=')
+        kv[key.strip()] = val.strip()
+    return '\n'.join(f'{k} = {kv[k]}' for k in sorted(kv))
 
 
 # conv_driver.cpp computes is_wmma_f16_acc/is_wmma_bf16_acc/is_wmma_atomic_pack_bf16/
