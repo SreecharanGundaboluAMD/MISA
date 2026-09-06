@@ -30,12 +30,18 @@ hangs). Per-defect disposition:
 - **R4** (`472f274`) — fixed. `wrw_streamk` on a non-unit-conv (3×3) shape now correctly
   reports "not applicable" instead of dispatching and returning `valid:n` at impossible
   >100% "efficiency".
-- **R5** (`20d6061`) — mitigated by rejection, not root-caused. `bwd`'s WMMA
-  `tunable_is_valid` now unconditionally rejects `gemm_k_global_split=1`, so no config in
-  this repo can dispatch the faulting path; see
-  `docs/gfx1250_bwd_gsplit_memory_fault.md` for the investigation notes and root-cause
-  status (still open — GPU access was lost mid-session to an unrelated `rocm-smi
-  --gpureset` incident before deeper hardware debugging could complete).
+- **R5** (`ed870e6`) — **fixed, root-caused.** `igemm_bwd_gtc_wmma_nhwc.py`'s
+  `get_kernel_args()` was missing the `gemm_k_per_wg` argument declaration at kernarg
+  offset 88 from the PAL metadata `.args` array (fwd and wrw both declare it; bwd's own
+  comment claimed it was "always present" but the `kas.append()` call was never written).
+  The 4-byte hole meant the ROCm runtime did not reliably populate that dword on the
+  device, which read stale/garbage data instead — exactly the observed
+  `HSA_STATUS_ERROR_MEMORY_FAULT`/silent-corruption symptom. One-line fix (add the missing
+  `kas.append`), hardware-validated on every previously-crashing shape plus the full
+  standing regression set, `tunable_is_valid`'s rejection removed. Two earlier hypotheses
+  (SGPR allocation order/adjacency, gfx1250 hardware kernarg preloading) were tested and
+  ruled out with hardware evidence before the real cause was found — see
+  `docs/gfx1250_bwd_gsplit_memory_fault.md` for the full trail.
 - **R6** (`980dad1`, then `a3b1476`) — **disproven, not a real hardware bug.** The original
   hang report was itself a test-driver artifact: `conv_driver.cpp`'s host-side RNG fill
   (`gen_rand_vector`) and `tensor_copy_cpu.h`'s tensor copy both had severe false-sharing
@@ -57,10 +63,10 @@ hangs). Per-defect disposition:
 
 **Net effect:** R1's fix alone unblocks wrw's entire master-config search (previously
 couldn't build at all), which in turn makes §5's `lds_row_pad` finding reachable for wrw for
-the first time. R5 is a rejection-based mitigation, not a fix — the underlying bwd gsplit
-memory fault remains uncharacterized and `docs/gfx1250_bwd_gsplit_memory_fault.md` should be
-consulted before re-enabling `gemm_k_global_split` for bwd. R6 turned out to require no
-product change at all once the measurement artifact was fixed.
+the first time. R5 turned out to be a genuine, fully-root-caused fix (a missing PAL metadata
+argument declaration), not merely a mitigation — bwd `gemm_k_global_split` is safe to use
+again and its 2 sections are already reachable in the master `_all.config`. R6 turned out to
+require no product change at all once the measurement artifact was fixed.
 
 ---
 
@@ -102,7 +108,7 @@ repo.
 | R2 | `wmma_fp16_output` still reachable from 0 configs (now with more code behind it: `c52944a` extended it to the non-atomic epilogue too) | **FIXED `12d3c0d`** — see Resolution status above | high |
 | R3 | `fp_factor=9` still non-physical; comment added acknowledging it, value unchanged | **FIXED `175f455`** — see Resolution status above | medium |
 | R4 | `wrw_streamk`'s missing `nxe==0` runtime rejection still absent from the WMMA branch of `tunable_is_valid` | **FIXED `472f274`** — see Resolution status above | medium-high |
-| **R5 (new)** | **bwd `gemm_k_global_split=1` GPU memory-fault crash** on `n128 c1024 17×17 k1024` (`HSA_STATUS_ERROR_MEMORY_FAULT`, `hipEventSynchronize` returns illegal-memory-access) | **MITIGATED (rejected, not root-caused) `20d6061`** — see Resolution status above and `docs/gfx1250_bwd_gsplit_memory_fault.md` | **critical** |
+| **R5 (new)** | **bwd `gemm_k_global_split=1` GPU memory-fault crash** on `n128 c1024 17×17 k1024` (`HSA_STATUS_ERROR_MEMORY_FAULT`, `hipEventSynchronize` returns illegal-memory-access) | **FIXED, root-caused `ed870e6`** — see Resolution status above and `docs/gfx1250_bwd_gsplit_memory_fault.md` | ~~critical~~ n/a |
 | **R6 (new)** | **wrw hangs indefinitely** (not `valid:n` — an unrecoverable device-side hang requiring `timeout`) on any non-split-K tunable (`k2x`, `dbuf`, `bf16acc`, and by extension `interleave`) whenever the shape's GEMM grid exactly equals 256 (= CU count) | **DISPROVEN — test-driver artifact, not a hardware bug (`a3b1476`, root-caused fixed by `c56fb4e`)** — see Resolution status above and `docs/gfx1250_wrw_full_cu_grid_hang.md` | ~~critical~~ n/a |
 
 The **single biggest opportunity is not the one v2 named.** v2's "compute/memory overlap"
@@ -437,9 +443,11 @@ the top of this document)**
 1. ~~**R1**~~ **DONE** (`b367d93`) — moved `threads_per_krow` computation inside
    `if lds_row_pad > 0:` in `igemm_wrw_gtc_wmma_nhwc.py`. wrw's master-config search
    (including item P0.5 below) is now unblocked.
-2. ~~**R5 (new)**~~ **MITIGATED, not root-caused** (`20d6061`) — bwd's WMMA
-   `tunable_is_valid` now rejects `gemm_k_global_split=1` outright rather than dispatching
-   the faulting path. Root cause remains open; see `docs/gfx1250_bwd_gsplit_memory_fault.md`.
+2. ~~**R5 (new)**~~ **DONE, root-caused** (`ed870e6`) — the crash was a missing
+   `gemm_k_per_wg` PAL metadata argument declaration at kernarg offset 88 in bwd's
+   `get_kernel_args()` (fwd/wrw both declare it; bwd's `kas.append()` call was simply never
+   written). Fixed with a one-line addition; `tunable_is_valid`'s rejection removed;
+   hardware-validated on every crashing shape plus the full standing regression set.
 3. ~~**R6 (new)**~~ **DISPROVEN** (`a3b1476`) — the "hang" was a test-driver host-side
    false-sharing bug in RNG fill / tensor copy inflating setup time past the sweep timeout,
    fixed at its actual root cause (`c56fb4e`). No wrw kernel/driver change was needed; see
