@@ -280,15 +280,20 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             row_pitch_b_dwords = (tunable.gemm_n_per_block * self.data_byte + tunable.lds_row_pad) // 4
             assert math.gcd(row_pitch_b_dwords, 64) == 4, \
                 f"lds_row_pad({tunable.lds_row_pad}): gcd(B row_pitch_dwords={row_pitch_b_dwords}, 64)={math.gcd(row_pitch_b_dwords, 64)} must be 4 (conflict-free)"
+            # threads_per_krow is only consumed by the padded v_sst_os formula (below,
+            # ~line 742) -- computing/asserting it unconditionally used to fire spuriously
+            # on unpadded deep-K tiles where gemm_k_per_block > gemm_{m,n}_per_block makes
+            # it truncate to 0 (R1, gfx1250_wmma_perf_report_v2.md). Gated here so it only
+            # runs when it's actually needed and actually meaningful.
+            self.threads_per_krow_a = (tunable.gemm_m_per_block * self.data_byte) // self.bytes_per_row
+            self.threads_per_krow_b = (tunable.gemm_n_per_block * self.data_byte) // self.bytes_per_row
+            assert self.threads_per_krow_a == self.threads_per_krow_b, \
+                f"threads_per_krow_a({self.threads_per_krow_a}) must equal threads_per_krow_b({self.threads_per_krow_b}) for wrw (both operands transposed, shared v_sst_os)"
+            self.threads_per_krow = self.threads_per_krow_a
+            assert self.threads_per_krow > 0 and (self.threads_per_krow & (self.threads_per_krow - 1)) == 0, \
+                f"threads_per_krow({self.threads_per_krow}) must be > 0 and a power of 2"
         self.lds_row_pitch_a = tunable.gemm_m_per_block * self.data_byte + tunable.lds_row_pad
         self.lds_row_pitch_b = tunable.gemm_n_per_block * self.data_byte + tunable.lds_row_pad
-        self.threads_per_krow_a = (tunable.gemm_m_per_block * self.data_byte) // self.bytes_per_row
-        self.threads_per_krow_b = (tunable.gemm_n_per_block * self.data_byte) // self.bytes_per_row
-        assert self.threads_per_krow_a == self.threads_per_krow_b, \
-            f"threads_per_krow_a({self.threads_per_krow_a}) must equal threads_per_krow_b({self.threads_per_krow_b}) for wrw (both operands transposed, shared v_sst_os)"
-        self.threads_per_krow = self.threads_per_krow_a
-        assert self.threads_per_krow > 0 and (self.threads_per_krow & (self.threads_per_krow - 1)) == 0, \
-            f"threads_per_krow({self.threads_per_krow}) must be > 0 and a power of 2"
         # Overwrite LDS sizes with padded row_pitch
         self.lds_a_size = tunable.gemm_k_per_block * self.lds_row_pitch_a
         self.lds_b_size = tunable.gemm_k_per_block * self.lds_row_pitch_b
