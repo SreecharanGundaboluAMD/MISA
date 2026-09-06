@@ -297,6 +297,9 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             "saddr_global_load is not yet combined with gemm_k_global_split for fwd -- not audited against the base-pointer shard offset"
         assert not (tunable.saddr_global_load and (self.row_repeat_a > 1 or self.row_repeat_b > 1)), \
             "saddr_global_load is not yet supported together with row_repeat_a/b > 1 (untested combination)"
+        if tunable.wmma_l2_prefetch:
+            assert self.row_repeat_a == 1 and self.row_repeat_b == 1, \
+                "wmma_l2_prefetch is only implemented for row_repeat_a/b==1 (plain 64-bit VADDR path) so far"
 
         # Phase 24/27: 'fp16_f16acc'/'bf16_bf16acc' are separate table keys (not fields), see
         # wmma_mapping.py -- pick the num_v_c=4 narrow-accumulate instruction instead of the
@@ -2040,6 +2043,36 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 return outer._get_deferred()
         return functor_t()
 
+    def prefetch_a_functor(self):
+        ''' Phase D1-P2 / guide §19: issues a speculative global_prefetch_b8 for the tile
+        TWO K-stages ahead. Called from wmma_main_loop.py's can_hoist branch right after the
+        hoisted move_slice_window_a (which already advanced v_addr_a by 1 stage) and
+        global_load_a. Uses the instruction's immediate offset field to add bytes_per_row
+        (one more stage) to the address -- does NOT modify v_addr_a at all, because on
+        gfx1250 the global_load's address is NOT latched at issue time (modifying v_addr_a
+        after the load is issued but before it reaches the memory controller corrupts the
+        load's address, confirmed via rocgdb). TH_LOAD_NT_RT (speculative) + scope:SCOPE_DEV
+        so a bad address near the K-loop tail is silently dropped (ISA doc §10.5). '''
+        outer = self
+        class functor_t:
+            def __call__(self):
+                v = outer.vgpr
+                with outer._deferred_context():
+                    outer._emit(f"global_prefetch_b8 v[{v.v_addr_a()}:{v.v_addr_a(1)}], off offset:{outer.bytes_per_row} th:TH_LOAD_NT_RT scope:SCOPE_DEV")
+                return outer._get_deferred()
+        return functor_t()
+
+    def prefetch_b_functor(self):
+        ''' Phase D1-P2 / guide §19: mirrors prefetch_a_functor for operand B. '''
+        outer = self
+        class functor_t:
+            def __call__(self):
+                v = outer.vgpr
+                with outer._deferred_context():
+                    outer._emit(f"global_prefetch_b8 v[{v.v_addr_b()}:{v.v_addr_b(1)}], off offset:{outer.bytes_per_row} th:TH_LOAD_NT_RT scope:SCOPE_DEV")
+                return outer._get_deferred()
+        return functor_t()
+
     def emit_kernel_fma_main_loop(self):
         ctrl = ctrl_wmma_main_loop_t()
         ctrl.wmma_m           = self.wmma_mapping.ctrl
@@ -2056,6 +2089,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.interleave_b = self.tunable.main_loop_interleave
         ctrl.wmma_setprio = self.tunable.wmma_setprio
         ctrl.gap_hoist = self.tunable.wmma_gap_hoist
+        ctrl.l2_prefetch = self.tunable.wmma_l2_prefetch
         ctrl.local_prefetch_num = self.tunable.local_prefetch_num
         ctrl.vgpr_msb_tracker = self.vgpr_msb_tracker
         # Phase 71 (PERF-004): both A and B use the plain, untransposed
@@ -2075,6 +2109,9 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.shared_load_b_functor       = self.shared_load_b_functor()
         ctrl.move_slice_window_a_functor = self.move_slice_window_a_functor()
         ctrl.move_slice_window_b_functor = self.move_slice_window_b_functor()
+        if self.tunable.wmma_l2_prefetch:
+            ctrl.prefetch_a_functor = self.prefetch_a_functor()
+            ctrl.prefetch_b_functor = self.prefetch_b_functor()
         if self.tunable.main_loop_interleave:
             ctrl.global_load_chunk_a_functor  = self.global_load_chunk_a_functor()
             ctrl.global_load_chunk_b_functor  = self.global_load_chunk_b_functor()

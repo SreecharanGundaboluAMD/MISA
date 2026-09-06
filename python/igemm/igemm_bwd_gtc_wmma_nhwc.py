@@ -163,6 +163,9 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             "saddr_global_load is not yet combined with gemm_k_global_split for bwd -- not audited against the base-pointer shard offset"
         assert not (tunable.saddr_global_load and self.row_repeat_a > 1), \
             "saddr_global_load is not yet supported together with row_repeat_a > 1 (untested combination)"
+        if tunable.wmma_l2_prefetch:
+            assert self.row_repeat_a == 1, \
+                "wmma_l2_prefetch is only implemented for row_repeat_a==1 (plain 64-bit VADDR path) so far"
         # Phase 48 (gemm_k_global_split, bwd): not yet combined with TDM -- TDM's own
         # s_tdm_k_remain init reads s_gemm_k directly (the true, un-sharded total), not
         # s_knum/s_gemm_k_per_wg, so combining the two would silently give every shard the
@@ -1798,6 +1801,43 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                 return outer._get_deferred()
         return functor_t()
 
+    def prefetch_a_functor(self):
+        ''' Phase D1-P2 / guide §19: speculative global_prefetch_b8 for the tile TWO K-stages
+        ahead. bwd's A (grad_output, untransposed) advances by bytes_per_row (compile-time
+        constant), so the instruction's immediate offset field is used -- no v_addr_a
+        modification (see fwd's prefetch_a_functor docstring for the gfx1250 address-latching
+        rationale). '''
+        outer = self
+        class functor_t:
+            def __call__(self):
+                v = outer.vgpr
+                with outer._deferred_context():
+                    outer._emit(f"global_prefetch_b8 v[{v.v_addr_a()}:{v.v_addr_a(1)}], off offset:{outer.bytes_per_row} th:TH_LOAD_NT_RT scope:SCOPE_DEV")
+                return outer._get_deferred()
+        return functor_t()
+
+    def prefetch_b_functor(self):
+        ''' Phase D1-P2 / guide §19: bwd's B (weight, TRANSPOSED) advances by s_wei_k_stride
+        (runtime SGPR), so the immediate offset approach cannot be used. Instead, copy v_addr_b
+        into scratch v_gtc_tmp(1:2) (even-aligned when v_gtc_tmp is odd, the common case), add
+        s_wei_k_stride, and issue the prefetch from the scratch pair. Does NOT modify v_addr_b.
+        NOTE: the even-alignment of v_gtc_tmp+1 depends on the VGPR allocation; if v_gtc_tmp is
+        even, v_gtc_tmp(0:1) is used instead. This is validated per-config at build time. '''
+        outer = self
+        class functor_t:
+            def __call__(self):
+                v = outer.vgpr
+                s = outer.sgpr
+                with outer._deferred_context():
+                    # copy 1-stage-ahead address into scratch (v_gtc_tmp+1 is even-aligned when v_gtc_tmp is odd)
+                    outer._emit(f"v_mov_b32 v[{v.v_gtc_tmp(1)}], v[{v.v_addr_b()}]")
+                    outer._emit(f"v_mov_b32 v[{v.v_gtc_tmp(2)}], v[{v.v_addr_b(1)}]")
+                    outer._emit(f"v_add_co_u32 v[{v.v_gtc_tmp(1)}], vcc_lo, s[{s.s_wei_k_stride()}], v[{v.v_gtc_tmp(1)}]")
+                    outer._emit(f"v_add_co_ci_u32 v[{v.v_gtc_tmp(2)}], vcc_lo, 0, v[{v.v_gtc_tmp(2)}], vcc_lo")
+                    outer._emit(f"global_prefetch_b8 v[{v.v_gtc_tmp(1)}:{v.v_gtc_tmp(2)}], off th:TH_LOAD_NT_RT scope:SCOPE_DEV")
+                return outer._get_deferred()
+        return functor_t()
+
     def emit_kernel_fma_main_loop(self):
         ctrl = ctrl_wmma_main_loop_t()
         ctrl.wmma_m           = self.wmma_mapping.ctrl
@@ -1819,6 +1859,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.interleave_b = False
         ctrl.wmma_setprio = self.tunable.wmma_setprio
         ctrl.gap_hoist = self.tunable.wmma_gap_hoist
+        ctrl.l2_prefetch = self.tunable.wmma_l2_prefetch
         ctrl.vgpr_msb_tracker = self.vgpr_msb_tracker
         # Phase 71 (PERF-004): A (untransposed) uses the plain ds_read_b128-chunked
         # shared_load technique; B (transposed) uses the pack/wait-batched technique
@@ -1841,6 +1882,9 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.shared_load_b_functor       = self.shared_load_b_functor()
         ctrl.move_slice_window_a_functor = self.move_slice_window_a_functor()
         ctrl.move_slice_window_b_functor = self.move_slice_window_b_functor()
+        if self.tunable.wmma_l2_prefetch:
+            ctrl.prefetch_a_functor = self.prefetch_a_functor()
+            ctrl.prefetch_b_functor = self.prefetch_b_functor()
         if self.tunable.main_loop_interleave:
             ctrl.global_load_chunk_a_functor  = self.global_load_chunk_a_functor()
             ctrl.shared_store_chunk_a_functor = self.shared_store_chunk_a_functor()

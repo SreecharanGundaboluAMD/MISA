@@ -204,6 +204,11 @@ typedef struct {
     // into the kernel name for the same hipModuleGetFunction-lookup reason as
     // wmma_setprio. Default 0 = every existing config byte-identical.
     int wmma_gap_hoist = 0;
+    // Phase D1-P2 / guide §19 (L2 prefetch two K-stages ahead): when set AND can_hoist
+    // is also true, issues speculative global_prefetch_b8 for the tile two K-stages
+    // ahead. Folded into the kernel name for the same hipModuleGetFunction-lookup
+    // reason as wmma_setprio. Default 0 = every existing config byte-identical.
+    int wmma_l2_prefetch = 0;
     // Phase 34: packed-bf16 atomic epilogue for wrw's gemm_k_global_split path -- changes
     // the OUTPUT (grad_weight) buffer's native width from fp32 to bf16 (2 bytes), so the
     // driver's dtype_alloc_byte override and wrw_post's verification path need to know
@@ -375,6 +380,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.wmma_n_tail               = sec.count("wmma_n_tail") > 0 ? sec.at("wmma_n_tail").get_int() : 0;
                 tunable.wmma_setprio               = sec.count("wmma_setprio") > 0 ? sec.at("wmma_setprio").get_int() : 0;
                 tunable.wmma_gap_hoist             = sec.count("wmma_gap_hoist") > 0 ? sec.at("wmma_gap_hoist").get_int() : 0;
+                tunable.wmma_l2_prefetch            = sec.count("wmma_l2_prefetch") > 0 ? sec.at("wmma_l2_prefetch").get_int() : 0;
                 tunable.atomic_pack_bf16           = sec.count("atomic_pack_bf16") > 0 ? sec.at("atomic_pack_bf16").get_int() : 0;
                 tunable.wmma_k_tail                = sec.count("wmma_k_tail") > 0 ? sec.at("wmma_k_tail").get_int() : 0;
                 tunable.wrw_reduction_kernel       = sec.count("wrw_reduction_kernel") > 0 ? sec.at("wrw_reduction_kernel").get_int() : 0;
@@ -613,6 +619,8 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += std::string("_setprio");
         if(tunable->wmma_gap_hoist)
             kernel_name += std::string("_gaphoist");
+        if(tunable->wmma_l2_prefetch)
+            kernel_name += std::string("_l2pf");
         if(tunable->atomic_pack_bf16)
             kernel_name += std::string("_pkatomic");
         if(tunable->wrw_reduction_kernel)

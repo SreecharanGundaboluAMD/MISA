@@ -356,6 +356,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             "saddr_global_load is not yet combined with gemm_k_global_split/wrw_streamk for wrw -- not audited together"
         assert not (tunable.saddr_global_load and self.row_stride > 1), \
             "saddr_global_load is not yet supported together with row_stride > 1 (untested combination)"
+        if tunable.wmma_l2_prefetch:
+            assert self.row_stride == 1, \
+                "wmma_l2_prefetch is only implemented for row_stride==1 (plain 64-bit VADDR path) so far"
         self.sgpr = self.kernel_sgpr_t(mc, self)
         self.vgpr = self.kernel_vgpr_t(mc, self)
 
@@ -1044,6 +1047,12 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"s_mov_b32 s[{s.s_tdm_k_remain()}], s[{s.s_knum()}]   ; Phase 45: this shard's own remaining K (s_knum already reflects split-K)")
             self._emit_tdm_descriptor_setup_a()
             self._emit_tdm_descriptor_setup_b()
+        elif self.tunable.wmma_l2_prefetch:
+            # Phase D1-P2: nxe==0 makes B's gather a provable identity (see TDM docstring
+            # above), so s_b_k_stride is a valid constant per-K-block stride for the
+            # speculative prefetch's 2-stages-ahead address computation. Uses s_mul_i32
+            # (not s_lshl_b32) since gemm_k_per_block may not be a power of 2.
+            self._emit(f"s_mul_i32 s[{s.s_b_k_stride()}], s[{s.s_b_n_total()}], {self.data_byte * self.tunable.gemm_k_per_block}   ; b_n_total * databyte * {self.tunable.gemm_k_per_block} (l2_prefetch scratch stride)")
         self._emit(f"s_mul_i32 s[{s.s_hi_wi()}], s[{s.s_hi()}], s[{s.s_wi()}]")
         # grad_weight's per-K_out-row element count is y*x*c (not just c as in the 1x1 case) --
         # reused for the epilogue's row stride (Phase 5f). B (input) itself has no y/x
@@ -2063,6 +2072,45 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 return outer._get_deferred()
         return functor_t()
 
+    def prefetch_a_functor(self):
+        ''' Phase D1-P2 / guide §19: speculative global_prefetch_b8 for the tile TWO K-stages
+        ahead. wrw's A (grad_output) advances by s_a_k_stride (runtime SGPR), so the immediate
+        offset approach cannot be used. Copy v_addr_a into scratch v_gtc_tmp(1:2) (even-aligned
+        when v_gtc_tmp is odd), add s_a_k_stride, and issue the prefetch from the scratch pair.
+        Does NOT modify v_addr_a (gfx1250 global_load does not latch address at issue time). '''
+        outer = self
+        class functor_t:
+            def __call__(self):
+                v = outer.vgpr
+                s = outer.sgpr
+                with outer._deferred_context():
+                    outer._emit(f"v_mov_b32 v[{v.v_gtc_tmp(1)}], v[{v.v_addr_a()}]")
+                    outer._emit(f"v_mov_b32 v[{v.v_gtc_tmp(2)}], v[{v.v_addr_a(1)}]")
+                    outer._emit(f"v_add_co_u32 v[{v.v_gtc_tmp(1)}], vcc_lo, s[{s.s_a_k_stride()}], v[{v.v_gtc_tmp(1)}]")
+                    outer._emit(f"v_add_co_ci_u32 v[{v.v_gtc_tmp(2)}], vcc_lo, 0, v[{v.v_gtc_tmp(2)}], vcc_lo")
+                    outer._emit(f"global_prefetch_b8 v[{v.v_gtc_tmp(1)}:{v.v_gtc_tmp(2)}], off th:TH_LOAD_NT_RT scope:SCOPE_DEV")
+                return outer._get_deferred()
+        return functor_t()
+
+    def prefetch_b_functor(self):
+        ''' Phase D1-P2 / guide §19: wrw's B (input) non-TDM path recomputes its address via
+        gather every iteration, but nxe==0 makes the gather a provable identity -- so
+        s_b_k_stride (computed in the prologue when wmma_l2_prefetch is set) is a valid constant
+        per-K-block stride. Uses scratch v_gtc_tmp(1:2) -- see prefetch_a_functor. '''
+        outer = self
+        class functor_t:
+            def __call__(self):
+                v = outer.vgpr
+                s = outer.sgpr
+                with outer._deferred_context():
+                    outer._emit(f"v_mov_b32 v[{v.v_gtc_tmp(1)}], v[{v.v_addr_b()}]")
+                    outer._emit(f"v_mov_b32 v[{v.v_gtc_tmp(2)}], v[{v.v_addr_b(1)}]")
+                    outer._emit(f"v_add_co_u32 v[{v.v_gtc_tmp(1)}], vcc_lo, s[{s.s_b_k_stride()}], v[{v.v_gtc_tmp(1)}]")
+                    outer._emit(f"v_add_co_ci_u32 v[{v.v_gtc_tmp(2)}], vcc_lo, 0, v[{v.v_gtc_tmp(2)}], vcc_lo")
+                    outer._emit(f"global_prefetch_b8 v[{v.v_gtc_tmp(1)}:{v.v_gtc_tmp(2)}], off th:TH_LOAD_NT_RT scope:SCOPE_DEV")
+                return outer._get_deferred()
+        return functor_t()
+
     def emit_kernel_fma_main_loop(self):
         ctrl = ctrl_wmma_main_loop_t()
         ctrl.wmma_m           = self.wmma_mapping.ctrl
@@ -2078,6 +2126,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.interleave_b = False
         ctrl.wmma_setprio = self.tunable.wmma_setprio
         ctrl.gap_hoist = self.tunable.wmma_gap_hoist
+        ctrl.l2_prefetch = self.tunable.wmma_l2_prefetch
         ctrl.tdm_global_to_lds_a = self.tunable.tdm_global_load
         ctrl.tdm_global_to_lds_b = self.tunable.tdm_global_load
         # Phase 71 (PERF-004): both A and B are transposed (pack/wait-batched
@@ -2100,6 +2149,9 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.shared_load_b_functor       = self.shared_load_b_functor()
         ctrl.move_slice_window_a_functor = self.move_slice_window_a_functor()
         ctrl.move_slice_window_b_functor = self.move_slice_window_b_functor()
+        if self.tunable.wmma_l2_prefetch:
+            ctrl.prefetch_a_functor = self.prefetch_a_functor()
+            ctrl.prefetch_b_functor = self.prefetch_b_functor()
         if self.tunable.main_loop_interleave:
             ctrl.global_load_chunk_a_functor  = self.global_load_chunk_a_functor()
             ctrl.shared_store_chunk_a_functor = self.shared_store_chunk_a_functor()

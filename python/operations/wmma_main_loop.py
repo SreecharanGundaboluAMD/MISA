@@ -159,6 +159,20 @@ class ctrl_wmma_main_loop_t(object):
         # today's exact byte-identical behavior.
         self.gap_hoist                   = False
 
+        # Phase D1-P2 / guide §19 (L2 prefetch two K-stages ahead): when True AND
+        # can_hoist is also true, calls prefetch_a_functor/prefetch_b_functor right
+        # after the hoisted move_slice_window+global_load issuance, to issue a
+        # purely-speculative global_prefetch_b8 for the tile TWO K-stages ahead.
+        # Default False = today's exact byte-identical behavior.
+        self.l2_prefetch                  = False
+        # Called from the can_hoist branch right after the hoisted move_slice_window
+        # + global_load issuance. Each functor computes the 2-stages-ahead address
+        # (one more bytes_per_row add beyond what move_slice_window already advanced)
+        # and issues global_prefetch_b8 with a speculative TH (TH_LOAD_NT_RT) and
+        # scope:SCOPE_DEV. None = mechanism off (same as l2_prefetch=False).
+        self.prefetch_a_functor           = None
+        self.prefetch_b_functor           = None
+
         self.global_load_a_functor       = None
         self.global_load_b_functor       = None
         self.shared_store_a_functor      = None
@@ -279,6 +293,8 @@ class wmma_main_loop_t(mc_base_t):
         f_gld_chunk_b = ctrl.global_load_chunk_b_functor
         f_sst_chunk_a = ctrl.shared_store_chunk_a_functor
         f_sst_chunk_b = ctrl.shared_store_chunk_b_functor
+        f_prefetch_a = ctrl.prefetch_a_functor
+        f_prefetch_b = ctrl.prefetch_b_functor
 
         v_a, v_b, v_c = ctrl.v_a, ctrl.v_b, ctrl.v_c
         v_sst_a_os, v_sld_a_os = ctrl.v_sst_a_os, ctrl.v_sld_a_os
@@ -570,6 +586,11 @@ class wmma_main_loop_t(mc_base_t):
         is_fp32 = (ctrl.precision == 'fp32')
         can_hoist = (not a_style_async) and (not b_style_async) and (not interleave_a) and (not interleave_b) and double_buffer and (not is_fp32)
         gap_hoist = ctrl.gap_hoist and can_hoist
+        # Phase D1-P2 / guide §19: L2 prefetch two K-stages ahead, gated on can_hoist
+        # (same safety envelope as gap_hoist: move_slice_window/global_load/prefetch touch
+        # only SGPR/VGPR address descriptors and scratch VGPRs, never LDS). Silently
+        # no-op when can_hoist is False (no assert -- mirrors gap_hoist's precedent).
+        l2_prefetch = ctrl.l2_prefetch and can_hoist and (f_prefetch_a is not None) and (f_prefetch_b is not None)
 
         # Phase 13: an operand on the async path already issued its first tile's data
         # straight into LDS (global_load_async_to_lds_b128, no VGPR staging, no separate
@@ -657,6 +678,14 @@ class wmma_main_loop_t(mc_base_t):
             self._emit(f_move_slice_window_b())
             self._emit(f_gld_a())
             self._emit(f_gld_b())
+            if l2_prefetch:
+                # Phase D1-P2 / guide §19: issue speculative global_prefetch_b8 for the
+                # tile TWO K-stages ahead (one more bytes_per_row advance beyond what
+                # move_slice_window just computed), into L2/WGP cache only. Uses TH_LOAD_NT_RT
+                # (speculative temporal hint) + scope:SCOPE_DEV so a bad address near the
+                # K-loop tail is silently dropped instead of faulting (ISA doc §10.5).
+                self._emit(f_prefetch_a())
+                self._emit(f_prefetch_b())
             self._emit_empty_line()
 
             if gap_hoist:
