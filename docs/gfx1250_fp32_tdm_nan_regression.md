@@ -125,6 +125,39 @@ Non-TDM fp32 kernels in `config/igemm_fwd_gtc_gfx1250_nhwc_fp32_all.config` (spo
 10+ kernels including `_dbuf`, `_dbuf_async`, `_dbuf_direct`, `_dbuf_gkgs`) all still
 `valid:y` — no regression from the fix.
 
+### Addendum: wrw needed the same fix separately (`efe84c0` follow-up)
+
+The original fix (`efe84c0`) only wired `buffer_switch_extra_functor` into fwd and bwd's
+`emit_kernel_fma_main_loop()`. wrw's `emit_kernel_fma_main_loop()` was missed — it set
+`ctrl.s_tdm_k_remain` but never set the functor, so wrw's fp32 TDM kernels had the identical
+double-buffer bug. This gap was invisible at the time because wrw's fp32 TDM kernels were
+unreachable: a separate build-collision bug (duplicate kernel symbols from a dedup key-order
+mismatch, fixed in `b33cbd3`) prevented `config/igemm_wrw_gtc_gfx1250_nhwc_fp32_all.config`
+from building at all. Once `b33cbd3` unblocked the build, wrw's `_dbuf_tdm` and
+`_dbuf_tdm_gkgs` kernels became reachable and immediately failed on real hardware.
+
+The fix ports the identical pattern from fwd/bwd into
+`python/igemm/igemm_wrw_gtc_wmma_nhwc.py`'s `emit_kernel_fma_main_loop()`, guarded by the
+same `if self.tunable.tdm_global_load and self.lds_buffer_num == 2:` condition, emitting
+the same `s_xor_b32` toggles on `s_tdm_g0(1)` (A) and `s_tdm_g0_b(1)` (B). The
+`gemm_k_global_split=1` (`_gkgs`) path needs no additional treatment — split-K's epilogue
+writes to global memory, not LDS, so it is orthogonal to the TDM descriptor's LDS base
+toggle.
+
+wrw hardware validation (real gfx1250 silicon, `-V 1`, `-F 4`):
+
+| Kernel | n128 c1024 17x17 k1024 | n64 c512 28x28 k512 | n8 c2048 32x32 k2048 |
+|--------|------------------------|---------------------|----------------------|
+| wrw `_dbuf_tdm` | valid:y | valid:y | valid:y |
+| wrw `_dbuf_tdm_gkgs` | valid:y | valid:y | valid:y |
+
+Before the fix: `_dbuf_tdm` was `valid:n` (`pred:inf`), `_dbuf_tdm_gkgs` was `valid:n`
+(`pred:-nan`) on the standing shape.
+
+Regression check: fwd/bwd `_tdm`/`_tdm_direct` (all 3 shapes, both directions) re-confirmed
+`valid:y`. Six non-TDM wrw fp32 kernels (`_dbuf`, `_dbuf_direct`, `_dbuf_gkgs`, `_dbuf_ktail`,
+`_dbuf_ktail_gkgs`, `_dbuf_ktail_direct`) spot-checked `valid:y` on the standing shape.
+
 ## Reproduction
 
 ```
