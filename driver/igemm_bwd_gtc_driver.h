@@ -559,6 +559,16 @@ public:
                (!tunable->wmma_n_tail && gemm_n % gemm_n_per_block != 0) ||
                (!tunable->tdm_global_load && !tunable->wmma_k_tail && gemm_k % gemm_k_per_block != 0))
                 return false;
+            // R7 (docs/gfx1250_bwd_dbuf_ldsrp_nan.md): stacking lds_double_buffer=1 with
+            // lds_row_pad>0 on bwd produces silent wrong-answer (-nan) output on every
+            // shape/tile tested, even though each mechanism individually is
+            // hardware-validated correct for bwd (this is the one direction with
+            // asymmetric A/B transpose -- A untransposed, B transposed -- unlike fwd
+            // (neither transposed) and wrw (both transposed), and is the only one of the
+            // three where the combination breaks). Reject until root-caused, mirroring
+            // R5's rejection precedent above.
+            if(tunable->lds_double_buffer && tunable->lds_row_pad > 0)
+                return false;
             return true;
         }
 

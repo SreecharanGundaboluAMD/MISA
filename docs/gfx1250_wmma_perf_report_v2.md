@@ -462,14 +462,39 @@ the top of this document)**
    already excluded from every master `_all.config`'s search path (pre-existing
    accumulate-width-hazard mechanism — no code change needed).
 
-**P0.5 — the biggest win on the table, cheap to test**
+**P0.5 — DONE (this session), mixed result — additivity is direction-dependent, not universal**
 
-8. **Combine `lds_row_pad=16` with `lds_double_buffer=1`** (and, once correctness-checked,
-   `main_loop_interleave`/`k2x`) in one config per tile family, for all three directions
-   (wrw blocked on item 1). Measured today: `lds_row_pad` alone is a **+41–98%** relative win,
-   4-9× larger than hoisting alone; nothing currently tests whether they stack. This is the
-   report's top recommendation — cheaper than any P1/P2 item below and larger than all of
-   them measured so far.
+8. ~~**Combine `lds_row_pad=16` with `lds_double_buffer=1`**~~ Added `_dbuf_ldsrp.config` for
+   all three directions (128×128 and 64×64 tiles), hardware-validated on the standing
+   regression set. Result, measured at `n128 c1024 17×17 k1024`, 128×128 tile, pinned
+   1100 MHz (this session's machine is clock-capped, see §0 — **these numbers are directional
+   only, from a single shape/tile, and MUST be re-measured on the faster reference machine
+   before being treated as a real perf sign-off; further perf collection on this machine was
+   stopped once this was flagged mid-session**), warmed-up (`IGEMM_WARMUP=5 IGEMM_REPEAT=20`):
+
+   | direction | baseline | `dbuf` alone | `ldsrp` alone | `dbuf`+`ldsrp` | incremental `dbuf` gain over `ldsrp` alone |
+   |---|---|---|---|---|---|
+   | fwd | 275.2 TFLOP/s | 312.3 (+13.5%) | 404.5 (+47.0%) | 401.9 (+46.0%) | **~0%, noise-level** |
+   | wrw | 169.1 TFLOP/s | *(not comparable — wrw's `_dbuf.config` lacks `gemm_k_global_split=1`, an 8× parallelism handicap that dominates its number)* | 280.2 (+65.7%) | 310.5 (+83.7%) | **+10.8%, real** |
+   | bwd | — | — | — | **`-nan`, broken** | see R7 below |
+
+   **fwd: not additive** — `lds_row_pad` alone already captures essentially the entire win
+   at this shape/tile; stacking `lds_double_buffer` on top adds nothing measurable (within
+   run-to-run noise). **wrw: genuinely additive** — `lds_double_buffer` contributes a real
+   further +10.8% once `lds_row_pad` is already applied. **bwd: broken, not shippable** —
+   new defect **R7** (`docs/gfx1250_bwd_dbuf_ldsrp_nan.md`): the combination produces
+   silent `-nan` output on every regression shape/tile tested, despite each mechanism
+   individually being hardware-validated correct for bwd — plausibly related to bwd being
+   the only direction with asymmetric A/B transpose (A untransposed, B transposed, unlike
+   fwd's neither/wrw's both), not yet root-caused. Mitigated by a `tunable_is_valid`
+   rejection (mirroring R5's pattern) so no wrong-answer bwd kernel is reachable through
+   the master config.
+
+   fwd's and wrw's `_dbuf_ldsrp.config` are shipped, folded into their master
+   `_all.config` unions. bwd's is not (excluded by the driver-side rejection).
+   **Takeaway for future stacking experiments**: "two independently-good mechanisms compose"
+   is not a safe default assumption in this codebase — verify per-direction, not just
+   per-mechanism.
 
 **P1 — guide-derived, cheap, unchanged from v2 (still not attempted)**
 
