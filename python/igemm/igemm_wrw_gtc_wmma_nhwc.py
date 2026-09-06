@@ -1648,6 +1648,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         '''
         for c in range(self.num_k_chunks):
             self._emit_gld_chunk_load(v_gld, v_addr, c, v_flag=v_flag, v_flag_col=v_flag_col, saddr=saddr)
+            self._emit(f"s_wait_loadcnt 0x0")
             self._emit_sst_chunk(v_gld, v_sst_os, sst_extra_off, c)
 
     def _a_flag_symbol(self):
