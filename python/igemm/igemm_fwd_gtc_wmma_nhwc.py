@@ -2051,14 +2051,17 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         (one more stage) to the address -- does NOT modify v_addr_a at all, because on
         gfx1250 the global_load's address is NOT latched at issue time (modifying v_addr_a
         after the load is issued but before it reaches the memory controller corrupts the
-        load's address, confirmed via rocgdb). TH_LOAD_NT_RT (speculative) + scope:SCOPE_DEV
-        so a bad address near the K-loop tail is silently dropped (ISA doc §10.5). '''
+        load's address, confirmed via rocgdb). TH_LOAD_NT_RT (speculative) + scope:SCOPE_CU
+        so a bad address near the K-loop tail is silently dropped (ISA doc §10.5). SCOPE_CU
+        (CU/WGP-local) pulls data into all cache levels on miss; SCOPE_DEV would bypass WGP
+        cache and force every prefetch into the shared GL2, causing severe device-wide L2
+        request-queue contention (see docs/gfx1250_d1_l2_prefetch_validation.md). '''
         outer = self
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    outer._emit(f"global_prefetch_b8 v[{v.v_addr_a()}:{v.v_addr_a(1)}], off offset:{outer.bytes_per_row} th:TH_LOAD_NT_RT scope:SCOPE_DEV")
+                    outer._emit(f"global_prefetch_b8 v[{v.v_addr_a()}:{v.v_addr_a(1)}], off offset:{outer.bytes_per_row} th:TH_LOAD_NT_RT scope:SCOPE_CU")
                 return outer._get_deferred()
         return functor_t()
 
@@ -2069,7 +2072,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    outer._emit(f"global_prefetch_b8 v[{v.v_addr_b()}:{v.v_addr_b(1)}], off offset:{outer.bytes_per_row} th:TH_LOAD_NT_RT scope:SCOPE_DEV")
+                    outer._emit(f"global_prefetch_b8 v[{v.v_addr_b()}:{v.v_addr_b(1)}], off offset:{outer.bytes_per_row} th:TH_LOAD_NT_RT scope:SCOPE_CU")
                 return outer._get_deferred()
         return functor_t()
 

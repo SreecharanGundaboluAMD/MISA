@@ -1812,29 +1812,28 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             def __call__(self):
                 v = outer.vgpr
                 with outer._deferred_context():
-                    outer._emit(f"global_prefetch_b8 v[{v.v_addr_a()}:{v.v_addr_a(1)}], off offset:{outer.bytes_per_row} th:TH_LOAD_NT_RT scope:SCOPE_DEV")
+                    outer._emit(f"global_prefetch_b8 v[{v.v_addr_a()}:{v.v_addr_a(1)}], off offset:{outer.bytes_per_row} th:TH_LOAD_NT_RT scope:SCOPE_CU")
                 return outer._get_deferred()
         return functor_t()
 
     def prefetch_b_functor(self):
         ''' Phase D1-P2 / guide §19: bwd's B (weight, TRANSPOSED) advances by s_wei_k_stride
         (runtime SGPR), so the immediate offset approach cannot be used. Instead, copy v_addr_b
-        into scratch v_gtc_tmp(1:2) (even-aligned when v_gtc_tmp is odd, the common case), add
-        s_wei_k_stride, and issue the prefetch from the scratch pair. Does NOT modify v_addr_b.
-        NOTE: the even-alignment of v_gtc_tmp+1 depends on the VGPR allocation; if v_gtc_tmp is
-        even, v_gtc_tmp(0:1) is used instead. This is validated per-config at build time. '''
+        into scratch v_gtc_tmp pair (even-aligned: offset 1 when v_gtc_tmp is odd, offset 0
+        when even), add s_wei_k_stride, and issue the prefetch from the scratch pair.
+        Does NOT modify v_addr_b. '''
         outer = self
+        pf_off = 1 if (outer.vgpr.v_gtc_tmp.value % 2 == 1) else 0
         class functor_t:
             def __call__(self):
                 v = outer.vgpr
                 s = outer.sgpr
                 with outer._deferred_context():
-                    # copy 1-stage-ahead address into scratch (v_gtc_tmp+1 is even-aligned when v_gtc_tmp is odd)
-                    outer._emit(f"v_mov_b32 v[{v.v_gtc_tmp(1)}], v[{v.v_addr_b()}]")
-                    outer._emit(f"v_mov_b32 v[{v.v_gtc_tmp(2)}], v[{v.v_addr_b(1)}]")
-                    outer._emit(f"v_add_co_u32 v[{v.v_gtc_tmp(1)}], vcc_lo, s[{s.s_wei_k_stride()}], v[{v.v_gtc_tmp(1)}]")
-                    outer._emit(f"v_add_co_ci_u32 v[{v.v_gtc_tmp(2)}], vcc_lo, 0, v[{v.v_gtc_tmp(2)}], vcc_lo")
-                    outer._emit(f"global_prefetch_b8 v[{v.v_gtc_tmp(1)}:{v.v_gtc_tmp(2)}], off th:TH_LOAD_NT_RT scope:SCOPE_DEV")
+                    outer._emit(f"v_mov_b32 v[{v.v_gtc_tmp(pf_off)}], v[{v.v_addr_b()}]")
+                    outer._emit(f"v_mov_b32 v[{v.v_gtc_tmp(pf_off+1)}], v[{v.v_addr_b(1)}]")
+                    outer._emit(f"v_add_co_u32 v[{v.v_gtc_tmp(pf_off)}], vcc_lo, s[{s.s_wei_k_stride()}], v[{v.v_gtc_tmp(pf_off)}]")
+                    outer._emit(f"v_add_co_ci_u32 v[{v.v_gtc_tmp(pf_off+1)}], vcc_lo, 0, v[{v.v_gtc_tmp(pf_off+1)}], vcc_lo")
+                    outer._emit(f"global_prefetch_b8 v[{v.v_gtc_tmp(pf_off)}:{v.v_gtc_tmp(pf_off+1)}], off th:TH_LOAD_NT_RT scope:SCOPE_CU")
                 return outer._get_deferred()
         return functor_t()
 

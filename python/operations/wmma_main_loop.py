@@ -169,7 +169,7 @@ class ctrl_wmma_main_loop_t(object):
         # + global_load issuance. Each functor computes the 2-stages-ahead address
         # (one more bytes_per_row add beyond what move_slice_window already advanced)
         # and issues global_prefetch_b8 with a speculative TH (TH_LOAD_NT_RT) and
-        # scope:SCOPE_DEV. None = mechanism off (same as l2_prefetch=False).
+        # scope:SCOPE_CU. None = mechanism off (same as l2_prefetch=False).
         self.prefetch_a_functor           = None
         self.prefetch_b_functor           = None
 
