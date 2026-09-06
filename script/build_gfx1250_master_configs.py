@@ -93,17 +93,20 @@ def normalize(body_lines):
     return '\n'.join(keep)
 
 
-# conv_driver.cpp computes is_wmma_f16_acc/is_wmma_bf16_acc/is_wmma_atomic_pack_bf16 (and the
-# derived dtype_alloc_byte output-buffer width) ONCE from tunables[0], not per-tunable inside
-# the search loop -- confirmed by reading conv_driver.cpp directly (lines ~669-780) after this
-# script's first attempt at a master file produced a REAL, reproducible valid:n for wmma_acc_f16/
-# bf16 kernels that pass fine standalone. Mixing an accumulate-width-variant section into a file
-# whose first tunable doesn't share that width silently corrupts verification for it -- a
-# pre-existing driver limitation this consolidation is the first thing to expose (gfx950/942
-# never had a per-tunable output-width concept at all). Excluded here rather than fixed in
-# conv_driver.cpp (which would need buffer allocation restructured to happen per-tunable, not
-# once upfront) -- these keep working fine as their own separate, narrower config files.
-ACCUMULATE_WIDTH_KEYS = ('wmma_acc_f16', 'wmma_acc_bf16', 'atomic_pack_bf16')
+# conv_driver.cpp computes is_wmma_f16_acc/is_wmma_bf16_acc/is_wmma_atomic_pack_bf16/
+# is_wmma_fp16_output (and the derived dtype_alloc_byte output-buffer width) ONCE from
+# tunables[0], not per-tunable inside the search loop -- confirmed by reading
+# conv_driver.cpp directly (lines ~669-780) after this script's first attempt at a master
+# file produced a REAL, reproducible valid:n for wmma_acc_f16/bf16 kernels that pass fine
+# standalone. Mixing an accumulate-width-variant section into a file whose first tunable
+# doesn't share that width silently corrupts verification for it -- a pre-existing driver
+# limitation this consolidation is the first thing to expose (gfx950/942 never had a
+# per-tunable output-width concept at all). Excluded here rather than fixed in
+# conv_driver.cpp (which would need buffer allocation restructured to happen per-tunable,
+# not once upfront) -- these keep working fine as their own separate, narrower config
+# files. wmma_fp16_output (R2, gfx1250_wmma_perf_report_v2.md) has the identical hazard --
+# same "computed once from tunables[0]" pattern -- so it gets the same treatment.
+ACCUMULATE_WIDTH_KEYS = ('wmma_acc_f16', 'wmma_acc_bf16', 'atomic_pack_bf16', 'wmma_fp16_output')
 
 
 def has_accumulate_width_variant(body_lines):
