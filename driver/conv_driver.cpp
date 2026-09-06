@@ -194,7 +194,7 @@ static inline double get_theoritical_gpu_gflops(int sclk_mhz, driverDataType_t d
         else if(gcn_arch == 908 || gcn_arch == 910)
             fp_factor = 4;  // xdlops
         else if(gcn_arch == 1250)
-            fp_factor = 9;  // wmma, v_wmma_f32_16x16x32_f16: measured burst 1411 TFLOP/s
+            fp_factor = 8;  // wmma, v_wmma_f32_16x16x32_f16: same MAC-throughput class as CDNA MFMA (xdlops) fp16
         else
             fp_factor = 2;  // dlops
         if(gcn_arch >= 1000 && gcn_arch != 1250)
@@ -210,7 +210,7 @@ static inline double get_theoritical_gpu_gflops(int sclk_mhz, driverDataType_t d
         else if(gcn_arch == 908 || gcn_arch == 910)
             fp_factor = 4;  // xdlops
         else if(gcn_arch == 1250)
-            fp_factor = 9;  // wmma, v_wmma_f32_16x16x32_bf16: same throughput as fp16 WMMA
+            fp_factor = 8;  // wmma, v_wmma_f32_16x16x32_bf16: same throughput as fp16 WMMA
         else
             fp_factor = 2;  // dlops
         if(gcn_arch >= 1000 && gcn_arch != 1250)
