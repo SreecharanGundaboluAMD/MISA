@@ -534,7 +534,8 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         kas.append(amdgpu_kernel_arg_t('group'     , 4, 84, 'by_value', 'i32'))
         # Phase 48 (gemm_k_global_split): this workgroup's K-slice length. Always present in
         # the karg layout (even for non-split kernels, which never read it) so both variants
-        # share one struct on the driver side -- mirrors wrw's identical field.
+        # share one struct on the driver side -- mirrors wrw/fwd's identical field.
+        kas.append(amdgpu_kernel_arg_t('gemm_k_per_wg', 4, 88, 'by_value', 'i32'))
         # Phase 60 (Magic Division): host-precomputed magic multipliers for the
         # hi_wi/wi/stride_h/stride_w divisors. Always present so all variants share one
         # karg struct. Placed after gemm_k_per_wg to avoid shifting existing offsets.

@@ -1,10 +1,16 @@
 # bwd `gemm_k_global_split` memory fault — investigation notes (R5)
 
-**Status: unresolved, mitigated by rejection.** `driver/igemm_bwd_gtc_driver.h`'s WMMA
-`tunable_is_valid` now unconditionally rejects `gemm_k_global_split=1` for bwd. No bwd config
-in this repo sets it, so this is a no-op today; it exists to stop a *future* config or driver
-change from silently re-exposing a crash. Do not remove the rejection without either fixing
-the root cause below or getting a second, independent hardware confirmation that it's gone.
+**Status: RESOLVED.** Root cause found and fixed: `igemm_bwd_gtc_wmma_nhwc.py`'s
+`get_kernel_args()` was missing the `gemm_k_per_wg` argument declaration at kernarg offset 88
+from the PAL metadata `.args` array. The driver-side C++ karg struct
+(`igemm_bwd_gtc_wmma_nhwc_karg_t`) and the kernel's assembly prologue (`s_load_dword` at
+offset 0x58=88) both correctly referenced this field, but the `.hsaco`'s PAL metadata declared
+no argument at offset 88 — creating a 4-byte hole that the ROCm runtime did not reliably
+populate, causing the device to read stale/garbage data at that offset. fwd and wrw both
+correctly declared this argument; bwd's comment said "always present" but the actual
+`kas.append(amdgpu_kernel_arg_t('gemm_k_per_wg', ...))` call was missing. The one-line fix
+(adding the missing `kas.append`) has been hardware-validated on all repro shapes and the
+standing regression set. The `tunable_is_valid` rejection has been removed.
 
 ## Symptom
 
@@ -98,35 +104,120 @@ side — but this was not conclusively traced further. In particular:
   be a HIP/ROCr kernarg-copy or hardware kernarg-preload interaction that depends on exact
   SGPR pressure or register number, not a bug in this codebase's Python/C++ source. This
   hypothesis was not verified further (would require ROCm runtime source-level debugging or
-  a minimal non-igemm repro, out of scope for this pass).
+- The above hypothesis (a) — that the absolute SGPR number or total SGPR count was the cause
+  — was ruled out by item 7 above (commit 6cd1ce7: moving s_gemm_k_per_wg from s50 to s42
+  changed nothing). The true root cause was found by a different approach: comparing the two
+  kernels' compiled `.hsaco` PAL metadata (see "Root cause" below).
 
-## Recommendation for whoever picks this up next
+## Root cause (FOUND)
 
-1. Build the smallest possible standalone repro: a HIP kernel with a >84-byte kernarg struct
-   where a lone `s_load_dword` sits between a `group`-of-fields region and a `dwordx4`
-   region, launched via the exact `HIP_LAUNCH_PARAM_BUFFER_POINTER`/`_SIZE` mechanism this
-   driver uses (not `hipLaunchKernelGGL`), to see if the corruption reproduces outside this
-   codebase entirely — that would point conclusively at ROCm/HIP or the hardware rather than
-   at anything in this repo.
-2. If reproducible standalone, escalate to the ROCm/hardware team (same track as
-   `docs/gfx1250_fp32_wmma_occupancy_race.md`).
-3. If **not** reproducible standalone, the next suspect is `wmma_k_tail`/`row_repeat_a`-style
-   codegen-time register-count interactions specific to `igemm_bwd_gtc_wmma_nhwc_t`'s
-   `sseq()` allocation order — try moving `s_gemm_k_per_wg`'s declaration to be immediately
-   adjacent to `s_group`'s (so the two loads can merge into one `s_load_dwordx2`) as a
-   structural workaround, and confirm whether the corruption follows the register number or
-   disappears.
-4. Do not re-enable bwd `gemm_k_global_split` (remove the `tunable_is_valid` rejection in
-   `driver/igemm_bwd_gtc_driver.h`) without a hardware-validated fix — this is a memory-fault
-   crash, not a wrong-answer, and must not regress silently.
+The initial hypothesis was that gfx1250 hardware kernarg preloading metadata differed between
+fwd and bwd. That hypothesis was **wrong** — neither kernel's `.amdhsa_kernel` descriptor in
+the `.s`/`.inc` source contains any `.amdhsa_user_sgpr_kernarg_preload_length` or
+`.amdhsa_user_sgpr_count` directives, and the compiled `.hsaco`'s PAL metadata contains no
+preload-related fields either. Both kernels rely entirely on manual `s_load_b32`/`s_load_b128`
+sequences in their prologues to read kernargs from the segment pointer in `s[0:1]`.
 
-## Reproduction
+The actual root cause was a **missing argument declaration in the PAL metadata `.args` array**.
+
+`igemm_bwd_gtc_wmma_nhwc.py`'s `get_kernel_args()` builds the list of kernel arguments that
+gets emitted into the `.hsaco`'s PAL metadata (the `.args` array seen by
+`llvm-readobj --notes`). This list had a 4-byte hole at offset 88: after `group` (offset 84),
+it jumped directly to `magic_hi_wi` (offset 92), **omitting `gemm_k_per_wg` (offset 88)**.
+The comment at that location said "Always present in the karg layout (even for non-split
+kernels, which never read it) so both variants share one struct on the driver side — mirrors
+wrw's identical field" — but the actual `kas.append(amdgpu_kernel_arg_t('gemm_k_per_wg', 4,
+88, 'by_value', 'i32'))` call was never written. fwd (line 701) and wrw (line 646) both have
+it; bwd was the only one missing it.
+
+Evidence from `llvm-readobj --notes --elf-output-style=GNU` on the compiled `.hsaco` files:
+
+**fwd (working)** `.args` array — correctly declares `gemm_k_per_wg` at offset 88:
+```
+      - .name:           group
+        .offset:         84
+        .size:           4
+        .value_kind:     by_value
+      - .name:           gemm_k_per_wg    ← PRESENT
+        .offset:         88
+        .size:           4
+        .value_kind:     by_value
+      - .name:           magic_0
+        .offset:         92
+```
+
+**bwd (broken)** `.args` array — skips offset 88 entirely:
+```
+      - .name:           group
+        .offset:         84
+        .size:           4
+        .value_kind:     by_value
+      - .name:           magic_hi_wi      ← NO gemm_k_per_wg at offset 88!
+        .offset:         92
+```
+
+Both kernels' assembly prologues load from offset 0x58=88 via `s_load_b32`:
+```
+fwd: s_load_b32 s38, s[0:1], 0x58     ; gemm_k_per_wg
+bwd: s_load_b32 s50, s[0:1], 0x58     ; gemm_k_per_wg
+```
+
+The ROCm runtime uses the PAL metadata `.args` array to determine which kernarg dwords to copy
+to the device. With no argument declared at offset 88, the runtime does not reliably populate
+that dword — the device reads stale/garbage data (the `0x5f317831` / `"1x1_"` fragment observed
+in the rocgdb session), exactly matching the symptom.
+
+## Fix
+
+One-line fix in `python/igemm/igemm_bwd_gtc_wmma_nhwc.py`'s `get_kernel_args()`: add the
+missing `kas.append(amdgpu_kernel_arg_t('gemm_k_per_wg', 4, 88, 'by_value', 'i32'))` between
+the `group` and `magic_hi_wi` entries, matching fwd and wrw. The `tunable_is_valid` rejection
+in `driver/igemm_bwd_gtc_driver.h` has been removed.
+
+## Hardware validation
+
+After the fix, all previously-crashing shapes now report `valid:y`:
 
 ```
-$ python3 igemm_codegen.py config/igemm_bwd_gtc_gfx1250_nhwc_fp16_all.config -d /tmp/x
-# (with the tunable_is_valid rejection above reverted, to rebuild the affected kernel)
+# Trivial tile-aligned shape, 128x128 tile, real split count 4:
 $ IGEMM_RUN_ONLY_KERNEL=igemm_bwd_gtcw_nhwc_fp16_bx0_ex0_bt128x128x32_wt16x16_wr4x4_ta1x32x1x1_1x1x1x128_tb1x32x1x1_1x1x1x128_dstrb_gkgs \
-  /opt/rocm/bin/rocgdb -q -ex 'set amdgpu precise-memory on' -ex run --args \
   ./conv_driver.exe convfp16 -n 32 -c 128 -H 16 -W 16 -k 128 -y 1 -x 1 -p 0 -q 0 -u 1 -v 1 \
   -l 1 -j 1 -g 1 -F 2 -V 1 --in_layout NHWC --fil_layout NHWC --out_layout NHWC
+[bwd: 0] ..._dstrb_gkgs[4], cost:0.022ms, tflops:12.228(2.12%), valid:y
+
+# Original report shape (n128 c1024 17x17 k1024), real split count 1:
+$ IGEMM_RUN_ONLY_KERNEL=..._128x128x32_..._dstrb_gkgs \
+  ./conv_driver.exe convfp16 -n 128 -c 1024 -H 17 -W 17 -k 1024 -y 1 -x 1 -p 0 -q 0 -u 1 -v 1 \
+  -l 1 -j 1 -g 1 -F 2 -V 1 --in_layout NHWC --fil_layout NHWC --out_layout NHWC
+[bwd: 0] ..._dstrb_gkgs[1], cost:0.400ms, tflops:193.809(33.61%), valid:y
+
+# 64x64 tile, trivial shape:
+$ IGEMM_RUN_ONLY_KERNEL=..._64x64x32_..._dstrb_gkgs \
+  ./conv_driver.exe convfp16 -n 32 -c 128 -H 16 -W 16 -k 128 ...
+[bwd: 0] ..._dstrb_gkgs[2], cost:0.069ms, tflops:3.869(0.67%), valid:y
+
+# Forced split count 1 (IGEMM_GSPLIT_SWEEP=1):
+$ IGEMM_GSPLIT_SWEEP=1 IGEMM_RUN_ONLY_KERNEL=..._128x128x32_..._dstrb_gkgs \
+  ./conv_driver.exe convfp16 -n 32 -c 128 -H 16 -W 16 -k 128 ...
+[bwd: 0] ..._dstrb_gkgs[1], cost:0.026ms, tflops:10.389(1.80%), valid:y
+```
+
+Standing regression set (from `docs/gfx1250_wmma_perf_report_v2.md`) — all bwd shapes pass
+with zero `valid:n` or crashes across all kernel variants in the master fp16 config:
+```
+-n 256 -c 2048 -H 14 -W 14 -k 2048 -y 1 -x 1   # 12 kernels, all valid:y
+-n 128 -c 1024 -H 17 -W 17 -k 1024 -y 1 -x 1   # 24 kernels, all valid:y
+-n 64  -c 512  -H 28 -W 28 -k 512  -y 3 -x 3   # 22 kernels, all valid:y
+-n 32  -c 256  -H 56 -W 56 -k 256  -y 3 -x 3   # 22 kernels, all valid:y
+-n 128 -c 64   -H 56 -W 56 -k 64   -y 1 -x 1   # 24 kernels, all valid:y
+```
+
+## Reproduction (post-fix; no longer crashes)
+
+```
+$ python3 igemm_codegen.py config/igemm_bwd_gtc_gfx1250_nhwc_fp16_gsplit.config -d /tmp/x
+$ IGEMM_RUN_ONLY_KERNEL=igemm_bwd_gtcw_nhwc_fp16_bx0_ex0_bt128x128x32_wt16x16_wr4x4_ta1x32x1x1_1x1x1x128_tb1x32x1x1_1x1x1x128_dstrb_gkgs \
+  ./conv_driver.exe convfp16 -n 32 -c 128 -H 16 -W 16 -k 128 -y 1 -x 1 -p 0 -q 0 -u 1 -v 1 \
+  -l 1 -j 1 -g 1 -F 2 -V 1 --in_layout NHWC --fil_layout NHWC --out_layout NHWC
+# Expected: valid:y (pre-fix: HSA_STATUS_ERROR_MEMORY_FAULT or silent corruption)
 ```
