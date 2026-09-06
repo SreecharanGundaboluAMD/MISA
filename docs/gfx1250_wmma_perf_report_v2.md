@@ -496,7 +496,7 @@ the top of this document)**
    is not a safe default assumption in this codebase — verify per-direction, not just
    per-mechanism.
 
-**P1 — guide-derived, cheap (item 9 DONE this session; items 10–12 unchanged from v2)**
+**P1 — guide-derived, cheap (items 9-10 DONE this session; items 11-12 unchanged from v2)**
 
 9. ~~**Fill the split-barrier signal→wait gap (guide §14) with the next tile's hoisted load
    issue**~~ **DONE** — `wmma_gap_hoist` tunable added to `wmma_main_loop.py` (moves
@@ -512,8 +512,31 @@ the top of this document)**
    additive (+8.2%)**, **bwd inconclusive at this clock** (delta within run-to-run noise).
    All three `_dbuf_gaphoist.config` files shipped, folded into master `_all.config`.
    See `docs/gfx1250_d1_split_barrier_gap_hoist_validation.md` for full details.
-10. Temporal hints (`RT_NT` on A/B cooperative loads, `NT` on C stores, guide §18) — still a
-    one-line-per-emitter change, still unbenchmarked.
+10. ~~**Temporal hints (`RT_NT` on A/B cooperative loads, `NT` on C stores, guide §18)**~~
+    **DONE** — `th:TH_LOAD_RT_NT` added to all 6 cooperative A/B `global_load_dwordx4`
+    emit sites (2 per direction: saddr + non-saddr variants, `_emit_gld_chunk_load` in each
+    WMMA generator) and `th:TH_STORE_NT` added to all 9 non-atomic C-output
+    `global_store_dword*` emit sites in `coalescing_store_wmma.py` (chunked + unchunked
+    LDS-reshuffle epilogue, `wrw_reduction_kernel`'s plain-store branch, and the
+    `direct_store`/C1 per-lane epilogue). Unconditional codegen change (no new tunable) --
+    matches every existing config. Async/TDM loads and the atomic (`gemm_k_global_split`)
+    epilogue are deliberately excluded (different instruction families/semantics; atomics
+    already have their own separate, currently-disabled `atomic_th`/`atomic_cascade`
+    mechanism -- untouched). `th:`/`scope:` syntax confirmed accepted by this repo's
+    toolchain (`clang -x assembler -mcpu=gfx1250`) and verified via disassembly to encode
+    genuinely different bytes from the default (not silently dropped). Zero-diff regression
+    verified via `git stash` (identical assembly modulo the `th:` suffixes). Correctness
+    validated (`-V 1`, `valid:y`) on fwd/bwd/wrw fp16 across the standard regression shapes;
+    a pre-existing, unrelated fp32+`tdm_global_load` `-nan` failure was found and confirmed
+    via `git stash` to reproduce identically without this change (not a regression, not
+    investigated further -- out of scope). Basic before/after (this session's capped
+    1100 MHz sclk, see §0 -- **directional only**): fwd **+2.4%**, bwd **+2.5%** (both
+    consistent across 3 runs, <0.5% noise) on the primary standing regression shape; wrw
+    showed no measurable change on either its grid-starved plain-`dbuf` config or its
+    default split-K (`gemm_k_global_split=1`) config, consistent with wrw's default
+    epilogue being the atomic path this change deliberately does not touch. Must be
+    re-verified on the faster reference machine before treating as a final performance
+    verdict.
 11. gfx1250 shader prologue / `S_CODE_END` padding, then `GLOBAL_PREFETCH_B8` two K-stages
     ahead (guide §19) for compute-bound 1×1 shapes.
 12. Packed 2-wide vector atomics for wrw's split-K epilogue

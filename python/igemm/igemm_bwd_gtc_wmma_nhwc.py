@@ -1225,9 +1225,9 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         for i in range(self.chunk_num_dwordx4):
             idx = chunk_idx * self.chunk_num_dwordx4 + i
             if saddr is not None:
-                self._emit(f"global_load_dwordx4 v[{v_gld(i*4)}:{v_gld(i*4+3)}], v[{v_addr()}], s[{saddr()}:{saddr(1)}] offset:{idx*16}")
+                self._emit(f"global_load_dwordx4 v[{v_gld(i*4)}:{v_gld(i*4+3)}], v[{v_addr()}], s[{saddr()}:{saddr(1)}] offset:{idx*16} th:TH_LOAD_RT_NT")
             else:
-                self._emit(f"global_load_dwordx4 v[{v_gld(i*4)}:{v_gld(i*4+3)}], v[{v_addr()}:{v_addr(1)}], off offset:{idx*16}")
+                self._emit(f"global_load_dwordx4 v[{v_gld(i*4)}:{v_gld(i*4+3)}], v[{v_addr()}:{v_addr(1)}], off offset:{idx*16} th:TH_LOAD_RT_NT")
         if v_flag is not None:
             self._emit(f"s_mov_b32 exec_lo, -1")
 

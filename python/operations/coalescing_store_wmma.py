@@ -508,7 +508,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                     if ctrl.wmma_m_tail:
                         self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (fast path)")
                     self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n (fast path)")
-                    self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
+                    self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1] th:TH_STORE_NT")
                     self._emit(f"s_mov_b32 exec_lo, -1")
                     self._emit(f"s_branch {label_done}")
                     self._emit_front(f"{label_slow}:")
@@ -516,7 +516,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                         if ctrl.wmma_m_tail:
                             self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (elem {i})")
                         self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], {i}   ; wmma_n_tail: col+{i} < real gemm_n")
-                        self._emit(f"global_store_dword v[{v_tmp2}], v[{v_gather}+{i}], s[{s_p_out}:{s_p_out}+1] offset:{i * elem_bytes}")
+                        self._emit(f"global_store_dword v[{v_tmp2}], v[{v_gather}+{i}], s[{s_p_out}:{s_p_out}+1] offset:{i * elem_bytes} th:TH_STORE_NT")
                         self._emit(f"s_mov_b32 exec_lo, -1")
                     self._emit_front(f"{label_done}:")
                 else:
@@ -524,7 +524,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                         self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
                     if ctrl.wmma_n_tail:
                         self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n")
-                    self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
+                    self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1] th:TH_STORE_NT")
                     if ctrl.wmma_m_tail or ctrl.wmma_n_tail:
                         self._emit(f"s_mov_b32 exec_lo, -1")
             self._emit_empty_line()
@@ -710,7 +710,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                             # non-atomic store (no concurrent writers ever target the same
                             # workspace address, so no ordering/scope concern exists).
                             if ctrl.wrw_reduction_kernel:
-                                self._emit(f"global_store_dword v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str}")
+                                self._emit(f"global_store_dword v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str} th:TH_STORE_NT")
                             else:
                                 th_str = f" th:{ctrl.atomic_th}" if ctrl.atomic_cascade else ""
                                 # Phase 57: int8/int4's WMMA accumulator is a genuine int32
@@ -1066,7 +1066,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                             if ctrl.wmma_m_tail:
                                 self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (fast path)")
                             self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n (fast path)")
-                            self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
+                            self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1] th:TH_STORE_NT")
                             self._emit(f"s_mov_b32 exec_lo, -1")
                             self._emit(f"s_branch {label_done}")
                             self._emit_front(f"{label_slow}:")
@@ -1074,7 +1074,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                                 if ctrl.wmma_m_tail:
                                     self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (elem {i})")
                                 self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], {i}   ; wmma_n_tail: col0+{i} < real gemm_n")
-                                self._emit(f"global_store_dword v[{v_tmp2}], v[{v_gather}+{i}], s[{s_p_out}:{s_p_out}+1] offset:{i * elem_bytes}")
+                                self._emit(f"global_store_dword v[{v_tmp2}], v[{v_gather}+{i}], s[{s_p_out}:{s_p_out}+1] offset:{i * elem_bytes} th:TH_STORE_NT")
                                 self._emit(f"s_mov_b32 exec_lo, -1")
                             self._emit_front(f"{label_done}:")
                         else:
@@ -1091,7 +1091,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                                 # so this further narrows to lanes that are ALSO column-in-range.
                                 # Phase 51: "remaining > 0" is exactly the old "col0 < gemm_n" flag.
                                 self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n")
-                            self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1]")
+                            self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1] th:TH_STORE_NT")
                             if ctrl.wmma_m_tail or ctrl.wmma_n_tail:
                                 self._emit(f"s_mov_b32 exec_lo, -1")
                         if it != num_passes - 1:
@@ -1221,7 +1221,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                         self._emit(f"{cvt_inst} v[{v_tmp4}], v[{v_c}+{c_index}], v[{v_tmp3}]   ; lo16=this lane's col, hi16=partner's")
                         self._emit(f"v_and_b32 v[{v_tmp3}], 1, v[{v_tid}]")
                         self._emit(f"v_cmpx_eq_u32 0, v[{v_tmp3}]   ; EXEC = (this lane is even)")
-                        self._emit(f"global_store_dword v[{cur}], v[{v_tmp4}], s[{s_p_out}:{s_p_out}+1]{offset_str}")
+                        self._emit(f"global_store_dword v[{cur}], v[{v_tmp4}], s[{s_p_out}:{s_p_out}+1]{offset_str} th:TH_STORE_NT")
                         self._emit(f"s_mov_b32 exec_lo, -1   ; restore full EXEC for the next iteration's exchange")
                     else:
                         masked = ctrl.wmma_m_tail or ctrl.wmma_n_tail
@@ -1231,7 +1231,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                             col_val = i_rn * cxm.wave_tile_n
                             self._emit(f"v_add_u32 v[{v_tmp4}], {col_val}, v[{v_gemm_in}]" if col_val != 0 else f"v_mov_b32 v[{v_tmp4}], v[{v_gemm_in}]")
                             self._emit(f"v_cmpx_gt_u32 s[{s_gemm_n}], v[{v_tmp4}]   ; wmma_n_tail: col < real gemm_n")
-                        self._emit(f"global_store_dword v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str}")
+                        self._emit(f"global_store_dword v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str} th:TH_STORE_NT")
                         if masked:
                             self._emit(f"s_mov_b32 exec_lo, -1")
                 cur, nxt = nxt, cur
