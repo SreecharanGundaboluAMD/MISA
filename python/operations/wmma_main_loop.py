@@ -167,6 +167,14 @@ class ctrl_wmma_main_loop_t(object):
         self.shared_load_b_functor       = None
         self.move_slice_window_a_functor = None
         self.move_slice_window_b_functor = None
+        # TDM double-buffering: when set, called by emit_buffer_switch() right after the
+        # VGPR offset toggles, to toggle any mechanism-specific LDS base address that the
+        # VGPR XORs don't cover. TDM's tensor_load_to_lds writes to a fixed LDS base in
+        # SGPRs (s_tdm_g0(1)/s_tdm_g0_b(1)), set once in the prologue and invisible to
+        # the generic VGPR-only buffer switch -- without this callback, TDM always writes
+        # to buffer 0 while reads alternate to buffer 1, producing -nan. Set by the
+        # generator only when tdm_global_load AND lds_double_buffer are both active.
+        self.buffer_switch_extra_functor  = None
         # Phase 15 (interleaving): single-chunk primitives, only used when interleave_a/b.
         # Callable as f(chunk_idx) -- see docstring above.
         self.global_load_chunk_a_functor  = None
@@ -493,6 +501,11 @@ class wmma_main_loop_t(mc_base_t):
             self._emit(f"v_xor_b32 v[{v_sst_a_os()}], {ctrl.lds_single_size}, v[{v_sst_a_os()}]")
             self._emit(f"v_xor_b32 v[{v_sld_a_os()}], {ctrl.lds_single_size}, v[{v_sld_a_os()}]")
             self._emit(f"v_xor_b32 v[{v_sld_b_os()}], {ctrl.lds_single_size}, v[{v_sld_b_os()}]")
+            if ctrl.buffer_switch_extra_functor is not None:
+                # TDM: toggle the tensor descriptor's SGPR LDS base in lockstep with the
+                # VGPR offsets, so TDM's tensor_load_to_lds writes to the same buffer the
+                # VGPR store offset now points at.
+                self._emit(ctrl.buffer_switch_extra_functor())
 
         # ---- prologue: caller has already issued the first global A/B load ----
         # Structure note: the LDS-load + compute for a tile always happens at the TOP
@@ -579,6 +592,11 @@ class wmma_main_loop_t(mc_base_t):
             # tile) and prefetch-store (buffer 1, the next tile) target different
             # buffers from the very first iteration onward.
             self._emit(f"v_xor_b32 v[{v_sst_a_os()}], {ctrl.lds_single_size}, v[{v_sst_a_os()}]")
+            if ctrl.buffer_switch_extra_functor is not None:
+                # TDM: advance the tensor descriptor's SGPR LDS base to buffer 1 too, so
+                # the first loop iteration's TDM load (which IS the store) writes to the
+                # same buffer v_sst_a_os now points at.
+                self._emit(ctrl.buffer_switch_extra_functor())
             self._emit_empty_line()
 
         self._emit(f"s_mov_b32 s[{s_kitr()}], s[{s_knum()}]")

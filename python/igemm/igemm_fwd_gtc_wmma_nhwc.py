@@ -2084,7 +2084,20 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.s_knum    = sym_t(self.sgpr.s_knum.label)
         if self.tunable.tdm_global_load:
             ctrl.s_tdm_k_remain = sym_t(self.sgpr.s_tdm_k_remain.label)
-
+            if self.lds_buffer_num == 2:
+                # TDM's tensor_load_to_lds writes to a fixed LDS base in SGPRs
+                # (s_tdm_g0(1) for A, s_tdm_g0_b(1) for B), set once in the prologue and
+                # invisible to wmma_main_loop.py's generic VGPR-only buffer switch. With
+                # double-buffering, the descriptor base must toggle in lockstep with the
+                # VGPR store/read offsets so TDM's load (which IS the store) writes to the
+                # same buffer v_sst_a_os points at. This functor is called by
+                # emit_buffer_switch() and the prologue's initial buffer advance.
+                s = self.sgpr
+                lds_sz = self.lds_single_size
+                ctrl.buffer_switch_extra_functor = lambda: (
+                    f"s_xor_b32 s[{s.s_tdm_g0(1)}], {lds_sz}, s[{s.s_tdm_g0(1)}]   ; TDM A descriptor LDS base toggle\n"
+                    f"s_xor_b32 s[{s.s_tdm_g0_b(1)}], {lds_sz}, s[{s.s_tdm_g0_b(1)}]   ; TDM B descriptor LDS base toggle"
+                )
         # first global load for this tap already issued by emit_kernel_tap_loop(), which is
         # also the sole caller of this method (see class docstring, Phase 5d)
         wmma_main_loop_t(self.mc, ctrl).emit()
