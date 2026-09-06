@@ -308,6 +308,13 @@ class igemm_gtc_tunable_parameter_t(object):
             # -- see docs/gfx1250_perf_parity_action_plan.md's Tier 1 item 1. Default 0 = every
             # existing config byte-identical.
             self.wmma_setprio                    = utility_dict_with_default_t(tunable_dict)('wmma_setprio', 0)
+            # Phase D1-P1 / guide §14 (split-barrier gap hoist): when set AND can_hoist
+            # is also true (lds_double_buffer=1, non-async, non-TDM, non-interleave,
+            # non-fp32), moves s_barrier_wait from immediately after s_barrier_signal to
+            # immediately after the hoisted move_slice_window+global_load issuance, filling
+            # the signal→wait gap with useful work. Default 0 = every existing config
+            # byte-identical.
+            self.wmma_gap_hoist                   = utility_dict_with_default_t(tunable_dict)('wmma_gap_hoist', 0)
             # Phase 22 (VGPR-level prefetch): local_prefetch_num is read further below,
             # in the num_vgpr_accumulate_a/b section -- this __init__ has a later, shared
             # `self.local_prefetch_num = 1` default (for every fma_type) that runs AFTER
@@ -1521,6 +1528,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_bf16acc"
         if tunable.wmma_setprio:
             kernel_name += "_setprio"
+        if tunable.wmma_gap_hoist:
+            kernel_name += "_gaphoist"
         if tunable.atomic_pack_bf16:
             kernel_name += "_pkatomic"
         if tunable.wrw_reduction_kernel:

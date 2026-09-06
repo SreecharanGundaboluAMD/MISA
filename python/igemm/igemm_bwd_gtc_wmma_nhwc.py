@@ -1811,6 +1811,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.interleave_a = self.tunable.main_loop_interleave
         ctrl.interleave_b = False
         ctrl.wmma_setprio = self.tunable.wmma_setprio
+        ctrl.gap_hoist = self.tunable.wmma_gap_hoist
         ctrl.vgpr_msb_tracker = self.vgpr_msb_tracker
         # Phase 71 (PERF-004): A (untransposed) uses the plain ds_read_b128-chunked
         # shared_load technique; B (transposed) uses the pack/wait-batched technique

@@ -2070,6 +2070,7 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl.interleave_a = self.tunable.main_loop_interleave
         ctrl.interleave_b = False
         ctrl.wmma_setprio = self.tunable.wmma_setprio
+        ctrl.gap_hoist = self.tunable.wmma_gap_hoist
         ctrl.tdm_global_to_lds_a = self.tunable.tdm_global_load
         ctrl.tdm_global_to_lds_b = self.tunable.tdm_global_load
         # Phase 71 (PERF-004): both A and B are transposed (pack/wait-batched

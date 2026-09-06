@@ -149,6 +149,16 @@ class ctrl_wmma_main_loop_t(object):
         # rationale/citation. Default False = today's exact byte-identical behavior.
         self.wmma_setprio                = False
 
+        # Phase D1-P1 / guide §14 (split-barrier gap hoist): when True AND can_hoist is
+        # also True, moves s_barrier_wait -1 from immediately after s_barrier_signal -1 to
+        # immediately after the hoisted move_slice_window+global_load issuance, filling the
+        # signal→wait gap with the next tile's load issue — a finer-grained version of
+        # what can_hoist already does at block granularity. Safe whenever can_hoist already
+        # is (same 3-point safety argument: move_slice_window/global_load touch only SGPR/
+        # VGPR address descriptors and private staging VGPRs, never LDS). Default False =
+        # today's exact byte-identical behavior.
+        self.gap_hoist                   = False
+
         self.global_load_a_functor       = None
         self.global_load_b_functor       = None
         self.shared_store_a_functor      = None
@@ -546,6 +556,7 @@ class wmma_main_loop_t(mc_base_t):
         # the pre-Phase-70 schedule restores valid:y on all four bwd/fp32 tunables.
         is_fp32 = (ctrl.precision == 'fp32')
         can_hoist = (not a_style_async) and (not b_style_async) and (not interleave_a) and (not interleave_b) and double_buffer and (not is_fp32)
+        gap_hoist = ctrl.gap_hoist and can_hoist
 
         # Phase 13: an operand on the async path already issued its first tile's data
         # straight into LDS (global_load_async_to_lds_b128, no VGPR staging, no separate
@@ -586,8 +597,9 @@ class wmma_main_loop_t(mc_base_t):
         if any_old:
             self._emit(f"s_wait_dscnt 0x0")
         self._emit(f"s_barrier_signal -1")
-        self._emit(f"s_barrier_wait -1")
-        self._emit_empty_line()
+        if not gap_hoist:
+            self._emit(f"s_barrier_wait -1")
+            self._emit_empty_line()
 
         if can_hoist:
             # Decide up front whether another tile remains, THEN advance the next
@@ -629,6 +641,10 @@ class wmma_main_loop_t(mc_base_t):
             self._emit(f_gld_b())
             self._emit_empty_line()
 
+            if gap_hoist:
+                self._emit(f"s_barrier_wait -1")
+                self._emit_empty_line()
+
             if prefetch:
                 self._emit(f_sld_a(v_a(), v_sld_a_os(), 0))
                 self._emit(f_sld_b(v_b(), v_sld_b_os(), 0))
@@ -650,6 +666,9 @@ class wmma_main_loop_t(mc_base_t):
             self._emit_empty_line()
 
             self._emit_front(f"{label_body}_last:")
+            if gap_hoist:
+                self._emit(f"s_barrier_wait -1")
+                self._emit_empty_line()
             if prefetch:
                 self._emit(f_sld_a(v_a(), v_sld_a_os(), 0))
                 self._emit(f_sld_b(v_b(), v_sld_b_os(), 0))

@@ -496,11 +496,22 @@ the top of this document)**
    is not a safe default assumption in this codebase — verify per-direction, not just
    per-mechanism.
 
-**P1 — guide-derived, cheap, unchanged from v2 (still not attempted)**
+**P1 — guide-derived, cheap (item 9 DONE this session; items 10–12 unchanged from v2)**
 
-9. Fill the split-barrier signal→wait gap (guide §14) with the next tile's hoisted load
-   issue — a finer-grained version of what `can_hoist` already does at block granularity;
-   evaluate whether it's additive with `can_hoist` or redundant.
+9. ~~**Fill the split-barrier signal→wait gap (guide §14) with the next tile's hoisted load
+   issue**~~ **DONE** — `wmma_gap_hoist` tunable added to `wmma_main_loop.py` (moves
+   `s_barrier_wait -1` from immediately after `s_barrier_signal -1` to immediately after
+   the hoisted `move_slice_window`+`global_load` issuance, filling the signal→wait gap),
+   plumbed through `igemm_base.py` + 3 WMMA generators + `driver/igemm_gtc_base.h`.
+   Zero-diff regression verified (all existing configs byte-identical when
+   `wmma_gap_hoist=0`). Correctness validated (`-V 1`, `valid:y`) on all 9
+   shape/direction combinations (fwd/bwd/wrw × 3 standing regression shapes).
+   Three-way perf benchmark (baseline vs dbuf-alone vs dbuf+gaphoist) at this session's
+   capped 1100 MHz sclk (see §0 — **directional only, must be re-verified on the reference
+   machine**): **fwd directionally additive (+4.4% over dbuf-alone)**, **wrw directionally
+   additive (+8.2%)**, **bwd inconclusive at this clock** (delta within run-to-run noise).
+   All three `_dbuf_gaphoist.config` files shipped, folded into master `_all.config`.
+   See `docs/gfx1250_d1_split_barrier_gap_hoist_validation.md` for full details.
 10. Temporal hints (`RT_NT` on A/B cooperative loads, `NT` on C stores, guide §18) — still a
     one-line-per-emitter change, still unbenchmarked.
 11. gfx1250 shader prologue / `S_CODE_END` padding, then `GLOBAL_PREFETCH_B8` two K-stages
