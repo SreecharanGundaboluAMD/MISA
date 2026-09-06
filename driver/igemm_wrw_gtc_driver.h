@@ -814,6 +814,21 @@ public:
                 HIP_CALL(hipGetDevice(&_dev));
                 HIP_CALL(hipGetDeviceProperties(&_dev_prop, _dev));
                 size_t base_grid = grid_x * grid_y;
+                // R6 (docs/gfx1250_wrw_full_cu_grid_hang.md): a non-split-K wrw tunable
+                // whose grid exactly saturates (or exceeds) the CU count -- every CU
+                // running an identical, lockstep-synchronized workgroup with zero queued
+                // workgroups left over to desynchronize them -- reliably HANGS the device
+                // (not merely a wrong answer) on real hardware; root cause not resolved
+                // (see the doc). This is strictly more dangerous than the starvation
+                // warning below: a hang requires a host reboot to clear, so this is a hard
+                // rejection, not a warning. gemm_k_global_split routes around it entirely
+                // (confirmed: it changes the grid shape away from the exact collision), so
+                // reject only the non-split case.
+                if (base_grid >= static_cast<size_t>(_dev_prop.multiProcessorCount)) {
+                    result_t result;
+                    result.return_code = -1;
+                    return result;
+                }
                 if (base_grid < static_cast<size_t>(_dev_prop.multiProcessorCount)) {
                     printf("[wrw] WARNING: gemm_k_global_split=0 with grid=%zu (< %d CUs); "
                            "grid starvation will cause severe underutilization. "
