@@ -555,6 +555,19 @@ public:
             // TDM kernel that doesn't handle it and produce wrong results.
             if(tunable->tdm_global_load && !unit_conv)
                 return false;
+            // R5 (docs/gfx1250_bwd_gsplit_memory_fault.md): bwd's gemm_k_global_split atomic
+            // epilogue crashes with HSA_STATUS_ERROR_MEMORY_FAULT (or silently corrupts output
+            // on shapes that don't fault) on real hardware -- reproduced on every tested shape,
+            // including trivial exact-tile cases and even with grid.z forced to 1. Traced via
+            // rocgdb (precise-memory mode) to the device kernarg SGPR load for gemm_k_per_wg
+            // (kernarg offset 88, s_load_dword) reading stale/garbage data despite the host
+            // writing the correct value at that offset in an identically-laid-out struct that
+            // fwd's WMMA driver copies successfully via the exact same mechanism -- root cause
+            // not resolved (see the doc for the full investigation and hardware-escalation
+            // recommendation). Reject at the driver level so no config can dispatch this path
+            // and crash a caller's process until this is properly root-caused.
+            if(tunable->gemm_k_global_split)
+                return false;
             if((!tunable->wmma_m_tail && gemm_m % gemm_m_per_block != 0) ||
                (!tunable->wmma_n_tail && gemm_n % gemm_n_per_block != 0) ||
                (!tunable->tdm_global_load && !tunable->wmma_k_tail && gemm_k % gemm_k_per_block != 0))
