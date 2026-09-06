@@ -331,6 +331,15 @@ public:
                 return false;
             if(tunable->tdm_global_load && tunable->gemm_k_global_split && wmma_gemm_k % tunable->gemm_k_per_block != 0)
                 return false;
+            // R4 (gfx1250_wmma_perf_report_v2.md): wrw_streamk is asserted nxe==0 at
+            // config-construction time (igemm_base.py, "first pass only supports nxe==0
+            // -- single-tap, y=x=1"), but this WMMA branch previously never checked the
+            // runtime-requested shape against that restriction before returning true --
+            // unlike every other nxe==0-restricted mechanism above (tdm_global_load).
+            // Without this, a wrw_streamk tunable silently ran (and reported valid:n) on
+            // real multi-tap/strided shapes it was never designed to handle.
+            if(tunable->wrw_streamk && !unit_conv)
+                return false;
             if((!tunable->wmma_m_tail && wmma_gemm_m % tunable->gemm_m_per_block != 0) ||
                (!tunable->wmma_n_tail && wmma_gemm_n % tunable->gemm_n_per_block != 0) ||
                (!tunable->tdm_global_load && !tunable->wmma_k_tail && wmma_gemm_k % tunable->gemm_k_per_block != 0))
