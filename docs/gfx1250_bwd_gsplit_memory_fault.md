@@ -53,7 +53,20 @@ mode reports an imprecise, often-wrong faulting PC) and were confirmed **not** t
    split-count-4 case, where a different (`bz>0`) workgroup's `gemm_k_wg_off = bz *
    garbage_gemm_k_per_wg` still corrupts its own A/B/output addressing regardless of the
    loop-bound hardcode. Both observations are consistent with a single root cause: garbage
-   at kernarg offset 88 as read by the device, not a loop-logic bug.
+7. **sseq() SGPR allocation order (recommendation #3 probe).** Moved `s_gemm_k_per_wg`'s
+   `sseq()` declaration to be immediately adjacent to `s_group`'s in
+   `igemm_bwd_gtc_wmma_nhwc.py`'s SGPR allocator, changing the register number from s50 to
+   s42 (now consecutive with `s_group`=s41) and reducing the gap between the two kernarg
+   loads at offsets 84+88 to zero. The assembler did **not** merge them into a single
+   `s_load_dwordx2` (still two separate `s_load_dword` instructions), but the absolute SGPR
+   number changed substantially (s50→s42, closer to fwd's s38). Both repro shapes (`n32 c128
+   16x16 k128` and `n128 c1024 17x17 k1024`) still crashed with
+   `HSA_STATUS_ERROR_MEMORY_FAULT` / `hipEventSynchronize` illegal-memory-access on the same
+   hardware. The corruption at kernarg offset 88 is **not** caused by the absolute SGPR
+   number or the allocation-order adjacency between `s_group` and `s_gemm_k_per_wg`. This
+   rules out recommendation #3's structural-workaround hypothesis and further supports the
+   suspicion that the bug is in the ROCm/HIP runtime kernarg-copy path or hardware
+   kernarg-preload, not in this codebase's Python/C++ source.
 
 ## What was found (and not further explained)
 
