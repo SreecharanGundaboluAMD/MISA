@@ -732,6 +732,13 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
 
     def emit_kernel_end(self):
         self._emit('s_endpgm')
+        # CDNA5 (gfx1250) ISA mandates padding every shader with 64 s_code_end
+        # dwords (256 bytes) after the real code so the instruction prefetcher
+        # never speculatively reads uninitialized/unmapped memory past s_endpgm.
+        # See amd-instinct-cdna5-instruction-set-architecture.md (S_CODE_END).
+        # Unreachable: s_endpgm halts the wave first; inert safety padding.
+        for _ in range(64):
+            self._emit('s_code_end')
 
     def emit_kernel_footer(self):
         self._emit_empty_line()
