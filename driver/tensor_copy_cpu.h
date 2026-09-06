@@ -45,7 +45,14 @@ typedef struct
 template <typename Dst_T, typename Src_T>
 void block_wise_tensor_copy(Dst_T *p_dst, Src_T *p_src, int tid, size_t block_size, size_t total_size)
 {
-    for (int i = tid; i < total_size; i += block_size) {
+    // Contiguous per-thread range, not a strided round-robin -- see conv_driver.cpp's
+    // gen_rand_vector fix for the identical false-sharing rationale (hardware_concurrency()
+    // threads in the hundreds means a stride-by-thread-count access pattern has every 64B
+    // cache line written by many different threads).
+    size_t chunk = (total_size + block_size - 1) / block_size;
+    size_t begin = static_cast<size_t>(tid) * chunk;
+    size_t end = begin + chunk < total_size ? begin + chunk : total_size;
+    for (size_t i = begin; i < end; i++) {
         p_dst[i] = static_cast<Dst_T>(p_src[i]);
     }
 }
@@ -55,7 +62,11 @@ void block_wise_tensor_copy<int4x2_t, float>(int4x2_t *p_dst, float *p_src, int 
 {
     // sizeof(int4x2_t) is 4. So need to find a way to avoid seg fault
     int8_t *tmp_dst = (int8_t*)(p_dst);
-    for (int i = tid; i < (total_size / 2); i += block_size) {
+    size_t half_total = total_size / 2;
+    size_t chunk = (half_total + block_size - 1) / block_size;
+    size_t begin = static_cast<size_t>(tid) * chunk;
+    size_t end = begin + chunk < half_total ? begin + chunk : half_total;
+    for (size_t i = begin; i < end; i++) {
         int8_t lo = static_cast<int8_t>(p_src[2 * i]);
         int8_t hi = static_cast<int8_t>(p_src[2 * i + 1]);
 

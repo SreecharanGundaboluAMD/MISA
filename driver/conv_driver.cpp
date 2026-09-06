@@ -299,7 +299,18 @@ void block_wise_rand_generator(Dst_T *p, int tid, int block_size, size_t total_s
                         .count() +
                     std::hash<std::thread::id>()(std::this_thread::get_id()));
     distribution_t<Src_T> distribution(min,max);
-    for (size_t i = tid; i < total_size; i += block_size) {
+    // Contiguous per-thread range, not a strided round-robin: with hardware_concurrency()
+    // threads in the hundreds (e.g. 255 on this workstation) and a stride-by-thread-count
+    // access pattern, every 64B cache line (16 fp32 elements) is written by up to 16
+    // DIFFERENT threads -- severe false sharing that made this loop take 60+ seconds for a
+    // ~100M-element tensor (n256 c2048 14x14 wrw host buffers), long enough to be
+    // misdiagnosed as a device hang before any kernel was even dispatched. Contiguous
+    // chunks give each thread an exclusive, cache-line-aligned-enough range with no
+    // cross-thread writes to the same line.
+    size_t chunk = (total_size + static_cast<size_t>(block_size) - 1) / static_cast<size_t>(block_size);
+    size_t begin = static_cast<size_t>(tid) * chunk;
+    size_t end = std::min(begin + chunk, total_size);
+    for (size_t i = begin; i < end; i++) {
         p[i] = static_cast<Dst_T>(scale * distribution(rng));
     }
 }
