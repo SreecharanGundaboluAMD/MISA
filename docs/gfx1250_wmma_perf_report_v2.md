@@ -527,9 +527,12 @@ the top of this document)**
     genuinely different bytes from the default (not silently dropped). Zero-diff regression
     verified via `git stash` (identical assembly modulo the `th:` suffixes). Correctness
     validated (`-V 1`, `valid:y`) on fwd/bwd/wrw fp16 across the standard regression shapes;
-    a pre-existing, unrelated fp32+`tdm_global_load` `-nan` failure was found and confirmed
-    via `git stash` to reproduce identically without this change (not a regression, not
-    investigated further -- out of scope). Basic before/after (this session's capped
+    a pre-existing fp32+`tdm_global_load` `-nan` failure was found and confirmed via
+    `git stash` to reproduce identically without this change (not caused by this change) --
+    further characterization showed it **is a regression** (fp16/bf16 TDM unaffected; fp32
+    TDM fails even on the exact shape `docs/gfx1250_wmma_layout.md`'s Phase 29 recorded as
+    hardware-validated) -- written up separately, see `docs/gfx1250_fp32_tdm_nan_regression.md`
+    and `AGENTS.md`'s Known Issues. Basic before/after (this session's capped
     1100 MHz sclk, see §0 -- **directional only**): fwd **+2.4%**, bwd **+2.5%** (both
     consistent across 3 runs, <0.5% noise) on the primary standing regression shape; wrw
     showed no measurable change on either its grid-starved plain-`dbuf` config or its
