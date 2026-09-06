@@ -496,7 +496,7 @@ the top of this document)**
    is not a safe default assumption in this codebase — verify per-direction, not just
    per-mechanism.
 
-**P1 — guide-derived, cheap (items 9-10 DONE this session; items 11-12 unchanged from v2)**
+**P1 — guide-derived, cheap (items 9-11 DONE this session; item 12 unchanged from v2)**
 
 9. ~~**Fill the split-barrier signal→wait gap (guide §14) with the next tile's hoisted load
    issue**~~ **DONE** — `wmma_gap_hoist` tunable added to `wmma_main_loop.py` (moves
@@ -542,8 +542,32 @@ the top of this document)**
     epilogue being the atomic path this change deliberately does not touch. Must be
     re-verified on the faster reference machine before treating as a final performance
     verdict.
-11. gfx1250 shader prologue / `S_CODE_END` padding, then `GLOBAL_PREFETCH_B8` two K-stages
-    ahead (guide §19) for compute-bound 1×1 shapes.
+11. ~~**gfx1250 shader prologue `S_CODE_END` padding, then `GLOBAL_PREFETCH_B8` two
+    K-stages ahead (guide §19)**~~ **DONE, mixed disposition** — two independent parts:
+    **(a) `S_CODE_END` padding: shipped, mandatory, unconditional.** The CDNA5 ISA doc
+    mandates padding every shader with 64 `s_code_end` dwords (256 bytes) past the real
+    code so the instruction prefetcher never speculatively reads unmapped memory. Confirmed
+    this repo emitted **zero** such padding anywhere across every kernel it has ever
+    shipped. Fixed in all three directions' `emit_kernel_end()`; hardware-confirmed inert
+    (`valid:y`, fwd/bwd/wrw) since `s_endpgm` halts the wave first.
+    **(b) `GLOBAL_PREFETCH_B8` two K-stages ahead: implemented, correctness-validated,
+    NOT recommended for adoption.** New opt-in `wmma_l2_prefetch` tunable (default off),
+    gated on `can_hoist`, scoped to `nxe==0`/unit-conv. First landed with `scope:SCOPE_DEV`,
+    which caused a catastrophic **~10x regression** (device-wide GL2 request-queue
+    contention — every concurrently-resident workgroup's prefetch bypassing WGP-local
+    cache) that got mischaracterized as "this clock-capped machine can't amortize the
+    overhead"; caught via independent reproduction and isolated A/B testing, corrected to
+    `scope:SCOPE_CU` (CU/WGP-local, matching the ISA doc's actual Scope=0 semantics for this
+    use case). Hardware-validated `valid:y` on fwd/bwd/wrw across standard shapes and a
+    short-K-loop boundary case (confirms the required speculative `TH_LOAD_NT_RT` encoding
+    correctly drops out-of-bounds 2-ahead addresses). **Even with the scope corrected, this
+    session measures a real ~22% regression** (not a win) on both tested shapes at this
+    session's capped 1100 MHz sclk — directional only, but a plainly negative result, not
+    the mischaracterized one originally reported. Shipped anyway (scope fix prevents a
+    future 10x foot-gun if anyone enables it) but not folded into any master config and not
+    recommended without further tuning (less-frequent prefetch, different K-stage distance)
+    or re-testing on the faster reference machine. See
+    `docs/gfx1250_d1_l2_prefetch_validation.md` for full details.
 12. Packed 2-wide vector atomics for wrw's split-K epilogue
     (`docs/gfx1250_perf_parity_action_plan.md` item 2, cross-validated against CK and
     FlyDSL) — compose with claused stores (guide §17.1) once the atomic op itself is packed.

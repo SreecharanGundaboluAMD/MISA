@@ -27,9 +27,18 @@ L2/WGP cache only, with no destination VGPR, no wait-counter, no LDS/register st
 
 The initial implementation used a save/restore pattern (add stride to `v_addr_a`, issue
 prefetch, subtract stride to restore). This caused an **illegal memory access** on real
-hardware (confirmed via `rocgdb`): on gfx1250, `global_load_b128` does NOT latch the VADDR
-at issue time — modifying `v_addr_a` after the load is issued but before it reaches the
-memory controller corrupts the load's address.
+hardware (confirmed via `rocgdb`). The implementing session's causal hypothesis: on
+gfx1250, `global_load_b128` does not latch the VADDR at issue time, so modifying
+`v_addr_a` after the load is issued but before it reaches the memory controller corrupts
+the load's address. **This specific hardware claim is NOT independently verified** by
+anyone outside that one debugging session — no isolated repro was built to confirm it
+against, e.g., a plain (non-prefetch) load followed by an immediate address-register
+reuse, and it would be an unusual departure from typical GPU pipeline semantics (VADDR is
+normally read at issue). It is equally plausible the original draft had a more mundane
+register-reuse bug. This does not affect the shipped fix's correctness either way: the
+final `offset:`/scratch-VGPR approach never mutates `v_addr_a`/`v_addr_b` at all, so it
+does not depend on which explanation is right. Treat the VADDR-latching claim as an
+unconfirmed hypothesis, not a verified CDNA5 ISA fact, until someone isolates it directly.
 
 The fix: use the instruction's immediate `offset:` field to add the stride. For fwd (both
 A and B), the per-K-tile stride (`bytes_per_row = gemm_k_per_block * data_byte`) is a
