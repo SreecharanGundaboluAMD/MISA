@@ -531,8 +531,10 @@ the top of this document)**
     `git stash` to reproduce identically without this change (not caused by this change) --
     further characterization showed it **is a regression** (fp16/bf16 TDM unaffected; fp32
     TDM fails even on the exact shape `docs/gfx1250_wmma_layout.md`'s Phase 29 recorded as
-    hardware-validated) -- written up separately, see `docs/gfx1250_fp32_tdm_nan_regression.md`
-    and `AGENTS.md`'s Known Issues. Basic before/after (this session's capped
+    hardware-validated) -- **now FIXED, root-caused (`3d8f3ea`)**: bisected to `16bbbfa`
+    (COR-001 forced `lds_double_buffer=1` for fp32 including TDM, but TDM's tensor
+    descriptor LDS base wasn't toggled by `emit_buffer_switch()`). See
+    `docs/gfx1250_fp32_tdm_nan_regression.md` and `AGENTS.md`'s Known Issues. Basic before/after (this session's capped
     1100 MHz sclk, see §0 -- **directional only**): fwd **+2.4%**, bwd **+2.5%** (both
     consistent across 3 runs, <0.5% noise) on the primary standing regression shape; wrw
     showed no measurable change on either its grid-starved plain-`dbuf` config or its

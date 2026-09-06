@@ -1,12 +1,18 @@
 # fp32 + `tdm_global_load` produces `-nan` output — regression, not a new gap
 
-**Status: unresolved, not bisected, not mitigated.** Every `tdm_global_load=1` fp32 kernel
-in the repo (fwd and bwd; wrw's fp32 master doesn't even build — see the separate, unrelated
-finding at the bottom) produces silent `-nan` output on every shape tested, including the
-exact shape `docs/gfx1250_wmma_layout.md`'s own Phase 29 recorded as hardware-validated
-`valid:y`. This is a **regression somewhere between Phase 29 and current `HEAD`**, not an
-unvalidated new code path — the bug is real and currently reachable through the fp32 master
-`_all.config` for both fwd and bwd; no driver-side rejection currently excludes it.
+**Status: FIXED, root-caused (`3d8f3ea`).** Bisect identified commit `16bbbfa` ("gfx1250
+WMMA: implement 11-item prioritized action plan from hardware review") as the breaking
+commit. Its COR-001 item enforced `lds_double_buffer=1` for all fp32 WMMA configs —
+including TDM. But TDM's `tensor_load_to_lds` writes to a fixed LDS base address in SGPRs
+(`s_tdm_g0(1)`/`s_tdm_g0_b(1)`), set once in the prologue and invisible to
+`wmma_main_loop.py`'s generic VGPR-only `emit_buffer_switch()`. With double-buffering,
+TDM always wrote to buffer 0 while the read offsets alternated to buffer 1 every other
+iteration, reading uninitialized LDS and producing silent `-nan` output. Fix: added a
+`buffer_switch_extra_functor` callback to `ctrl_wmma_main_loop_t`, called by
+`emit_buffer_switch()` and the prologue's initial buffer advance, which XORs the TDM
+descriptor's SGPR LDS base with `lds_single_size` in lockstep with the VGPR toggles.
+Hardware-validated: fwd/bwd `_tdm` and `_tdm_direct`, 3 shapes each, all `valid:y`;
+non-TDM fp32 kernels in the master config still `valid:y`.
 
 ## Discovery context
 
@@ -54,29 +60,70 @@ bug to `tdm_global_load=1` specifically, not some broader fp32 issue.
     validated — something changed fp32's TDM path (or something TDM's fp32 path depends on)
     between Phase 29's commit and now.
 
-## Not yet done (next steps for whoever picks this up)
+## Resolution (bisect + root cause + fix)
 
-1. **Bisect** `git log` between Phase 29's commit (search `docs/gfx1250_wmma_layout.md` for
-   the exact hash near its "Phase 29" heading) and current `HEAD` for the change that broke
-   this — not attempted in this session (out of scope for what was being validated).
-2. Given fp16/bf16 TDM still work and only fp32 broke, look first at fp32-specific TDM
-   surface area: `python/igemm/igemm_fwd_gtc_wmma_nhwc.py`'s `_emit_tdm_descriptor_setup_a`
-   and any `precision`-conditional branch in it or in `tdm_global_to_lds_a` wiring
-   (`wmma_main_loop.py`), and fp32's distinct `gemm_k_per_block=4`/`inst_wmma.k=4` shape
-   (every other precision uses a wider K) — a K-tail, stride, or element-size assumption
-   baked in for the wider fp16/bf16 K might silently mis-handle fp32's narrower one.
-3. `-nan`, not a crash or `valid:n`-without-diagnostic — the kernel dispatches and completes,
-   so this reads like a genuine uninitialized/garbage LDS or VGPR read (same failure
-   signature category as R7's bwd `dbuf`+`lds_row_pad` `-nan`, `docs/gfx1250_bwd_dbuf_ldsrp_nan.md`
-   — unrelated mechanism, but worth checking with the same "read `-nan`-producing address
-   computation line-by-line against a working precision" method that found R7's issue... except
-   here fp16/bf16 TDM's own address computation is presumably shared code with fp32's, so the
-   divergence is more likely in a precision-conditional branch than in TDM's shared plumbing.
-4. **Do not add a `tunable_is_valid` rejection speculatively** — no fp32 TDM config is
-   currently in wide use or a documented recommendation, so unlike R5/R7 there's no urgent
-   need to guard a reachable "recommended" path. But this should be tracked so it doesn't get
-   rediscovered from scratch, and any future perf work involving fp32 TDM should re-run this
-   repro first.
+### Bisect
+
+Good anchor: `35dd4ab` (Phase 29, "TDM single-issuer-wave fix") — confirmed `valid:y` on
+the exact Phase 29 shape (`n8 c2048 32x32 k2048 1x1`), 10/10 runs, fresh build.
+Bad anchor: `ffa4577` (HEAD at time of investigation) — confirmed `pred:-nan`, 10/10 runs.
+`git bisect` across 51 commits touching the 5 relevant source paths identified:
+
+**Breaking commit: `16bbbfa`** ("gfx1250 WMMA: implement 11-item prioritized action plan
+from hardware review"). The commit immediately before it (`a1b8889`, "architecture map")
+is `valid:y`; `16bbbfa` is `pred:-nan`.
+
+### Root cause
+
+Commit `16bbbfa`'s COR-001 item enforced `lds_double_buffer=1` for all fp32 WMMA tunables
+(a structural assert in `igemm_base.py`), and "repaired" all fp32 config files missing the
+flag — including the TDM configs. This was correct for non-TDM fp32 (COR-001's original
+purpose: fp32's 4-byte-wide WMMA operands need double-buffering to avoid a last-lane
+LDS-visibility race at high occupancy). But it broke TDM:
+
+TDM's `tensor_load_to_lds` instruction writes tile data directly to LDS using a **tensor
+descriptor** whose LDS base address is a fixed SGPR constant (`s_tdm_g0(1)` for operand A,
+`s_tdm_g0_b(1)` for B), set once in the prologue by `_emit_tdm_descriptor_setup_a/b`.
+`wmma_main_loop.py`'s `emit_buffer_switch()` toggles only the VGPR read/store offsets
+(`v_sst_a_os`, `v_sld_a_os`, `v_sld_b_os`) via XOR with `lds_single_size` — it cannot
+toggle the TDM descriptor's SGPR LDS base. With double-buffering enabled, TDM always wrote
+to buffer 0 while the read offsets alternated to buffer 1 every other iteration, reading
+uninitialized LDS and producing `-nan`.
+
+fp16/bf16 TDM were unaffected because COR-001's `lds_double_buffer=1` mandate only targets
+`precision == 'fp32'`; fp16/bf16 TDM configs stayed single-buffered (the default). The
+regression doc's original hypothesis about K-tail/stride/element-size assumptions was wrong
+— the actual divergence was in the buffer-switching layer, not in TDM's shared plumbing.
+
+### Fix (`3d8f3ea`)
+
+Added a `buffer_switch_extra_functor` field to `ctrl_wmma_main_loop_t`
+(`wmma_main_loop.py`), called by `emit_buffer_switch()` and the prologue's initial buffer
+advance, right after the VGPR XOR toggles. The fwd/bwd generators set this functor when
+`tdm_global_load=1` AND `lds_buffer_num==2`, to emit:
+
+```asm
+s_xor_b32 s[s_tdm_g0+1], lds_single_size, s[s_tdm_g0+1]   ; TDM A descriptor LDS base toggle
+s_xor_b32 s[s_tdm_g0_b+1], lds_single_size, s[s_tdm_g0_b+1]   ; TDM B descriptor LDS base toggle
+```
+
+This makes TDM's `tensor_load_to_lds` write to the same buffer `v_sst_a_os` points at,
+maintaining the double-buffer invariant (store and read always target different buffers).
+
+### Hardware validation
+
+All runs on real gfx1250 silicon, `-V 1` verify:
+
+| Direction | Config | n128 c1024 17x17 k1024 | n64 c512 28x28 k512 | n8 c2048 32x32 k2048 |
+|-----------|--------|------------------------|---------------------|----------------------|
+| fwd | `_tdm` | valid:y | valid:y | valid:y |
+| fwd | `_tdm_direct` | valid:y | valid:y | valid:y |
+| bwd | `_tdm` | valid:y | valid:y | valid:y |
+| bwd | `_tdm_direct` | valid:y | valid:y | valid:y |
+
+Non-TDM fp32 kernels in `config/igemm_fwd_gtc_gfx1250_nhwc_fp32_all.config` (spot-checked
+10+ kernels including `_dbuf`, `_dbuf_async`, `_dbuf_direct`, `_dbuf_gkgs`) all still
+`valid:y` — no regression from the fix.
 
 ## Reproduction
 
