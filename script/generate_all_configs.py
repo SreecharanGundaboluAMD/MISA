@@ -32,7 +32,22 @@ from itertools import product
 # "symbol already defined" collision from two combos producing byte-identical
 # kernels under different names). _FORCE_ZERO marks "explicitly write/merge the
 # literal value 0" instead of "omit"; see the ds_load_tr_b remap in gen_combos().
-_FORCE_ZERO = object()
+#
+# MUST be a value compared by == (never `is`) and MUST NOT be a bare `object()`:
+# gen_combos() ships `vals` dicts through ProcessPoolExecutor.map(), which
+# pickles every task argument across the process boundary. Pickling a generic
+# `object()` does not preserve identity -- confirmed the hard way: an `is`-based
+# sentinel silently lost its identity in every worker, fell through to the
+# generic "truthy, not 0" branch, and ended up MERGED AS A RAW GARBAGE OBJECT
+# into the tunable dict (still truthy, so ds_load_tr_b's assert branch and the
+# kernel-name mangling both treated it as "on") -- every real bwd/wrw fp16/bf16
+# combo silently behaved as ds_load_tr_b=1 regardless of which bit was
+# requested, and the entire =0 escape hatch was never actually reachable in
+# the generated files despite passing every single-process unit test. A
+# distinct, sufficiently-unlikely-to-collide STRING survives pickling by value
+# (Python string equality, unlike generic object identity, is preserved across
+# a pickle round-trip) -- use `==`/`in` against it, never `is`.
+_FORCE_ZERO = '__generate_all_configs_force_zero_sentinel__'
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_DIR = os.path.join(REPO_ROOT, 'config')
 
@@ -249,7 +264,7 @@ def is_valid(direction, base_dict, vals):
     merged = dict(base_dict)
     merged['arch'] = 'gfx1250'
     for k, v in vals.items():
-        if v is _FORCE_ZERO:
+        if v == _FORCE_ZERO:
             merged[k] = 0
         elif v not in (0, 'SCOPE_SYS'):
             merged[k] = v
@@ -329,7 +344,7 @@ def _extra_lines(base_body, vals):
         val = vals.get(flag)
         if flag in base_keys:
             continue
-        if val is _FORCE_ZERO:
+        if val == _FORCE_ZERO:
             extra.append(f"{flag:25s} = 0\n")
         elif val is not None and val != 0 and val != 'SCOPE_SYS':
             extra.append(f"{flag:25s} = {val}\n")
