@@ -425,6 +425,23 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             # replaces B's GLOBAL->LDS transfer, not this later shared-load step -- still
             # needed whenever ds_load_tr_b isn't doing the hardware transpose instead).
             self.v_gld_b   = sym_t('v_gld_b'       , vseq(outer.chunk_num_dwords))   # also reused as scratch by the transposed shared_load_b
+            if not outer.tunable.ds_load_tr_b:
+                # Root cause (docs/gfx1250_dstrb_dbuf_race.md): shared_load_b_functor's
+                # manual read+pack path used to reuse v_gld_b as scratch, justified by
+                # "this iteration's real global load into v_gld_b happens later in the
+                # main loop, after shared_load completes" -- true under the legacy
+                # schedule, but violated by Phase 70's hoisted double-buffer schedule,
+                # which issues the NEXT tile's global load into v_gld_b BEFORE this
+                # tile's shared_load_b_functor call. Dedicated, unconditionally-safe
+                # scratch (never touched by global_load_b_functor) removes the
+                # dependency on scheduling order entirely -- correct regardless of any
+                # future main-loop schedule change. Sized 2 (not chunk_num_dwords) to
+                # fit gfx1250 WMMA's tight VGPR budget (128x128 tiles run at 253-256/256
+                # already) -- costs 2 extra `s_wait_dscnt` batches worth of latency in
+                # the pack loop vs the old (unsafe) 16-wide batching, not correctness.
+                # Only allocated when the manual path is actually used -- ds_load_tr_b=1
+                # kernels are completely unaffected (byte-identical, zero extra VGPRs).
+                self.v_b_pack_scratch = sym_t('v_b_pack_scratch', vseq(2))
             self.v_tid         = sym_t('v_tid'         , vseq(1))
             # 64-bit VADDR pairs must be even-aligned on gfx1250 (verified with llvm-mc)
             if outer.tunable.tdm_global_load:
@@ -1735,7 +1752,16 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                 # slots -> 2 batches instead of 8; fp32: 2 slots, already 1 batch). Read
                 # values and pack results are identical to the original per-`a` version --
                 # only the wait GROUPING changes. See docs/gfx1250_optimization_backlog.md.
-                batch_cap = outer.chunk_num_dwords
+                #
+                # Root-cause fix (docs/gfx1250_dstrb_dbuf_race.md): this used to batch into
+                # v_gld_b (shared with global_load_b_functor's real staging use), which
+                # Phase 70's hoisted double-buffer schedule can clobber (issues the NEXT
+                # tile's global load into v_gld_b before this call). Now uses v_b_pack_scratch,
+                # a small (2-wide) DEDICATED scratch pool never touched by any other functor
+                # -- correct regardless of scheduling, at the cost of smaller (2-wide, not
+                # 16-wide) wait batches to fit gfx1250's tight VGPR budget.
+                pack_scratch = v.v_b_pack_scratch
+                batch_cap = 2
                 with outer._deferred_context():
                     for i_rn in range(outer.tunable.wmma_repeat_n):
                         col_off = i_rn * outer.tunable.wmma_tile_n * outer.data_byte
@@ -1749,17 +1775,17 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                                 # tile; v_sld_b_os only carries the offset local to B's own
                                 # region.
                                 off = outer.lds_a_size + col_off + abs_slot * row_pitch
-                                outer._emit(f"{read_instr} v[{v.v_gld_b(j)}], v[{v.v_sld_b_os()}] offset:{extra_off + off}")
+                                outer._emit(f"{read_instr} v[{pack_scratch(j)}], v[{v.v_sld_b_os()}] offset:{extra_off + off}")
                             outer._emit(f"s_wait_dscnt 0x0")
                             for j in range(n_batch):
                                 abs_slot = slot + j
                                 a, s = abs_slot // elem_per_dword, abs_slot % elem_per_dword
                                 dst = v.v_b(slot_off+i_rn*num_v_b+a)
                                 if s == 0:
-                                    outer._emit(f"v_mov_b32 v[{dst}], v[{v.v_gld_b(j)}]")
+                                    outer._emit(f"v_mov_b32 v[{dst}], v[{pack_scratch(j)}]")
                                 else:
                                     shift = s * 8 * outer.data_byte
-                                    outer._emit(f"v_lshl_or_b32 v[{dst}], v[{v.v_gld_b(j)}], {shift}, v[{dst}]")
+                                    outer._emit(f"v_lshl_or_b32 v[{dst}], v[{pack_scratch(j)}], {shift}, v[{dst}]")
                             slot += n_batch
                 return outer._get_deferred()
         return functor_t()

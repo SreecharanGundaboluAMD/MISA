@@ -930,28 +930,26 @@ class igemm_gtc_tunable_parameter_t(object):
             if self.ds_load_tr_b:
                 assert self.direction in ('bwd', 'wrw'), "ds_load_tr_b is bwd/wrw only (Phase 63/64) -- fwd's operands aren't LDS-transposed to begin with"
                 assert self.precision in ('fp16', 'bf16'), "ds_load_tr16_b128 is a 16-bit-element instruction only -- no fp32 variant exists"
-            # Phase 7 dominance-study fair-shake re-test (2026-09-07) found a real
-            # correctness bug when ds_load_tr_b's "off" escape hatch (the manual
-            # read+pack shared_load_b_functor path, only reachable at all as of this
-            # same session -- ds_load_tr_b was an unconditional default before) is
-            # combined with lds_double_buffer=1: CONFIRMED valid:n on real hardware,
-            # 100% failure rate, both bwd and wrw, fp16 and bf16, every other-flag
-            # combination tested, with the tdm_global_load variant (a completely
-            # different B-load mechanism) unaffected. fp32 is unaffected too (its
-            # shared_load_b_functor path has no packing loop at all -- elem_per_dword=1,
-            # a structurally simpler code path). Root cause not yet isolated (prime
-            # suspect: v_gld_b scratch reuse in the manual pack loop -- see that
-            # functor's docstring for a similar, previously-fixed clobber hazard under
-            # a different condition -- vs. lds_double_buffer's more aggressive
-            # hoisted/pipelined schedule). Gated here rather than left silently
-            # reachable by the search; TODO before lifting: isolate the exact
-            # clobber/ordering hazard, fix it, then delete this assert.
-            if self.direction in ('bwd', 'wrw') and self.precision in ('fp16', 'bf16') \
-                    and not self.ds_load_tr_b and self.lds_double_buffer and not self.tdm_global_load:
-                assert False, \
-                    "ds_load_tr_b=0 + lds_double_buffer=1 (non-TDM) is CONFIRMED wrong-answer " \
-                    "on real hardware for bwd/wrw fp16/bf16 -- not yet root-caused, see the " \
-                    "comment above this assert"
+            # Root cause found and fixed (docs/gfx1250_dstrb_dbuf_race.md): the manual
+            # (non-native, ds_load_tr_b=0) shared_load_a/b_functor pack loop used to
+            # reuse v_gld_a/v_gld_b as scratch, justified by "this iteration's real
+            # global load into v_gld_a/b happens later in the main loop, after
+            # shared_load completes" -- true under the legacy schedule, but violated by
+            # Phase 70's hoisted double-buffer schedule (wmma_main_loop.py's
+            # can_hoist), which issues the NEXT tile's global load into that same
+            # register BEFORE shared_load_a/b_functor's scratch use of it. Confirmed
+            # 100% valid:n on real hardware for the affected combination (bwd/wrw
+            # fp16/bf16, ds_load_tr_b=0, lds_double_buffer=1, non-TDM) before the fix;
+            # unaffected: ds_load_tr_b=1 (native ds_load_tr16_b128 never touches
+            # v_gld_a/b at all), tdm_global_load (B's "load" IS the LDS write, no
+            # v_gld_a/b staging), and fp32 (can_hoist explicitly excludes fp32, so it
+            # never takes the hoisted schedule regardless). Fixed in
+            # igemm_bwd_gtc_wmma_nhwc.py/igemm_wrw_gtc_wmma_nhwc.py by giving the
+            # manual pack loop its own small, dedicated scratch VGPRs (never touched by
+            # global_load_a/b_functor) instead of reusing the global-load staging
+            # registers -- correct regardless of scheduling, at the cost of smaller
+            # (2-4-wide, not chunk_num_dwords=16-wide) wait-batches to fit gfx1250
+            # WMMA's tight VGPR budget (128x128 tiles already run at 253-256/256).
             # Phase 35 (hipconv-style reduction-kernel epilogue): replaces the atomic epilogue
             # entirely for wrw's split-K path -- each shard writes a plain, non-atomic store
             # into its own disjoint slice of a workspace buffer (num_splits x output_size),

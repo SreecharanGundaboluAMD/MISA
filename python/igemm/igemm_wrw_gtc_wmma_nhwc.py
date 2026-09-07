@@ -503,9 +503,27 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             # active, A's chunk loads occupy v_gld_a in-flight during compute, so
             # shared_load_a can no longer reuse v_gld_a as scratch for its transposed
             # read-and-pack. v_scratch provides an alternative scratch (sized to
-            # elem_per_dword=4, the int8 worst case). Only allocated when interleave is on.
-            if outer.tunable.main_loop_interleave:
+            # elem_per_dword=4, the int8 worst case).
+            #
+            # Root cause (docs/gfx1250_dstrb_dbuf_race.md): the SAME v_gld_a reuse is
+            # ALSO unsafe whenever ds_load_tr_b==0 (the manual read+pack path), because
+            # Phase 70's hoisted double-buffer schedule issues the NEXT tile's global
+            # load into v_gld_a BEFORE shared_load_a_functor's scratch use of it, for ANY
+            # config (not just interleave) once lds_double_buffer=1 and nothing else
+            # disqualifies hoisting. So this is now allocated whenever EITHER hazard
+            # applies -- ds_load_tr_b=1 kernels are unaffected (byte-identical, this
+            # branch never allocates for them; the manual path they never execute is the
+            # only place v_scratch is read).
+            if outer.tunable.main_loop_interleave or not outer.tunable.ds_load_tr_b:
                 self.v_scratch     = sym_t('v_scratch'     , vseq(4))
+            if not outer.tunable.ds_load_tr_b:
+                # Mirrors bwd's identical fix for B's shared_load_b_functor -- see
+                # docs/gfx1250_dstrb_dbuf_race.md. B never interleaves in wrw (see
+                # emit_kernel_fma_main_loop's ctrl.interleave_b=False), so this only
+                # ever needs to solve the hoisted-schedule hazard, not an interleave
+                # one too -- sized 2 (not 4) since there's no interleave-driven need for
+                # the bigger pool here, and gfx1250 WMMA's VGPR budget is tight.
+                self.v_b_pack_scratch = sym_t('v_b_pack_scratch' , vseq(2))
             self.v_tid         = sym_t('v_tid'         , vseq(1))
             # 64-bit VADDR pairs must be even-aligned on gfx1250 (verified with llvm-mc).
             # row_stride redesign: when row_stride>1 a thread owns row_stride separate
@@ -1875,16 +1893,20 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                 else:
                     read_instr = 'ds_read_u8'
                 # Phase 15 (wrw port): when main_loop_interleave is active, v_gld_a holds
-                # in-flight A chunk loads during compute -- use v_scratch instead of v_gld_a
-                # for the read-and-pack scratch. v_scratch is sized to elem_per_dword (max 4).
-                if outer.tunable.main_loop_interleave:
-                    v_scratch = lambda s: v.v_scratch(s)
-                else:
-                    v_scratch = lambda s: v.v_gld_a(s)
+                # in-flight A chunk loads during compute. Root cause
+                # (docs/gfx1250_dstrb_dbuf_race.md): v_gld_a is ALSO unsafe to reuse
+                # whenever ds_load_tr_b==0 regardless of interleave (Phase 70's hoisted
+                # double-buffer schedule issues the next tile's global load into v_gld_a
+                # before this call). Since this manual-pack code only ever runs when
+                # ds_load_tr_b==0 (the native branch above returns early otherwise),
+                # v_scratch is unconditionally allocated by kernel_vgpr_t whenever this
+                # code path is reachable -- always use it, no v_gld_a fallback needed.
+                v_scratch = lambda s: v.v_scratch(s)
                 # Phase 63 (wait-batching): see bwd's shared_load_b_functor for the
                 # rationale -- batch reads up to the scratch buffer's actual capacity
-                # before a single wait, instead of one wait per `a`.
-                batch_cap = outer.chunk_num_dwords if not outer.tunable.main_loop_interleave else 4
+                # before a single wait, instead of one wait per `a`. v_scratch is
+                # 4-wide regardless of interleave now (see kernel_vgpr_t's docstring).
+                batch_cap = 4
                 with outer._deferred_context():
                     for i_rm in range(outer.tunable.wmma_repeat_m):
                         col_off = i_rm * outer.tunable.wmma_tile_m * outer.data_byte
@@ -1947,7 +1969,8 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                     read_instr = 'ds_read_b32'   # fp32: full-dword read, no zero-extension needed
                 else:
                     read_instr = 'ds_read_u8'
-                batch_cap = outer.chunk_num_dwords
+                pack_scratch = v.v_b_pack_scratch
+                batch_cap = 2
                 with outer._deferred_context():
                     for i_rn in range(outer.tunable.wmma_repeat_n):
                         col_off = i_rn * outer.tunable.wmma_tile_n * outer.data_byte
@@ -1961,17 +1984,17 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
                                 # tile; v_sld_b_os only carries the offset local to B's own
                                 # region.
                                 off = outer.lds_a_size + col_off + abs_slot * row_pitch
-                                outer._emit(f"{read_instr} v[{v.v_gld_b(j)}], v[{v.v_sld_b_os()}] offset:{extra_off + off}")
+                                outer._emit(f"{read_instr} v[{pack_scratch(j)}], v[{v.v_sld_b_os()}] offset:{extra_off + off}")
                             outer._emit(f"s_wait_dscnt 0x0")
                             for j in range(n_batch):
                                 abs_slot = slot + j
                                 a, s = abs_slot // elem_per_dword, abs_slot % elem_per_dword
                                 dst = v.v_b(slot_off+i_rn*num_v_b+a)
                                 if s == 0:
-                                    outer._emit(f"v_mov_b32 v[{dst}], v[{v.v_gld_b(j)}]")
+                                    outer._emit(f"v_mov_b32 v[{dst}], v[{pack_scratch(j)}]")
                                 else:
                                     shift = s * 8 * outer.data_byte
-                                    outer._emit(f"v_lshl_or_b32 v[{dst}], v[{v.v_gld_b(j)}], {shift}, v[{dst}]")
+                                    outer._emit(f"v_lshl_or_b32 v[{dst}], v[{pack_scratch(j)}], {shift}, v[{dst}]")
                             slot += n_batch
                 return outer._get_deferred()
         return functor_t()
