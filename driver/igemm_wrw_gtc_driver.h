@@ -331,6 +331,24 @@ public:
                 return false;
             if(tunable->tdm_global_load && tunable->gemm_k_global_split && wmma_gemm_k % tunable->gemm_k_per_block != 0)
                 return false;
+            // W-6 correctness bug (found via Phase 6 dominance-study fair-shake re-test,
+            // 2026-09-07): wrw_incremental_gather's per-iteration hw_idx wrap
+            // (igemm_wrw_gtc_wmma_nhwc.py's _emit_b_gather_incremental) does `hw_idx +=
+            // gemm_k_per_block` then a SINGLE conditional subtract-by-ho_wo. That is only
+            // correct when at most one wrap can occur per K-step, i.e. when
+            // gemm_k_per_block <= ho*wo. Whenever gemm_k_per_block > ho*wo (small output
+            // spatial size relative to the K-tile), multiple wraps are needed per
+            // iteration but only one is applied -- silently wrong addresses, confirmed
+            // valid:n on real hardware whenever ho*wo < gemm_k_per_block (e.g. ho*wo=1..25
+            // with gemm_k_per_block=32 all fail); ho*wo >= gemm_k_per_block (including
+            // exact equality, e.g. ho*wo=32) passes every time -- a single wrap is only
+            // sufficient once ho*wo has caught up to at least one full K-step's advance.
+            // This is a runtime shape hazard unknowable at compile/codegen time (ho/wo come
+            // from the launch args, not the tunable config), so it cannot be caught by
+            // igemm_base.py's assert-based validation -- must be gated here against the
+            // actual requested shape.
+            if(tunable->wrw_incremental_gather && (ho * wo) < tunable->gemm_k_per_block)
+                return false;
             // R4 (gfx1250_wmma_perf_report_v2.md): wrw_streamk is asserted nxe==0 at
             // config-construction time (igemm_base.py, "first pass only supports nxe==0
             // -- single-tap, y=x=1"), but this WMMA branch previously never checked the

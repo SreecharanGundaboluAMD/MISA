@@ -118,23 +118,103 @@ first) it becomes a new feature to benchmark from scratch, not a revival of dead
   performance A/B choice -- the dynamic mechanism was gone; this just swept up its
   corpse.
 
-## Prior-session dominance findings (unchanged by this review)
+## Second fairness pass: `ds_load_tr_b` and `wrw_incremental_gather`
 
-Carried over from the same Phase 6 pass, all already tested across the corrected,
-broader shape set including the long-K/large-grid additions above where applicable:
+The claim that these two had "already [been] tested across the corrected, broader
+shape set" in an earlier draft of this document was **not accurate** -- they had
+only been run against the original 5-shape battery, not against any shape
+constructed from their own specific design rationale (the same standard applied
+above to `wmma_l2_prefetch` and `wg_swizzle`). Corrected below.
 
-- **`ds_load_tr_b`** (bwd/wrw fp16/bf16 native 16-bit transpose load): irregular
-  tradeoff, confirmed real (stable over repeats, effect sizes 2-38%). 64-tile: always
-  wins with tr_b=1. 128-tile: tr_b=0 wins on large-K/N 1x1 bottleneck shapes (-7% to
-  -9% for tr_b=1), tr_b=1 wins on 3x3 shapes (+5% to +9%). **Action item still open:**
-  `script/generate_all_configs.py`'s combinatorial FLAGS never varies `ds_load_tr_b`
-  (it's promoted to an unconditional default), so the 128-tile's tr_b=0 win is
-  currently unreachable by the searched config surface -- should be added as a
-  combinatorial toggle for bwd/wrw.
-- **`wrw_incremental_gather`**: no measurable effect (deltas 0.1-1.6%, inside the
-  noise floor). No action.
+### `ds_load_tr_b` -- KEEP (irregular tradeoff), but the existing rule doesn't extrapolate
+
+Prior characterization: "64-tile always wins with tr_b=1; 128-tile: tr_b=0 wins on
+large-K/N 1x1 bottleneck shapes, tr_b=1 wins on 3x3 (multi-tap) shapes" -- based on
+one shape size per category. Re-tested with the SAME categories pushed more
+extreme (bigger K/N bottleneck: `n512 c8192 H4W4 k8192`; more taps: 7x7 instead of
+3x3), stable over 3 repeats each (<0.5% variance):
+
+| direction | shape | tr_b=0 | tr_b=1 | winner |
+|---|---|---|---|---|
+| bwd | extreme 1x1 bottleneck | 596.5 | 615.6 | **tr_b=1 (+3.2%)** -- reverses the prior rule |
+| bwd | extreme multitap (7x7) | 494.9 | 483.2 | **tr_b=0 (+2.4%)** -- reverses the prior rule |
+| wrw | extreme 1x1 bottleneck | 541.7 | 486.7 | tr_b=0 (+10.2%) -- consistent with prior rule |
+| wrw | extreme multitap (7x7) | 11.14 | 12.58 | tr_b=1 (+12.9%) -- consistent with prior rule |
+
+**bwd's preference reverses at more extreme shape magnitudes; wrw's holds.** The
+previous "1x1-bottleneck vs. 3x3" categorical framing was generalized from a single
+shape per category and does not hold uniformly across shape scale for bwd -- the
+real relationship is shape-magnitude-dependent, not simply tap-count-dependent.
+**Disposition: keep both, still an irregular tradeoff, but retract the confident
+categorical rule for bwd specifically until it's characterized across a proper
+size sweep (not just two data points per direction).** wrw's rule is corroborated
+by a second, more extreme data point and can be trusted with more confidence.
+
+**Action item still open:** `script/generate_all_configs.py`'s combinatorial FLAGS
+never varies `ds_load_tr_b` (it's promoted to an unconditional default), so neither
+direction's `tr_b=0` win is reachable by the searched config surface today -- should
+be added as a combinatorial toggle for bwd/wrw, especially now that bwd's win
+condition is known to be less predictable than previously stated.
+
+### `wrw_incremental_gather` -- KEEP, small real win, but a real correctness bug was found and fixed
+
+**Correctness bug found and fixed.** Testing the shapes that were meant to probe
+this mechanism's long-K hypothesis (`n128 c8192 H1W1 k128`, `n128 c16384 H1W1
+k128`) returned `valid:n` for `wrw_incremental_gather=1` on both -- a genuine,
+previously-undiscovered wrong-answer bug, not a performance question. Root cause
+(read directly from `igemm_wrw_gtc_wmma_nhwc.py`'s `_emit_b_gather_incremental`):
+the per-iteration index update does `hw_idx += gemm_k_per_block` followed by a
+**single** conditional wrap-by-`ho*wo`. That is only correct when at most one wrap
+can occur per K-step, i.e. `gemm_k_per_block <= ho*wo`. Whenever `gemm_k_per_block
+> ho*wo` (small output spatial size relative to the K-tile -- exactly the shapes
+above, where `ho*wo=1`), multiple wraps are needed per iteration but only one is
+applied, silently corrupting the gathered addresses. Confirmed the exact boundary
+by bisection (`gemm_k_per_block=32` in all test configs):
+
+| ho*wo | vs. gemm_k_per_block(32) | result |
+|---|---|---|
+| 1, 16, 25 | < 32 | **valid:n** |
+| 32 (exact) | == 32 | valid:y |
+| 36, 68, 102, 119, 289 | > 32 | valid:y |
+
+Since `ho`/`wo` are runtime launch-shape values, not known at Python-codegen time,
+this cannot be caught by `igemm_base.py`'s assert-based tunable validation -- it
+needed a runtime shape guard in the C++ driver, mirroring the existing
+pattern used for other shape-dependent kernel legality checks in the same file.
+**Fixed in `driver/igemm_wrw_gtc_driver.h`'s `tunable_is_valid()`:** rejects
+(`not applicable`, matching how e.g. an undersized M/N tile is already handled)
+whenever `wrw_incremental_gather` is set and `ho*wo < gemm_k_per_block`. Verified:
+the WMMA kernel's own compiled `.hsaco` is byte-identical before/after (driver-only
+change); the guard correctly rejects every case that previously returned `valid:n`
+and accepts every case (including the exact `ho*wo == gemm_k_per_block` boundary)
+that returns `valid:y`. No shipped config sets `wrw_incremental_gather=1` today, so
+this had zero shipped-result impact -- but the flag was live and reachable, and
+would have silently corrupted results for anyone who tried it on a small-spatial
+shape (a common, plausible shape class, not an exotic corner case).
+
+**Performance, re-tested on a corrected shape.** The original long-K test shapes
+were also geometrically wrong for this mechanism: wrw's `GEMM_K = N*Ho*Wo`
+(batch x spatial), not channel-driven like fwd/bwd -- the `c=8192/16384, H=W=1`
+shapes used had `gemm_k=128` (only 4 iterations, the opposite of "long K") and
+`ho*wo=1` (which is exactly why they hit the correctness bug above). Rebuilt a
+genuinely long-K, correctness-safe shape (`n128 c128 H224 W224 k128`: `gemm_k=
+6.4M` iterations, `ho*wo=50176 >> gemm_k_per_block`): `wrw_incremental_gather=0`
+averages 298.6ms, `=1` averages 297.2ms across 3 repeats each (<0.5% variance) --
+a small, real, consistent **~0.5% win**. This matches the mechanism's actual
+nature: it removes a small, fixed number of instructions (magic div/rem ->
+add+conditional) from each K-iteration's overhead, not a memory-latency-hiding
+trick like `wmma_l2_prefetch` -- so even with millions of iterations, the relative
+savings stays small.
+
+**Disposition: keep the tunable.** Small but genuine win once restricted to safe
+shapes (now enforced by the driver guard); too marginal to justify promoting to a
+default. Not reachable by any shipped config today, so no immediate action beyond
+the correctness fix already applied.
+
+## Findings unchanged by this fairness pass
+
 - **`wmma_setprio`**: small, inconsistent effect (+0.2% to +2% on most shapes,
   occasionally negative/noisy on extreme shapes). Keep as an independent tunable.
 - **`wmma_gap_hoist`**: moderate, mostly-positive effect (+4% to +20% depending on
-  shape, including the long-K shapes above), but not universal. Irregular tradeoff --
-  keep, do not make unconditional.
+  shape, including the long-K shapes tested for `wmma_l2_prefetch` above), but not
+  universal. Irregular tradeoff -- keep, do not make unconditional.
