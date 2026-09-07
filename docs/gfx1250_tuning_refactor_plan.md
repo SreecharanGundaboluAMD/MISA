@@ -479,7 +479,13 @@ space small enough to enumerate rather than 2^30 booleans).
 the same correctness-only discipline used throughout this engagement, not
 a performance comparison.
 
-### Phase 6 — Dominance study — **[was BLOCKED, now UNBLOCKED: exclusive hardware access available]**
+### Phase 6 — Dominance study — **DONE.** See `docs/gfx1250_dominance_study.md`
+for full results (all 4 listed candidates below, plus a fair-chance re-test of
+every tuning flag *removed* in the surrounding commits: `wg_swizzle` confirmed no
+benefit and stays removed; `atomic_cascade` excluded, hangs hardware, not a perf
+question). One correction logged: the first shape sweep almost led to deleting
+`wmma_l2_prefetch` before broader coverage reversed that (it has a real winning
+region on long-K shapes) — caught before commit; see the doc's "Correction" note.
 
 **Scope:** Apply `gpt_astra_tuning.md` §6's 5-step procedure (validate
 domain → compare against best applicable baseline → measure complete
