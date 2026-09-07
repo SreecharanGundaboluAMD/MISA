@@ -1,6 +1,3 @@
- Yes—but remove knobs that represent implementation details or correctness requirements, not knobs whose benefit genuinely depends on the 
- workload.                                                                                                                                
-                                                                                                                                          
  The goal should be a small set of meaningful kernel choices, rather than dozens of independent booleans. “Everything tunable” and        
  “everything enabled” are both poor endpoints.                                                                                            
                                                                                                                                           
