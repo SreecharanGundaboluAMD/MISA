@@ -443,6 +443,22 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                 # kernels are completely unaffected (byte-identical, zero extra VGPRs).
                 self.v_b_pack_scratch = sym_t('v_b_pack_scratch', vseq(2))
             self.v_tid         = sym_t('v_tid'         , vseq(1))
+            # VGPR-reuse (register pressure relief): checkpoint vseq right before A's and
+            # B's address-computation registers (v_addr_a/v_off_a/v_sst_tmp for A;
+            # v_addr_b/v_addr_b_base/v_off_b/v_off_b_base for B, whichever branch below
+            # actually fires) -- every one of these is a PURE VALU-computed value (global
+            # address or byte offset), never the destination of an in-flight async/memory
+            # operation, so none need a drain wait to reuse safely (unlike v_gld_a/v_gld_b's
+            # global-load staging). Their last write is the final tap's
+            # move_slice_window_a/b_functor (synchronous VALU, no completion latency), and
+            # grepping every reference in this file confirms none are read in
+            # emit_kernel_epilogue/coalescing_store -- dead by the time the epilogue runs
+            # (strictly after emit_kernel_tap_loop in emit_kernel_body). Safe to alias with
+            # the small epilogue-only scratch pool declared right after B's block (v_addr_out
+            # and friends). See igemm_fwd_gtc_wmma_nhwc.py's identical mechanism for the full
+            # rationale -- this is the WMMA generators' analogue of the older MAC/XDLOPS
+            # generators' v_c_resuable_num coalescing trick.
+            epilogue_reuse_base = vseq.get()
             # 64-bit VADDR pairs must be even-aligned on gfx1250 (verified with llvm-mc)
             if outer.tunable.tdm_global_load:
                 # Phase 3: no VADDR pairs or byte-offset VGPRs -- the SGPR descriptor
@@ -477,12 +493,24 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                 # computed once from the now-correct y*x*c row stride, reset into v_addr_b fresh
                 # every tap (then move_slice_window_b bumps v_addr_b across K-iterations within a tap).
                 self.v_addr_b_base = sym_t('v_addr_b_base' , vseq(2, 2))
-            self.v_addr_out    = sym_t('v_addr_out'    , vseq(2))    # scratch used by coalescing_store_wmma (ping-pong pair)
+            epilogue_reuse_size = vseq.get() - epilogue_reuse_base
+            epilogue_only_needed = 2   # v_addr_out, always
+            if outer.tunable.wmma_epilogue_chunked:
+                epilogue_only_needed += 1
+            if outer.tunable.wmma_m_tail:
+                epilogue_only_needed += 1
+            if outer.tunable.wmma_n_tail:
+                epilogue_only_needed += 1
+            if outer.tunable.wmma_fp16_output:
+                epilogue_only_needed += 2
+            self.vgpr_epilogue_reuse = epilogue_reuse_size >= epilogue_only_needed and epilogue_reuse_size > 0
+            epilogue_alloc = gpr_sequencer_t(epilogue_reuse_base) if self.vgpr_epilogue_reuse else vseq
+            self.v_addr_out    = sym_t('v_addr_out'    , epilogue_alloc(2))    # scratch used by coalescing_store_wmma (ping-pong pair)
             if outer.tunable.wmma_epilogue_chunked:
                 # Phase 53 bugfix: see igemm_fwd_gtc_wmma_nhwc.py's identical comment --
                 # persistent per-lane global column, needed across every pass of the
                 # chunked epilogue's per-group gather.
-                self.v_chunked_col = sym_t('v_chunked_col' , vseq(1))
+                self.v_chunked_col = sym_t('v_chunked_col' , epilogue_alloc(1))
             if outer.tunable.wmma_m_tail:
                 # Phase 26a: extra scratch for coalescing_store_wmma's per-pass absolute-row
                 # EXEC-mask guard -- only allocated when wmma_m_tail is set (every existing
@@ -491,20 +519,22 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                 # is already at the hard 256-VGPR/wave limit for some tile shapes (see
                 # _emit_lds_offset_setup's docstring), so this 1 extra VGPR needs checking
                 # against .vgpr_count per shape, not assumed to always fit.
-                self.v_m_tail_row = sym_t('v_m_tail_row' , vseq(1))
+                self.v_m_tail_row = sym_t('v_m_tail_row' , epilogue_alloc(1))
             if outer.tunable.wmma_n_tail:
                 # N-tail (B/weight, hard case -- see __init__'s docstring): v_n_tail_col is
                 # the epilogue's scratch (mirrors v_m_tail_row); v_b_col_start_abs/
                 # v_n_valid_base are load-side, kernel-lifetime constants (col_start_abs
                 # doesn't depend on the K-loop, unlike K-tail's remaining count) computed
-                # once in the prologue and reused by every shared_store_b_functor call.
-                self.v_n_tail_col      = sym_t('v_n_tail_col'      , vseq(1))
+                # once in the prologue and reused by every shared_store_b_functor call --
+                # NOT epilogue-only (still live through the whole main loop), so these two
+                # stay on the main vseq, unlike v_n_tail_col.
+                self.v_n_tail_col      = sym_t('v_n_tail_col'      , epilogue_alloc(1))
                 self.v_b_col_start_abs = sym_t('v_b_col_start_abs' , vseq(1))
                 self.v_n_valid_base    = sym_t('v_n_valid_base'    , vseq(1))
             if outer.tunable.wmma_fp16_output:
                 # C1: scratch for direct_store epilogue's cross-lane exchange + packed result.
-                self.v_fp16o_partner = sym_t('v_fp16o_partner', vseq(1))
-                self.v_fp16o_packed  = sym_t('v_fp16o_packed', vseq(1))
+                self.v_fp16o_partner = sym_t('v_fp16o_partner', epilogue_alloc(1))
+                self.v_fp16o_packed  = sym_t('v_fp16o_packed', epilogue_alloc(1))
             if outer.tunable.wmma_k_tail:
                 # K-tail (A's hard fine-grained mask + B's easy per-lane EXEC flag -- see
                 # __init__'s docstring). v_b_row_local is a kernel-lifetime constant

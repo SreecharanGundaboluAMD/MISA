@@ -610,6 +610,26 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 # row_repeat_a docstring); vseq(2*row_repeat_a, 2) keeps EVERY pair
                 # (v_addr_a(i*2), v_addr_a(i*2+1)) even-aligned since the whole block starts
                 # even-aligned. row_repeat_a==1 for every existing config (byte-identical).
+                #
+                # VGPR-reuse (register pressure relief): v_addr_a/v_addr_b/v_addr_b_base are
+                # PURE VALU-computed global addresses -- never the destination of an
+                # in-flight async/memory operation (unlike v_gld_a/v_gld_b's global-load
+                # staging, which would need an explicit drain wait to reuse safely). Their
+                # last write is the final tap's move_slice_window_a/b_functor
+                # (v_add_co_u32/v_add_co_ci_u32, synchronous VALU, no completion latency),
+                # and nothing reads them again after the tap loop ends -- confirmed by
+                # grepping every v_addr_a/v_addr_b/v_addr_b_base reference in this file: all
+                # are inside prologue/tap-loop/main-loop functors, none in
+                # emit_kernel_epilogue or coalescing_store. So this 2*row_repeat_a +
+                # 4*row_repeat_b (==6 for every existing config) register range is
+                # provably dead by the time emit_kernel_epilogue runs (strictly after
+                # emit_kernel_tap_loop in emit_kernel_body) -- safe to alias with the small
+                # epilogue-only scratch pool declared right below (v_addr_out and friends),
+                # which is never touched before the epilogue starts. This is the WMMA
+                # generators' analogue of the older MAC/XDLOPS generators' v_c_resuable_num
+                # coalescing trick (igemm_fwd_gtc.py's kernel_vgpr_t), adapted to a register
+                # file with no separate AGPR accumulator to exploit.
+                epilogue_reuse_base = vseq.get()
                 self.v_addr_a      = sym_t('v_addr_a'      , vseq(2 * outer.row_repeat_a, 2))    # persistent global A address(es) (64-bit each)
                 # row_repeat_b copies, mirroring v_addr_a/row_repeat_a above -- B needs no
                 # flag/masking (weight is never out of bounds), so this is the whole story:
@@ -619,7 +639,26 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 # Phase 5d: B's fixed per-thread row base(s) (before this tap's column offset
                 # is added) -- computed once from the *y*x*c* row stride, reused every tap.
                 self.v_addr_b_base = sym_t('v_addr_b_base' , vseq(2 * outer.row_repeat_b, 2))
-            self.v_addr_out    = sym_t('v_addr_out'    , vseq(2))    # scratch used by coalescing_store_wmma (ping-pong pair)
+                self._epilogue_reuse_base = epilogue_reuse_base
+                self._epilogue_reuse_size = 2 * outer.row_repeat_a + 4 * outer.row_repeat_b
+            if not hasattr(self, '_epilogue_reuse_size'):
+                # TDM/async/saddr paths: no provably-dead post-loop address-only register
+                # pool exists here (TDM has none; async/saddr's v_off_a/b/b_base are much
+                # smaller and not audited for this yet) -- fall back to today's exact
+                # behavior (fresh registers, no reuse). Zero risk, zero regression.
+                self._epilogue_reuse_size = 0
+            epilogue_only_needed = 2   # v_addr_out, always
+            if outer.tunable.wmma_epilogue_chunked:
+                epilogue_only_needed += 1
+            if outer.tunable.wmma_m_tail:
+                epilogue_only_needed += 1
+            if outer.tunable.wmma_n_tail:
+                epilogue_only_needed += 1
+            if outer.tunable.wmma_fp16_output:
+                epilogue_only_needed += 2
+            self.vgpr_epilogue_reuse = self._epilogue_reuse_size >= epilogue_only_needed and self._epilogue_reuse_size > 0
+            epilogue_alloc = gpr_sequencer_t(self._epilogue_reuse_base) if self.vgpr_epilogue_reuse else vseq
+            self.v_addr_out    = sym_t('v_addr_out'    , epilogue_alloc(2))    # scratch used by coalescing_store_wmma (ping-pong pair)
             if outer.tunable.wmma_epilogue_chunked:
                 # Phase 53 bugfix: the chunked epilogue's gather phase must recompute
                 # each pass's TRUE (uncompacted) global row fresh (the compact->true
@@ -631,23 +670,23 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 # computed using v_gather/v_tmp1/v_tmp2, all of which get reused as
                 # scratch or clobbered by the per-pass LDS read) -- see
                 # coalescing_store_wmma.py's _emit_chunked_non_atomic_store.
-                self.v_chunked_col = sym_t('v_chunked_col' , vseq(1))
+                self.v_chunked_col = sym_t('v_chunked_col' , epilogue_alloc(1))
             if outer.tunable.wmma_m_tail:
                 # Phase 25: extra scratch for coalescing_store_wmma's per-pass absolute-row
                 # EXEC-mask guard -- only allocated when wmma_m_tail is set (every existing
                 # config is byte-identical, this register simply doesn't exist otherwise).
-                self.v_m_tail_row = sym_t('v_m_tail_row' , vseq(1))
+                self.v_m_tail_row = sym_t('v_m_tail_row' , epilogue_alloc(1))
             if outer.tunable.wmma_n_tail:
                 # Phase 26b: extra scratch for coalescing_store_wmma's pass-invariant
                 # column-in-range flag -- only allocated when wmma_n_tail is set.
-                self.v_n_tail_col = sym_t('v_n_tail_col' , vseq(1))
+                self.v_n_tail_col = sym_t('v_n_tail_col' , epilogue_alloc(1))
             if outer.tunable.wmma_fp16_output:
                 # C1: scratch for the direct_store epilogue's cross-lane exchange +
                 # packed result (v_permlane_xor_b32 partner value, v_cvt_pk result) --
                 # only allocated when wmma_fp16_output is set (mutually exclusive with
                 # wmma_m_tail/wmma_n_tail which would otherwise reuse these slots).
-                self.v_fp16o_partner = sym_t('v_fp16o_partner', vseq(1))
-                self.v_fp16o_packed  = sym_t('v_fp16o_packed', vseq(1))
+                self.v_fp16o_partner = sym_t('v_fp16o_partner', epilogue_alloc(1))
+                self.v_fp16o_packed  = sym_t('v_fp16o_packed', epilogue_alloc(1))
             self.v_sst_os      = sym_t('v_sst_os'      , vseq(1))    # shared store offset (same for A/B region)
             if outer.col_split_b > 1:
                 # Phase 69: B's own store offset -- n_idx*bytes_per_row + k_group's
