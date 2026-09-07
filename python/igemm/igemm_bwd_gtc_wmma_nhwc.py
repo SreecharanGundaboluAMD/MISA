@@ -401,10 +401,17 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             self.v_c           = sym_t('v_c'           , v_c_vseq(outer.tunable.num_vgpr_accumulate_c))     # 128
             self.v_a           = sym_t('v_a'           , vseq(outer.tunable.num_vgpr_accumulate_a))     # 32
             self.v_b           = sym_t('v_b'           , vseq(outer.tunable.num_vgpr_accumulate_b))     # 32
-            # Phase 1 (k-sub-loop): sized to outer.num_dwords (=bytes_per_row//4), NOT a
-            # hardcoded 16 -- bytes_per_row can now exceed 64B once gemm_k_per_block is a
-            # multiple (not just equal to) inst_wmma.k, so the old fixed-16 allocation
-            # silently overflowed into whatever VGPR followed it.
+            # VGPR-reuse pool 2 (see the addr-block comment below for pool 1's rationale):
+            # v_gld_a/v_gld_b's global-load staging (and v_zero/v_b_pack_scratch, which
+            # happen to sit in the same allocation span) are ALSO dead by the time the
+            # epilogue runs (confirmed by grep -- never referenced in
+            # emit_kernel_epilogue/coalescing_store), but v_gld_a/v_gld_b ARE the
+            # destination of an in-flight global_load_dwordx4, so reusing this pool needs
+            # an explicit drain wait (s_wait_loadcnt 0x0, emitted in emit_kernel_epilogue
+            # whenever this pool is actually used) -- unconditionally, regardless of
+            # whatever schedule wmma_main_loop.py uses (the exact class of hazard Phase
+            # 70's ds_load_tr_b bug taught this project not to assume away).
+            gld_reuse_base = vseq.get()
             if outer.tunable.async_global_load:
                 # Phase 13: A (untransposed) has no VGPR staging buffer at all -- see
                 # igemm_fwd_gtc_wmma_nhwc.py's kernel_vgpr_t for the full rationale.
@@ -442,6 +449,8 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                 # Only allocated when the manual path is actually used -- ds_load_tr_b=1
                 # kernels are completely unaffected (byte-identical, zero extra VGPRs).
                 self.v_b_pack_scratch = sym_t('v_b_pack_scratch', vseq(2))
+            self._gld_reuse_base = gld_reuse_base
+            self._gld_reuse_size = vseq.get() - gld_reuse_base
             self.v_tid         = sym_t('v_tid'         , vseq(1))
             # VGPR-reuse (register pressure relief): checkpoint vseq right before A's and
             # B's address-computation registers (v_addr_a/v_off_a/v_sst_tmp for A;
@@ -503,8 +512,27 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                 epilogue_only_needed += 1
             if outer.tunable.wmma_fp16_output:
                 epilogue_only_needed += 2
-            self.vgpr_epilogue_reuse = epilogue_reuse_size >= epilogue_only_needed and epilogue_reuse_size > 0
-            epilogue_alloc = gpr_sequencer_t(epilogue_reuse_base) if self.vgpr_epilogue_reuse else vseq
+            addr_avail = epilogue_reuse_size
+            gld_avail  = self._gld_reuse_size
+            addr_seq = gpr_sequencer_t(epilogue_reuse_base) if addr_avail else None
+            gld_seq  = gpr_sequencer_t(self._gld_reuse_base) if gld_avail else None
+            self.vgpr_epilogue_reuse = False
+            self.vgpr_epilogue_reuse_gld = False
+            def epilogue_alloc(n):
+                nonlocal addr_avail, gld_avail
+                # Bin-pack: prefer the wait-free addr pool; only spill into the gld pool
+                # (needs an explicit drain wait, see the gld_reuse_base declaration above)
+                # when addr alone isn't enough for this symbol; fall back to a fresh
+                # register when neither pool has room (today's exact behavior).
+                if addr_seq is not None and addr_avail >= n:
+                    addr_avail -= n
+                    self.vgpr_epilogue_reuse = True
+                    return addr_seq(n)
+                if gld_seq is not None and gld_avail >= n:
+                    gld_avail -= n
+                    self.vgpr_epilogue_reuse_gld = True
+                    return gld_seq(n)
+                return vseq(n)
             self.v_addr_out    = sym_t('v_addr_out'    , epilogue_alloc(2))    # scratch used by coalescing_store_wmma (ping-pong pair)
             if outer.tunable.wmma_epilogue_chunked:
                 # Phase 53 bugfix: see igemm_fwd_gtc_wmma_nhwc.py's identical comment --
@@ -2023,6 +2051,11 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
     def emit_kernel_epilogue(self):
         v = self.vgpr
         s = self.sgpr
+        if self.vgpr.vgpr_epilogue_reuse_gld:
+            # VGPR-reuse pool 2 (see kernel_vgpr_t's gld_reuse_base comment): guarantees
+            # any global_load_dwordx4 still in flight into v_gld_a/v_gld_b has landed
+            # before the epilogue below overwrites those same physical registers.
+            self._emit(f"s_wait_loadcnt 0x0   ; VGPR-reuse: drain v_gld_a/v_gld_b before epilogue reuses their registers")
         if os.environ.get('BWD_RAW_DUMP'):
             # DIAGNOSTIC: bypass coalescing_store, dump v_c raw to s_p_out (one dword per
             # register per thread). Proves whether v_c is already correct after the K-loop
