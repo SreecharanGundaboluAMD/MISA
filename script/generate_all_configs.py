@@ -23,6 +23,16 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from itertools import product
 
+
+# Sentinel: a small number of flags have a NONZERO construct-time default for part
+# of their domain (e.g. ds_load_tr_b defaults to 1 for bwd/wrw fp16/bf16) -- the
+# generic "vals[k]==0 -> omit the override line, rely on the constructor's own
+# default" convention used by every other flag below would then make BOTH bit
+# values resolve to the SAME tunable there (found the hard way: a real assembler
+# "symbol already defined" collision from two combos producing byte-identical
+# kernels under different names). _FORCE_ZERO marks "explicitly write/merge the
+# literal value 0" instead of "omit"; see the ds_load_tr_b remap in gen_combos().
+_FORCE_ZERO = object()
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_DIR = os.path.join(REPO_ROOT, 'config')
 
@@ -104,14 +114,29 @@ BASE_SECTIONS = [
 # Phase 67: added saddr_global_load -- was previously only ever tested in its own
 # bespoke single-feature _saddr.config, never combined with direct_store/tail-relief/
 # lds_double_buffer/wmma_setprio/local_prefetch_num/epilogue_lds_pad in the searched
-# corpus. ds_load_tr_b is NOT added here: it was promoted to an unconditional default
-# for bwd/wrw fp16/bf16 (igemm_base.py), so every combination below already gets it
-# for free without needing a combinatorial toggle.
+# corpus.
+# Phase 7 (gfx1250_tuning_refactor_plan.md, per Phase 6's dominance study): added
+# ds_load_tr_b, wmma_gap_hoist, wmma_l2_prefetch. Phase 6 (docs/gfx1250_dominance_study.md)
+# found all three are genuine, non-trivial, shape-dependent tradeoffs -- not dominated,
+# not redundant with the existing FLAGS combinations:
+#   - ds_load_tr_b was previously an unconditional default for bwd/wrw fp16/bf16 (no
+#     escape hatch searched); Phase 6 found real wins for BOTH values depending on shape
+#     magnitude (bwd's own win region even reverses direction at more extreme shapes,
+#     see the doc), so the =0 escape hatch needs to be reachable by the search.
+#   - wmma_gap_hoist/wmma_l2_prefetch previously only existed via bespoke standalone
+#     config files (never combined with tail-relief/saddr/setprio in the searched
+#     corpus); Phase 6 found wmma_l2_prefetch's best measured result (+27-33% on a
+#     long-K shape) was the COMBINATION of setprio+gaphoist+l2pf together, which the
+#     old bespoke-file approach could never produce. is_valid()'s real construction
+#     (not a hand-maintained rule) transparently rejects the illegal combinations for
+#     all three (e.g. l2_prefetch + async/saddr/tdm/interleave, ds_load_tr_b on fwd or
+#     fp32) via AssertionError -- no special-casing needed here, same as every other
+#     flag below.
 FLAGS = [
     'direct_store', 'gemm_k_global_split', 'wmma_m_tail', 'wmma_n_tail',
     'tdm_global_load', 'lds_double_buffer', 'wmma_setprio',
     'local_prefetch_num', 'main_loop_interleave', 'epilogue_lds_pad',
-    'saddr_global_load',
+    'saddr_global_load', 'ds_load_tr_b', 'wmma_gap_hoist', 'wmma_l2_prefetch',
 ]
 
 
@@ -224,14 +249,18 @@ def is_valid(direction, base_dict, vals):
     merged = dict(base_dict)
     merged['arch'] = 'gfx1250'
     for k, v in vals.items():
-        if v not in (0, 'SCOPE_SYS'):
+        if v is _FORCE_ZERO:
+            merged[k] = 0
+        elif v not in (0, 'SCOPE_SYS'):
             merged[k] = v
     try:
         tunable = igemm_gtc_tunable_parameter_t(merged)
         kernel = _GEN_CLASS[direction](mc_asm_printer_t(_MC.emitter, _MC.arch_config), tunable)
-        return _assembles(kernel)
+        if not _assembles(kernel):
+            return False, None
+        return True, kernel.name()
     except AssertionError:
-        return False
+        return False, None
     finally:
         # Never actually consumed (validation-only) -- reset so thousands of
         # combos don't grow one shared string buffer unboundedly.
@@ -240,7 +269,8 @@ def is_valid(direction, base_dict, vals):
 
 def _check_combo(task):
     direction, precision, tile_m, tile_n, gemm_k, base_dict, vals = task
-    return (direction, precision, tile_m, tile_n, gemm_k, vals) if is_valid(direction, base_dict, vals) else None
+    ok, kname = is_valid(direction, base_dict, vals)
+    return (direction, precision, tile_m, tile_n, gemm_k, vals, kname) if ok else None
 
 
 def gen_combos():
@@ -259,6 +289,11 @@ def gen_combos():
             vals = {FLAGS[i]: bits[i] for i in range(len(FLAGS))}
             # local_prefetch_num: bit 0 -> 1, bit 1 -> 2
             vals['local_prefetch_num'] = 2 if vals['local_prefetch_num'] == 1 else 1
+            # ds_load_tr_b: bit 0 -> 0 (omit, preserves the pre-Phase-7 default-ON
+            # behavior for bwd/wrw fp16/bf16 byte-identically); bit 1 -> _FORCE_ZERO
+            # (explicit `ds_load_tr_b = 0` override, the escape-hatch Phase 6 found
+            # real wins for). See _FORCE_ZERO's module-level docstring.
+            vals['ds_load_tr_b'] = _FORCE_ZERO if vals['ds_load_tr_b'] == 1 else 0
             tasks.append((direction, precision, tile_m, tile_n, gemm_k, base_dict, vals))
 
     nproc = min(64, os.cpu_count() or 1)
@@ -269,16 +304,6 @@ def gen_combos():
                 results.append(res)
     return results
 
-
-def section_key(body_lines):
-    """Deterministic dedup key: all non-comment tunable lines, sorted."""
-    tunable_lines = []
-    for l in body_lines:
-        s = l.strip()
-        if not s or s.startswith('#') or s.startswith(';'):
-            continue
-        tunable_lines.append(s)
-    return '\n'.join(sorted(tunable_lines))
 
 
 def _extra_lines(base_body, vals):
@@ -302,7 +327,11 @@ def _extra_lines(base_body, vals):
     extra = []
     for flag in FLAGS:
         val = vals.get(flag)
-        if val is not None and val != 0 and val != 'SCOPE_SYS' and flag not in base_keys:
+        if flag in base_keys:
+            continue
+        if val is _FORCE_ZERO:
+            extra.append(f"{flag:25s} = 0\n")
+        elif val is not None and val != 0 and val != 'SCOPE_SYS':
             extra.append(f"{flag:25s} = {val}\n")
     return extra
 
@@ -337,8 +366,8 @@ def main():
 
     # Group by (direction, precision, tile_m, tile_n, gemm_k)
     per_tile = defaultdict(list)
-    for direction, precision, tile_m, tile_n, gemm_k, vals in combos:
-        per_tile[(direction, precision, tile_m, tile_n, gemm_k)].append(vals)
+    for direction, precision, tile_m, tile_n, gemm_k, vals, kname in combos:
+        per_tile[(direction, precision, tile_m, tile_n, gemm_k)].append((vals, kname))
 
     total_files = 0
     total_sections = 0
@@ -366,7 +395,21 @@ def main():
         out_lines.append(f"{'#' * 89}\n\n")
 
         seen = set()
-        for vals in sorted(combos_list, key=lambda v: sorted(v.items())):
+        for vals, kname in sorted(combos_list, key=lambda vk: (vk[1], sorted((k, repr(val)) for k, val in vk[0].items()))):
+            # Dedup by the REAL resolved kernel name (not raw config text): some
+            # flag combinations are no-ops under certain other tunables (e.g.
+            # local_prefetch_num's value is irrelevant once tdm_global_load=1 uses
+            # its own descriptor-based prefetch instead) -- these produce
+            # byte-identical kernels under the identical name from textually
+            # DIFFERENT config sections, which the old raw-text section_key dedup
+            # didn't catch, causing a real "symbol already defined" assembler
+            # collision. Mirrors the same fix already applied in
+            # build_gfx1250_master_configs.py's ACCUMULATE_WIDTH_KEYS-adjacent
+            # kernel-name dedup (Phase 5b).
+            if kname in seen:
+                continue
+            seen.add(kname)
+
             # Clone base body and append non-default tunable flags
             new_body = list(base_body)
 
@@ -382,10 +425,6 @@ def main():
                 for i, el in enumerate(extra):
                     new_body.insert(insert_at + i, el)
 
-            key = section_key(new_body)
-            if key in seen:
-                continue
-            seen.add(key)
 
             # Build label
             active = [k for k, v in sorted(vals.items()) if v not in (0, 'SCOPE_SYS')]
@@ -434,7 +473,10 @@ def main():
             if base_body is None:
                 continue
             seen = set()
-            for vals in sorted(combos_list, key=lambda v: sorted(v.items())):
+            for vals, kname in sorted(combos_list, key=lambda vk: (vk[1], sorted((k, repr(val)) for k, val in vk[0].items()))):
+                if kname in seen:
+                    continue
+                seen.add(kname)
                 new_body = list(base_body)
                 extra = _extra_lines(base_body, vals)
                 if extra:
@@ -446,10 +488,6 @@ def main():
                             break
                     for i, el in enumerate(extra):
                         new_body.insert(insert_at + i, el)
-                key = section_key(new_body)
-                if key in seen:
-                    continue
-                seen.add(key)
                 active = [k for k, v in sorted(vals.items()) if v not in (0, 'SCOPE_SYS')]
                 label = '+'.join(active) if active else 'base'
                 section_name = f'igemm_{direction}_gtc'

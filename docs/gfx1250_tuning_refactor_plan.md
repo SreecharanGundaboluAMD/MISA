@@ -524,7 +524,8 @@ since it's already isolated.
 session); ready to execute. Prepare the exact shape/config matrix (still a
 real prerequisite regardless of hardware access) before starting.
 
-### Phase 7 — Expand tuning search — **[was BLOCKED, now UNBLOCKED pending Phase 6]**
+### Phase 7 — Expand tuning search — **DONE (fp32/bf16/fp16 scope; int8/int4
+explicitly excluded per user direction, not attempted)**
 
 **Scope:** Per `gpt_astra_tuning.md`'s explicit ordering, only *after*
 Phase 6 shrinks the space, consider widening `script/generate_all_configs.py`'s
@@ -540,6 +541,50 @@ output-width variants, with each new dimension backed by a Phase 6-style
 dominance check showing it isn't redundant.
 **Depends on:** Phase 6.
 **Benchmarking:** required.
+
+**Delivered (fp32/bf16/fp16 only — int8/int4 explicitly out of scope per user
+direction):** added `ds_load_tr_b`, `wmma_gap_hoist`, `wmma_l2_prefetch` to
+`script/generate_all_configs.py`'s combinatorial `FLAGS`, each backed by
+Phase 6's dominance-study evidence that it's a real, non-redundant,
+shape-dependent choice (not a dominated/no-op flag). INT8's base-section
+enumeration and the accumulate/output-width variants (`wmma_acc_f16`,
+`wmma_acc_bf16`, `atomic_pack_bf16`, `wmma_fp16_output`) were investigated
+and found **structurally blocked**, not merely undone: `conv_driver.cpp`
+computes buffer/accumulate-width flags once from `tunables[0]`, not
+per-tunable, so folding those four into the combinatorial union would
+silently corrupt verification for any section after the first with a
+different width (already documented in
+`build_gfx1250_master_configs.py`'s `ACCUMULATE_WIDTH_KEYS` comment) — fixing
+that needs a real driver buffer-allocation restructure, out of scope here.
+They remain correctly available only as separate, narrower standalone
+config files, as before.
+
+Two real bugs surfaced and fixed during this work, both found only because
+the combinatorial product actually grew large enough to expose them:
+1. `ds_load_tr_b`'s own construct-time default is 1 (not 0) for bwd/wrw
+   fp16/bf16 — naively adding it as a FLAGS toggle under the existing
+   "value 0 -> omit the override, rely on the constructor default"
+   convention made both bit values resolve to the identical tunable/kernel
+   name, a real "symbol already defined" assembler collision. Fixed with a
+   `_FORCE_ZERO` sentinel so bit=1 explicitly writes `ds_load_tr_b = 0`.
+2. More generally: several flag combinations become no-ops under certain
+   other tunables (e.g. `local_prefetch_num`'s value is irrelevant once
+   `tdm_global_load=1` uses its own descriptor-based prefetch instead) —
+   these produce byte-identical kernels under an identical resolved name
+   from textually different config sections, which raw-text dedup can't
+   catch. Fixed by having `is_valid()` return the real, actually-constructed
+   kernel name (`kernel.name()`) and deduping by that in the writer, instead
+   of by literal config text — the same fix pattern Phase 5b already
+   established for `build_gfx1250_master_configs.py`, now applied to
+   `generate_all_configs.py` itself. Section counts dropped substantially
+   after the fix (e.g. bwd 128x128: 560 → 280) — that's the true prior
+   redundancy, not a regression.
+
+Verified: all 27 per-tile `_all.config` files rebuild cleanly
+(`build_and_filter_configs.py`: 8272/8272 sections pass assembly), the
+3 untouched narrow bespoke configs (fwd/bwd/wrw base) are byte-identical
+before/after, and a 440-kernel hardware `-V 1` sweep (all 27 files x 2
+shapes) reports zero `valid:n`.
 
 ## Parking lot — carried-over ideas, explicitly out of scope for this plan
 
