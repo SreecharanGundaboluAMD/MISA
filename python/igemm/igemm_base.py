@@ -83,6 +83,29 @@ def igemm_log2(v):
     assert (v and (not(v & (v - 1)))), 'v:{} must be power of 2'.format(v)
     return int(math.log2(v))
 
+def igemm_tdm_row_pad_bits(row_bytes, lds_row_pad):
+    '''
+    Computes the TDM Group-1 word-0 pad_enable/pad_interval/pad_amount bit fields
+    (CDNA5 ISA "Tensor DMA Resource Descriptor, Group 1" table) so hardware TDM
+    padding matches the LDS row pitch (row_bytes + lds_row_pad) the WMMA operand
+    reads already assume when lds_row_pad > 0. Returns the OR-able 32-bit
+    contribution occupying bits [20] and [31:22]; 0 when lds_row_pad == 0 (byte-
+    identical to today's behavior for every currently-shipped tdm_global_load
+    config, none of which combine it with lds_row_pad).
+    '''
+    if lds_row_pad == 0:
+        return 0
+    assert row_bytes % 4 == 0, f"TDM row width ({row_bytes} bytes) must be dword-aligned for LDS padding"
+    dwords_per_row = row_bytes // 4
+    assert dwords_per_row >= 2 and dwords_per_row <= 256 and (dwords_per_row & (dwords_per_row - 1)) == 0, \
+        f"TDM pad_interval only encodes power-of-two 2..256 DWORD rows; got {dwords_per_row} DWORDs ({row_bytes} bytes) for lds_row_pad={lds_row_pad}"
+    assert lds_row_pad % 4 == 0
+    pad_amount_dwords = lds_row_pad // 4
+    assert 1 <= pad_amount_dwords <= 128, f"TDM pad_amount encodes 1..128 DWORDs; lds_row_pad={lds_row_pad} needs {pad_amount_dwords} DWORDs"
+    pad_interval_field = igemm_log2(dwords_per_row) - 1
+    pad_amount_field = pad_amount_dwords - 1
+    return (1 << 20) | (pad_interval_field << 22) | (pad_amount_field << 25)
+
 def igemm_division_magic(divisor):
     '''
     compute magic num for fast int divison

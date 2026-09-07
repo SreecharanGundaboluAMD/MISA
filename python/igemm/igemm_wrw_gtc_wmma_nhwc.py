@@ -830,8 +830,8 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_or_b32 s[{s.s_tdm_g0(3)}], s[{s.s_tmp(1)}], 0x80000000   ; | type=2 (image) in bits[31:30]")
         self._emit_empty_line()
 
-        self._emit(f"; group1: data_size={data_size_code}, workgroup_mask=0 (not clustered)")
-        self._emit(f"s_mov_b32 s[{s.s_tdm_g1(0)}], {data_size_code << 16}")
+        self._emit(f"; group1: data_size={data_size_code}, workgroup_mask=0 (not clustered), pad from lds_row_pad")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1(0)}], {data_size_code << 16 | igemm_tdm_row_pad_bits(tile_dim0 * self.data_byte, self.tunable.lds_row_pad)}")
         self._emit(f"s_lshl_b32 s[{s.s_tdm_g1(1)}], s[{s.s_gemm_m()}], 16   ; tensor_dim0 (gemm_m) lo16 -> [31:16]")
         self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_gemm_m()}], 16   ; tensor_dim0 hi16")
         self._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim1 (this shard's remaining K) lo16")
@@ -874,8 +874,8 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_or_b32 s[{s.s_tdm_g0_b(3)}], s[{s.s_tmp(1)}], 0x80000000   ; | type=2 (image) in bits[31:30]")
         self._emit_empty_line()
 
-        self._emit(f"; group1: data_size={data_size_code}, workgroup_mask=0 (not clustered)")
-        self._emit(f"s_mov_b32 s[{s.s_tdm_g1_b(0)}], {data_size_code << 16}")
+        self._emit(f"; group1: data_size={data_size_code}, workgroup_mask=0 (not clustered), pad from lds_row_pad")
+        self._emit(f"s_mov_b32 s[{s.s_tdm_g1_b(0)}], {data_size_code << 16 | igemm_tdm_row_pad_bits(tile_dim0 * self.data_byte, self.tunable.lds_row_pad)}")
         self._emit(f"s_lshl_b32 s[{s.s_tdm_g1_b(1)}], s[{s.s_gemm_n()}], 16   ; tensor_dim0 (gemm_n) lo16 -> [31:16]")
         self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_gemm_n()}], 16   ; tensor_dim0 hi16")
         self._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim1 (this shard's remaining K) lo16")

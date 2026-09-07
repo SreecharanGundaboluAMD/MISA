@@ -740,10 +740,18 @@ public:
                     return 1;
                 };
                 int num_k_blocks = gemm_k / tunable->gemm_k_per_block;
-                int sweep_target = env_get_int("IGEMM_GSPLIT_SWEEP", 0);
-                int target_splits = sweep_target > 0 ? sweep_target :
-                    std::min(std::max(1, static_cast<int>((512 + grid_x * grid_y - 1) / (grid_x * grid_y))),
-                             igemm_gemm_k_global_split_cap(gemm_k, tunable->gemm_k_per_block));
+                int split_cap = igemm_gemm_k_global_split_cap(gemm_k, tunable->gemm_k_per_block);
+                int target_splits;
+                if (current_gks >= 0) {
+                    // Explicit override from the caller (conv_driver.cpp's IGEMM_GKS_ITERATIVE
+                    // sweep) -- an actual split-COUNT request, clamped to this shape's valid
+                    // range the same way every other candidate here is.
+                    target_splits = std::min(std::max(current_gks, 1), split_cap);
+                } else {
+                    int sweep_target = env_get_int("IGEMM_GSPLIT_SWEEP", 0);
+                    target_splits = sweep_target > 0 ? sweep_target :
+                        std::min(std::max(1, static_cast<int>((512 + grid_x * grid_y - 1) / (grid_x * grid_y))), split_cap);
+                }
                 gemm_k_global_splits = largest_divisor_leq(num_k_blocks, target_splits);
                 karg.gemm_k_per_wg = (num_k_blocks / gemm_k_global_splits) * tunable->gemm_k_per_block;
             } else {
@@ -1241,7 +1249,24 @@ public:
 
         if(tunable->gemm_k_global_split == 0)
             return std::vector<int>{0};
-        else{
+        if (tunable->fma_type == IGEMM_GTC_TUNABLE_FMA_TYPE_WMMA) {
+            int c = arg->get_int("in_channels");
+            int group = arg->get_int("group_count");
+            int gemm_k = c / group;
+            int num_k_blocks = gemm_k / tunable->gemm_k_per_block;
+            int split_cap = igemm_gemm_k_global_split_cap(gemm_k, tunable->gemm_k_per_block);
+            std::vector<int> divisors;
+            for (int i = 1; static_cast<long long>(i) * i <= num_k_blocks; i++) {
+                if (num_k_blocks % i == 0) {
+                    if (i <= split_cap) divisors.push_back(i);
+                    int j = num_k_blocks / i;
+                    if (j != i && j <= split_cap) divisors.push_back(j);
+                }
+            }
+            std::sort(divisors.begin(), divisors.end());
+            if (divisors.empty()) divisors.push_back(1);
+            return divisors;
+        } else {
             int c = arg->get_int("in_channels");
             int group = arg->get_int("group_count");
 
