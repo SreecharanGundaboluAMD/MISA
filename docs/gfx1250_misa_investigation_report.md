@@ -138,14 +138,22 @@ main() → hipModuleLoad(hsaco) → config_parser → igemm_gtc_tunable_from_con
 - **Fix:** Already applied at code level. Needs hardware validation with genuinely signed/large int8 data.
 - **Risk:** None for the fix itself; remaining risk is unvalidated hardware behavior.
 
-### COR-004: atomic_cascade=1 hangs on real hardware
-- **Severity:** Medium (blocked, but a trap)
-- **Confidence:** Confirmed (hangs on hardware)
-- **Evidence:** `igemm_base.py:377-379` — `assert not self.atomic_cascade`
+### COR-004: atomic_cascade=1 hangs on real hardware (field deleted)
+- **Severity:** Medium (was blocked, but a trap) — resolved by deletion
+- **Confidence:** Confirmed (hung on hardware)
+- **Evidence (historical):** `igemm_base.py:377-379` — `assert not self.atomic_cascade`
 - **Mechanism:** Cascading atomic defers completion to a subsequent release that's never issued; `s_wait_storecnt 0x0` never completes.
-- **Trigger:** `atomic_cascade=1` (currently blocked by assert).
-- **Fix:** Assert is correct. The TODO in `igemm_base.py:328-376` documents the required release mechanism.
-- **Risk:** None while assert is in place.
+- **Trigger:** `atomic_cascade=1` (was blocked by assert; field no longer exists).
+- **Fix:** `gfx1250_tuning_refactor_plan.md` Phase 2: the assert was correct, but the
+  field/`atomic_th`/the dead `th:` branch were unreachable schema cruft (the ISA doc's
+  companion-release mechanism the TODO described was never implemented). Deleted the
+  tunable, its C++/ctrl wiring in all three WMMA generators, and the dead `th_str`
+  branches in `coalescing_store_wmma.py` entirely, rather than leaving a
+  permanently-asserted-off trap in the schema.
+- **Risk:** None — deletion of unreachable code, confirmed via a repo-wide grep
+  (zero remaining `atomic_cascade`/`atomic_th`/`TH_ATOMIC_CASCADE_RT` references
+  in `python/`, `driver/`, `script/`) before removal and a full fp16 master-config
+  regression sweep (94 kernels x 2 shapes).
 
 ### COR-005: WMMA hazard avoidance relies on hardware arbiter stall only
 - **Severity:** Low (correctness OK, but performance-limiting)

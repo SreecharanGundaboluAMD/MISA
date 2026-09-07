@@ -182,7 +182,7 @@ typedef struct {
     int saddr_global_load;
     int main_loop_interleave;
     // Phase 24: also folded into the kernel name (unlike local_prefetch_num/atomic_scope/
-    // atomic_cascade/epilogue_lds_pad, which are purely internal-codegen choices that don't
+    // epilogue_lds_pad, which are purely internal-codegen choices that don't
     // change anything the driver needs to know) -- wmma_acc_f16 changes the WMMA kernel's
     // native-width output-role buffer from fp32 to fp16, which the driver's buffer allocation/
     // comparison logic (conv_driver.cpp's is_wmma handling) must match, and which must be

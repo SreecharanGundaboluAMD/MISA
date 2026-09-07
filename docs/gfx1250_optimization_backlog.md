@@ -173,12 +173,19 @@ section for the record).
       `saddr_global_load` + `wmma_m_tail` alone -- only the `saddr`+`n_tail` pairing on
       fwd fails. bwd's identical pairing hardware-validates fine (wrw structurally can't
       combine them: wrw requires `gemm_k_global_split` alongside any tail flag, which
-      `saddr_global_load` already excludes). Not root-caused (plausibly fwd's B-operand
-      N-boundary address computation not accounting for `saddr`'s different addressing
-      path) -- excluded from the generated corpus via a new `is_valid()` rule
-      (`if sa and nt and direction == 'fwd': return False`) rather than left broken in
-      the searched space. Root-causing and fixing this is real, separate follow-up work.
-      See `docs/gfx1250_wmma_layout.md`'s Phase 68.
+      `saddr_global_load` already excludes).
+      **Root-caused and fixed (gfx1250_tuning_refactor_plan.md Phase 2, correctness
+      pass)**: `igemm_fwd_gtc_wmma_nhwc.py`'s `async_global_load`/`saddr_global_load`
+      B-address branch never computed `v_flag_b` (the per-lane N-tail mask) at all --
+      only the plain-VADDR path (the `row_repeat_b` loop) did -- so the flag held
+      whatever garbage was last in that VGPR, corrupting the N-tail
+      store/load mask on every lane, even on an exact-fit shape with no real tail.
+      Fixed by computing `v_flag_b` in that branch too, from the same pre-multiply
+      absolute-column value already computed there (`v_off_b_base`). Hardware-validated
+      `valid:y` on an exact-fit shape, two genuine N-tail shapes (1x1 and 3x3), and the
+      full fp16 master `_all.config` regression sweep (94 kernels x 2 shapes). The
+      `is_valid()` exclusion in `script/generate_all_configs.py` has been removed.
+      See `docs/gfx1250_wmma_layout.md`'s Phase 68 for the original discovery.
 - [ ] **`script/build_and_filter_configs.py`'s per-section failure isolation doesn't
       recognize the `register index is out of range` error class** — found 2026-09-01
       (Phase 68) while validating the saddr combinatorial expansion above. When a

@@ -226,7 +226,6 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_coalescing_store_wmma.precision = tunable.precision
         ctrl_coalescing_store_wmma.gemm_k_global_split = tunable.gemm_k_global_split
         ctrl_coalescing_store_wmma.atomic_scope = tunable.atomic_scope
-        ctrl_coalescing_store_wmma.atomic_cascade = tunable.atomic_cascade
         ctrl_coalescing_store_wmma.epilogue_lds_pad = tunable.epilogue_lds_pad
         # Phase 27: see igemm_fwd_gtc_wmma_nhwc.py's identical comment -- the ctrl field's
         # actual behavior is precision-agnostic (2-byte-packed accumulator), so both tunables

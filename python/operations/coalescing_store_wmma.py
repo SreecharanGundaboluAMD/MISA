@@ -68,19 +68,6 @@ class ctrl_coalescing_store_wmma_t(object):
         # forcing a full system-level flush/invalidate -- sufficient since gemm_k_global_split's
         # contending workgroups are always on the same device. See docs/gfx1250_wmma_layout.md.
         self.atomic_scope = 'SCOPE_SYS'
-        # atomic path only. 0 (default) = regular atomic. 1 = TH[2] cascading/deferred-scope
-        # atomic. The `th:TH_ATOMIC_CASCADE_RT` ENCODING was confirmed correct via an
-        # `llvm-mc -show-encoding` round-trip probe (Phase 23) -- but using it CONFIRMED HANGS
-        # ON REAL HARDWARE: this kernel's `s_wait_storecnt 0x0` before `s_endpgm` never
-        # completes, because the doc states a cascading atomic's full scope/completion is only
-        # realized at "a subsequent release... of a matching or higher scope", which this
-        # kernel never issues. Hard-blocked in igemm_base.py's tunable read (`assert not
-        # self.atomic_cascade`) until a companion release mechanism is designed and added --
-        # do not wire this up without that. See docs/gfx1250_wmma_layout.md's Phase 23.
-        self.atomic_cascade = 0
-        # the confirmed `th:` identifier to emit when atomic_cascade=1 -- a string, not a raw
-        # number (llvm-mc requires a symbolic th value, rejects numeric immediates).
-        self.atomic_th = 'TH_ATOMIC_CASCADE_RT'
         # non-atomic path only. 0 (default) = today's unpadded tile-linear LDS layout. 1 =
         # pad the row stride by one element to break a bank-conflict periodicity (macro_tile_n
         # is always a multiple of 64, so the unpadded layout puts every row of a given column
@@ -717,8 +704,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                             # the pair's lower/base column); narrow EXEC, issue, restore.
                             self._emit(f"v_and_b32 v[{v_tmp3}], 1, v[{v_tid}]")
                             self._emit(f"v_cmpx_eq_u32 0, v[{v_tmp3}]   ; EXEC = (this lane is even)")
-                            th_str = f" th:{ctrl.atomic_th}" if ctrl.atomic_cascade else ""
-                            self._emit(f"global_atomic_pk_add_bf16 v[{cur}], v[{v_tmp4}], s[{s_p_out}:{s_p_out}+1]{offset_str} scope:{ctrl.atomic_scope}{th_str}")
+                            self._emit(f"global_atomic_pk_add_bf16 v[{cur}], v[{v_tmp4}], s[{s_p_out}:{s_p_out}+1]{offset_str} scope:{ctrl.atomic_scope}")
                             self._emit(f"s_mov_b32 exec_lo, -1   ; restore full EXEC for the next iteration's exchange")
                         cur, nxt = nxt, cur
                 self._emit_empty_line()
@@ -766,15 +752,13 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                             # (CU/WGP-local) cache scope on gfx1250, which silently drops
                             # updates when the two accumulating workgroups land on different
                             # compute units -- confirmed on hardware. See
-                            # docs/gfx1250_wmma_layout.md. th:{th} (Phase 23, optional) marks
-                            # a cascading/deferred-scope atomic -- see ctrl.atomic_cascade.
+                            # docs/gfx1250_wmma_layout.md.
                             # Phase 35: wrw_reduction_kernel needs neither -- it's a plain,
                             # non-atomic store (no concurrent writers ever target the same
                             # workspace address, so no ordering/scope concern exists).
                             if ctrl.wrw_reduction_kernel:
                                 self._emit(f"global_store_dword v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str} th:TH_STORE_NT")
                             else:
-                                th_str = f" th:{ctrl.atomic_th}" if ctrl.atomic_cascade else ""
                                 # Phase 57: int8/int4's WMMA accumulator is a genuine int32
                                 # value, not a float -- global_atomic_add_f32 would silently
                                 # bit-reinterpret it as float and only coincidentally add
@@ -787,7 +771,7 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                                 # needed (confirmed: no GLOBAL_ATOMIC_ADD_I32 in the ISA doc's
                                 # opcode table, only U32/F32/F64/U64).
                                 atomic_add_inst = 'global_atomic_add_u32' if ctrl.precision in ('int8', 'int4') else 'global_atomic_add_f32'
-                                self._emit(f"{atomic_add_inst} v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str} scope:{ctrl.atomic_scope}{th_str}")
+                                self._emit(f"{atomic_add_inst} v[{cur}], v[{v_c}+{c_index}], s[{s_p_out}:{s_p_out}+1]{offset_str} scope:{ctrl.atomic_scope}")
                             if masked:
                                 self._emit(f"s_mov_b32 exec_lo, -1")
                         cur, nxt = nxt, cur

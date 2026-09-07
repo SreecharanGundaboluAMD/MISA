@@ -202,7 +202,6 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_coalescing_store_wmma.block_size = tunable.block_size
         ctrl_coalescing_store_wmma.precision = tunable.precision
         ctrl_coalescing_store_wmma.atomic_scope = tunable.atomic_scope
-        ctrl_coalescing_store_wmma.atomic_cascade = tunable.atomic_cascade
         ctrl_coalescing_store_wmma.epilogue_lds_pad = tunable.epilogue_lds_pad
         # Phase 27: see igemm_fwd_gtc_wmma_nhwc.py's identical comment -- the ctrl field's
         # actual behavior is precision-agnostic (2-byte-packed accumulator), so both tunables
@@ -1536,6 +1535,23 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                         outer._emit(f"v_lshrrev_b32 v[{v.v_tmp(2)}], {utility_log2(outer.threads_per_krow_b)}, v[{v.v_tid()}]  ; tid // threads_per_krow")
                         outer._emit(f"v_mul_lo_u32 v[{v.v_tmp(2)}], {outer.tunable.lds_row_pad}, v[{v.v_tmp(2)}]  ; * lds_row_pad")
                         outer._emit(f"v_add_u32 v[{v.v_tmp(3)}], v[{v.v_tmp(2)}], v[{v.v_tmp(3)}]  ; B transposed store offset")
+                        if outer.lds_buffer_num == 2:
+                            # R7 fix (docs/gfx1250_bwd_dbuf_ldsrp_nan.md): this offset is
+                            # recomputed fresh from v_tid on every call, so unlike v_sst_os
+                            # itself (the SAME physical VGPR emit_buffer_switch's v_xor_b32
+                            # toggles), it never picked up the runtime double-buffer
+                            # selection -- B's padded store silently always targeted buffer
+                            # 0, corrupting whichever buffer the OTHER, correctly-toggled
+                            # operand/wave was concurrently reading/writing (-nan). A's own
+                            # buffer-0 offset (tid*lds_bytes_per_row) is always strictly
+                            # less than lds_single_size (next_pow2(lds_a_size+lds_b_size)),
+                            # so the XOR toggle never sets any bit of v_sst_os other than
+                            # the lds_single_size one -- AND-ing it out of the (already
+                            # toggled) v_sst_os recovers exactly the current buffer-select
+                            # bit (0 or lds_single_size), which is folded into B's offset
+                            # the same way it's already baked into A's.
+                            outer._emit(f"v_and_b32 v[{v.v_tmp(2)}], {outer.lds_single_size}, v[{v.v_sst_os()}]  ; current buffer-select bit")
+                            outer._emit(f"v_add_u32 v[{v.v_tmp(3)}], v[{v.v_tmp(2)}], v[{v.v_tmp(3)}]  ; fold buffer selection into B's store offset")
                         v_b_sst_os = lambda: v.v_tmp(3)
                     else:
                         v_b_sst_os = v.v_sst_os

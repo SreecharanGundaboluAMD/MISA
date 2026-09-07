@@ -560,15 +560,17 @@ public:
                (!tunable->tdm_global_load && !tunable->wmma_k_tail && gemm_k % gemm_k_per_block != 0))
                 return false;
             // R7 (docs/gfx1250_bwd_dbuf_ldsrp_nan.md): stacking lds_double_buffer=1 with
-            // lds_row_pad>0 on bwd produces silent wrong-answer (-nan) output on every
-            // shape/tile tested, even though each mechanism individually is
-            // hardware-validated correct for bwd (this is the one direction with
-            // asymmetric A/B transpose -- A untransposed, B transposed -- unlike fwd
-            // (neither transposed) and wrw (both transposed), and is the only one of the
-            // three where the combination breaks). Reject until root-caused, mirroring
-            // R5's rejection precedent above.
-            if(tunable->lds_double_buffer && tunable->lds_row_pad > 0)
-                return false;
+            // lds_row_pad>0 on bwd used to produce silent wrong-answer (-nan) output on
+            // every shape/tile tested -- root-caused (gfx1250_tuning_refactor_plan.md
+            // Phase 2): shared_store_b_functor's on-the-fly padded B store offset
+            // (igemm_bwd_gtc_wmma_nhwc.py) was recomputed fresh from v_tid on every call
+            // and never picked up the double-buffer XOR toggle applied to v_sst_os (the
+            // physical register A's own store offset -- and the non-padded B path --
+            // reuses), so B's padded store silently always targeted buffer 0 regardless
+            // of which buffer the rest of the wave believed was active. Fixed by folding
+            // the current buffer-select bit (extracted from v_sst_os) into the padded
+            // offset. Hardware-validated valid:y across the standing regression set;
+            // rejection removed.
             return true;
         }
 

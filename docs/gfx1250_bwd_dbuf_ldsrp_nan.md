@@ -1,11 +1,19 @@
 # bwd `lds_double_buffer` + `lds_row_pad` stacking produces `-nan` output (R7)
 
-**Status: unresolved, mitigated by rejection.** `driver/igemm_bwd_gtc_driver.h`'s WMMA
-`tunable_is_valid` now unconditionally rejects `lds_double_buffer=1 && lds_row_pad>0` for
-bwd. No committed bwd config sets both today outside the new (also-excluded)
-`igemm_bwd_gtc_gfx1250_nhwc_fp16_dbuf_ldsrp.config`, so this is a no-op for the master
-`_all.config` union; it exists to stop a future config or driver change from silently
-re-exposing wrong-answer output.
+**Status: RESOLVED (gfx1250_tuning_refactor_plan.md Phase 2, correctness pass).**
+Root cause: `shared_store_b_functor`'s on-the-fly padded B store offset
+(`igemm_bwd_gtc_wmma_nhwc.py`) was recomputed fresh from `v_tid` on every store call,
+so unlike `v_sst_os` itself -- the SAME physical VGPR `emit_buffer_switch`'s
+`v_xor_b32` toggles, and the one the non-padded B path reuses directly -- it never
+picked up the runtime double-buffer selection. B's padded store silently always
+targeted buffer 0, corrupting whichever buffer the rest of the wave believed was
+active. Fixed by extracting the current buffer-select bit from `v_sst_os` (AND with
+`lds_single_size`, valid because A's own buffer-0 offset is always strictly less than
+`lds_single_size`, so the XOR toggle never touches any other bit) and folding it into
+B's freshly-computed offset. Hardware-validated `valid:y` on both tiles (128x128 and
+64x64), the original repro shape, a 3x3 shape, and the full fp16 master `_all.config`
+regression sweep (94 kernels x 2 shapes, zero regressions). The `tunable_is_valid`
+rejection in `driver/igemm_bwd_gtc_driver.h` has been removed.
 
 ## Context
 

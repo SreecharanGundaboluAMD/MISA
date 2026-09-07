@@ -115,16 +115,12 @@ def is_valid(direction, precision, tile_m, tile_n, gemm_k, vals):
     # the same way the nt/tdm/mli rules above already do).
     if sa and (tdm or mli or gs): return False
     if sa and tile_m != tile_n: return False
-    # Phase 67: fwd's saddr_global_load + wmma_n_tail is a REAL, newly-discovered
-    # correctness bug -- confirmed via hardware A/B (plain wmma_n_tail alone passes
-    # `valid:y` on an exact-fit shape; the identical shape with saddr_global_load
-    # ALSO set fails `valid:n`; saddr_global_load + wmma_m_tail alone is fine). Not
-    # root-caused (likely fwd's B-operand N-boundary address computation not
-    # accounting for saddr's different addressing path) -- excluded here rather than
-    # silently shipped broken in the searched corpus. bwd's identical combination
-    # (saddr_global_load + wmma_n_tail) hardware-validated fine and is NOT excluded --
-    # this is fwd-specific. See docs/gfx1250_optimization_backlog.md.
-    if sa and nt and direction == 'fwd': return False
+    # Phase 2 (gfx1250_tuning_refactor_plan.md correctness pass): fwd's
+    # saddr_global_load + wmma_n_tail combination was root-caused and fixed --
+    # v_flag_b (the per-lane N-tail mask) was never computed on the
+    # async_global_load/saddr_global_load B-address branch in
+    # igemm_fwd_gtc_wmma_nhwc.py, leaving it garbage on every lane. Fixed by
+    # computing it there too (mirroring the plain-VADDR path). No longer excluded.
 
     if ds and gs:            return False
     if gs and direction != 'wrw' and (mt or nt): return False

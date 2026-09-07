@@ -49,9 +49,9 @@ cross-check performed against the C++ mirror). Categories per
 |---|---|---|
 | TDM descriptor padding (`lds_row_pad` + `tdm_global_load`) | Fixed (`48e694f`): padding fields derived from `lds_row_pad`, not independently settable | None — already matches the doc's "one selected LDS layout" model |
 | fp32 requires `lds_double_buffer=1` | Enforced via assert (`igemm_base.py` COR-001) | Already correctly a hard requirement, not a knob — good |
-| `atomic_cascade` | Hard-blocked via assert (`assert not self.atomic_cascade`) | Correctly excluded, but the field and its `atomic_th`/dead code path still exist in the tunable schema — Phase 2 candidate for deletion, not just assertion |
-| Backward rejects `lds_double_buffer && lds_row_pad` | Currently an exclusion, not derived | Not yet root-caused — Phase 2 candidate |
-| Forward excludes `saddr_global_load` + `wmma_n_tail` | Currently an exclusion (hardware-confirmed real bug, not just untested) in **three places**: Python has no assert at all, `script/generate_all_configs.py:127`, and nowhere in C++ `tunable_is_valid` | Root-cause needed; also an example of Phase 5's "legality distributed across layers" problem — right now this specific restriction exists in exactly **one** of three places that should agree |
+| `atomic_cascade` | **Deleted (Phase 2).** Field, `atomic_th`, and the dead `th:` branches removed entirely | Resolved — no longer schema cruft |
+| Backward rejects `lds_double_buffer && lds_row_pad` | **Root-caused and fixed (Phase 2, R7)** | Resolved — see `docs/gfx1250_bwd_dbuf_ldsrp_nan.md` |
+| Forward excludes `saddr_global_load` + `wmma_n_tail` | **Root-caused and fixed (Phase 2)** | Resolved — see `docs/gfx1250_optimization_backlog.md` |
 | `wavefront_size`, `cumode`, `tensor_layout` | Forced/single-valued for gfx1250 in practice: every existing config sets `wavefront_size=32` (32-lane wave, per AGENTS.md), `cumode=0`, `tensor_layout='nhwc'`. Consumed by the shared codegen framework (`python/codegen/amdgpu.py`), not per-generator, so they didn't show up in a WMMA-generator-file grep | Not a live tuning dimension today — no config varies them. Belongs in Category A (platform-fixed) rather than Category C; no action needed beyond documenting that they're fixed, not omitted from search |
 
 ### Category B — Implementation improvements (should be automatic within their validated domain, flag should shrink then disappear)
@@ -214,38 +214,52 @@ silently drift, instead of a one-time markdown snapshot.
 CI in this repo).
 **Depends on:** nothing. **Benchmarking:** not needed.
 
-### Phase 2 — Root-cause or delete remaining Category A/E items
+### Phase 2 — Root-cause or delete remaining Category A/E items — **DONE**
 
 **Scope:** For each unresolved item in Category A/E above:
 
-1. `atomic_cascade` — delete the field, `atomic_th`, and the dead branch in
-   `coalescing_store_wmma.py` entirely (it cannot be enabled; keeping it in
-   the schema is exactly "leaving obsolete flags accepted but ignored"
-   which §7 calls out as recreating the reachability problem). This is a
-   deletion, not a fix — no hardware needed to verify a deletion of
-   unreachable code, only a build-time sanity check that nothing else
-   references it (`lsp references` before removing).
-2. Backward's `lds_double_buffer && lds_row_pad` rejection — read
-   `igemm_bwd_gtc_wmma_nhwc.py`'s exact assert and its cited reason; determine
-   whether it's a genuine hardware constraint (keep, document why) or an
-   untested-not-fundamentally-incompatible combination (root-cause and
-   relax). This requires a **single correctness-only** hardware run once
-   the combination is implemented — small, not a benchmarking campaign.
-3. Forward's `saddr_global_load` + `wmma_n_tail` exclusion — same
-   treatment; already confirmed as a *real* bug (not just untested) per
-   `script/generate_all_configs.py`'s comment, so root-causing fwd's
-   B-operand N-boundary address computation under `saddr_global_load` is
-   the actual fix, not just documentation.
-4. Move restriction (2) and (3)'s logic (once resolved) into the single
-   legality contract from Phase 5, not back into three separate places.
+1. `atomic_cascade` — **deleted.** Removed the field (and its TODO block) and the
+   `assert not self.atomic_cascade` from `igemm_base.py`, the dead cross-exclusion
+   assert from `atomic_pack_bf16`'s block, the `atomic_cascade`/`atomic_th` ctrl
+   fields and both `th_str` branches from `coalescing_store_wmma.py`, and the
+   `ctrl_coalescing_store_wmma.atomic_cascade = tunable.atomic_cascade` wiring line
+   from all three WMMA generators. Repo-wide grep confirmed zero remaining
+   references before removal (no C++ mirror ever existed for this field). See
+   `docs/gfx1250_misa_investigation_report.md`'s COR-004.
+2. Backward's `lds_double_buffer && lds_row_pad` rejection (**R7**) —
+   **root-caused and fixed.** `shared_store_b_functor`'s on-the-fly padded B store
+   offset (`igemm_bwd_gtc_wmma_nhwc.py`) was recomputed fresh from `v_tid` on every
+   call, so unlike `v_sst_os` itself (the physical VGPR the double-buffer XOR
+   toggles, and the one the non-padded B path reuses directly) it never picked up
+   the runtime buffer selection — B's padded store silently always targeted buffer
+   0. Fixed by folding the current buffer-select bit (extracted from `v_sst_os` via
+   AND with `lds_single_size`) into B's offset. Hardware-validated `valid:y` on both
+   tiles, the original `-nan` repro shape, and a 3x3 shape; the `tunable_is_valid`
+   rejection in `driver/igemm_bwd_gtc_driver.h` has been removed. See
+   `docs/gfx1250_bwd_dbuf_ldsrp_nan.md`.
+3. Forward's `saddr_global_load` + `wmma_n_tail` exclusion —
+   **root-caused and fixed.** `igemm_fwd_gtc_wmma_nhwc.py`'s
+   `async_global_load`/`saddr_global_load` B-address branch never computed
+   `v_flag_b` (the per-lane N-tail mask) at all — only the plain-VADDR path did —
+   leaving it garbage on every lane, corrupting the mask even on exact-fit shapes.
+   Fixed by computing it in that branch too. Hardware-validated `valid:y` on an
+   exact-fit shape and two genuine N-tail shapes; the exclusion in
+   `script/generate_all_configs.py`'s `is_valid()` has been removed. See
+   `docs/gfx1250_optimization_backlog.md`.
+4. Not yet done: folding (2) and (3)'s now-resolved logic into a single legality
+   contract remains Phase 5's job (there was no exclusion logic to *move* for (2)/(3)
+   any more — the rejections were removed outright, not relocated — but Phase 5
+   still applies to every other cross-layer duplication cataloged above).
 
-**Deliverable:** either a fix + a single correctness verification run per
-item, or a documented-and-kept restriction with its rationale recorded once
-(not per-layer).
-**Depends on:** nothing structurally, but coordinate with Phase 5 so the
-resolution lands in the unified contract, not a fourth copy.
-**Benchmarking:** not needed (correctness-only verification per item, same
-discipline as this session's earlier fixes).
+**Verification:** full fp16 master `_all.config` regression sweep for all three
+directions (94 kernel candidates total) across two shapes (1x1 exact-fit, 3x3 with
+padding) — zero `valid:n`/`invalid float` results. `test/unittest.py` unaffected
+(its one pre-existing failure, `unittest_dotx_coalescing_store`'s
+`ctrl_dotx_mapping_t` arity mismatch, reproduces identically on a clean checkout —
+unrelated legacy DOTX code, not touched by this phase).
+**Depends on:** nothing structurally.
+**Benchmarking:** not needed (correctness-only, as scoped).
+
 
 ### Phase 3 — Extend "make derived details internal" to bwd/wrw
 

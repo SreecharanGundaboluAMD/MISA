@@ -325,7 +325,6 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         ctrl_coalescing_store_wmma.block_size = tunable.block_size
         ctrl_coalescing_store_wmma.precision = tunable.precision
         ctrl_coalescing_store_wmma.atomic_scope = tunable.atomic_scope
-        ctrl_coalescing_store_wmma.atomic_cascade = tunable.atomic_cascade
         ctrl_coalescing_store_wmma.epilogue_lds_pad = tunable.epilogue_lds_pad
         # Phase 27: coalescing_store_wmma.py's ctrl field is named wmma_acc_f16 but its actual
         # behavior is precision-agnostic ("is the accumulator 2-byte-packed"), proven by
@@ -1347,6 +1346,22 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"; v_off_b_base = (block_n_off + tid) * wei_k_stride * {self.data_byte} bytes")
             self._emit(f"; (Phase 13/61: byte OFFSET only -- s_p_wei is passed separately as SADDR)")
             self._emit(f"v_add_u32 v[{v.v_off_b_base()}], s[{s.s_block_n_off()}], v[{v.v_tid()}]")
+            if self.tunable.wmma_n_tail:
+                # Correctness fix (was: saddr_global_load + wmma_n_tail excluded in
+                # script/generate_all_configs.py as an unroot-caused hardware failure,
+                # even on exact-fit shapes with no real tail -- see
+                # docs/gfx1250_optimization_backlog.md). Root cause: this branch never
+                # computed v_flag_b at all -- only the plain-VADDR path below (the
+                # row_repeat_b loop) did -- so async_global_load/saddr_global_load left
+                # v_flag_b holding whatever garbage was last in that VGPR, corrupting the
+                # N-tail store/load mask on every lane. v_off_b_base here is still the
+                # pre-multiply absolute column (block_n_off + tid), mirroring the plain
+                # path's check exactly. (async_global_load can't reach here with
+                # wmma_n_tail set -- asserted mutually exclusive in igemm_base.py -- so
+                # this is saddr_global_load-only in practice.)
+                self._emit(f"; wmma_n_tail: v_flag_b = 1 iff this lane's absolute column < real gemm_n")
+                self._emit(f"v_cmp_gt_u32 vcc_lo, s[{s.s_gemm_n()}], v[{v.v_off_b_base()}]")
+                self._emit(f"v_cndmask_b32 v[{v.v_flag_b()}], 0, 1, vcc_lo")
             self._emit(f"v_mul_lo_u32 v[{v.v_off_b_base()}], s[{s.s_wei_k_stride()}], v[{v.v_off_b_base()}]")
             self._emit(f"v_lshlrev_b32 v[{v.v_off_b_base()}], {utility_log2(self.data_byte)}, v[{v.v_off_b_base()}]")
             self._emit_empty_line()
