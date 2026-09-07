@@ -1,10 +1,10 @@
 # gfx950 vs gfx1250 Tile-Shape Coverage Gap
 
-## Current state (measured directly, 2026-09-07)
+## Current state (measured directly, updated 2026-09-07 after this session's fwd extension)
 
 | Direction | gfx950 distinct (M x N) tile shapes | gfx1250 distinct (M x N) tile shapes |
 |---|---|---|
-| fwd | **14**: 128x128, 128x256, 128x32, 128x64, 256x128, 256x32, 256x64, 32x128, 32x256, 32x64, 64x128, 64x256, 64x32, 64x64 | **5**: 128x128, 128x64, 256x128, 64x128, 64x64 |
+| fwd | **14**: 128x128, 128x256, 128x32, 128x64, 256x128, 256x32, 256x64, 32x128, 32x256, 32x64, 64x128, 64x256, 64x32, 64x64 | **9**: 128x128, 128x32, 128x64, 256x128, 32x128, 32x64, 64x128, 64x32, 64x64 |
 | bwd | **14**: 128x128, 128x256, 128x32, 128x64, 256x128, 256x256, 256x32, 256x64, 32x128, 32x64, 64x128, 64x256, 64x32, 64x64 | **3**: 128x128, 32x32, 64x64 |
 | wrw | **12**: 128x128, 128x256, 128x64, 256x128, 256x256, 256x32, 256x64, 32x256, 64x128, 64x256, 64x32, 64x64 | **3**: 128x128, 32x32, 64x64 |
 
@@ -149,3 +149,129 @@ tile's tunable combination needs against whatever dead-register pools
 that tile's addressing path happens to have), so a new tile shape gets
 this reuse "for free" as long as its generator code is added using the
 existing `kernel_vgpr_t` pattern, not a new one.
+
+## Update (2026-09-07, later same day): fwd extended to 4 new asymmetric shapes (hardware-validated); bwd/wrw's remaining gaps now precisely characterized, one confirmed as a real hardware bug
+
+Picked this gap back up per explicit request to close it incrementally. Result:
+**fwd gained 128x32, 32x128, 32x64, 64x32** (12 new config files: 4 shapes x
+3 precisions, fp16/bf16/fp32), each hardware-validated (`conv_driver.exe -V 1`,
+multiple shapes including grouped/multi-tap cases, plus `script/sweep_shapes.py`
+across `config/shapes/default.json` for every combinatorial FLAGS variant --
+4400+ `(config, kernel, shape)` checks total, 0 failures). **bwd and wrw gained
+nothing new** -- both hit real, now-documented blockers described below, not
+unwillingness to try.
+
+### Method: the real gating mechanism is a hand-maintained wave/repeat table, not just config authorship
+
+Contrary to this doc's original "author a base .config section" framing,
+the actual gate for a new WMMA tile shape is
+`python/operations/wmma_mapping.py`'s `ctrl_wmma_mapping_table` --
+`get_ctrl_wmma_mapping_from_wave_tile()` asserts the exact
+`(macro_tile_m, macro_tile_n, wave_tile, wave_repeat_m, wave_repeat_n, waves)`
+tuple must already be a row in that table, keyed by precision (not
+direction -- fwd and bwd share entries for identical tile geometries).
+Closing a gap entry means: (1) derive a valid wave/repeat decomposition,
+(2) add it to the table for each precision, (3) author the `.config`
+section, (4) construct-and-real-assemble (`clang -x assembler`) to catch
+VGPR-budget/register-range failures the Python-level asserts miss, (5)
+hardware-validate. All four new fwd shapes are single-wave
+(`block_size=32` -- the smaller of the two macro-tile dimensions forces
+`waves_per_m*waves_per_n=1`). 128x32/32x128 additionally need
+`wmma_acc_high_bank=1` + `wmma_epilogue_chunked=1`: measured at 275/278
+VGPRs without them (19-22 over the 256/wave ceiling) despite a modest
+`total_acc_c=128` -- a single-wave block's prologue/epilogue overhead does
+not shrink with fewer waves the way the accumulator does. With high-bank
+moving the accumulator to the second bank, both fit comfortably. 32x64/64x32
+fit the plain 0-255 range directly, no extra flags. Per the existing
+256x128 precedent, the two high-bank shapes are opt-in standalone files
+(`config/igemm_fwd_gtc_gfx1250_nhwc_{prec}_{128x32,32x128}.config`), kept
+OUT of `BASE_SECTIONS`/the combinatorial FLAGS sweep (high-bank's own
+asserts already reject most of FLAGS); 32x64/64x32 are plain row_repeat-only
+shapes and were added to `BASE_SECTIONS` normally.
+
+### Generalizes the earlier "256-anything is a VGPR-ceiling/perf trap" finding
+
+`total_acc_c = gemm_m_per_block * gemm_n_per_block / block_size`, and
+`block_size` is capped at the SMALLER of the two macro-tile dims (fwd's A
+side has no col_split equivalent, so `block_size <= gemm_m_per_block`
+always). Whenever either dimension is 256 and the other is < 256, the best
+achievable `total_acc_c` is exactly 256 (at `block_size = min(M,N)`) --
+meaning 128x256, 256x32, 256x64, 32x256, 64x256 all require the SAME
+high-bank treatment as the already-explored, already-rejected 256x256/
+256x128 (measured 1.35-2.7x SLOWER than 128x128 at every scale, see the
+update above). Not measured individually this session, but the register
+arithmetic is exact and universal -- these five entries should be treated
+as the same "not worth pursuing" bucket, not re-investigated one at a time.
+That leaves 128x256 as fwd's only remaining, genuinely-unexplored-for-a-
+real-reason gap: it hits the identical ceiling.
+
+### bwd: found a real, previously-latent hardware correctness bug, not just "lagging behind fwd"
+
+bwd's `row_repeat_a` generalization (mirroring fwd's A-side mechanism) was
+added to `igemm_bwd_gtc_wmma_nhwc_t` back on 2026-08-25 but **no config or
+`BASE_SECTIONS` entry ever actually used it** -- it was dead, hardware-
+unvalidated code. This session authored the first real one (64x32,
+`block_size=32`, `row_repeat_a=2`) to close that gap entry, and it passed
+construction AND real assembly, but **`conv_driver.exe -V 1` reports
+`valid:n`** even on the simplest possible shape (1x1 conv, no padding,
+single group) -- not root-caused (candidates: the recomputed-per-row
+n/hi/wi decomposition in `global_load_a_functor`'s row>0 branch, or a
+group/split-K SGPR interaction fwd's A-side doesn't share). Deleted the
+config and added `assert self.row_repeat_a == 1` in
+`igemm_bwd_gtc_wmma_nhwc_t.__init__`, gating row_repeat_a>1 off entirely
+(not just combined with `wmma_acc_high_bank`, which was already gated
+separately) until someone root-causes it. This is the SAME failure class
+`docs/gfx1250_dominance_study.md` warns about: passes every construction-
+time and assembly-time check, wrong only on real hardware -- reinforces
+that `is_valid()`-style automation (construct+assemble) is necessary but
+not sufficient; hardware validation via `sweep_shapes.py`/`conv_driver.exe`
+is not optional for new tile-shape work, even when the underlying mechanism
+already has a working precedent elsewhere in the same file.
+
+Separately (not re-verified this session, but the math is unchanged): even
+where bwd's `row_repeat_a` mechanism DID work, 128x64 measures at 257
+VGPRs -- one register over budget -- and 128x32 at 279 (23 over). bwd
+cannot use the `wmma_acc_high_bank` escape hatch fwd used, because
+`igemm_base.py` already asserts `wmma_acc_high_bank` combined with bwd
+`row_repeat_a>1` is a CONFIRMED-bad hardware combination (separate,
+pre-existing finding, `docs/gfx1250_wmma_vgpr_msb_wip_status.md`). So even
+after the correctness bug above is fixed, 128x64/128x32 need a genuine
+VGPR trim (same class of work as the existing liveness-based reuse pass,
+~1-2 registers) to become reachable -- not a fundamental blocker, but real,
+separate optimization work.
+
+bwd's remaining gap entries needing gemm_n_per_block != block_size
+(128x256, 32x128, 32x64, 64x128, 64x256) are unreachable at all without
+porting a B-side mechanism (row_repeat_b or col_split_b) to bwd's
+TRANSPOSED B operand -- explicitly out of scope for both this session and
+the original doc (see "What closing it would actually require" above).
+
+### wrw: not "lagging", structurally blocked -- zero new shapes possible without an addressing redesign
+
+`igemm_wrw_gtc_wmma_nhwc_t.__init__` (the line 190-193 assert) requires
+**`gemm_n_per_block == gemm_m_per_block` unconditionally** -- wrw's B
+(input) operand addressing reuses A's row/col-group tiling scheme, which is
+only correct when M==N. This is not an unexplored corner or a missing
+config section: every asymmetric shape in wrw's gap list (128x256, 128x64,
+256x32, 256x64, 32x128, 64x128, 64x256, 32x64, 64x32) is asserted
+unreachable by construction. The only shapes wrw can ever have are square
+powers of 2 -- 32x32, 64x64, 128x128, 256x256 -- and all four already exist
+(256x256 explored and rejected as a perf loss in the update above). **wrw's
+tile-shape gap is fully closed in the sense that nothing more is reachable
+without redesigning B's addressing to not reuse A's tiling** (a genuine,
+substantial rework of `emit_kernel_prologue`'s row/col-group derivation and
+every functor that depends on it -- not attempted this session, and not
+recommended as an incremental follow-up; it is its own project).
+
+### Updated recommendation
+
+fwd's tile-shape gap is now essentially closed (128x256 is a known,
+quantified non-win, not an oversight). Remaining genuinely valuable work,
+in priority order: (1) root-cause bwd's `row_repeat_a` hardware bug --
+unblocks 64x32 immediately and de-risks 128x32/128x64 once their VGPR
+trims land; (2) the 1-2-register trims for bwd 128x64/128x32; (3) porting
+fwd's B-side row_repeat_b/col_split_b mechanism to bwd's transposed B,
+unblocking 32x128/32x64/64x128 (128x256/64x256 still hit the 256-ceiling
+trap and should be deprioritized per the finding above regardless). wrw's
+B-addressing redesign remains its own dedicated project, not a queue item
+alongside these.

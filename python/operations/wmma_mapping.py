@@ -340,6 +340,27 @@ ctrl_wmma_mapping_table = {
         # (VGPR-MSB) and wmma_epilogue_chunked=1, same as bf16.
         ctrl_wmma_mapping_t(256, 256, 16, 16, 8, 4, 8, v_wmma_f32_16x16x32_f16),
         ctrl_wmma_mapping_t(256, 128, 16, 16, 4, 8, 4, v_wmma_f32_16x16x32_f16),
+        # Tile-coverage-gap follow-up (2026-09-07, docs/gfx1250_tile_coverage_gap.md):
+        # four more asymmetric shapes, all single-wave (block_size=32 -- the smaller of
+        # the two macro-tile dims caps waves_per_m*waves_per_n at 1 for these). 128x32/
+        # 32x128 need wmma_acc_high_bank=1+wmma_epilogue_chunked=1 (measured 275/278
+        # VGPRs without it, 19-22 over the 256/wave ceiling -- a single-wave block's
+        # prologue/epilogue overhead does not shrink with fewer waves the way the
+        # accumulator does, so these hit the ceiling despite a modest total_acc_c=128).
+        # 32x64/64x32 fit the plain 0-255 range directly (measured well under ceiling).
+        # fwd-only support confirmed by construction+real-assembly probe; bwd additionally
+        # reaches 64x32 (row_repeat_a=2, block_size==gemm_n_per_block, no B-side change
+        # needed) but NOT 128x32/128x64 -- bwd+wmma_acc_high_bank+row_repeat_a>1 is a
+        # confirmed-bad hardware combination (see igemm_base.py's assert), and without
+        # high-bank both measure just over budget (128x32: 279 VGPRs; 128x64: 257, a
+        # single register over -- see the tile-coverage-gap doc's update for the measured
+        # numbers). wrw cannot reach any of these (or any M!=N tile) at all --
+        # igemm_wrw_gtc_wmma_nhwc_t's B-operand addressing asserts gemm_n_per_block ==
+        # gemm_m_per_block unconditionally.
+        ctrl_wmma_mapping_t(128, 32,  16, 16, 1, 8, 2, v_wmma_f32_16x16x32_f16),
+        ctrl_wmma_mapping_t(32,  128, 16, 16, 1, 2, 8, v_wmma_f32_16x16x32_f16),
+        ctrl_wmma_mapping_t(32,  64,  16, 16, 1, 2, 4, v_wmma_f32_16x16x32_f16),
+        ctrl_wmma_mapping_t(64,  32,  16, 16, 1, 4, 2, v_wmma_f32_16x16x32_f16),
     ],
     # Phase 24 (F16-accumulate WMMA): separate table key (not a field on ctrl_wmma_mapping_t)
     # so the existing f32-accumulate 'fp16' entries stay byte-identical -- the caller
@@ -419,6 +440,12 @@ ctrl_wmma_mapping_table = {
         # (bf16, fwd, exact-divisibility only -- no tail/interleave/double-buffer
         # support yet, see the col_split_b asserts in igemm_fwd_gtc_wmma_nhwc.py).
         ctrl_wmma_mapping_t(256, 128, 16, 16, 8, 4, 4, v_wmma_f32_16x16x32_bf16),
+        # Tile-coverage-gap follow-up (2026-09-07): see the identical 'fp16' entries
+        # above for the full derivation (precision-generic, mechanical port).
+        ctrl_wmma_mapping_t(128, 32,  16, 16, 1, 8, 2, v_wmma_f32_16x16x32_bf16),
+        ctrl_wmma_mapping_t(32,  128, 16, 16, 1, 2, 8, v_wmma_f32_16x16x32_bf16),
+        ctrl_wmma_mapping_t(32,  64,  16, 16, 1, 2, 4, v_wmma_f32_16x16x32_bf16),
+        ctrl_wmma_mapping_t(64,  32,  16, 16, 1, 4, 2, v_wmma_f32_16x16x32_bf16),
     ],
     # Phase 27 (BF16-accumulate WMMA): mirrors 'fp16_f16acc' above exactly -- same tile shapes
     # as 'bf16', just v_wmma_bf16_16x16x32_bf16 instead of v_wmma_f32_16x16x32_bf16.
@@ -479,6 +506,12 @@ ctrl_wmma_mapping_table = {
         # gated, so fp32 passes them unchanged.
         ctrl_wmma_mapping_t(256, 256, 16, 16, 8, 4, 8, v_wmma_f32_16x16x4_f32),
         ctrl_wmma_mapping_t(256, 128, 16, 16, 4, 8, 4, v_wmma_f32_16x16x4_f32),
+        # Tile-coverage-gap follow-up (2026-09-07): see the identical 'fp16' entries
+        # above for the full derivation (precision-generic, mechanical port).
+        ctrl_wmma_mapping_t(128, 32,  16, 16, 1, 8, 2, v_wmma_f32_16x16x4_f32),
+        ctrl_wmma_mapping_t(32,  128, 16, 16, 1, 2, 8, v_wmma_f32_16x16x4_f32),
+        ctrl_wmma_mapping_t(32,  64,  16, 16, 1, 2, 4, v_wmma_f32_16x16x4_f32),
+        ctrl_wmma_mapping_t(64,  32,  16, 16, 1, 4, 2, v_wmma_f32_16x16x4_f32),
     ],
 }
 

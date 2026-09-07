@@ -106,6 +106,22 @@ BASE_SECTIONS = [
     ('fwd', 'fp32', 64,  64,  4,  'config/igemm_fwd_gtc_gfx1250_nhwc_fp32.config'),
     ('fwd', 'fp32', 128, 64,  4,  'config/igemm_fwd_gtc_gfx1250_nhwc_fp32_128x64.config'),
     ('fwd', 'fp32', 64,  128, 4,  'config/igemm_fwd_gtc_gfx1250_nhwc_fp32_64x128.config'),
+    # Tile-coverage-gap follow-up (2026-09-07, docs/gfx1250_tile_coverage_gap.md): 32x64/
+    # 64x32, single-wave, plain row_repeat only (no wmma_acc_high_bank/chunked needed --
+    # fits the plain 0-255 VGPR range) -- safe to fold into the normal combinatorial FLAGS
+    # sweep like every other row_repeat-only shape above. 128x32/32x128 need
+    # wmma_acc_high_bank+wmma_epilogue_chunked (see the matching standalone .config files'
+    # own comments) and are deliberately KEPT OUT of BASE_SECTIONS, same precedent as the
+    # existing 256x128 wr8x4w4/wr4x4w8 high-bank configs -- high-bank's own asserts already
+    # reject most of FLAGS (gemm_k_global_split, several tail combos), so sweeping it
+    # combinatorially would mostly just churn on AssertionErrors; kept as opt-in standalone
+    # files instead, matching how every other high-bank shape is already handled.
+    ('fwd', 'fp16', 32,  64,  32, 'config/igemm_fwd_gtc_gfx1250_nhwc_fp16_32x64.config'),
+    ('fwd', 'fp16', 64,  32,  32, 'config/igemm_fwd_gtc_gfx1250_nhwc_fp16_64x32.config'),
+    ('fwd', 'bf16', 32,  64,  32, 'config/igemm_fwd_gtc_gfx1250_nhwc_bf16_32x64.config'),
+    ('fwd', 'bf16', 64,  32,  32, 'config/igemm_fwd_gtc_gfx1250_nhwc_bf16_64x32.config'),
+    ('fwd', 'fp32', 32,  64,  4,  'config/igemm_fwd_gtc_gfx1250_nhwc_fp32_32x64.config'),
+    ('fwd', 'fp32', 64,  32,  4,  'config/igemm_fwd_gtc_gfx1250_nhwc_fp32_64x32.config'),
     # bwd
     ('bwd', 'fp16', 128, 128, 32, 'config/igemm_bwd_gtc_gfx1250_nhwc_fp16.config'),
     ('bwd', 'fp16', 64,  64,  32, 'config/igemm_bwd_gtc_gfx1250_nhwc_fp16.config'),

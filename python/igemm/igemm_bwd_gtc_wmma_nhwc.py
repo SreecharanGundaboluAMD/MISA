@@ -119,6 +119,25 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         self.row_repeat_b = tunable.gemm_n_per_block // tunable.block_size
         assert self.row_repeat_b == 1, \
             "row_repeat_b > 1 (B needing multiple rows/thread) is not implemented for bwd's transposed B"
+        # Tile-coverage-gap follow-up (2026-09-07, docs/gfx1250_tile_coverage_gap.md):
+        # row_repeat_a>1 was added (2026-08-25) alongside fwd's identical mechanism but,
+        # unlike fwd's, NEVER actually exercised by a real config/BASE_SECTIONS entry --
+        # it silently sat as dead, hardware-unvalidated code. This session tried the first
+        # real bwd row_repeat_a>1 config (64x32, gemm_m_per_block=64, block_size=32,
+        # row_repeat_a=2) and got a REAL, reproducible valid:n on hardware (conv_driver.exe
+        # -V 1) even on the simplest possible shape (1x1, no pad, single group) -- passes
+        # every construction-time and assembly-time check, wrong on real hardware. Not yet
+        # root-caused (candidate culprits: the recomputed-per-row n/hi/wi decomposition in
+        # global_load_a_functor's row>0 branch, or a v_flag/mask interaction specific to
+        # bwd's group/split-K SGPR setup that fwd's A-side doesn't share). Gated off
+        # entirely (not just combined with wmma_acc_high_bank, which was already gated
+        # separately above) until root-caused -- do not remove this assert without a
+        # hardware re-validation.
+        assert self.row_repeat_a == 1, \
+            "bwd row_repeat_a > 1 is CONFIRMED valid:n on real hardware (found via the " \
+            "first-ever real 64x32 config, 2026-09-07) and not yet root-caused -- see " \
+            "docs/gfx1250_tile_coverage_gap.md. Gated off entirely, not just combined " \
+            "with wmma_acc_high_bank (see the separate assert on this below)."
         assert not (tunable.async_global_load and self.row_repeat_a > 1), \
             "row_repeat_a > 1 is not yet supported together with async_global_load"
         # Phase 42 (TDM global load, bwd): mirrors igemm_fwd_gtc_wmma_nhwc_t's identical
