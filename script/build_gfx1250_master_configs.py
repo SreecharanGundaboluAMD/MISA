@@ -24,6 +24,7 @@ Without --write, only reports what WOULD be written (dry run). With --write, gen
 config/igemm_{direction}_gtc_gfx1250_nhwc_{precision}_all.config for every (direction,
 precision) pair found.
 """
+import tempfile
 import argparse
 import glob
 import os
@@ -32,6 +33,42 @@ import sys
 from collections import OrderedDict
 
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'config')
+# Phase 5b step 1 (gfx1250_tuning_refactor_plan.md): dedup by the section's
+# RESOLVED kernel identity, not just its raw text -- normalize()'s key-sorted
+# text comparison cannot catch two sections that resolve to the identical
+# kernel via different raw text (e.g. one explicitly writing wmma_setprio=0,
+# another omitting it entirely; both resolve to the same igemm_gtc_encode_
+# kernel_name). Two sections colliding on kernel name are a genuine, 100%-
+# certain duplicate: the assembler would collide on them if both were ever
+# built together. This is a strictly stronger key than normalize()'s, so it
+# subsumes it (every normalize()-caught duplicate is also caught here).
+REPO_ROOT_FOR_PY = os.path.dirname(CONFIG_DIR)
+sys.path.insert(0, REPO_ROOT_FOR_PY)
+from python.igemm.igemm_base import igemm_gtc_tunable_parameter_t, igemm_gtc_encode_kernel_name
+from python.codegen.config_parser import config_parser_t
+
+_KNAME_TMP = os.path.join(tempfile.gettempdir(), f'gfx1250_kname_resolve_{os.getpid()}.config')
+
+
+def resolve_kernel_name(direction, body_lines):
+    '''Construct the real tunable object for this section (same parser and same
+    class igemm_codegen.py itself uses) and return its resolved kernel name, or
+    None if the section doesn't construct (caller keeps it either way -- this
+    function's job is dedup, not validity filtering; script/generate_all_configs.py
+    and script/build_and_filter_configs.py own that).'''
+    with open(_KNAME_TMP, 'w') as f:
+        f.writelines(body_lines)
+    try:
+        content = config_parser_t(_KNAME_TMP).parse()
+        secs = content.get_section(f'igemm_{direction}_gtc')
+        if not secs:
+            return None
+        d = secs[0].to_dict()
+        d['arch'] = 'gfx1250'
+        tunable = igemm_gtc_tunable_parameter_t(d)
+        return igemm_gtc_encode_kernel_name(tunable, 'gfx1250')
+    except AssertionError:
+        return None
 
 FILENAME_RE = re.compile(r'^igemm_(fwd|bwd|wrw)_gtc_gfx1250_nhwc_(fp16|bf16|fp32|int8)(_.*)?\.config$')
 
@@ -150,7 +187,10 @@ def main():
     for (direction, precision), paths in groups.items():
         codegen_lines = None
         seen = OrderedDict()  # normalized body -> (source_file, section_name, body_lines)
+        seen_kernel_names = {}  # resolved kernel name -> (source_file, section_name)
         dup_count = 0
+        kname_dup_count = 0
+        kname_dups = []  # (source_file, section_name, colliding_with)
         excluded = []  # (source_file, reason)
         for path in paths:
             cg, sections = parse_config_file(path)
@@ -167,14 +207,24 @@ def main():
                 if key in seen:
                     dup_count += 1
                     continue
+                kname = resolve_kernel_name(direction, body)
+                if kname is not None:
+                    if kname in seen_kernel_names:
+                        kname_dup_count += 1
+                        kname_dups.append((os.path.basename(path), name, seen_kernel_names[kname]))
+                        continue
+                    seen_kernel_names[kname] = (os.path.basename(path), name)
                 seen[key] = (os.path.basename(path), name, body)
 
         out_name = f"igemm_{direction}_gtc_gfx1250_nhwc_{precision}_all.config"
         out_path = os.path.join(CONFIG_DIR, out_name)
         n_sections = len(seen)
         excl_note = f", {len(excluded)} accumulate-width-variant sections excluded ({', '.join(sorted(set(v for _, v in excluded)))})" if excluded else ""
+        kname_note = f", {kname_dup_count} resolved-kernel-name duplicates skipped" if kname_dup_count else ""
         print(f"{direction}/{precision}: {len(paths)} source files -> {n_sections} unique tunable sections "
-              f"({dup_count} exact duplicates skipped{excl_note}) -> {out_name}", file=sys.stderr)
+              f"({dup_count} exact duplicates skipped{kname_note}{excl_note}) -> {out_name}", file=sys.stderr)
+        for src, name, colliding_with in kname_dups:
+            print(f"    kernel-name duplicate: {src}:{name} == {colliding_with[0]}:{colliding_with[1]}", file=sys.stderr)
 
         if args.write:
             with open(out_path, 'w') as f:
@@ -203,6 +253,9 @@ def main():
                     f.write(f"\n# --- from {src} ---\n")
                     f.writelines(body)
             print(f"  wrote {out_path}", file=sys.stderr)
+
+    if os.path.exists(_KNAME_TMP):
+        os.unlink(_KNAME_TMP)
 
 
 if __name__ == '__main__':

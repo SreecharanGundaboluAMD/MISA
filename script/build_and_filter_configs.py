@@ -14,7 +14,7 @@ import os
 import re
 import subprocess
 import sys
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_DIR = os.path.join(REPO_ROOT, 'config')
@@ -100,6 +100,58 @@ def extract_failing_sections(build_stdout, build_stderr):
     return failing
 
 
+def _build_ok(header, section_texts):
+    """Write header+these sections to a scratch config and try to build it."""
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(suffix='.config', dir=CONFIG_DIR)
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.writelines(header)
+            f.write('\n')
+            for sec in section_texts:
+                f.writelines(sec)
+                if not sec[-1].endswith('\n'):
+                    f.write('\n')
+                f.write('\n')
+        rc, _, _ = build_and_capture_errors(tmp_path)
+        return rc == 0
+    finally:
+        os.unlink(tmp_path)
+
+
+def bisect_bad_sections(header, sections):
+    """Delta-debugging fallback: find every section that, alone, fails to
+    build -- independent of whether its error text happens to cite a kernel
+    name. This is what extract_failing_sections()'s regex misses (documented
+    gap, docs/gfx1250_optimization_backlog.md): 'register index is out of
+    range' errors cite an .inc line number or a synthetic <instantiation>
+    location, never a kernel name, so the regex-based isolation above always
+    falls through to "keeping all" for that whole error class -- silently
+    shipping a config file that never builds at all. O(log N) builds per
+    actual failure via recursive halving (each section is an independent,
+    self-contained kernel definition -- no cross-section codegen state -- so
+    a section's build outcome does not depend on which other sections share
+    its file). Returns the set of section indices (into `sections`) that
+    must be dropped for the remainder to build cleanly; empty if the failure
+    isn't localizable to individual sections (e.g. a whole-file resource
+    limit like the old branch-range overflow) -- caller must keep everything
+    in that case rather than guess.
+    """
+    def helper(indices):
+        if len(indices) == 1:
+            return set(indices) if not _build_ok(header, [sections[indices[0]]]) else set()
+        mid = len(indices) // 2
+        left, right = indices[:mid], indices[mid:]
+        bad = set()
+        if not _build_ok(header, [sections[i] for i in left]):
+            bad |= helper(left)
+        if not _build_ok(header, [sections[i] for i in right]):
+            bad |= helper(right)
+        return bad
+    all_idx = list(range(len(sections)))
+    return helper(all_idx)
+
+
 def section_to_signature(section_lines):
     """Extract the unique identifying features of a section."""
     sig_parts = []
@@ -156,25 +208,33 @@ def process_config(config_path, write=False):
 
     failing = extract_failing_sections(stdout, stderr)
 
-    if not failing:
-        # Failed but couldn't parse which sections -- keep all
-        print(f"FAILED (unparseable, keeping all {len(sections)})")
-        return len(sections), len(sections)
+    if failing:
+        # Identify failing sections by matching kernel name patterns in their lines
+        passing_sections = []
+        removed = 0
+        for sec in sections:
+            sig = build_kernel_name_from_section(sec)
+            fails = any(f in sig for f in failing)
+            if fails:
+                removed += 1
+            else:
+                passing_sections.append(sec)
+        if removed == 0:
+            failing = None  # fall through to bisection below
+    else:
+        failing = None
 
-    # Identify failing sections by matching kernel name patterns in their lines
-    passing_sections = []
-    removed = 0
-    for sec in sections:
-        sig = build_kernel_name_from_section(sec)
-        fails = any(f in sig for f in failing)
-        if fails:
-            removed += 1
-        else:
-            passing_sections.append(sec)
-
-    if removed == 0:
-        print(f"FAILED (couldn't isolate, keeping all {len(sections)})")
-        return len(sections), len(sections)
+    if failing is None:
+        # Regex-based isolation found nothing usable -- fall back to bisection
+        # (handles error classes that never cite a kernel name at all, e.g.
+        # "register index is out of range"; see bisect_bad_sections's docstring).
+        print("regex isolation failed, bisecting...", end=' ', flush=True)
+        bad_idx = bisect_bad_sections(header, sections)
+        if not bad_idx:
+            print(f"FAILED (not localizable to individual sections, keeping all {len(sections)})")
+            return len(sections), len(sections)
+        passing_sections = [sec for i, sec in enumerate(sections) if i not in bad_idx]
+        removed = len(bad_idx)
 
     print(f"FAILED ({removed} removed, {len(passing_sections)} kept)")
     # Rebuild with only passing sections
@@ -201,27 +261,30 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--write', action='store_true',
                     help='Rewrite failing config files with only passing sections')
-    ap.add_argument('--jobs', type=int, default=4,
-                    help='Number of parallel build jobs (default: 4)')
+    ap.add_argument('--jobs', type=int, default=8,
+                    help='Number of parallel per-file build jobs (default: 8)')
     args = ap.parse_args()
 
     configs = find_per_tile_configs()
     print(f"Found {len(configs)} per-tile configs to verify\n")
 
-    # Build sequentially (each igemm_codegen.py already uses Python multiprocessing
-    # internally for kernel emission -- parallelizing at this level would create
-    # nested process pools which deadlock or thrash)
+    # Parallel across FILES: each is an independent subprocess (its own temp
+    # build dir, its own igemm_codegen.py invocation with no -s/split_kernel,
+    # so no nested multiprocessing pool) -- safe to run concurrently with
+    # plain threads (each just blocks on its own subprocess).
     total_orig = 0
     total_pass = 0
-    for config_path in configs:
-        orig, passing = process_config(config_path, write=args.write)
-        total_orig += orig
-        total_pass += passing
+    with ThreadPoolExecutor(max_workers=args.jobs) as ex:
+        futures = {ex.submit(process_config, config_path, args.write): config_path
+                   for config_path in configs}
+        for fut in as_completed(futures):
+            orig, passing = fut.result()
+            total_orig += orig
+            total_pass += passing
 
     print(f"\nTotal: {total_pass}/{total_orig} sections pass assembly")
     if not args.write:
         print("Dry run -- use --write to actually filter configs.")
-
 
 if __name__ == '__main__':
     main()

@@ -20,9 +20,51 @@ import os
 import re
 import sys
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
+from itertools import product
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_DIR = os.path.join(REPO_ROOT, 'config')
+
+# Phase 5 step 1 (gfx1250_tuning_refactor_plan.md): legality is determined by
+# actually constructing the real Python objects (igemm_gtc_tunable_parameter_t,
+# then the direction's WMMA generator class) and catching AssertionError --
+# not a hand-maintained parallel copy of the same rules. This is the exact
+# same construction igemm_codegen.py itself performs before emitting a kernel,
+# so "constructs without error" here means the same thing it means for a real
+# build. See docs/gfx1250_tunable_exclusions.md for the resulting catalog of
+# what actually gets rejected and why.
+sys.path.insert(0, REPO_ROOT)
+from python.igemm.igemm_base import igemm_gtc_tunable_parameter_t
+from python.igemm.igemm_fwd_gtc_wmma_nhwc import igemm_fwd_gtc_wmma_nhwc_t
+from python.igemm.igemm_bwd_gtc_wmma_nhwc import igemm_bwd_gtc_wmma_nhwc_t
+from python.igemm.igemm_wrw_gtc_wmma_nhwc import igemm_wrw_gtc_wmma_nhwc_t
+from python.codegen.mc import mc_asm_printer_t, mc_emit_to_string_t, mc_set_current
+from python.codegen.amdgpu import (amdgpu_arch_config_t, amdgpu_string_to_arch,
+                                    amdgpu_string_to_codeobj, AMDGPU_PRECISION_FP32)
+from python.codegen.config_parser import config_parser_t
+from python.operations.utility import (macro_mdiv_u32_vs_t, macro_mdiv_u32_rem_vs_t,
+                                        macro_mdiv_u32_ss_t, macro_mdiv_u32_rem_ss_t)
+import subprocess
+import tempfile
+
+ROCM_PATH = '/home/sgundabo/rocm-10.1'
+_COMMON_MACROS = [macro_mdiv_u32_vs_t, macro_mdiv_u32_rem_vs_t, macro_mdiv_u32_ss_t,
+                  macro_mdiv_u32_rem_ss_t]
+
+_GEN_CLASS = {
+    'fwd': igemm_fwd_gtc_wmma_nhwc_t,
+    'bwd': igemm_bwd_gtc_wmma_nhwc_t,
+    'wrw': igemm_wrw_gtc_wmma_nhwc_t,
+}
+
+_ARCH = amdgpu_arch_config_t({
+    'arch'          :   amdgpu_string_to_arch('gfx1250'),
+    'data_type'     :   AMDGPU_PRECISION_FP32,
+    'code_object'   :   amdgpu_string_to_codeobj('cov3'),
+})
+_MC = mc_asm_printer_t(mc_emit_to_string_t(), _ARCH)
+mc_set_current(_MC)
 
 # (direction, precision, tile_m, tile_n, gemm_k, source_config)
 BASE_SECTIONS = [
@@ -94,67 +136,138 @@ def find_base(sections, direction, tile_m):
     return None, None
 
 
-def is_valid(direction, precision, tile_m, tile_n, gemm_k, vals):
-    gs = vals.get('gemm_k_global_split', 0)
-    ds = vals.get('direct_store', 0)
-    mt = vals.get('wmma_m_tail', 0)
-    nt = vals.get('wmma_n_tail', 0)
-    tdm = vals.get('tdm_global_load', 0)
-    ldb = vals.get('lds_double_buffer', 0)
-    sp  = vals.get('wmma_setprio', 0)
-    lpn = vals.get('local_prefetch_num', 1)
-    mli = vals.get('main_loop_interleave', 0)
-    elp = vals.get('epilogue_lds_pad', 0)
-    sa  = vals.get('saddr_global_load', 0)
-    ik  = 4 if precision == 'fp32' else 32
+_typed_section_cache = {}   # src path -> {gemm_m_per_block: typed dict}
 
-    # saddr_global_load exclusions mirror the exact hard asserts in
-    # igemm_{fwd,bwd,wrw}_gtc_wmma_nhwc.py (tdm/interleave/gsplit all explicitly
-    # asserted incompatible; row_repeat_a/b>1 -- i.e. the asymmetric 128x64/64x128
-    # tile shapes -- also asserted incompatible, proxied here via tile_m != tile_n
-    # the same way the nt/tdm/mli rules above already do).
-    if sa and (tdm or mli or gs): return False
-    if sa and tile_m != tile_n: return False
-    # Phase 2 (gfx1250_tuning_refactor_plan.md correctness pass): fwd's
-    # saddr_global_load + wmma_n_tail combination was root-caused and fixed --
-    # v_flag_b (the per-lane N-tail mask) was never computed on the
-    # async_global_load/saddr_global_load B-address branch in
-    # igemm_fwd_gtc_wmma_nhwc.py, leaving it garbage on every lane. Fixed by
-    # computing it there too (mirroring the plain-VADDR path). No longer excluded.
+def get_base_typed_dict(direction, tile_m, src):
+    '''Parse `src` once via the REAL config_parser_t (the same parser
+    igemm_codegen.py itself uses) and cache every igemm_{direction}_gtc
+    section's fully value-typed dict, keyed by gemm_m_per_block.'''
+    if src not in _typed_section_cache:
+        content = config_parser_t(os.path.join(REPO_ROOT, src)).parse()
+        by_tile_m = {}
+        for section in content.get_section(f'igemm_{direction}_gtc'):
+            d = section.to_dict()
+            if 'gemm_m_per_block' in d:
+                by_tile_m.setdefault(d['gemm_m_per_block'], d)
+        _typed_section_cache[src] = by_tile_m
+    return _typed_section_cache[src].get(tile_m)
 
-    if ds and gs:            return False
-    if gs and direction != 'wrw' and (mt or nt): return False
-    if gs and elp:           return False
-    if nt and tile_m != tile_n: return False  # wmma_n_tail requires row_repeat_b==1
-    if tdm and tile_m != tile_n: return False  # TDM not supported with row_repeat_a>1
-    # NOTE: VGPR-budget exclusions removed -- now handled by a post-build filter
-    if tdm and gs:           return False
-    if tdm and (lpn > 1 or mli): return False
-    if tdm and tile_m != 128: return False
-    if tdm and direction != 'fwd' and (mt or nt): return False
-    if mli and lpn > 1:      return False
-    if mli and not ldb:      return False
-    if mli and gs:           return False
-    if mli and tile_m != tile_n: return False
-    if lpn > 1 and precision in ('fp16', 'bf16') and tile_m == 128: return False
-    if elp and tile_m == 128: return False
-    if elp and ds:           return False
-    if direction == 'wrw' and (mt or nt) and not gs: return False
-    if lpn > 1 and gemm_k <= ik: return False
-    if mli and gemm_k <= ik: return False
-    return True
+
+def _assembles(kernel):
+    '''Actually assemble THIS ONE kernel via clang (hsa_header_t is a cov2-only
+    no-op for our cov3 configs, so no other preamble is needed) -- fast (~30-
+    40ms), catches real assembler-only failures a Python-level check cannot
+    (confirmed real-world hit: "register index is out of range" for fwd's
+    128x64 asymmetric tile + wmma_n_tail, on every precision -- passes every
+    Python-level assert, `row_repeat_b==1` holds for this tile, but a register
+    formula somewhere still overflows). _COMMON_MACROS mirrors what
+    codegen_driver.py's emit_igemm_macro() would otherwise register once
+    per-file from each kernel's get_kernel_macros() plus the shared magic-
+    division macros every WMMA generator uses but does not re-declare
+    (igemm_fwd_gtc_wmma_nhwc_t.get_kernel_macros()'s own docstring: "already
+    registered globally... do not need re-registration here").'''
+    _MC.emitter.string_buffer = ''
+    for cls in _COMMON_MACROS:
+        cls(_MC).emit()
+    if hasattr(kernel, 'get_kernel_macros'):
+        for macro in kernel.get_kernel_macros():
+            macro.emit()
+    kernel.emit_kernel_symbol()
+    kernel.emit_kernel_header()
+    kernel.emit_kernel_body()
+    kernel.emit_kernel_end()
+    kernel.emit_kernel_amd_kernel_code_t()
+    kernel.emit_kernel_footer()
+    asm_text = _MC.emitter.get_buffer()
+    _MC.emitter.string_buffer = ''
+    fd, asm_path = tempfile.mkstemp(suffix='.s')
+    hsaco_path = asm_path[:-2] + '.hsaco'
+    try:
+        with os.fdopen(fd, 'w') as f:
+            f.write(asm_text)
+        cmd = [f'{ROCM_PATH}/llvm/bin/clang++', '-x', 'assembler',
+               '-target', 'amdgcn--amdhsa', '-mcpu=gfx1250', asm_path, '-o', hsaco_path]
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        return p.returncode == 0
+    finally:
+        for pth in (asm_path, hsaco_path):
+            if os.path.exists(pth):
+                os.unlink(pth)
+
+
+def is_valid(direction, base_dict, vals):
+    '''Phase 5 step 1 (gfx1250_tuning_refactor_plan.md): legality is
+    determined by actually constructing the real Python objects
+    (igemm_gtc_tunable_parameter_t, then the direction's WMMA generator
+    class), emitting the full kernel body, AND assembling it with the real
+    ROCm toolchain (_assembles above) -- not a hand-maintained parallel copy
+    of the same rules. This is the exact same construct-emit-assemble
+    sequence igemm_codegen.py itself performs before shipping a kernel, so
+    "succeeds here" means the same thing it means for a real build. Replaces
+    a hand-rolled rule set that had already drifted out of sync more than
+    once (ds_load_tr_b's promotion to unconditional; the saddr_global_load +
+    wmma_n_tail bug this copy only caught two phases after the real
+    constructor could have; a genuinely unbuildable wrw saddr_global_load
+    section -- inheriting gemm_k_global_split from its base -- silently
+    deemed "valid" by the old rules) and catches failure classes at three
+    different layers: construction-time asserts, emission-time-only asserts
+    (e.g. "interleave requires num_k_substeps>1"), and real assembler
+    failures (e.g. "register index is out of range", found only by actually
+    assembling every candidate). See docs/gfx1250_tunable_exclusions.md for
+    the resulting catalog of what actually gets rejected and why.
+
+    Mirrors main()'s actual text-generation merge below: a combinatorial
+    bit=0 does NOT emit an override line into the generated .config (so it
+    must not force-zero an already-nonzero base default either -- e.g. fp32
+    base sections already set lds_double_buffer=1, and bit=0 must leave that
+    alone, not silently violate COR-001).'''
+    merged = dict(base_dict)
+    merged['arch'] = 'gfx1250'
+    for k, v in vals.items():
+        if v not in (0, 'SCOPE_SYS'):
+            merged[k] = v
+    try:
+        tunable = igemm_gtc_tunable_parameter_t(merged)
+        kernel = _GEN_CLASS[direction](mc_asm_printer_t(_MC.emitter, _MC.arch_config), tunable)
+        return _assembles(kernel)
+    except AssertionError:
+        return False
+    finally:
+        # Never actually consumed (validation-only) -- reset so thousands of
+        # combos don't grow one shared string buffer unboundedly.
+        _MC.emitter.string_buffer = ''
+
+
+def _check_combo(task):
+    direction, precision, tile_m, tile_n, gemm_k, base_dict, vals = task
+    return (direction, precision, tile_m, tile_n, gemm_k, vals) if is_valid(direction, base_dict, vals) else None
 
 
 def gen_combos():
-    """Yield all (dir, prec, tm, tn, gk, src, vals_dict)."""
-    from itertools import product
+    """Return all (dir, prec, tm, tn, gk, vals_dict) that pass is_valid(),
+    checked in PARALLEL across CPUs -- each check independently constructs,
+    emits, and assembles one candidate kernel (~30-40ms, dominated by the
+    clang subprocess) -- embarrassingly parallel, no shared state between
+    candidates (each worker process gets its own forked copy of _MC)."""
+    tasks = []
     for direction, precision, tile_m, tile_n, gemm_k, src in BASE_SECTIONS:
+        base_dict = get_base_typed_dict(direction, tile_m, src)
+        if base_dict is None:
+            print(f"WARNING: no {tile_m} section in {src}", file=sys.stderr)
+            continue
         for bits in product([0, 1], repeat=len(FLAGS)):
             vals = {FLAGS[i]: bits[i] for i in range(len(FLAGS))}
             # local_prefetch_num: bit 0 -> 1, bit 1 -> 2
             vals['local_prefetch_num'] = 2 if vals['local_prefetch_num'] == 1 else 1
-            if is_valid(direction, precision, tile_m, tile_n, gemm_k, vals):
-                yield direction, precision, tile_m, tile_n, gemm_k, vals
+            tasks.append((direction, precision, tile_m, tile_n, gemm_k, base_dict, vals))
+
+    nproc = min(64, os.cpu_count() or 1)
+    results = []
+    with ProcessPoolExecutor(max_workers=nproc) as ex:
+        for res in ex.map(_check_combo, tasks, chunksize=16):
+            if res is not None:
+                results.append(res)
+    return results
 
 
 def section_key(body_lines):
@@ -166,6 +279,32 @@ def section_key(body_lines):
             continue
         tunable_lines.append(s)
     return '\n'.join(sorted(tunable_lines))
+
+
+def _extra_lines(base_body, vals):
+    '''Non-default tunable override lines to append after the cloned base body.
+    Skips any flag the base body ALREADY sets (regardless of value) -- config
+    files are plain INI, and config_parser_t (like every real consumer,
+    igemm_codegen.py included) rejects a duplicate key outright. This is a
+    real, previously-latent bug: wrw's own base sections default
+    gemm_k_global_split=1 and fp32's default lds_double_buffer=1 (COR-001) --
+    toggling either flag ON via the combinatorial FLAGS loop used to try to
+    emit a second, duplicate line for a key the base already set to the exact
+    same value, which config_parser_t rejects at parse time. Never triggered
+    before Phase 5 step 1 (gfx1250_tuning_refactor_plan.md) because the old,
+    stricter is_valid() happened to never generate those specific combinations.'''
+    base_keys = set()
+    for line in base_body:
+        s = line.strip()
+        if not s or s.startswith('#') or s.startswith(';') or '=' not in s:
+            continue
+        base_keys.add(s.split('=', 1)[0].strip())
+    extra = []
+    for flag in FLAGS:
+        val = vals.get(flag)
+        if val is not None and val != 0 and val != 'SCOPE_SYS' and flag not in base_keys:
+            extra.append(f"{flag:25s} = {val}\n")
+    return extra
 
 
 def main():
@@ -231,13 +370,7 @@ def main():
             # Clone base body and append non-default tunable flags
             new_body = list(base_body)
 
-            # Gather non-default tunable lines
-            extra = []
-            for flag in FLAGS:
-                val = vals.get(flag)
-                if val is not None and val != 0 and val != 'SCOPE_SYS':
-                    extra.append(f"{flag:25s} = {val}\n")
-
+            extra = _extra_lines(base_body, vals)
             if extra:
                 # Insert after last non-comment body line
                 insert_at = len(new_body)
@@ -303,11 +436,7 @@ def main():
             seen = set()
             for vals in sorted(combos_list, key=lambda v: sorted(v.items())):
                 new_body = list(base_body)
-                extra = []
-                for flag in FLAGS:
-                    val = vals.get(flag)
-                    if val is not None and val != 0 and val != 'SCOPE_SYS':
-                        extra.append(f"{flag:25s} = {val}\n")
+                extra = _extra_lines(base_body, vals)
                 if extra:
                     insert_at = len(new_body)
                     for i in range(len(new_body) - 1, -1, -1):
