@@ -542,7 +542,13 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             self.v_c           = sym_t('v_c'           , v_c_vseq(outer.tunable.num_vgpr_accumulate_c))     # 128
             self.v_a           = sym_t('v_a'           , vseq(outer.tunable.num_vgpr_accumulate_a))     # 32
             self.v_b           = sym_t('v_b'           , vseq(outer.tunable.num_vgpr_accumulate_b))     # 32
-            if outer.tunable.async_global_load:
+            if outer.tunable.tdm_global_load:
+                # Phase 28 (TDM): tensor_load_to_lds moves data straight to LDS via a
+                # dedicated SGPR descriptor -- no VGPR staging buffer, no per-lane VADDR
+                # pairs, no offsets, no sst_tmp. None of v_gld_a/b, v_addr_a/b/b_base,
+                # v_off_a/b/b_base, v_sst_tmp are allocated or referenced.
+                pass
+            elif outer.tunable.async_global_load:
                 # Phase 13: no VGPR staging buffer needed at all -- global_load_async_to_lds_b128
                 # writes straight to LDS. v_zero is a persistent all-zero quad used to explicitly
                 # zero-fill padding lanes' LDS destinations (see global_load_a_functor).
@@ -556,7 +562,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                 self.v_gld_a   = sym_t('v_gld_a'       , vseq(outer.chunk_num_dwords))
                 self.v_gld_b   = sym_t('v_gld_b'       , vseq(outer.chunk_num_dwords))
             self.v_tid         = sym_t('v_tid'         , vseq(1))
-            if outer.tunable.async_global_load or outer.tunable.saddr_global_load:
+            if outer.tunable.tdm_global_load:
+                # Phase 28 (TDM): no VADDR pairs or byte-offset VGPRs -- the SGPR descriptor
+                # carries the full global address. See the tdm_global_load arm above.
+                pass
+            elif outer.tunable.async_global_load or outer.tunable.saddr_global_load:
                 # Phase 13: global_load_async_to_lds_b128's VADDR is a plain 32-bit per-lane
                 # byte OFFSET (SADDR carries the 64-bit base separately) -- no need for a
                 # 2-VGPR-aligned full address pair like the old global_load_dwordx4 path.
@@ -652,7 +662,10 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
             # every tap inside _emit_tap_gather, reusing v_gtc_tmp's existing 5 scratch slots
             # (no extra persistent VGPRs) -- see that function's docstring. This keeps the
             # asymmetric shape's VGPR cost to +3 total (v_flag +1, v_addr_a +2) instead of +6.
-            self.v_flag        = sym_t('v_flag'        , vseq(outer.row_repeat_a))
+            # Phase 28 (TDM): v_flag is never allocated -- TDM's tensor_load_to_lds ignores
+            # EXEC and uses SGPR descriptors, so no per-lane masking flag exists.
+            if not outer.tunable.tdm_global_load:
+                self.v_flag        = sym_t('v_flag'        , vseq(outer.row_repeat_a))
             if outer.tunable.wmma_n_tail:
                 # Phase 26b: B's column (block_n_off + tid) is a kernel-lifetime constant
                 # (unlike A's per-tap v_flag) -- computed once in emit_kernel_prologue, not
@@ -1231,7 +1244,11 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
 
         # ---- B's fixed per-thread row base (this tap's column offset is added fresh every
         # tap in _emit_tap_gather -- see class docstring) ----
-        if self.tunable.async_global_load or self.tunable.saddr_global_load:
+        if self.tunable.tdm_global_load:
+            # Phase 28 (TDM): B's address lives in the SGPR descriptor (s_tdm_g0_b),
+            # not in per-lane VGPRs -- no v_off_b_base/v_addr_b_base computation needed.
+            pass
+        elif self.tunable.async_global_load or self.tunable.saddr_global_load:
             self._emit(f"; v_off_b_base = (block_n_off + tid) * wei_k_stride * {self.data_byte} bytes")
             self._emit(f"; (Phase 13/61: byte OFFSET only -- s_p_wei is passed separately as SADDR)")
             self._emit(f"v_add_u32 v[{v.v_off_b_base()}], s[{s.s_block_n_off()}], v[{v.v_tid()}]")
@@ -1331,6 +1348,13 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         i=0 and takes the row-0 branch (byte-identical). B is untouched -- row_repeat_b==1
         always for this phase (see __init__'s assert).
         '''
+        if self.tunable.tdm_global_load:
+            # Phase 28 (TDM): no per-tap VGPR address/flag/offset computation -- TDM's
+            # tensor_load_to_lds reads via SGPR descriptors (built once in
+            # _emit_tdm_descriptor_setup_a/b, advanced by move_slice_window_a/b_functor's
+            # TDM branch). The entire hi_idx/wi_idx/v_flag/v_addr_a/v_addr_b computation
+            # below is dead code for TDM.
+            return
         s = self.sgpr
         v = self.vgpr
         m_int_div_rem_vs = macro_int_div_rem_vs_gfx1250_t(self.mc)

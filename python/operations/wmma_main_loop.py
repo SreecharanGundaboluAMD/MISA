@@ -749,6 +749,32 @@ class wmma_main_loop_t(mc_base_t):
                 self._emit(f"s_sub_i32 s[{ctrl.s_tdm_k_remain()}], s[{ctrl.s_tdm_k_remain()}], {ctrl.unroll_k}   ; Phase 31: remaining valid K for the tile about to be issued")
             self._emit(f_move_slice_window_a())
             self._emit(f_move_slice_window_b())
+            if any_tdm:
+                # Phase 73 (TDM double-buffered schedule, docs/gpt_astra_review_gfx1250.md item 3):
+                # Issue the NEXT tile's TDM tensor_load_to_lds HERE -- right after move_slice_window
+                # advanced the descriptor to the next tile's global source address (unchanged
+                # behavior/position), and BEFORE the WMMA compute burst -- so the transfer gets the
+                # entire LDS-read + WMMA-compute window to complete in the background, instead of
+                # almost none (the old late-issue position gave it only the branch-back sliver before
+                # the next iteration's s_wait_tensorcnt 0x0 blocks on it). The LDS DESTINATION buffer
+                # this TDM transfer writes to is still whatever emit_buffer_switch() last set it to --
+                # emit_buffer_switch() itself stays at its EXISTING end-of-iteration position, so only
+                # the transfer's issue point moves earlier relative to the compute burst, not its
+                # destination-buffer computation. Safe because: move_slice_window only touched SGPR/VGPR
+                # address descriptors (never LDS, never the barrier); the CURRENT tile's operands are
+                # already fully read from LDS (s_wait_dscnt 0x0 above drained them); and the buffer
+                # this transfer targets is the OTHER buffer from what we just read (double_buffer
+                # invariant). tdm_a and tdm_b are always set identically from the same tdm_global_load
+                # tunable in every generator, and async_global_load+tdm_global_load are asserted
+                # mutually exclusive everywhere, so gating on any_tdm and issuing both is safe.
+                # Hardware-validated (5 shapes x 3 runs) prior to this change. NOTE: the LATE call
+                # site below (a_style_async/b_style_async) is changed to async_a/async_b so this TDM
+                # issue is NOT re-issued a second time there; only plain async_global_load operands
+                # (whose schedule is unchanged) still issue at the late position.
+                if tdm_a:
+                    self._emit(f_gld_a())
+                if tdm_b:
+                    self._emit(f_gld_b())
             if interleave_a or interleave_b:
                 # Phase 15: chunk 0 issued exactly as the non-interleaved path does; substep 0's
                 # compute happens next, then emit_mixed_substeps() takes over chunk 0's
@@ -787,9 +813,9 @@ class wmma_main_loop_t(mc_base_t):
                         self._emit(f_sst_a())
                     if not b_style_async:
                         self._emit(f_sst_b())
-                if a_style_async:
+                if async_a:
                     self._emit(f_gld_a())
-                if b_style_async:
+                if async_b:
                     self._emit(f_gld_b())
             if double_buffer:
                 emit_buffer_switch()
