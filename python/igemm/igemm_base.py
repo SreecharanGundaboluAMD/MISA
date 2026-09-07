@@ -1047,6 +1047,24 @@ class igemm_gtc_tunable_parameter_t(object):
                     f"wmma_acc_high_bank (Phase 54) only moves v_c into a SINGLE extra bank -- " \
                     f"num_vgpr_accumulate_c:{self.num_vgpr_accumulate_c} must fit within one 256-register " \
                     f"bank; a bigger accumulator needs multi-bank MSB switching inside the main loop, not implemented"
+                # bwd's row_repeat_a>1 tiles (e.g. 256x128, gemm_m_per_block > block_size)
+                # combined with wmma_acc_high_bank are CONFIRMED valid:n on real hardware at
+                # every K-depth tested (Phase 55/67, docs/gfx1250_wmma_vgpr_msb_wip_status.md
+                # + the gfx1250 tuning session's VGPR-pressure investigation) -- not yet
+                # root-caused. bwd's row_repeat_a==1 (128x128) mechanism-only use is
+                # unaffected (hardware-validated valid:y, both bf16 and int8/fp32/fp16).
+                # fwd's 256x256 (row_repeat_a==1 there too -- fwd has no row_repeat_a>1
+                # requirement for its own 256x256 entry) remains valid:y and is NOT gated.
+                # Gated here (config-construction time, not a runtime driver check) since
+                # it's a pure tunable-shape invalidity, not dependent on the actual conv
+                # args -- mirrors this file's other "known-broken combination" gates (e.g.
+                # the gemm_k_global_split assert immediately above).
+                assert not (self.direction == 'bwd' and self.gemm_m_per_block > self.block_size), \
+                    f"bwd wmma_acc_high_bank + gemm_m_per_block({self.gemm_m_per_block}) > " \
+                    f"block_size({self.block_size}) (row_repeat_a>1, e.g. 256x128) is CONFIRMED " \
+                    f"valid:n on real hardware at every K-depth tested and not yet root-caused -- " \
+                    f"see docs/gfx1250_wmma_vgpr_msb_wip_status.md's Phase 55/67. Not shippable " \
+                    f"until root-caused and fixed."
             # COR-001 (2026-09-02): fp32 WMMA tunables measured `valid:n` against the GPU
             # naive-conv reference on real gfx1250 hardware when single-buffered --
             # fp32's WMMA A/B operand loads are 4x wider than fp16/bf16's per K-element
