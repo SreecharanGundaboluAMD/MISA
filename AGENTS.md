@@ -113,6 +113,45 @@ python3 script/build_gfx1250_master_configs.py --write  # union narrow configs �
 python3 script/build_and_filter_configs.py --write      # build each, drop sections that fail assembly (VGPR overflow)
 ```
 
+### Shape sweep / correctness-across-shapes (`script/sweep_shapes.py`)
+
+Standardized tool for running one or more configs against a list of conv
+shapes, sequentially (always a single shared GPU — never concurrent),
+reporting every `(config, kernel, shape)` combination that fails
+correctness. Use this instead of ad-hoc one-off benchmarking loops
+whenever auditing correctness across a config's full combinatorial FLAGS
+space, validating that a new tunable is reachable/correct in every
+combination Phase 6/7 puts it in, or hunting for a shape-dependent bug.
+
+```bash
+python3 script/sweep_shapes.py \
+    --configs config/igemm_bwd_gtc_gfx1250_nhwc_fp16_128x128_all.config \
+    --shapes config/shapes/default.json --mode validity
+# --configs accepts a glob: 'config/igemm_*_gtc_gfx1250_nhwc_fp16_*_all.config'
+# --mode: validity (-V 1 only) | perf (-V 0 timing) | both (default)
+# --repeats N: repeat each (config, shape) N times; attaches per-repeat
+#   tflops per kernel (perf noise-floor check)
+# --timeout SECONDS: per-shape subprocess timeout (default 1800 -- large
+#   _all.config files with hundreds of kernels need this high)
+# --report /path/to/report.json: full JSON dump alongside the stdout summary
+```
+
+Shape list format: `config/shapes/*.json`, a JSON array of `{"name", "n",
+"c", "H", "W", "k", "y"?, "x"?, "p"?, "q"?, "u"?, "v"?, "l"?, "j"?, "g"?}`
+objects (conv geometry fields default to 1x1/stride-1/no-pad if omitted).
+`config/shapes/default.json` is a starter 5-shape battery (1x1
+bottleneck/wide/deep-bottleneck, 3x3 medium/wide).
+
+Two real correctness bugs were found this way that passed every
+construction-time (`is_valid()`) and assembly-time check:
+`wrw_incremental_gather`'s `ho*wo < gemm_k_per_block` wrong-answer case,
+and `ds_load_tr_b=0 + lds_double_buffer=1`'s universal wrong-answer case
+(see `docs/gfx1250_dominance_study.md` and
+`docs/gfx1250_tuning_refactor_plan.md`'s Phase 6/7 sections). Run it
+whenever adding a new tunable combination or a new tile shape, across a
+representative shape battery — not just the 1-2 shapes a benchmark script
+happens to use — before considering that combination validated.
+
 ### Benchmarking
 
 ```bash
@@ -202,6 +241,8 @@ Custom INI parser (`python/codegen/config_parser.py`), **not** Python's `configp
 | `driver/igemm_gtc_base.h` | `igemm_gtc_tunable_t` (C++ tunable), `igemm_driver_base_t` (abstract base), `igemm_launch_kernels` |
 | `driver/igemm_{fwd,bwd,wrw}_gtc_driver.h` | Per-direction driver subclasses: block/grid/run |
 | `driver/args.h` | MIOpenDriver-style CLI arg parser (`args_t`) |
+| `script/sweep_shapes.py` | Standardized shape-sweep correctness/perf tool (build configs once, run every shape sequentially, report `valid:n` failures) — see "Shape sweep" above |
+| `config/shapes/default.json` | Starter 5-shape battery for `script/sweep_shapes.py` |
 | `config/igemm_fwd_gtc_gfx1250_nhwc_fp16_all.config` | Master gfx1250 WMMA flat config (union of all validated fp16 fwd tunable combinations; use this for benchmarking and quick-start — the narrow `_direct` config picks the wrong `lds_double_buffer`/`direct_store` combo on large 1×1 shapes, see `docs/gfx1250_wmma_perf_report_2026-09-02.md` OPT-3) |
 | `driver/ENVIRONMENT.md` | Full env-var reference for `conv_driver.exe` |
 | `docs/gfx1250_wmma_layout.md` | **Master reference** (368KB): empirically-verified WMMA register layout + full phase-by-phase dev history (Phases 1–61+) |

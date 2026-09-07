@@ -64,7 +64,19 @@ For each missing (direction, tile shape) pair:
    macro-tile at all -- register budget, LDS sizing, and epilogue tiling
    are all tile-shape-dependent and may need generator code changes, not
    just a new config section.
-4. Hardware-validate (`-V 1`) across a representative shape battery.
+4. Hardware-validate (`-V 1`) across a representative shape battery using
+   `script/sweep_shapes.py` (see `AGENTS.md`/`CLAUDE.md`'s "Shape sweep"
+   section) -- e.g. `python3 script/sweep_shapes.py --configs
+   <new-tile-config> --shapes config/shapes/default.json --mode validity`,
+   then extend `config/shapes/default.json` (or pass a custom shape list)
+   with shapes specifically sized to exercise the new macro-tile's M/N
+   edges (exact-fit and tail-remainder cases). Do not rely on the 1-2
+   shapes a benchmark script happens to use -- both correctness bugs found
+   this session (`docs/gfx1250_dominance_study.md`) were combinations that
+   passed construction-time and assembly-time checks but failed on real
+   hardware for specific shapes only, exactly the failure mode a new tile
+   shape is most likely to introduce (new register/LDS layout, new
+   edge/tail arithmetic).
 5. Only then let it participate in the combinatorial FLAGS sweep like the
    existing tile shapes do.
 
