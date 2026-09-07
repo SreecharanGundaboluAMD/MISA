@@ -407,16 +407,31 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             # silently overflowed into whatever VGPR followed it.
             if outer.tunable.async_global_load:
                 # Phase 13: A (untransposed) has no VGPR staging buffer at all -- see
-                # igemm_fwd_gtc_wmma_nhwc.py's kernel_vgpr_t for the full rationale. B stays
-                # on the old technique (transposed, reuses v_gld_b as scratch -- out of
-                # scope for this phase), so v_gld_b is always declared.
+                # igemm_fwd_gtc_wmma_nhwc.py's kernel_vgpr_t for the full rationale.
+                # (async_global_load and tdm_global_load are mutually exclusive by
+                # assert, so this branch is never reached when TDM is also active.)
                 self.v_zero    = sym_t('v_zero'        , vseq(4))
+            elif outer.tunable.tdm_global_load:
+                # Phase 3 (gfx1250_tuning_refactor_plan.md): A's global-to-LDS transfer
+                # goes via a dedicated SGPR descriptor -- no VGPR staging buffer needed.
+                # Mirrors igemm_fwd_gtc_wmma_nhwc_t's identical Phase 28 pruning for A.
+                pass
             else:
                 self.v_gld_a   = sym_t('v_gld_a'       , vseq(outer.chunk_num_dwords))
+            # v_gld_b: ALWAYS allocated regardless of A's/TDM's loading mechanism -- B
+            # stays on the old technique (transposed); its shared_load_b_functor reuses
+            # this as scratch for the manual read+pack unpack, which is a LDS->VGPR step
+            # unrelated to how data got INTO LDS in the first place (TDM's Phase 30 only
+            # replaces B's GLOBAL->LDS transfer, not this later shared-load step -- still
+            # needed whenever ds_load_tr_b isn't doing the hardware transpose instead).
             self.v_gld_b   = sym_t('v_gld_b'       , vseq(outer.chunk_num_dwords))   # also reused as scratch by the transposed shared_load_b
             self.v_tid         = sym_t('v_tid'         , vseq(1))
             # 64-bit VADDR pairs must be even-aligned on gfx1250 (verified with llvm-mc)
-            if outer.tunable.async_global_load or outer.tunable.saddr_global_load:
+            if outer.tunable.tdm_global_load:
+                # Phase 3: no VADDR pairs or byte-offset VGPRs -- the SGPR descriptor
+                # carries the full global address (mirrors fwd's identical Phase 28 arm).
+                pass
+            elif outer.tunable.async_global_load or outer.tunable.saddr_global_load:
                 # Phase 13/61: plain 32-bit per-lane byte OFFSET (SADDR carries the 64-bit base
                 # separately) -- see igemm_fwd_gtc_wmma_nhwc.py's kernel_vgpr_t docstring.
                 self.v_off_a   = sym_t('v_off_a'        , vseq(1))
@@ -429,7 +444,11 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
                 # that file's __init__ docstring. row_repeat_a==1 for every existing config
                 # (byte-identical).
                 self.v_addr_a  = sym_t('v_addr_a'       , vseq(2 * outer.row_repeat_a, 2))    # persistent global A address(es) (64-bit each)
-            if outer.tunable.saddr_global_load:
+            if outer.tunable.tdm_global_load:
+                # Phase 3: B's address lives in the SGPR descriptor (s_tdm_g0_b) -- see
+                # the tdm_global_load arm above; mirrors fwd's identical Phase 28 arm.
+                pass
+            elif outer.tunable.saddr_global_load:
                 # Phase 61: B also uses 32-bit offset (SADDR carries s_p_wei separately).
                 # v_off_b_base is B's tap-independent base offset (reset per tap, same as
                 # v_addr_b_base in the VADDR path).
@@ -496,7 +515,11 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
             # v_wi_idx stay SINGLE registers even for row_repeat_a>1 -- only row 0's
             # decomposition is persisted; rows 1..row_repeat_a-1 recompute their own FRESH
             # every tap inside _emit_tap_gather, reusing v_gtc_tmp's existing scratch slots.
-            self.v_flag        = sym_t('v_flag'        , vseq(outer.row_repeat_a))
+            # Phase 3: v_flag is never allocated under TDM -- tensor_load_to_lds ignores
+            # EXEC and uses SGPR descriptors, so no per-lane masking flag exists (mirrors
+            # fwd's identical Phase 28 gating).
+            if not outer.tunable.tdm_global_load:
+                self.v_flag        = sym_t('v_flag'        , vseq(outer.row_repeat_a))
             self.v_n_idx       = sym_t('v_n_idx'       , vseq(1))
             self.v_hi_idx      = sym_t('v_hi_idx'      , vseq(1))
             self.v_wi_idx      = sym_t('v_wi_idx'      , vseq(1))
@@ -981,43 +1004,51 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         # for fp16/bf16 (4 col_groups), 64 for int8 (2 col_groups) -- NOT the hardcoded
         # tid>>2/tid&3/col_group*32 an fp16-only version of this code once had) -- see class
         # docstring / wmma_mapping.py ----
-        num_col_groups = self.tunable.gemm_n_per_block // self.tunable.gemm_k_per_block
-        col_group_bits = utility_log2(num_col_groups)
-        col_start_shift = utility_log2(self.tunable.gemm_k_per_block)
-        self._emit(f"; v_addr_b_base = p_wei + (row_local*wei_row_c + block_n_off + col_start) * databyte")
-        self._emit(f"v_lshrrev_b32 v[{v.v_tmp()}], {col_group_bits}, v[{v.v_tid()}]        ; row_local = tid>>{col_group_bits}")
-        if self.tunable.wmma_k_tail:
-            # K-tail: persist row_local BEFORE the very next line multiplies it by
-            # wei_row_c in place -- see kernel_vgpr_t's v_b_row_local docstring.
-            self._emit(f"v_mov_b32 v[{v.v_b_row_local()}], v[{v.v_tmp()}]   ; K-tail: persist row_local")
-        self._emit(f"v_mul_lo_u32 v[{v.v_tmp()}], s[{s.s_wei_row_c()}], v[{v.v_tmp()}]  ; row_local * wei_row_c")
-        self._emit(f"v_and_b32 v[{v.v_tmp(1)}], {num_col_groups - 1}, v[{v.v_tid()}]           ; col_group = tid&{num_col_groups - 1}")
-        self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], {col_start_shift}, v[{v.v_tmp(1)}]      ; col_start = col_group*{self.tunable.gemm_k_per_block}")
-        if self.tunable.wmma_n_tail:
-            # N-tail: persist col_start_abs (= block_n_off + col_start) BEFORE the very next
-            # line consumes v_tmp(1) by merging it into v_tmp(0) -- see kernel_vgpr_t's
-            # v_b_col_start_abs docstring. Kernel-lifetime constant (col_start doesn't change
-            # across the K-loop or taps), so n_valid_base can be derived once, here too.
-            self._emit(f"v_add_u32 v[{v.v_b_col_start_abs()}], s[{s.s_block_n_off()}], v[{v.v_tmp(1)}]   ; N-tail: col_start_abs")
-            self._emit(f"v_sub_u32 v[{v.v_n_valid_base()}], s[{s.s_gemm_n()}], v[{v.v_b_col_start_abs()}]   ; N-tail: n_valid_base = gemm_n - col_start_abs")
-        self._emit(f"v_add_u32 v[{v.v_tmp()}], v[{v.v_tmp(1)}], v[{v.v_tmp()}]")
-        self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_block_n_off()}], v[{v.v_tmp()}]")
-        if self.tunable.gemm_k_global_split:
-            # Phase 48: B's GEMM_K is its own ROW axis (structurally identical to wrw's A) --
-            # this shard's K-slice base, in B-row units, is s_gemm_k_wg_off*wei_row_c
-            # elements, added into the same flat row-index accumulator every other per-row
-            # term (row_local*wei_row_c, col_start, block_n_off) already feeds.
-            self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_gemm_k_wg_off()}], s[{s.s_wei_row_c()}]   ; this workgroup's K-slice base, in B row units")
-            self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_tmp(2)}], v[{v.v_tmp()}]")
-        self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.data_byte)}, v[{v.v_tmp()}]   ; * databyte (elements -> bytes)")
-        if self.tunable.saddr_global_load:
-            # Phase 61: byte OFFSET only -- s_p_wei is passed separately as SADDR
-            self._emit(f"v_mov_b32 v[{v.v_off_b_base()}], v[{v.v_tmp()}]   ; v_off_b_base = (row_local*wei_row_c + block_n_off + col_start) * databyte")
+        if self.tunable.tdm_global_load:
+            # Phase 3 (gfx1250_tuning_refactor_plan.md): B's address lives entirely in the
+            # SGPR descriptor (_emit_tdm_descriptor_setup_b, called above) -- none of
+            # v_addr_b_base/v_off_b_base/v_b_row_local/v_b_col_start_abs/v_n_valid_base
+            # are allocated under TDM (see kernel_vgpr_t), so this whole VGPR-based B-base
+            # computation is dead code for TDM. Mirrors fwd's identical Phase 28 skip.
+            pass
         else:
-            self._emit(f"v_mov_b32 v[{v.v_addr_b_base(1)}], s[{s.s_p_wei(1)}]")
-            self._emit(f"v_add_co_u32 v[{v.v_addr_b_base()}], vcc_lo, s[{s.s_p_wei()}], v[{v.v_tmp()}]")
-            self._emit(f"v_add_co_ci_u32 v[{v.v_addr_b_base(1)}], vcc_lo, 0, v[{v.v_addr_b_base(1)}], vcc_lo")
-        self._emit_empty_line()
+            num_col_groups = self.tunable.gemm_n_per_block // self.tunable.gemm_k_per_block
+            col_group_bits = utility_log2(num_col_groups)
+            col_start_shift = utility_log2(self.tunable.gemm_k_per_block)
+            self._emit(f"; v_addr_b_base = p_wei + (row_local*wei_row_c + block_n_off + col_start) * databyte")
+            self._emit(f"v_lshrrev_b32 v[{v.v_tmp()}], {col_group_bits}, v[{v.v_tid()}]        ; row_local = tid>>{col_group_bits}")
+            if self.tunable.wmma_k_tail:
+                # K-tail: persist row_local BEFORE the very next line multiplies it by
+                # wei_row_c in place -- see kernel_vgpr_t's v_b_row_local docstring.
+                self._emit(f"v_mov_b32 v[{v.v_b_row_local()}], v[{v.v_tmp()}]   ; K-tail: persist row_local")
+            self._emit(f"v_mul_lo_u32 v[{v.v_tmp()}], s[{s.s_wei_row_c()}], v[{v.v_tmp()}]  ; row_local * wei_row_c")
+            self._emit(f"v_and_b32 v[{v.v_tmp(1)}], {num_col_groups - 1}, v[{v.v_tid()}]           ; col_group = tid&{num_col_groups - 1}")
+            self._emit(f"v_lshlrev_b32 v[{v.v_tmp(1)}], {col_start_shift}, v[{v.v_tmp(1)}]      ; col_start = col_group*{self.tunable.gemm_k_per_block}")
+            if self.tunable.wmma_n_tail:
+                # N-tail: persist col_start_abs (= block_n_off + col_start) BEFORE the very next
+                # line consumes v_tmp(1) by merging it into v_tmp(0) -- see kernel_vgpr_t's
+                # v_b_col_start_abs docstring. Kernel-lifetime constant (col_start doesn't change
+                # across the K-loop or taps), so n_valid_base can be derived once, here too.
+                self._emit(f"v_add_u32 v[{v.v_b_col_start_abs()}], s[{s.s_block_n_off()}], v[{v.v_tmp(1)}]   ; N-tail: col_start_abs")
+                self._emit(f"v_sub_u32 v[{v.v_n_valid_base()}], s[{s.s_gemm_n()}], v[{v.v_b_col_start_abs()}]   ; N-tail: n_valid_base = gemm_n - col_start_abs")
+            self._emit(f"v_add_u32 v[{v.v_tmp()}], v[{v.v_tmp(1)}], v[{v.v_tmp()}]")
+            self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_block_n_off()}], v[{v.v_tmp()}]")
+            if self.tunable.gemm_k_global_split:
+                # Phase 48: B's GEMM_K is its own ROW axis (structurally identical to wrw's A) --
+                # this shard's K-slice base, in B-row units, is s_gemm_k_wg_off*wei_row_c
+                # elements, added into the same flat row-index accumulator every other per-row
+                # term (row_local*wei_row_c, col_start, block_n_off) already feeds.
+                self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_gemm_k_wg_off()}], s[{s.s_wei_row_c()}]   ; this workgroup's K-slice base, in B row units")
+                self._emit(f"v_add_u32 v[{v.v_tmp()}], s[{s.s_tmp(2)}], v[{v.v_tmp()}]")
+            self._emit(f"v_lshlrev_b32 v[{v.v_tmp()}], {utility_log2(self.data_byte)}, v[{v.v_tmp()}]   ; * databyte (elements -> bytes)")
+            if self.tunable.saddr_global_load:
+                # Phase 61: byte OFFSET only -- s_p_wei is passed separately as SADDR
+                self._emit(f"v_mov_b32 v[{v.v_off_b_base()}], v[{v.v_tmp()}]   ; v_off_b_base = (row_local*wei_row_c + block_n_off + col_start) * databyte")
+            else:
+                self._emit(f"v_mov_b32 v[{v.v_addr_b_base(1)}], s[{s.s_p_wei(1)}]")
+                self._emit(f"v_add_co_u32 v[{v.v_addr_b_base()}], vcc_lo, s[{s.s_p_wei()}], v[{v.v_tmp()}]")
+                self._emit(f"v_add_co_ci_u32 v[{v.v_addr_b_base(1)}], vcc_lo, 0, v[{v.v_addr_b_base(1)}], vcc_lo")
+            self._emit_empty_line()
 
         self._emit_lds_offset_setup()
 

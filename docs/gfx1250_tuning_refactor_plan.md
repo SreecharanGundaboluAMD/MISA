@@ -261,21 +261,40 @@ unrelated legacy DOTX code, not touched by this phase).
 **Benchmarking:** not needed (correctness-only, as scoped).
 
 
-### Phase 3 — Extend "make derived details internal" to bwd/wrw
+### Phase 3 — Extend "make derived details internal" to bwd/wrw — **DONE**
 
-**Scope:** `5a7d9c7`'s TDM register pruning only covered fwd (matching the
-review's citation at the time). Same audit-and-prune methodology, applied to
-`igemm_bwd_gtc_wmma_nhwc.py` and `igemm_wrw_gtc_wmma_nhwc.py`'s TDM paths:
-confirm (via grep, not assumption) which VGPR staging registers are
-allocated-but-unused when `tdm_global_load=1`, gate them off, verify
-byte-identical for non-TDM configs and `valid:y` for TDM configs in each
-direction.
+**Scope:** `5a7d9c7`'s TDM register pruning only covered fwd. Same audit-and-
+prune methodology applied to `igemm_bwd_gtc_wmma_nhwc.py` and
+`igemm_wrw_gtc_wmma_nhwc.py`'s TDM paths.
 
-**Deliverable:** same shape as the fwd fix — no new tunable flag, VGPR count
-reduction confirmed via `.vgpr_count`/`.amdhsa_next_free_vgpr` static
-inspection, correctness confirmed via single `valid:y` runs.
-**Depends on:** nothing (independent of every other phase; safe to run in
-parallel with Phase 2/4/5).
+bwd: pruned `v_gld_a` (A's global-load staging buffer) and the whole
+A/B-address VGPR set (`v_addr_a`, `v_off_a`/`v_sst_tmp`, `v_addr_b`/
+`v_addr_b_base`, `v_off_b`/`v_off_b_base`) plus `v_flag` (A's per-tap OOB
+mask) when `tdm_global_load=1` -- VGPR count 256->216 (128x128x32 fp16 TDM
+tile). **`v_gld_b` deliberately kept unconditional** (a real, hardware-
+confirmed distinction from fwd, found via a build crash this pass): bwd's B
+is transposed, and `shared_load_b_functor` reuses `v_gld_b` as scratch for
+the manual LDS->VGPR read+pack unpack -- a step TDM's Phase 30 doesn't touch
+at all (TDM only replaces the GLOBAL->LDS transfer). Two additional
+unconditional-reference sites (bwd's B-base prologue setup;
+`shared_load_b_functor`'s `v.v_gld_b` use) needed their own `tdm_global_load`
+guards added alongside the register-allocation gating, for the same reason.
+
+wrw: pruned the A/B-address VGPR set (`v_addr_a`/`v_addr_a_base`,
+`v_addr_b`, `v_off_a`/`v_off_b`/`v_off_a_base`) and `v_flag` (B's per-
+iteration gather flag) -- VGPR count 251->243 (128x128x32 fp16 TDM tile).
+`v_gld_a`/`v_gld_b` kept unconditional for the identical reason as bwd's
+`v_gld_b` (wrw transposes **both** operands). One unconditional-reference
+site (A-base + B-gather-setup prologue block) needed a `tdm_global_load`
+guard added.
+
+**Verification:** byte-identical non-TDM `.s` output (both directions,
+diffed against a pre-change build). Full regenerated per-tile config sweep
+(27 files, 2968 sections) -- zero crashes, 2968/2968 pass real assembly
+(`build_and_filter_configs.py`), and a full hardware regression (two shapes
+each) -- 5936 kernel-shape runs, zero `valid:n`/`invalid float`, for both
+the bwd and wrw pruning passes independently.
+**Depends on:** nothing (independent of every other phase).
 **Benchmarking:** not needed.
 
 ### Phase 4 — Consolidate booleans into strategy choices
@@ -360,16 +379,18 @@ related flags specifically.
 `tunable_is_valid`, `script/generate_all_configs.py`'s `is_valid`) into one.
 Concrete mechanism, in order of increasing effort:
 
-1. **Immediate, low-effort win:** replace
-   `script/generate_all_configs.py`'s hand-written `is_valid()` with an
-   actual attempt to construct `igemm_gtc_tunable_parameter_t` for the
-   candidate dict and catch `AssertionError` — the Python constructor
-   already *is* the build-time legality source; the generator should
-   consume it, not re-derive a parallel copy that can (and per the
-   `ds_load_tr_b`/`saddr_global_load`+`wmma_n_tail` history, already has)
-   drift out of sync. This alone eliminates one of the three copies with no
-   design work, just calling existing code from the script instead of a
-   duplicate.
+1. **DONE.** `script/generate_all_configs.py`'s hand-written `is_valid()`
+   replaced with an actual construct-emit-assemble attempt: the real
+   `igemm_gtc_tunable_parameter_t`, the real direction-specific WMMA
+   generator class, full in-memory kernel-body emission, and a real
+   `clang++` assembly of the resulting single kernel — catching Category A
+   asserts, generator-level asserts, emission-time-only asserts, AND real
+   assembler-only failures (found one previously-unknown bug this way: fwd's
+   128x64 tile + `wmma_n_tail`, "register index is out of range" on every
+   precision — passes every Python assert, only the real assembler catches
+   it). Parallelized across all CPUs (`ProcessPoolExecutor`); the full
+   55,296-combination sweep runs in ~2.7s. See
+   `docs/gfx1250_tunable_exclusions.md` for the resulting catalog.
 2. **Structural fix:** define build-time legality (Category A, "can this
    kernel be generated") entirely in the Python tunable constructor (already
    mostly true) and have it also emit the kernel's **runtime applicability
@@ -417,17 +438,15 @@ is very likely higher than 13.
 
 **Scope:**
 
-1. **Deduplicate by resolved kernel name, not raw config text.** Every
-   config section, once parsed into a real `igemm_gtc_tunable_parameter_t`,
-   already has a canonical resolved identity: `igemm_gtc_encode_kernel_name`.
-   Two sections producing the same kernel name are a genuine, 100%-certain
-   duplicate (the assembler would collide on them if both were ever built
-   together) — this is a strictly stronger dedup key than
-   `build_gfx1250_master_configs.py`'s current raw-text `normalize()`, and
-   subsumes it. Add this check to (or replace `normalize()` in) that script;
-   also run it across each direction/precision's full set of source configs
-   before they're even unioned into a master file, not just at
-   union time.
+1. **DONE.** Deduplicate by resolved kernel name, not raw config text.
+   `script/build_gfx1250_master_configs.py` now also computes each
+   section's `igemm_gtc_encode_kernel_name` (constructing the real tunable
+   object per section) and skips it if that name was already seen — a
+   strictly stronger key than `normalize()`'s raw-text comparison, run in
+   the same pass rather than replacing it. Zero kernel-name-only duplicates
+   found in the current corpus (the raw-text dedup already catches all 13
+   known ones) — the mechanism is now in place to catch future drift, which
+   was the point.
 2. **Cross-axis combination reachability.** Once Phase 4's enums exist,
    enumerate the legal combinations of `input_transfer × schedule ×
    output_transfer × reduction` (filtered through Phase 5's unified legality
@@ -460,7 +479,7 @@ space small enough to enumerate rather than 2^30 booleans).
 the same correctness-only discipline used throughout this engagement, not
 a performance comparison.
 
-### Phase 6 — Dominance study — **[BLOCKED: needs exclusive hardware access]**
+### Phase 6 — Dominance study — **[was BLOCKED, now UNBLOCKED: exclusive hardware access available]**
 
 **Scope:** Apply `gpt_astra_tuning.md` §6's 5-step procedure (validate
 domain → compare against best applicable baseline → measure complete
@@ -495,11 +514,11 @@ Category C tunable with the measured tradeoff region documented.
 **Depends on:** Phase 4 (cleaner to measure against enum choices than
 raw booleans) but can start on `ds_load_tr_b` specifically without waiting,
 since it's already isolated.
-**Benchmarking:** **required** — this phase cannot proceed on the current
-shared machine. Prepare the exact shape/config matrix now (as a followup to
-this plan) so execution is immediate once the machine is free.
+**Benchmarking:** **required** — hardware is no longer shared (per current
+session); ready to execute. Prepare the exact shape/config matrix (still a
+real prerequisite regardless of hardware access) before starting.
 
-### Phase 7 — Expand tuning search — **[BLOCKED: needs exclusive hardware access, and Phase 6 first]**
+### Phase 7 — Expand tuning search — **[was BLOCKED, now UNBLOCKED pending Phase 6]**
 
 **Scope:** Per `gpt_astra_tuning.md`'s explicit ordering, only *after*
 Phase 6 shrinks the space, consider widening `script/generate_all_configs.py`'s

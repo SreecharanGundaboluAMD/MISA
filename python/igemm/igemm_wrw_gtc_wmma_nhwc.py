@@ -512,7 +512,15 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             # K-rows, each needing its own persistent address -- sized 2*row_stride (row r's
             # pair is registers 2*r/2*r+1); row_stride==1 (every existing config) keeps this
             # byte-identical to a single pair.
-            if outer.tunable.saddr_global_load:
+            if outer.tunable.tdm_global_load:
+                # Phase 3 (gfx1250_tuning_refactor_plan.md): both A's and B's addresses
+                # live entirely in their SGPR descriptors (Phase 45) -- no VGPR global-
+                # address pair/offset for either. Mirrors fwd/bwd's identical Phase 28/42
+                # pruning (dead code confirmed: emit_kernel_tap_loop's `if not
+                # tdm_global_load:` already skips every emission site that would
+                # reference these).
+                pass
+            elif outer.tunable.saddr_global_load:
                 # Phase 61: 32-bit byte offsets (SADDR carries s_p_in/s_p_wei separately).
                 # row_stride==1 asserted when saddr is on.
                 self.v_off_a      = sym_t('v_off_a'      , vseq(1))
@@ -550,7 +558,12 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self.v_b_col_off   = sym_t('v_b_col_off'   , vseq(1))    # (block_n_off+col_start)*databyte, fixed
             # row_stride redesign: one flag per owned row (B's gather is redone per row);
             # row_stride==1 keeps this a single register, byte-identical to before.
-            self.v_flag        = sym_t('v_flag'        , vseq(outer.row_stride))
+            # Phase 3: never allocated under TDM -- tensor_load_to_lds ignores EXEC and
+            # uses SGPR descriptors, so no per-lane masking flag exists (_emit_b_gather is
+            # skipped entirely under TDM, see emit_kernel_tap_loop's `if not
+            # tdm_global_load:` guard -- mirrors fwd/bwd's identical Phase 28/3 gating).
+            if not outer.tunable.tdm_global_load:
+                self.v_flag        = sym_t('v_flag'        , vseq(outer.row_stride))
             self.v_gtc_tmp     = sym_t('v_gtc_tmp'     , vseq(5))
             if outer.tunable.wmma_m_tail:
                 # Phase 35: A's (grad_output) absolute-GEMM_M-index-in-range flag. Unlike B's
@@ -1090,7 +1103,17 @@ class igemm_wrw_gtc_wmma_nhwc_t(mc_base_t):
             self._emit(f"s_addc_u32 s[{s.s_p_out(1)}], s[{s.s_p_out(1)}], 0")
         self._emit_empty_line()
 
-        if self.row_stride == 1:
+        if self.tunable.tdm_global_load:
+            # Phase 3 (gfx1250_tuning_refactor_plan.md): both A's and B's addresses/
+            # gather setup live entirely in their SGPR descriptors -- none of
+            # v_addr_a_base/v_off_a_base/v_row_local/v_b_col_off are allocated under
+            # TDM (see kernel_vgpr_t), and _emit_b_gather is skipped entirely (see
+            # emit_kernel_tap_loop's `if not tdm_global_load:` guard), so this whole
+            # row_stride==1/row_stride>1 A-base + B-gather-setup computation is dead
+            # code for TDM (row_stride>1 is separately asserted incompatible with TDM
+            # anyway). Mirrors fwd/bwd's identical Phase 28/3 skip.
+            pass
+        elif self.row_stride == 1:
             # ---- global address for this thread's chunk of the A tile (grad_output, natural [GEMM_K][GEMM_M]) ----
             # thread tid owns row_local (one of gemm_k_per_block rows of this K-block) and
             # col_group (one of num_col_groups chunks of the 128-wide K_out tile, each chunk
