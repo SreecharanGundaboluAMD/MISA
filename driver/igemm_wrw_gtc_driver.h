@@ -349,6 +349,18 @@ public:
             // actual requested shape.
             if(tunable->wrw_incremental_gather && (ho * wo) < tunable->gemm_k_per_block)
                 return false;
+            // Same class of bug, for a different tunable: wmma_l2_prefetch's "1x1/
+            // unit-stride only" restriction (igemm_base.py's wmma_l2_prefetch assert
+            // on nxe==0) was likewise only enforced at CONFIG level -- nothing here
+            // checked the RUNTIME shape. The speculative prefetch functors
+            // (prefetch_a_functor/prefetch_b_functor in igemm_wrw_gtc_wmma_nhwc.py)
+            // compute their 2-stages-ahead address purely from a constant per-K-block
+            // stride, only a valid identity for a genuine 1x1/unit-stride conv -- a
+            // multi-tap/strided/padded/dilated shape feeds it a wrong stride and
+            // corrupts memory (confirmed on real hardware: illegal-memory-access GPU
+            // fault, not just valid:n) instead of being rejected as "not applicable".
+            if(tunable->wmma_l2_prefetch && !unit_conv)
+                return false;
             // R4 (gfx1250_wmma_perf_report_v2.md): wrw_streamk is asserted nxe==0 at
             // config-construction time (igemm_base.py, "first pass only supports nxe==0
             // -- single-tap, y=x=1"), but this WMMA branch previously never checked the

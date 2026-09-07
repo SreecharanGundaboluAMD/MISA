@@ -515,6 +515,19 @@ public:
                 if((ho * wo) % gemm_m_per_block != 0)
                     return false;
             }
+            // Same class of bug as tdm_global_load above, for a different tunable:
+            // wmma_l2_prefetch's "1x1/unit-stride only" restriction (igemm_base.py's
+            // wmma_l2_prefetch assert on nxe==0) was likewise only enforced at CONFIG
+            // level -- nothing here checked the RUNTIME shape. The speculative prefetch
+            // functors (prefetch_a_functor/prefetch_b_functor in
+            // igemm_fwd_gtc_wmma_nhwc.py) compute their 2-stages-ahead address purely
+            // from a constant per-K-block stride, which is only a valid identity for a
+            // genuine 1x1/unit-stride conv (nxe==0's whole premise) -- a multi-tap/
+            // strided/padded/dilated shape feeds it a wrong stride and corrupts memory
+            // (confirmed on real hardware: illegal-memory-access GPU fault, not just
+            // valid:n) instead of being rejected as "not applicable".
+            if(tunable->wmma_l2_prefetch && !unit_conv)
+                return false;
             if((!tunable->wmma_m_tail && gemm_m % gemm_m_per_block != 0) ||
                (!tunable->wmma_n_tail && gemm_n % gemm_n_per_block != 0) ||
                (!tunable->tdm_global_load && !tunable->wmma_k_tail && gemm_k % gemm_k_per_block != 0))
