@@ -218,6 +218,7 @@ class igemm_bwd_gtc_wmma_nhwc_t(mc_base_t):
         # Phase 53: see igemm_fwd_gtc_wmma_nhwc.py's identical comment.
         ctrl_coalescing_store_wmma.wmma_epilogue_chunked = tunable.wmma_epilogue_chunked
         ctrl_coalescing_store_wmma.vgpr_msb_tracker = self.vgpr_msb_tracker
+        ctrl_coalescing_store_wmma.wmma_async_store = tunable.wmma_async_store
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
         # K/N-tail (bwd-specific): bwd's B (weight) operand is TRANSPOSED (see class
         # docstring) -- unlike fwd's B, where each lane owns one fixed N-column and reads

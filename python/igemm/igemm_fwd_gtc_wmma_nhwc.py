@@ -344,6 +344,7 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         # groups -- see docs/gfx1250_wmma_layout.md's Phase 52/53.
         ctrl_coalescing_store_wmma.wmma_epilogue_chunked = tunable.wmma_epilogue_chunked
         ctrl_coalescing_store_wmma.vgpr_msb_tracker = self.vgpr_msb_tracker
+        ctrl_coalescing_store_wmma.wmma_async_store = tunable.wmma_async_store
         self.coalescing_store = igemm_coalescing_store_wmma_t(self.mc, ctrl_coalescing_store_wmma)
 
         # int8 added: the only two byte-width-dependent literals (the A/B global-address
@@ -499,6 +500,20 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                     self.s_tdm_m_remain = sym_t('s_tdm_m_remain', sseq(1))
                 if outer.tunable.wmma_n_tail:
                     self.s_tdm_n_remain = sym_t('s_tdm_n_remain', sseq(1))
+                if outer.tunable.tdm_multitap:
+                    # TDM multi-tap (new): 3D descriptor for A -- group2 (4 SGPRs:
+                    # tensor_dim2, tensor_dim3=0, tensor_dim2_stride, tile_dim3=0) and
+                    # group3 (4 SGPRs: tensor_dim3_stride=0, tensor_dim4=0, tile_dim4=0,
+                    # reserved=0). Both required (VADDR2 and VADDR3 must both be non-NULL
+                    # for >2D tensors, per ISA doc §10.11). Only allocated for multitap
+                    # (every existing TDM config stays 2D, byte-identical).
+                    self.s_tdm_g2 = sym_t('s_tdm_g2', sseq(4, 4))
+                    self.s_tdm_g3 = sym_t('s_tdm_g3', sseq(4, 4))
+                    # Per-tap base global_addr for A (saved in prologue, restored each tap
+                    # iteration since move_slice_window advances it during the K-loop).
+                    self.s_tdm_a_base = sym_t('s_tdm_a_base', sseq(2))
+                    # Per-tap base global_addr for B (same reason).
+                    self.s_tdm_b_base = sym_t('s_tdm_b_base', sseq(2))
             # Phase 60 (Magic Division): host-precomputed magic multipliers replace emulated
             # software division in the coordinate decomposition hot paths. Four 32-bit
             # magic words + one packed shift word, loaded from kernargs with one
@@ -893,6 +908,84 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         tile_dim1 = self.tunable.gemm_m_per_block
         assert tile_dim0 < 65536 and tile_dim1 < 65536, "TDM tile_dim0/1 are 16-bit fields"
 
+        if self.tunable.tdm_multitap:
+            # TDM multi-tap (new): 3D descriptor for A. The tile is (C x Wo x Ho_tile)
+            # where Ho_tile = gemm_m_per_block / Wo. global_addr must point to the correct
+            # INPUT position (not OUTPUT) since Hi != Ho when dilation > 1 or Y > 1.
+            # Decompose block_m_off into (n, ho_start) using SGPR-level magic division,
+            # then compute: p_in + (n*Hi*Wi + ho_start*Wi) * in_c_total * data_byte.
+            # For tap (0,0) this is the base; per-tap offsets are added in _emit_tap_gather.
+            m_mdiv_rem_ss = macro_mdiv_u32_rem_ss_t(self.mc)
+            self._emit(f"; --- TDM multi-tap: 3D descriptor for A operand ---")
+            self._emit(f"s_mov_b32 s[{s.s_tdm_g0(0)}], 1   ; group0: pred=1")
+            self._emit(f"s_mov_b32 s[{s.s_tdm_g0(1)}], 0   ; group0: lds_addr (A's LDS region starts at byte 0)")
+            self._emit(f"; global_addr = p_in + (n*Hi*Wi + ho_start*Wi) * in_c_total * data_byte")
+            # n = block_m_off / ho_wo, ho_wo_rem = block_m_off % ho_wo
+            # After: s_tmp(0) = ho_wo_rem, s_tmp(1) = n
+            self._emit(m_mdiv_rem_ss(s.s_tmp(0), s.s_tmp(1), s.s_block_m_off(), s.s_magic_ho_wo(), s.s_shift_ho_wo(), s.s_ho_wo(), s.s_tmp(2)))
+            # ho_start = ho_wo_rem / wo (wo_start = 0, guaranteed by gemm_m_per_block % Wo == 0)
+            # Save n in s_tmp(3) first (second division overwrites s_tmp(0)/(1))
+            self._emit(f"s_mov_b32 s[{s.s_tmp(3)}], s[{s.s_tmp(1)}]   ; save n")
+            # Use mdiv_u32_ss (quotient only) -- remainder is known to be 0, avoids
+            # the s_rem/s_numer aliasing issue in mdiv_u32_rem_ss
+            m_mdiv_ss = macro_mdiv_u32_ss_t(self.mc)
+            self._emit(m_mdiv_ss(s.s_tmp(0), s.s_tmp(0), s.s_magic_wo(), s.s_shift_wo(), s.s_tmp(2)))
+            # s_tmp(0) = ho_start (quot), s_tmp(3) = n
+            # base_elem = n * Hi*Wi + ho_start * Wi = n*hi_wi + ho_start*wi
+            self._emit(f"s_mul_i32 s[{s.s_tmp(2)}], s[{s.s_tmp(3)}], s[{s.s_hi_wi()}]   ; n * Hi*Wi")
+            self._emit(f"s_mul_i32 s[{s.s_tmp(3)}], s[{s.s_tmp(0)}], s[{s.s_wi()}]   ; ho_start * Wi")
+            self._emit(f"s_add_u32 s[{s.s_tmp(0)}], s[{s.s_tmp(2)}], s[{s.s_tmp(3)}]   ; n*Hi*Wi + ho_start*Wi")
+            self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_in_c_total()}]   ; * in_c_total")
+            self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {data_size_code}   ; * data_byte")
+            self._emit(f"s_add_u32 s[{s.s_tdm_g0(2)}], s[{s.s_p_in()}], s[{s.s_tmp(0)}]")
+            self._emit(f"s_addc_u32 s[{s.s_tmp(1)}], s[{s.s_p_in(1)}], 0")
+            self._emit(f"s_or_b32 s[{s.s_tdm_g0(3)}], s[{s.s_tmp(1)}], 0x80000000   ; | type=2 (image) in bits[31:30]")
+            self._emit_empty_line()
+            # Save base global_addr for per-tap restoration
+            self._emit(f"s_mov_b32 s[{s.s_tdm_a_base()}], s[{s.s_tdm_g0(2)}]   ; save base global_addr lo")
+            self._emit(f"s_mov_b32 s[{s.s_tdm_a_base(1)}], s[{s.s_tdm_g0(3)}]   ; save base global_addr hi")
+            self._emit_empty_line()
+            # group1: same config word as 2D, but tile_dim1=Wo, tile_dim2=Ho_tile
+            tile_dim2_mt = self.tunable.gemm_m_per_block  # divided by Wo at runtime
+            self._emit(f"s_mov_b32 s[{s.s_tdm_g1(0)}], {data_size_code << 16 | igemm_tdm_row_pad_bits(tile_dim0 * self.data_byte, self.tunable.lds_row_pad)}")
+            self._emit(f"s_lshl_b32 s[{s.s_tdm_g1(1)}], s[{s.s_gemm_k()}], 16   ; tensor_dim0 (gemm_k) lo16 -> [31:16]")
+            self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_gemm_k()}], 16   ; tensor_dim0 hi16")
+            self._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_wi()}], 16   ; tensor_dim1 (Wi) lo16 -> [31:16]")
+            self._emit(f"s_or_b32 s[{s.s_tdm_g1(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
+            self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_wi()}], 16   ; tensor_dim1 (Wi) hi16")
+            self._emit(f"s_or_b32 s[{s.s_tdm_g1(3)}], s[{s.s_tmp(0)}], {tile_dim0 << 16}   ; | tile_dim0 (compile-time)")
+            # tile_dim1=Wo in [15:0], tile_dim2=gemm_m_per_block/Wo in [31:16]
+            # Ho_tile = gemm_m_per_block / Wo (exact, asserted in tunable_is_valid)
+            # Use SGPR magic division (Wo may not be a power of 2)
+            self._emit(f"s_mov_b32 s[{s.s_tmp(0)}], {tile_dim2_mt}   ; gemm_m_per_block (immediate)")
+            self._emit(m_mdiv_ss(s.s_tmp(0), s.s_tmp(0), s.s_magic_wo(), s.s_shift_wo(), s.s_tmp(2)))
+            # s_tmp(0) = Ho_tile (quot)
+            self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], 16   ; tile_dim2 << 16")
+            self._emit(f"s_or_b32 s[{s.s_tdm_g1(4)}], s[{s.s_wo()}], s[{s.s_tmp(0)}]   ; tile_dim1=Wo | tile_dim2=Ho_tile<<16")
+            self._emit(f"s_mov_b32 s[{s.s_tdm_g1(5)}], s[{s.s_in_c_total()}]   ; tensor_dim0_stride lo32 (elements)")
+            # tensor_dim1_stride = Wi * in_c_total (one H-step in elements)
+            self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_wi()}], s[{s.s_in_c_total()}]   ; tensor_dim1_stride = Wi * in_c_total")
+            self._emit(f"s_lshr_b32 s[{s.s_tmp(1)}], s[{s.s_tmp(0)}], 16   ; tensor_dim1_stride hi16")
+            # g1(6) = tensor_dim0_stride_hi16(=0) | tensor_dim1_stride_lo16<<16
+            self._emit(f"s_and_b32 s[{s.s_tmp(2)}], s[{s.s_tmp(0)}], 0xFFFF   ; tensor_dim1_stride lo16")
+            self._emit(f"s_lshl_b32 s[{s.s_tdm_g1(6)}], s[{s.s_tmp(2)}], 16   ; tensor_dim0_stride_hi16(=0) | tensor_dim1_stride_lo16<<16")
+            self._emit(f"s_mov_b32 s[{s.s_tdm_g1(7)}], s[{s.s_tmp(1)}]   ; tensor_dim1_stride hi16")
+            self._emit_empty_line()
+            self._emit(f"; group2: tensor_dim2=Hi (OOB extent for dim2), tensor_dim2_stride=Wi*in_c_total")
+            self._emit(f"s_mov_b32 s[{s.s_tdm_g2(0)}], s[{s.s_hi()}]   ; tensor_dim2 = Hi")
+            self._emit(f"s_mov_b32 s[{s.s_tdm_g2(1)}], 0   ; tensor_dim3 = 0 (unused, 3D)")
+            self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_wi()}], s[{s.s_in_c_total()}]   ; tensor_dim2_stride = Wi * in_c_total")
+            self._emit(f"s_mov_b32 s[{s.s_tdm_g2(2)}], s[{s.s_tmp(0)}]   ; tensor_dim2_stride lo32")
+            self._emit(f"s_mov_b32 s[{s.s_tdm_g2(3)}], 0   ; tile_dim3=0 | reserved")
+            self._emit_empty_line()
+            # group3: all zero (3D tensor, dims 3/4 unused)
+            self._emit(f"; group3: all zero (3D tensor, dims 3/4 unused)")
+            self._emit(f"s_mov_b32 s[{s.s_tdm_g3(0)}], 0   ; tensor_dim3_stride = 0")
+            self._emit(f"s_mov_b32 s[{s.s_tdm_g3(1)}], 0   ; tensor_dim4 = 0")
+            self._emit(f"s_mov_b32 s[{s.s_tdm_g3(2)}], 0   ; tile_dim4 = 0")
+            self._emit(f"s_mov_b32 s[{s.s_tdm_g3(3)}], 0   ; reserved = 0")
+            self._emit_empty_line()
+            return
         self._emit(f"; --- Phase 28: TDM descriptor for A operand ---")
         self._emit(f"s_mov_b32 s[{s.s_tdm_g0(0)}], 1   ; group0: pred=1 (valid tensor)")
         self._emit(f"s_mov_b32 s[{s.s_tdm_g0(1)}], 0   ; group0: lds_addr (A's LDS region starts at byte 0)")
@@ -903,14 +996,10 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_addc_u32 s[{s.s_tmp(1)}], s[{s.s_p_in(1)}], 0")
         self._emit(f"s_or_b32 s[{s.s_tdm_g0(3)}], s[{s.s_tmp(1)}], 0x80000000   ; | type=2 (image) in bits[31:30]")
         self._emit_empty_line()
-
         self._emit(f"; group1: data_size={data_size_code}, workgroup_mask=0 (not clustered), pad from lds_row_pad")
         self._emit(f"s_mov_b32 s[{s.s_tdm_g1(0)}], {data_size_code << 16 | igemm_tdm_row_pad_bits(tile_dim0 * self.data_byte, self.tunable.lds_row_pad)}")
         self._emit(f"s_lshl_b32 s[{s.s_tdm_g1(1)}], s[{s.s_gemm_k()}], 16   ; tensor_dim0 (gemm_k) lo16 -> [31:16]")
         self._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_gemm_k()}], 16   ; tensor_dim0 hi16")
-        # M-tail via TDM (new): tensor_dim1 uses the block-relative remaining count instead
-        # of the absolute gemm_m -- see s_tdm_m_remain's declaration for why this is the
-        # architecturally-correct (not just plausible) semantics.
         m_operand = s.s_tdm_m_remain() if self.tunable.wmma_m_tail else s.s_gemm_m()
         self._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{m_operand}], 16   ; tensor_dim1 (gemm_m, or remaining-from-block if M-tail) lo16")
         self._emit(f"s_or_b32 s[{s.s_tdm_g1(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
@@ -959,6 +1048,12 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         self._emit(f"s_addc_u32 s[{s.s_tmp(1)}], s[{s.s_p_wei(1)}], 0")
         self._emit(f"s_or_b32 s[{s.s_tdm_g0_b(3)}], s[{s.s_tmp(1)}], 0x80000000   ; | type=2 (image) in bits[31:30]")
         self._emit_empty_line()
+        if self.tunable.tdm_multitap:
+            # Save B's base global_addr for per-tap restoration (move_slice_window
+            # advances it during the K-loop; each tap needs it reset to base + tap offset)
+            self._emit(f"s_mov_b32 s[{s.s_tdm_b_base()}], s[{s.s_tdm_g0_b(2)}]   ; save B base global_addr lo")
+            self._emit(f"s_mov_b32 s[{s.s_tdm_b_base(1)}], s[{s.s_tdm_g0_b(3)}]   ; save B base global_addr hi")
+            self._emit_empty_line()
 
         self._emit(f"; group1: data_size={data_size_code}, workgroup_mask=0 (not clustered), pad from lds_row_pad")
         self._emit(f"s_mov_b32 s[{s.s_tdm_g1_b(0)}], {data_size_code << 16 | igemm_tdm_row_pad_bits(tile_dim0 * self.data_byte, self.tunable.lds_row_pad)}")
@@ -1349,11 +1444,39 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
         always for this phase (see __init__'s assert).
         '''
         if self.tunable.tdm_global_load:
+            if self.tunable.tdm_multitap:
+                # TDM multi-tap (new): rebuild A's 3D descriptor's global_addr per-tap
+                # and shift B's 2D descriptor's global_addr per-tap. The descriptor's
+                # strides/extents (g1/g2/g3) are set once in the prologue and unchanged --
+                # only global_addr (g0(2)/(3)) changes per tap.
+                s = self.sgpr
+                data_size_code = utility_log2(self.data_byte)
+                self._emit(f"; --- TDM multi-tap: per-tap descriptor rebuild ---")
+                # A: tap_offset = (iy*dilation_h*Wi + ix*dilation_w) * in_c_total * data_byte
+                self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_iy()}], s[{s.s_dilation_h()}]")
+                self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_wi()}]   ; iy*dilation_h*Wi")
+                self._emit(f"s_mul_i32 s[{s.s_tmp(1)}], s[{s.s_ix()}], s[{s.s_dilation_w()}]   ; ix*dilation_w")
+                self._emit(f"s_add_u32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]   ; iy*dilation_h*Wi + ix*dilation_w")
+                self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_in_c_total()}]   ; * in_c_total")
+                self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {data_size_code}   ; * data_byte")
+                self._emit(f"s_add_u32 s[{s.s_tdm_g0(2)}], s[{s.s_tdm_a_base()}], s[{s.s_tmp(0)}]")
+                self._emit(f"s_addc_u32 s[{s.s_tmp(1)}], s[{s.s_tdm_a_base(1)}], 0")
+                self._emit(f"s_or_b32 s[{s.s_tdm_g0(3)}], s[{s.s_tmp(1)}], 0x80000000   ; | type=2 (image) in bits[31:30]")
+                # Reset s_tdm_k_remain to gemm_k (K-loop decrements it each iteration)
+                self._emit(f"s_mov_b32 s[{s.s_tdm_k_remain()}], s[{s.s_gemm_k()}]   ; reset K-remain for this tap")
+                self._emit_empty_line()
+                # B: tap_offset = (iy*X + ix) * gemm_k * data_byte
+                self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_iy()}], s[{s.s_x()}]")
+                self._emit(f"s_add_u32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_ix()}]   ; iy*X + ix")
+                self._emit(f"s_mul_i32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], s[{s.s_gemm_k()}]   ; * gemm_k")
+                self._emit(f"s_lshl_b32 s[{s.s_tmp(0)}], s[{s.s_tmp(0)}], {data_size_code}   ; * data_byte")
+                self._emit(f"s_add_u32 s[{s.s_tdm_g0_b(2)}], s[{s.s_tdm_b_base()}], s[{s.s_tmp(0)}]")
+                self._emit(f"s_addc_u32 s[{s.s_tmp(1)}], s[{s.s_tdm_b_base(1)}], 0")
+                self._emit(f"s_or_b32 s[{s.s_tdm_g0_b(3)}], s[{s.s_tmp(1)}], 0x80000000   ; | type=2 (image) in bits[31:30]")
+                self._emit_empty_line()
             # Phase 28 (TDM): no per-tap VGPR address/flag/offset computation -- TDM's
-            # tensor_load_to_lds reads via SGPR descriptors (built once in
-            # _emit_tdm_descriptor_setup_a/b, advanced by move_slice_window_a/b_functor's
-            # TDM branch). The entire hi_idx/wi_idx/v_flag/v_addr_a/v_addr_b computation
-            # below is dead code for TDM.
+            # tensor_load_to_lds reads via SGPR descriptors. The entire hi_idx/wi_idx/
+            # v_flag/v_addr_a/v_addr_b computation below is dead code for TDM.
             return
         s = self.sgpr
         v = self.vgpr
@@ -1731,7 +1854,10 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                         # only wave 0 issues it -- see _emit_wave0_only's docstring for why a
                         # scalar branch, not EXEC-masking, is required to suppress this on
                         # non-issuing waves.
-                        outer._emit_wave0_only(lambda: outer._emit(f"tensor_load_to_lds s[{s.s_tdm_g0()}:{s.s_tdm_g0(3)}], s[{s.s_tdm_g1()}:{s.s_tdm_g1(7)}]"))
+                        if outer.tunable.tdm_multitap:
+                            outer._emit_wave0_only(lambda: outer._emit(f"tensor_load_to_lds s[{s.s_tdm_g0()}:{s.s_tdm_g0(3)}], s[{s.s_tdm_g1()}:{s.s_tdm_g1(7)}], s[{s.s_tdm_g2()}:{s.s_tdm_g2(3)}], s[{s.s_tdm_g3()}:{s.s_tdm_g3(3)}]"))
+                        else:
+                            outer._emit_wave0_only(lambda: outer._emit(f"tensor_load_to_lds s[{s.s_tdm_g0()}:{s.s_tdm_g0(3)}], s[{s.s_tdm_g1()}:{s.s_tdm_g1(7)}]"))
                     elif outer.tunable.async_global_load:
                         outer._emit_gld_async_all_chunks(v.v_off_a, v.v_sst_os, 0, outer.sgpr.s_p_in, v_flag=v.v_flag)
                     elif outer.tunable.saddr_global_load:
@@ -2006,15 +2132,19 @@ class igemm_fwd_gtc_wmma_nhwc_t(mc_base_t):
                         skip_label = f"L_{outer.name()}_tdm_a_skip_rebuild"
                         outer._emit(f"s_cmp_lt_i32 s[{s.s_tdm_k_remain()}], {outer.tunable.gemm_k_per_block}   ; Phase 44: is the tile now being prepared genuinely partial?")
                         outer._emit(f"s_cbranch_scc0 {skip_label}   ; not partial -- skip the rebuild, tensor_dim0 stays >= tile_dim0")
-                        outer._emit(f"s_lshl_b32 s[{s.s_tdm_g1(1)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim0 (remaining K) lo16 -> [31:16]")
-                        outer._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim0 hi16")
-                        # M-tail via TDM (new): re-derive from s_tdm_m_remain (kernel-lifetime
-                        # constant, not decremented) instead of the absolute s_gemm_m -- must
-                        # stay consistent with what _emit_tdm_descriptor_setup_a's initial
-                        # value used, since this rebuild re-OR's BOTH halves of g1(2) fresh.
-                        m_operand = s.s_tdm_m_remain() if outer.tunable.wmma_m_tail else s.s_gemm_m()
-                        outer._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{m_operand}], 16   ; tensor_dim1 (gemm_m, or remaining-from-block if M-tail) lo16")
-                        outer._emit(f"s_or_b32 s[{s.s_tdm_g1(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
+                        if outer.tunable.tdm_multitap:
+                            # Multitap: tensor_dim1 is Wi (not gemm_m), must preserve it
+                            outer._emit(f"s_lshl_b32 s[{s.s_tdm_g1(1)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim0 (remaining K) lo16 -> [31:16]")
+                            outer._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim0 hi16")
+                            # Rebuild g1(2): tensor_dim0_hi16 | tensor_dim1(Wi)_lo16<<16
+                            outer._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{s.s_wi()}], 16   ; tensor_dim1 (Wi) lo16")
+                            outer._emit(f"s_or_b32 s[{s.s_tdm_g1(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
+                        else:
+                            outer._emit(f"s_lshl_b32 s[{s.s_tdm_g1(1)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim0 (remaining K) lo16 -> [31:16]")
+                            outer._emit(f"s_lshr_b32 s[{s.s_tmp(0)}], s[{s.s_tdm_k_remain()}], 16   ; tensor_dim0 hi16")
+                            m_operand = s.s_tdm_m_remain() if outer.tunable.wmma_m_tail else s.s_gemm_m()
+                            outer._emit(f"s_lshl_b32 s[{s.s_tmp(1)}], s[{m_operand}], 16   ; tensor_dim1 (gemm_m, or remaining-from-block if M-tail) lo16")
+                            outer._emit(f"s_or_b32 s[{s.s_tdm_g1(2)}], s[{s.s_tmp(0)}], s[{s.s_tmp(1)}]")
                         outer._emit_front(f"{skip_label}:")
                     elif outer.tunable.async_global_load or outer.tunable.saddr_global_load:
                         # Phase 13/61: v_off_a is a plain 32-bit byte OFFSET (no base pointer

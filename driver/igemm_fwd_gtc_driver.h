@@ -494,8 +494,27 @@ public:
             // padded/dilated shape would previously run a TDM kernel anyway and silently
             // produce wrong results (valid:n) instead of being correctly rejected as "not
             // applicable" the way every other inapplicable combination already is.
-            if(tunable->tdm_global_load && !unit_conv)
+            if(tunable->tdm_global_load && !tunable->tdm_multitap && !unit_conv)
                 return false;
+            // tdm_multitap: allows multi-tap (Y,X >= 1) but only for stride=1, pad=0,
+            // arbitrary dilation. The 3D TDM descriptor expresses the 2D input sub-tile
+            // (C x Wo x Ho_tile) a fixed tap reads -- TDM's dense nested-loop iteration
+            // maps consecutive OUTPUT positions to consecutive INPUT positions only when
+            // stride=1 (dilation shifts the fixed per-tap offset but doesn't change the
+            // output-to-input step size). Padding is out of scope (boundary handling
+            // deferred). Also requires gemm_m_per_block % Wo == 0 (so a 128-row M-tile
+            // spans complete output rows, making the tile a genuine rectangular block)
+            // and Ho*Wo % gemm_m_per_block == 0 (tile never crosses a batch/n boundary).
+            if(tunable->tdm_multitap){
+                if(stride_h != 1 || stride_w != 1)
+                    return false;
+                if(pad_h != 0 || pad_w != 0)
+                    return false;
+                if(gemm_m_per_block % wo != 0)
+                    return false;
+                if((ho * wo) % gemm_m_per_block != 0)
+                    return false;
+            }
             if((!tunable->wmma_m_tail && gemm_m % gemm_m_per_block != 0) ||
                (!tunable->wmma_n_tail && gemm_n % gemm_n_per_block != 0) ||
                (!tunable->tdm_global_load && !tunable->wmma_k_tail && gemm_k % gemm_k_per_block != 0))

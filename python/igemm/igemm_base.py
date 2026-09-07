@@ -311,7 +311,11 @@ class igemm_gtc_tunable_parameter_t(object):
                 # (no M/N-tail combined with TDM yet) -- see igemm_wrw_gtc_wmma_nhwc.py's
                 # __init__ assert and docs/gfx1250_wmma_layout.md's Phase 45.
                 assert tunable_dict['direction'] in ('fwd', 'bwd', 'wrw'), "tdm_global_load is only implemented for fwd/bwd/wrw so far, see docs/gfx1250_wmma_layout.md's Phase 28/42/45"
-                assert tunable_dict['nxe'] == 0, "tdm_global_load is only implemented for 1x1/unit-stride convs (nxe=0) so far, see docs/gfx1250_wmma_layout.md's Phase 28"
+                _tdm_multitap = utility_dict_with_default_t(tunable_dict)('tdm_multitap', 0)
+                if _tdm_multitap:
+                    assert tunable_dict['direction'] == 'fwd', "tdm_multitap is fwd-only for now -- bwd/wrw multi-tap TDM is future work"
+                else:
+                    assert tunable_dict['nxe'] == 0, "tdm_global_load is only implemented for 1x1/unit-stride convs (nxe=0) so far, see docs/gfx1250_wmma_layout.md's Phase 28"
                 assert not self.async_global_load, "tdm_global_load and async_global_load are mutually exclusive -- they're two different load mechanisms for the same operand"
                 assert not utility_dict_with_default_t(tunable_dict)('main_loop_interleave', 0), \
                     "tdm_global_load and main_loop_interleave are mutually exclusive for now, see docs/gfx1250_wmma_layout.md's Phase 28"
@@ -1031,6 +1035,24 @@ class igemm_gtc_tunable_parameter_t(object):
             # row_stride==1, non-TDM (tdm_global_load bypasses the gather entirely). Folded
             # into kernel name as "_wig" for the usual hipModuleGetFunction-lookup reason.
             self.wrw_incremental_gather = utility_dict_with_default_t(tunable_dict)('wrw_incremental_gather', 0)
+            # TDM multi-tap (new): extends fwd's TDM path from 1x1-only (nxe=0) to
+            # general multi-tap convolutions (Y,X >= 1) for a precisely bounded case:
+            # conv_stride_h = conv_stride_w = 1, pad_h = pad_w = 0, arbitrary
+            # dilation_h/dilation_w, arbitrary group. Uses TDM's 3D descriptor (4-operand
+            # tensor_load_to_lds with VADDR2+VADDR3) to express the 2D input sub-tile
+            # (C x Wo x Ho_tile) a fixed tap reads. Runtime shape restrictions (stride=1,
+            # pad=0, gemm_m_per_block % Wo == 0, Ho*Wo % gemm_m_per_block == 0) are
+            # enforced in tunable_is_valid (driver/igemm_fwd_gtc_driver.h), not here, since
+            # they depend on the actual conv args. Folded into kernel name as "_tdmmt" for
+            # the usual hipModuleGetFunction-lookup reason.
+            self.tdm_multitap = utility_dict_with_default_t(tunable_dict)('tdm_multitap', 0)
+            if self.tdm_multitap:
+                assert self.tdm_global_load, "tdm_multitap requires tdm_global_load=1"
+                assert self.direction == 'fwd', "tdm_multitap is fwd-only for now"
+                assert not self.wmma_m_tail, "tdm_multitap is not yet combined with wmma_m_tail"
+                assert not self.wmma_n_tail, "tdm_multitap is not yet combined with wmma_n_tail"
+                assert not self.lds_double_buffer, "tdm_multitap is not yet combined with lds_double_buffer (TDM LDS base toggle not reset between taps)"
+                assert not self.gemm_k_global_split, "tdm_multitap is not yet combined with gemm_k_global_split"
             if self.wrw_streamk:
                 assert self.gemm_k_global_split, \
                     "wrw_streamk builds on top of the atomic (gemm_k_global_split) epilogue -- set gemm_k_global_split=1 too"
@@ -1075,6 +1097,24 @@ class igemm_gtc_tunable_parameter_t(object):
                 assert self.lds_double_buffer == 1, \
                     f"fp32 WMMA tunables require lds_double_buffer=1 (see COR-001) -- " \
                     f"gemm_m_per_block:{self.gemm_m_per_block}x{self.gemm_n_per_block}x{self.gemm_k_per_block} is missing it"
+            # Phase 69 (async output store): non-atomic path only. 0 (default) = today's
+            # ds_read-from-LDS -> VGPR reload -> global_store_dword{,x2,x4} sequence,
+            # byte-identical for every existing config. 1 = replace that reload+store
+            # pair with global_store_async_from_lds_b{32,64,128}, which moves data
+            # directly from LDS to global memory with no VGPR round-trip -- fewer
+            # instructions, fewer VGPRs pressure (v_gather is dead in this path).
+            # Completion is tracked via ASYNCCNT -- the SAME counter the existing
+            # async_global_load path already waits on via s_wait_asynccnt 0x0. The wait
+            # is emitted (a) before every LDS-region-reuse point (inter-group barrier in
+            # the chunked epilogue) and (b) once more before the epilogue returns, so the
+            # kernel never exits or reuses its LDS while an async store is still in flight.
+            # Mutually exclusive with gemm_k_global_split (the atomic split-K epilogue has
+            # no LDS staging to skip -- it's a fundamentally different path). See
+            # coalescing_store_wmma.py's non-atomic branch for the implementation.
+            self.wmma_async_store = utility_dict_with_default_t(tunable_dict)('wmma_async_store', 0)
+            if self.wmma_async_store:
+                assert not self.gemm_k_global_split, \
+                    "wmma_async_store is not a replacement for the atomic split-K epilogue -- mutually exclusive"
 
         self.global_prefetch_a_num              = 2 if self.tensor_a_pass_through and not self.tensor_a_pass_through_interleave_gld else 1
         self.global_prefetch_b_num              = 2 if self.tensor_b_pass_through and not self.tensor_b_pass_through_interleave_gld else 1
@@ -1564,6 +1604,8 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += "_async"
         if tunable.tdm_global_load:
             kernel_name += "_tdm"
+        if tunable.tdm_multitap:
+            kernel_name += "_tdmmt"
         if tunable.saddr_global_load:
             kernel_name += "_saddr"
         if tunable.main_loop_interleave:
@@ -1639,6 +1681,11 @@ def igemm_gtc_encode_kernel_name(tunable, arch):
             kernel_name += f"_lp{tunable.local_prefetch_num}"
         if tunable.atomic_scope != 'SCOPE_SYS':
             kernel_name += "_scopedev" if tunable.atomic_scope == 'SCOPE_DEV' else f"_ascope{tunable.atomic_scope}"
+        # Phase 69: wmma_async_store changes the epilogue's store mechanism (async
+        # LDS->global vs ds_read+global_store) -- folded into the kernel name for the
+        # usual hipModuleGetFunction-lookup collision-avoidance reason.
+        if tunable.wmma_async_store:
+            kernel_name += "_asyncst"
 
     if tunable.tensor_a_pass_through:
         kernel_name += "_pta"

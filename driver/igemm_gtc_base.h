@@ -253,6 +253,12 @@ typedef struct {
     // per-iteration B-gather to an incremental index update (persistent wo_idx/ho_idx/
     // n_idx VGPRs). Only for row_stride==1, non-TDM. Folded into kernel name as "_wig".
     int wrw_incremental_gather = 0;
+    // TDM multi-tap: mirrors igemm_base.py's tdm_multitap -- extends fwd's TDM path
+    // from 1x1-only to general multi-tap (Y,X >= 1) for stride=1, pad=0, arbitrary
+    // dilation/group. Uses TDM's 3D descriptor (4-operand tensor_load_to_lds). Runtime
+    // shape restrictions are checked in tunable_is_valid. Folded into kernel name as
+    // "_tdmmt" for the usual hipModuleGetFunction-lookup reason. Default 0.
+    int tdm_multitap = 0;
     // Master-config phase (new): local_prefetch_num/atomic_scope/epilogue_lds_pad were
     // "purely internal-codegen choices" the driver never needed to know about, by the
     // ORIGINAL design -- true only as long as no two config sections of the SAME tile shape
@@ -302,6 +308,12 @@ typedef struct {
     // as wmma_acc_f16/wmma_acc_bf16/atomic_pack_bf16 above). Folded into the kernel name
     // as "_f16o" for the usual hipModuleGetFunction-lookup reason. Default 0.
     int wmma_fp16_output = 0;
+    // Phase 69: mirrors igemm_base.py's wmma_async_store -- replaces the epilogue's
+    // ds_read+global_store sequence with global_store_async_from_lds_b{N} (LDS -> global,
+    // no VGPR round-trip). Changes the generated epilogue code, so must be folded into
+    // the kernel name (see igemm_gtc_encode_kernel_name below) for the usual
+    // hipModuleGetFunction-lookup reason. Default 0, unused for every other fma_type.
+    int wmma_async_store = 0;
     // Default-member-initialized (unlike the int fields above, which zero-init safely via
     // aggregate-init anyway) so a default-constructed igemm_gtc_tunable_t{} -- e.g.
     // driver_mode_heuristic's still-unimplemented heuristic_select_kernel() stub -- doesn't
@@ -387,6 +399,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.gsplit_stagger              = sec.count("gsplit_stagger") > 0 ? sec.at("gsplit_stagger").get_int() : 0;
                 tunable.wrw_streamk                 = sec.count("wrw_streamk") > 0 ? sec.at("wrw_streamk").get_int() : 0;
                 tunable.wrw_incremental_gather    = sec.count("wrw_incremental_gather") > 0 ? sec.at("wrw_incremental_gather").get_int() : 0;
+                tunable.tdm_multitap              = sec.count("tdm_multitap") > 0 ? sec.at("tdm_multitap").get_int() : 0;
                 tunable.local_prefetch_num         = sec.count("local_prefetch_num") > 0 ? sec.at("local_prefetch_num").get_int() : 1;
                 tunable.epilogue_lds_pad           = sec.count("epilogue_lds_pad") > 0 ? sec.at("epilogue_lds_pad").get_int() : 0;
                 tunable.direct_store               = sec.count("direct_store") > 0 ? sec.at("direct_store").get_int() : 0;
@@ -395,6 +408,7 @@ igemm_gtc_tunable_from_config(const config_content_t &content) {
                 tunable.wmma_epilogue_chunked       = sec.count("wmma_epilogue_chunked") > 0 ? sec.at("wmma_epilogue_chunked").get_int() : 0;
                 tunable.wmma_acc_high_bank          = sec.count("wmma_acc_high_bank") > 0 ? sec.at("wmma_acc_high_bank").get_int() : 0;
                 tunable.wmma_fp16_output           = sec.count("wmma_fp16_output") > 0 ? sec.at("wmma_fp16_output").get_int() : 0;
+                tunable.wmma_async_store          = sec.count("wmma_async_store") > 0 ? sec.at("wmma_async_store").get_int() : 0;
                 tunable.atomic_scope               = sec.count("atomic_scope") > 0 ? sec.at("atomic_scope").get_string() : "SCOPE_SYS";
             }
             else{
@@ -607,6 +621,8 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += std::string("_async");
         if(tunable->tdm_global_load)
             kernel_name += std::string("_tdm");
+        if(tunable->tdm_multitap)
+            kernel_name += std::string("_tdmmt");
         if(tunable->saddr_global_load)
             kernel_name += std::string("_saddr");
         if(tunable->main_loop_interleave)
@@ -658,6 +674,9 @@ igemm_gtc_encode_kernel_name(const igemm_gtc_tunable_t *tunable) {
             kernel_name += std::string("_lp") + std::to_string(tunable->local_prefetch_num);
         if(tunable->atomic_scope != "SCOPE_SYS")
             kernel_name += (tunable->atomic_scope == "SCOPE_DEV") ? std::string("_scopedev") : (std::string("_ascope") + tunable->atomic_scope);
+        // Phase 69: mirrors igemm_base.py's _asyncst suffix.
+        if(tunable->wmma_async_store)
+            kernel_name += std::string("_asyncst");
     }
     if(tensor_a_pass_through)
         kernel_name += std::string("_pta");

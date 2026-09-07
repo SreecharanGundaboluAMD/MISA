@@ -187,6 +187,16 @@ class ctrl_coalescing_store_wmma_t(object):
         # gemm_k_global_split, wmma_acc_f16, wmma_acc_bf16, and atomic_pack_bf16
         # (asserted in igemm_base.py).
 
+        # Phase 69 (async output store): non-atomic path only (mutually exclusive with
+        # gemm_k_global_split, asserted in igemm_base.py). When True, the gather phase's
+        # ds_read-from-LDS + global_store_dword{,x2,x4} pair is replaced by
+        # global_store_async_from_lds_b{32,64,128}, which stores directly from LDS to
+        # global memory with no VGPR round-trip. Completion is tracked via ASYNCCNT
+        # (the same counter async_global_load already uses); s_wait_asynccnt 0x0 is
+        # emitted before every LDS-region-reuse point and before the epilogue returns.
+        # The n_tail slow path (per-element masking) still uses the old ds_read +
+        # global_store_dword sequence, since per-element stores need VGPR data.
+        self.wmma_async_store = False
 
 class igemm_coalescing_store_wmma_t(mc_base_t):
     def __init__(self, mc, ctrl):
@@ -204,7 +214,8 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
             v_tid, v_gather, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1,
             s_block_m_off, s_block_n_off, vwo, macro_tile_n, elem_bytes, elem_byte_shift,
             ds_read_inst, gst_inst, v_gather_range, pad, padded_stride, log2_n, v_chunked_col,
-            s_gemm_m=None, v_tmp3=None, s_gemm_n=None, v_tmp4=None, s_tmp2=None):
+            s_gemm_m=None, v_tmp3=None, s_gemm_n=None, v_tmp4=None, s_tmp2=None,
+            async_store_inst=None):
         '''
         Phase 53: chunked epilogue. Reuses one small, tile-size-INVARIANT LDS region
         across `wave_repeat_m` sequential groups instead of staging the whole macro-tile
@@ -326,6 +337,12 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
         for i_rm in range(wave_repeat_m):
             self._emit(f"; --- chunked epilogue group {i_rm}/{wave_repeat_m} ---")
             if i_rm != 0:
+                if async_store_inst is not None:
+                    # Phase 69: the previous group's async stores read from this same LDS
+                    # region -- they MUST complete (both LDS read and global write) before
+                    # this group's scatter overwrites those LDS bytes. s_wait_asynccnt 0x0
+                    # waits for ALL in-flight async stores to finish.
+                    self._emit(f"s_wait_asynccnt 0x0")
                 self._emit(f"s_wait_dscnt 0x0")
                 self._emit(f"s_barrier_signal -1")
                 self._emit(f"s_barrier_wait -1   ; group {i_rm-1}'s gather-reads must retire before this group's scatter reuses the same LDS bytes")
@@ -494,12 +511,19 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                 self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_chunked_col}], v[{v_gather}]   ; + global col")
                 self._emit(f"v_lshlrev_b32 v[{v_tmp2}], {elem_byte_shift}, v[{v_tmp2}]   ; global memory byte address, pass {it}")
 
-                self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * row_step_per_pass_g * padded_stride * elem_bytes}")
-                self._emit(f"s_wait_dscnt 0x0")
-                if ctrl.wmma_n_tail and vwo > 1 and not ctrl.wmma_acc_f16:
-                    # Phase 68: same Phase-51 fast(exact-multiple)/slow(per-element) split
-                    # as the unchunked gather -- a single vwo-wide EXEC mask can't
-                    # correctly handle gemm_n falling strictly inside one lane's group.
+                use_async_g = async_store_inst is not None
+                lds_pass_stride_g = row_step_per_pass_g * padded_stride * elem_bytes
+                if use_async_g and not (ctrl.wmma_n_tail and vwo > 1 and not ctrl.wmma_acc_f16):
+                    # ---- async fast path: no ds_read, no VGPR reload ----
+                    if ctrl.wmma_m_tail:
+                        self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
+                    if ctrl.wmma_n_tail:
+                        self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n")
+                    self._emit(f"{async_store_inst} v[{v_tmp2}], v[{v_tmp1}], s[{s_p_out}:{s_p_out}+1]")
+                    if ctrl.wmma_m_tail or ctrl.wmma_n_tail:
+                        self._emit(f"s_mov_b32 exec_lo, -1")
+                elif use_async_g and (ctrl.wmma_n_tail and vwo > 1 and not ctrl.wmma_acc_f16):
+                    # ---- async fast path (n_tail branch): exact-multiple case ----
                     self._label_counter += 1
                     label_slow = f"L_cstore_{id(self)}_{self._label_counter}_chunked_ntail_slow"
                     label_done = f"L_cstore_{id(self)}_{self._label_counter}_chunked_ntail_done"
@@ -508,10 +532,13 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                     if ctrl.wmma_m_tail:
                         self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (fast path)")
                     self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n (fast path)")
-                    self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1] th:TH_STORE_NT")
+                    self._emit(f"{async_store_inst} v[{v_tmp2}], v[{v_tmp1}], s[{s_p_out}:{s_p_out}+1]")
                     self._emit(f"s_mov_b32 exec_lo, -1")
                     self._emit(f"s_branch {label_done}")
                     self._emit_front(f"{label_slow}:")
+                    # slow path: still needs ds_read for per-element VGPR data
+                    self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * lds_pass_stride_g}")
+                    self._emit(f"s_wait_dscnt 0x0")
                     for i in range(vwo):
                         if ctrl.wmma_m_tail:
                             self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (elem {i})")
@@ -520,14 +547,49 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                         self._emit(f"s_mov_b32 exec_lo, -1")
                     self._emit_front(f"{label_done}:")
                 else:
-                    if ctrl.wmma_m_tail:
-                        self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
-                    if ctrl.wmma_n_tail:
-                        self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n")
-                    self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1] th:TH_STORE_NT")
-                    if ctrl.wmma_m_tail or ctrl.wmma_n_tail:
+                    # ---- sync path (original): ds_read + global_store ----
+                    self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * row_step_per_pass_g * padded_stride * elem_bytes}")
+                    self._emit(f"s_wait_dscnt 0x0")
+                    if ctrl.wmma_n_tail and vwo > 1 and not ctrl.wmma_acc_f16:
+                        # Phase 68: same Phase-51 fast(exact-multiple)/slow(per-element) split
+                        # as the unchunked gather -- a single vwo-wide EXEC mask can't
+                        # correctly handle gemm_n falling strictly inside one lane's group.
+                        self._label_counter += 1
+                        label_slow = f"L_cstore_{id(self)}_{self._label_counter}_chunked_ntail_slow"
+                        label_done = f"L_cstore_{id(self)}_{self._label_counter}_chunked_ntail_done"
+                        self._emit(f"s_cmp_eq_u32 s[{s_tmp2}], 0")
+                        self._emit(f"s_cbranch_scc0 {label_slow}   ; Phase 68: gemm_n % {vwo} != 0 this pass -> per-element masking")
+                        if ctrl.wmma_m_tail:
+                            self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (fast path)")
+                        self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n (fast path)")
+                        self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1] th:TH_STORE_NT")
                         self._emit(f"s_mov_b32 exec_lo, -1")
-            self._emit_empty_line()
+                        self._emit(f"s_branch {label_done}")
+                        self._emit_front(f"{label_slow}:")
+                        for i in range(vwo):
+                            if ctrl.wmma_m_tail:
+                                self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (elem {i})")
+                            self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], {i}   ; wmma_n_tail: col+{i} < real gemm_n")
+                            self._emit(f"global_store_dword v[{v_tmp2}], v[{v_gather}+{i}], s[{s_p_out}:{s_p_out}+1] offset:{i * elem_bytes} th:TH_STORE_NT")
+                            self._emit(f"s_mov_b32 exec_lo, -1")
+                        self._emit_front(f"{label_done}:")
+                    else:
+                        if ctrl.wmma_m_tail:
+                            self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
+                        if ctrl.wmma_n_tail:
+                            self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n")
+                        self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1] th:TH_STORE_NT")
+                        if ctrl.wmma_m_tail or ctrl.wmma_n_tail:
+                            self._emit(f"s_mov_b32 exec_lo, -1")
+                if it != num_passes_g - 1 and use_async_g:
+                    # Phase 69: advance LDS source addr (async store's offset shifts both
+                    # LDS source and global dest, which have different strides).
+                    self._emit(f"v_add_u32 v[{v_tmp1}], {lds_pass_stride_g}, v[{v_tmp1}]   ; advance LDS source addr to pass {it + 1}")
+        if async_store_inst is not None:
+            # Phase 69: wait for the LAST group's async stores to complete before the
+            # epilogue returns -- the kernel must not exit while stores are still in flight.
+            self._emit(f"s_wait_asynccnt 0x0")
+        self._emit_empty_line()
 
     def __call__(self, v_c, v_gemm_im, v_gemm_in, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1, v_tid=None, v_gather=None, s_block_m_off=None, s_block_n_off=None, s_gemm_m=None, v_tmp3=None, s_gemm_n=None, v_tmp4=None, s_tmp2=None, v_chunked_col=None):
         '''
@@ -833,6 +895,17 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                 # one full VGPR regardless of the 16-bit payload being smaller than a dword).
                 v_gather_num_regs = max(1, (vwo * elem_bytes) // 4)
                 v_gather_range = f"{v_gather}:{v_gather}+{v_gather_num_regs - 1}" if v_gather_num_regs > 1 else v_gather
+                # Phase 69: async store instruction selection. global_store_async_from_lds_b{N}
+                # moves data directly from LDS to global (no VGPR round-trip). The width N
+                # (in bytes) must match vwo*elem_bytes. Only b32/b64/b128 exist (no b16), so
+                # f16/vwo=1 (2 bytes) is not supported -- asserted below.
+                async_store_bytes = vwo * elem_bytes
+                async_store_inst = {4: "global_store_async_from_lds_b32",
+                                    8: "global_store_async_from_lds_b64",
+                                    16: "global_store_async_from_lds_b128"}.get(async_store_bytes)
+                if ctrl.wmma_async_store:
+                    assert async_store_inst is not None, \
+                        f"wmma_async_store: no global_store_async_from_lds instruction for {async_store_bytes}-byte store (vwo={vwo}, elem_bytes={elem_bytes}) -- smallest async store is b32 (4 bytes)"
 
                 if ctrl.wmma_epilogue_chunked:
                     assert v_chunked_col is not None, "wmma_epilogue_chunked requires v_chunked_col (see kernel_vgpr_t)"
@@ -840,7 +913,8 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                         v_tid, v_gather, s_p_out, s_gemm_m_stride, v_tmp1, v_tmp2, s_tmp1,
                         s_block_m_off, s_block_n_off, vwo, macro_tile_n, elem_bytes, elem_byte_shift,
                         ds_read_inst, gst_inst, v_gather_range, pad, padded_stride, log2_n, v_chunked_col,
-                        s_gemm_m=s_gemm_m, v_tmp3=v_tmp3, s_gemm_n=s_gemm_n, v_tmp4=v_tmp4, s_tmp2=s_tmp2)
+                        s_gemm_m=s_gemm_m, v_tmp3=v_tmp3, s_gemm_n=s_gemm_n, v_tmp4=v_tmp4, s_tmp2=s_tmp2,
+                        async_store_inst=async_store_inst if ctrl.wmma_async_store else None)
                 else:
 
                     if ctrl.vgpr_msb_tracker is not None:
@@ -1026,38 +1100,30 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                     self._emit(f"v_lshlrev_b32 v[{v_tmp2}], {elem_byte_shift}, v[{v_tmp2}]   ; global memory byte address for pass 0")
                     self._emit(f"s_lshl_b32 s[{s_tmp1}], s[{s_gemm_m_stride}], {utility_log2(row_step_per_pass) + elem_byte_shift}   ; per-pass memory stride")
                     self._emit_empty_line()
+                    # Phase 69: when wmma_async_store is set, the fast path uses
+                    # global_store_async_from_lds_b{N} (LDS -> global, no VGPR round-trip)
+                    # instead of ds_read + global_store. The LDS address (v_tmp1) must be
+                    # advanced per pass via v_add_u32 (can't use the ds_read's offset
+                    # immediate, since the async store's offset shifts BOTH LDS source and
+                    # global dest, and those strides differ). The n_tail slow path still
+                    # needs ds_read (per-element stores require VGPR data), so it keeps the
+                    # old mechanism. lds_pass_stride is a compile-time constant.
+                    use_async = ctrl.wmma_async_store
+                    lds_pass_stride = row_step_per_pass * padded_stride * elem_bytes
+                    if use_async:
+                        self._emit(f"; wmma async output store (global_store_async_from_lds), {num_passes} passes")
                     for it in range(num_passes):
-                        # row_step_per_pass*padded_stride*elem_bytes == elems_per_pass*elem_bytes
-                        # when pad=0 (since elems_per_pass is a multiple of macro_tile_n by
-                        # construction) -- one formula, byte-identical to the old literal in the
-                        # unpadded f32 case (elem_bytes=4).
-                        self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * row_step_per_pass * padded_stride * elem_bytes}")
-                        self._emit(f"s_wait_dscnt 0x0")
-                        if ctrl.wmma_n_tail and vwo > 1 and not is_2byte:
-                            # Phase 51: gemm_n is no longer guaranteed to be a multiple of vwo here
-                            # (that restriction -- previously required by tunable_is_valid()
-                            # whenever wmma_n_tail was set -- is exactly what this mechanism
-                            # lifts), so a single EXEC mask covering the whole vwo-wide vectorized
-                            # store can't correctly handle gemm_n falling STRICTLY INSIDE one
-                            # lane's group (the old mask only checked the group's first column,
-                            # silently writing up to vwo-1 out-of-range trailing columns too).
-                            #
-                            # A runtime scalar branch picks between the pre-Phase-51 fast path
-                            # (single vectorized store, exact-multiple case -- byte-identical to
-                            # before this phase) and a slow path decomposed into vwo individual
-                            # masked scalar stores (only the specific straddling group's write
-                            # differs from the fast path; every other lane's data is unaffected
-                            # either way) -- measured on real hardware to matter: without this
-                            # branch (always taking the slow path), an existing exact-multiple-of-4
-                            # shape regressed ~24% (0.132ms -> 0.164ms). gemm_n % vwo is pass-
-                            # invariant, precomputed once into s_tmp2 above. m_tail's row check
-                            # (if any) is cheaply recomputed fresh for each slow-path element (1
-                            # extra VALU instruction) rather than saving/restoring a partially-
-                            # narrowed EXEC state across elements -- avoids needing yet another
-                            # scratch register. Not yet extended to wmma_acc_f16/bf16acc's packed-
-                            # 2-elements-per-register layout (no existing config combines the two,
-                            # asserted against in igemm_base.py -- see
-                            # docs/gfx1250_optimization_backlog.md).
+                        if use_async and not (ctrl.wmma_n_tail and vwo > 1 and not is_2byte):
+                            # ---- async fast path: no ds_read, no VGPR reload ----
+                            if ctrl.wmma_m_tail:
+                                self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
+                            if ctrl.wmma_n_tail:
+                                self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n")
+                            self._emit(f"{async_store_inst} v[{v_tmp2}], v[{v_tmp1}], s[{s_p_out}:{s_p_out}+1]")
+                            if ctrl.wmma_m_tail or ctrl.wmma_n_tail:
+                                self._emit(f"s_mov_b32 exec_lo, -1")
+                        elif use_async and (ctrl.wmma_n_tail and vwo > 1 and not is_2byte):
+                            # ---- async fast path (n_tail branch): exact-multiple case ----
                             self._label_counter += 1
                             label_slow = f"L_cstore_{id(self)}_{self._label_counter}_ntail_slow"
                             label_done = f"L_cstore_{id(self)}_{self._label_counter}_ntail_done"
@@ -1066,10 +1132,13 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                             if ctrl.wmma_m_tail:
                                 self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (fast path)")
                             self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n (fast path)")
-                            self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1] th:TH_STORE_NT")
+                            self._emit(f"{async_store_inst} v[{v_tmp2}], v[{v_tmp1}], s[{s_p_out}:{s_p_out}+1]")
                             self._emit(f"s_mov_b32 exec_lo, -1")
                             self._emit(f"s_branch {label_done}")
                             self._emit_front(f"{label_slow}:")
+                            # slow path: still needs ds_read for per-element VGPR data
+                            self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * lds_pass_stride}")
+                            self._emit(f"s_wait_dscnt 0x0")
                             for i in range(vwo):
                                 if ctrl.wmma_m_tail:
                                     self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (elem {i})")
@@ -1078,26 +1147,90 @@ class igemm_coalescing_store_wmma_t(mc_base_t):
                                 self._emit(f"s_mov_b32 exec_lo, -1")
                             self._emit_front(f"{label_done}:")
                         else:
-                            if ctrl.wmma_m_tail:
-                                # Phase 25: EXEC-mask off lanes whose absolute row for this pass is in
-                                # the tail block's out-of-range tail (>= real gemm_m). Wave32-only idiom
-                                # (v_cmpx narrows EXEC directly, exec_lo restore afterward) -- mirrors
-                                # _emit_gld_chunk_load's existing v_flag masking in
-                                # igemm_fwd_gtc_wmma_nhwc.py, not XDLOPS's 64-bit saveexec/or pattern.
-                                self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
-                            if ctrl.wmma_n_tail:
-                                # Phase 26b: chained right after the M-tail guard (if any) -- wave32
-                                # v_cmpx intersects with the current EXEC rather than overwriting it,
-                                # so this further narrows to lanes that are ALSO column-in-range.
-                                # Phase 51: "remaining > 0" is exactly the old "col0 < gemm_n" flag.
-                                self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n")
-                            self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1] th:TH_STORE_NT")
-                            if ctrl.wmma_m_tail or ctrl.wmma_n_tail:
+                            # ---- sync path (original): ds_read + global_store ----
+                            # row_step_per_pass*padded_stride*elem_bytes == elems_per_pass*elem_bytes
+                            # when pad=0 (since elems_per_pass is a multiple of macro_tile_n by
+                            # construction) -- one formula, byte-identical to the old literal in the
+                            # unpadded f32 case (elem_bytes=4).
+                            self._emit(f"{ds_read_inst} v[{v_gather_range}], v[{v_tmp1}] offset:{it * row_step_per_pass * padded_stride * elem_bytes}")
+                            self._emit(f"s_wait_dscnt 0x0")
+                            if ctrl.wmma_n_tail and vwo > 1 and not is_2byte:
+                                # Phase 51: gemm_n is no longer guaranteed to be a multiple of vwo here
+                                # (that restriction -- previously required by tunable_is_valid()
+                                # whenever wmma_n_tail was set -- is exactly what this mechanism
+                                # lifts), so a single EXEC mask covering the whole vwo-wide vectorized
+                                # store can't correctly handle gemm_n falling STRICTLY INSIDE one
+                                # lane's group (the old mask only checked the group's first column,
+                                # silently writing up to vwo-1 out-of-range trailing columns too).
+                                #
+                                # A runtime scalar branch picks between the pre-Phase-51 fast path
+                                # (single vectorized store, exact-multiple case -- byte-identical to
+                                # before this phase) and a slow path decomposed into vwo individual
+                                # masked scalar stores (only the specific straddling group's write
+                                # differs from the fast path; every other lane's data is unaffected
+                                # either way) -- measured on real hardware to matter: without this
+                                # branch (always taking the slow path), an existing exact-multiple-of-4
+                                # shape regressed ~24% (0.132ms -> 0.164ms). gemm_n % vwo is pass-
+                                # invariant, precomputed once into s_tmp2 above. m_tail's row check
+                                # (if any) is cheaply recomputed fresh for each slow-path element (1
+                                # extra VALU instruction) rather than saving/restoring a partially-
+                                # narrowed EXEC state across elements -- avoids needing yet another
+                                # scratch register. Not yet extended to wmma_acc_f16/bf16acc's packed-
+                                # 2-elements-per-register layout (no existing config combines the two,
+                                # asserted against in igemm_base.py -- see
+                                # docs/gfx1250_optimization_backlog.md).
+                                self._label_counter += 1
+                                label_slow = f"L_cstore_{id(self)}_{self._label_counter}_ntail_slow"
+                                label_done = f"L_cstore_{id(self)}_{self._label_counter}_ntail_done"
+                                self._emit(f"s_cmp_eq_u32 s[{s_tmp2}], 0")
+                                self._emit(f"s_cbranch_scc0 {label_slow}   ; Phase 51: gemm_n % {vwo} != 0 this pass -> per-element masking")
+                                if ctrl.wmma_m_tail:
+                                    self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (fast path)")
+                                self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n (fast path)")
+                                self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1] th:TH_STORE_NT")
                                 self._emit(f"s_mov_b32 exec_lo, -1")
+                                self._emit(f"s_branch {label_done}")
+                                self._emit_front(f"{label_slow}:")
+                                for i in range(vwo):
+                                    if ctrl.wmma_m_tail:
+                                        self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m (elem {i})")
+                                    self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], {i}   ; wmma_n_tail: col0+{i} < real gemm_n")
+                                    self._emit(f"global_store_dword v[{v_tmp2}], v[{v_gather}+{i}], s[{s_p_out}:{s_p_out}+1] offset:{i * elem_bytes} th:TH_STORE_NT")
+                                    self._emit(f"s_mov_b32 exec_lo, -1")
+                                self._emit_front(f"{label_done}:")
+                            else:
+                                if ctrl.wmma_m_tail:
+                                    # Phase 25: EXEC-mask off lanes whose absolute row for this pass is in
+                                    # the tail block's out-of-range tail (>= real gemm_m). Wave32-only idiom
+                                    # (v_cmpx narrows EXEC directly, exec_lo restore afterward) -- mirrors
+                                    # _emit_gld_chunk_load's existing v_flag masking in
+                                    # igemm_fwd_gtc_wmma_nhwc.py, not XDLOPS's 64-bit saveexec/or pattern.
+                                    self._emit(f"v_cmpx_gt_u32 s[{s_gemm_m}], v[{v_tmp3}]   ; wmma_m_tail: row < real gemm_m")
+                                if ctrl.wmma_n_tail:
+                                    # Phase 26b: chained right after the M-tail guard (if any) -- wave32
+                                    # v_cmpx intersects with the current EXEC rather than overwriting it,
+                                    # so this further narrows to lanes that are ALSO column-in-range.
+                                    # Phase 51: "remaining > 0" is exactly the old "col0 < gemm_n" flag.
+                                    self._emit(f"v_cmpx_gt_i32 v[{v_tmp4}], 0   ; wmma_n_tail: col < real gemm_n")
+                                self._emit(f"{gst_inst} v[{v_tmp2}], v[{v_gather_range}], s[{s_p_out}:{s_p_out}+1] th:TH_STORE_NT")
+                                if ctrl.wmma_m_tail or ctrl.wmma_n_tail:
+                                    self._emit(f"s_mov_b32 exec_lo, -1")
                         if it != num_passes - 1:
                             self._emit(f"v_add_u32 v[{v_tmp2}], v[{v_tmp2}], s[{s_tmp1}]   ; advance to pass {it + 1}")
+                            if use_async:
+                                # Phase 69: advance the LDS source address too (async store has no
+                                # offset immediate for LDS-only advancement -- the offset shifts both
+                                # LDS source and global dest, which have different strides).
+                                self._emit(f"v_add_u32 v[{v_tmp1}], {lds_pass_stride}, v[{v_tmp1}]   ; advance LDS source addr to pass {it + 1}")
                             if ctrl.wmma_m_tail:
                                 self._emit(f"v_add_u32 v[{v_tmp3}], {row_step_per_pass}, v[{v_tmp3}]   ; wmma_m_tail: advance absolute row")
+                    if use_async:
+                        # Phase 69: wait for all async stores to complete before the epilogue returns --
+                        # the kernel must not exit (s_endpgm) or let its LDS be reused while a store
+                        # is still reading from LDS. ASYNCCNT is the same counter async_global_load
+                        # already uses; this wait is emitted here (epilogue-internal) so the caller's
+                        # existing s_wait_storecnt 0x0 need not change.
+                        self._emit(f"s_wait_asynccnt 0x0")
                     self._emit_empty_line()
         return self._get_deferred()
     def _emit_direct_store(self, ctrl, cxm, inst_wmma, v_c, v_gemm_im, v_gemm_in,
