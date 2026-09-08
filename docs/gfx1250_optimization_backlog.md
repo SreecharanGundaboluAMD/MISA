@@ -787,6 +787,21 @@ section for the record).
   small output-channel counts).
 - Blaming same-address atomic contention for wrw's slowness:
   `TX_VMW_ATOMIC_SETCONFLICT_STALL` measured at exactly zero (Finding 1).
+- `DISABLE_XDL_ARB_STALL` (`SCHED_MODE` bit[2], `s_setreg_imm32_b32
+  hwreg(HW_REG_WAVE_SCHED_MODE, 2, 1), 1` — confirmed assembler encoding via
+  `llvm-mc`/`libLLVM.so` symbol table; ISA doc §5.7.2.1 describes the semantics but
+  never spells out the hwreg id) — isolated hardware A/B test, spliced directly into
+  a built wrw split-K (`gsplit`) kernel's `.inc` right after the kernel entry label,
+  same shape/methodology as `docs/gfx1250_rocprof_profiling.md` Finding 2
+  (n42c192H60W80k64, 252-way split-K): `valid:y` on both baseline and probe (no
+  correctness break), but probe is ~1.2% *slower*, consistent across 5 repeats each
+  (baseline mean 114.1 TFLOPS, probe mean 112.7 TFLOPS). Matches the ISA doc's own
+  caution read literally: disabling the arbiter stall trades away co-execution
+  between waves sharing a SIMD, and this gsplit shape launches far more workgroups
+  than fit "one wave per SIMD" — the regime the feature is actually for. Not worth
+  re-testing on fwd/bwd (higher occupancy still, same argument applies harder); would
+  only be worth revisiting for a deliberately single-wave-per-SIMD-occupancy config,
+  which none of MISA's current tile shapes are.
 
 ## Done
 
